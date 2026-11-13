@@ -1,0 +1,20 @@
+# build output
+/target/
+/pkg/
+/src/target/
+*.pkg.tar.zst
+
+# local test pictures
+/shots/
+
+# machine-specific Windows GNU toolchain setting (contains a local path)
+/.cargo/config.toml
+
+# notes about the original program, kept out of the public repository
+/MECHANICS.md
+/mechanics.json
+
+# left over from the earlier Windows-only version
+/.venv/
+/__pycache__/
+/SimpleVMManager.exe

@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Simple VM Manager
+GenericName=Virtual Machine Manager
+Comment=Manage XenServer / XCP-ng pools: servers, VMs, storage and networks
+Exec=simple-vm-manager
+Icon=simple-vm-manager
+Terminal=false
+Categories=System;Utility;Network;
+Keywords=xen;xenserver;xcp-ng;vm;virtual;machine;hypervisor;server;
+StartupWMClass=simple-vm-manager
