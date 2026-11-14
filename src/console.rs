@@ -780,6 +780,38 @@ fn follow_pointer(ui: &Ui, resp: &egui::Response, focused: bool, allow: bool) {
     }
 }
 
+const ICON_BUTTON: egui::Vec2 = vec2(30.0, 22.0);
+
+/// A keyboard: an outline, two rows of keys and a space bar.
+fn paint_keyboard(p: &egui::Painter, r: Rect, col: Color32) {
+    let k = Rect::from_center_size(r.center(), vec2(17.0, 11.0));
+    p.rect_stroke(k, Rounding::same(2.0), Stroke::new(1.3, col));
+    for row in 0..2 {
+        for i in 0..5 {
+            let c = pos2(k.min.x + 3.0 + i as f32 * 2.75, k.min.y + 3.0 + row as f32 * 2.5);
+            p.rect_filled(Rect::from_center_size(c, vec2(1.4, 1.2)), 0.0, col);
+        }
+    }
+    p.line_segment([pos2(k.min.x + 5.0, k.max.y - 2.5), pos2(k.max.x - 5.0, k.max.y - 2.5)], Stroke::new(1.2, col));
+}
+
+/// A monitor on its stand; with `fit`, arrows pointing to its corners.
+fn paint_monitor(p: &egui::Painter, r: Rect, col: Color32, fit: bool) {
+    let m = Rect::from_center_size(r.center() - vec2(0.0, 1.5), vec2(17.0, 11.0));
+    let s = Stroke::new(1.3, col);
+    p.rect_stroke(m, Rounding::same(1.5), s);
+    p.line_segment([pos2(m.center().x, m.max.y), pos2(m.center().x, m.max.y + 2.5)], s);
+    p.line_segment([pos2(m.center().x - 3.5, m.max.y + 2.5), pos2(m.center().x + 3.5, m.max.y + 2.5)], s);
+    if fit {
+        let s = Stroke::new(1.1, col);
+        let (a, b) = (m.shrink2(vec2(3.0, 2.5)).min, m.shrink2(vec2(3.0, 2.5)).max);
+        for (corner, dx, dy) in [(a, 2.5, 2.0), (pos2(b.x, a.y), -2.5, 2.0), (pos2(a.x, b.y), 2.5, -2.0), (b, -2.5, -2.0)] {
+            p.line_segment([corner, corner + vec2(dx, 0.0)], s);
+            p.line_segment([corner, corner + vec2(0.0, dy)], s);
+        }
+    }
+}
+
 // ---------------------------------------------------------------- the demo server's pretend console
 
 #[derive(PartialEq)]
@@ -870,6 +902,10 @@ pub struct ConsoleView {
     retry_at: Option<Instant>,
     retries: u32,
     was_connected: bool,
+    last_pass: u64,
+    wake_pending: bool,
+    /// No room for the controls next to the tabs: they float over the screen's corner instead.
+    overlay_controls: bool,
 }
 
 impl ConsoleView {
@@ -891,6 +927,9 @@ impl ConsoleView {
             retry_at: None,
             retries: 0,
             was_connected: false,
+            last_pass: 0,
+            wake_pending: true,
+            overlay_controls: false,
         };
         if !demo {
             v.connect();
@@ -918,6 +957,18 @@ impl ConsoleView {
             self.was_connected = true;
             self.retries = 0;
         }
+        // Each time the screen comes into view (the tab opened, or another VM picked), tap Ctrl in
+        // the VM: it wakes a display that went dark to save power (Windows turns its screen off
+        // when idle) and does nothing else.
+        let pass = ui.ctx().cumulative_pass_nr();
+        if pass > self.last_pass + 1 {
+            self.wake_pending = true;
+        }
+        self.last_pass = pass;
+        if self.wake_pending && status == Status::Connected && self.remote.is_some() {
+            self.wake_pending = false;
+            self.tap(CTRL.0, CTRL.1);
+        }
         // After a reboot the VM's screen comes back on a new connection: try again by itself.
         if let Status::Failed(_) = &status {
             if self.was_connected && self.retries < MAX_RETRIES {
@@ -932,62 +983,7 @@ impl ConsoleView {
         }
         let focused = ui.memory(|m| m.has_focus(screen_id()));
 
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            let (dot, text) = match &status {
-                Status::Connecting => (pal.orange, "Connecting to the console…".to_string()),
-                Status::Connected if focused => (pal.green, "The keyboard goes to the VM while the mouse is over its screen.".to_string()),
-                Status::Connected => (pal.green, "Move the mouse over the screen to type in the VM.".to_string()),
-                Status::Failed(_) if self.retry_at.is_some() => (pal.orange, "The console went away (the VM may be rebooting). Connecting again…".to_string()),
-                Status::Failed(_) => (pal.red, "Not connected".to_string()),
-            };
-            let hint_full = text.clone();
-            // The buttons keep their room on the right; the hint gets what's left, cut short if need be.
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.checkbox(&mut self.fit, "Scale to fit");
-                let connected = status == Status::Connected;
-                let mut combo: Option<Vec<(u32, u32)>> = None;
-                ui.add_enabled_ui(connected, |ui| {
-                    let b = egui::Button::new("Send keys      ").stroke(Stroke::new(1.0, pal.border_strong)).rounding(Rounding::same(5.0));
-                    let menu = egui::menu::menu_custom_button(ui, b, |ui| {
-                        ui.set_min_width(230.0);
-                        for (label, keys) in KEY_MENU {
-                            if ui.button(label).clicked() {
-                                combo = Some(keys.to_vec());
-                                ui.close_menu();
-                            }
-                        }
-                        ui.separator();
-                        ui.menu_button("Linux text consoles", |ui| {
-                            for n in 1..=12 {
-                                if ui.button(format!("Ctrl+Alt+F{}", n)).clicked() {
-                                    combo = Some(vec![CTRL, ALT, function_key(n)]);
-                                    ui.close_menu();
-                                }
-                            }
-                        });
-                    });
-                    let r = menu.response.rect;
-                    let c = pos2(r.right() - 13.0, r.center().y);
-                    let col = if connected { pal.ink_soft } else { pal.ink_faint };
-                    ui.painter().add(egui::Shape::line(vec![pos2(c.x - 3.5, c.y - 1.5), pos2(c.x, c.y + 2.0), pos2(c.x + 3.5, c.y - 1.5)], Stroke::new(1.4, col)));
-                    let b = egui::Button::new("Send Ctrl+Alt+Del").stroke(Stroke::new(1.0, pal.border_strong)).rounding(Rounding::same(5.0));
-                    if ui.add(b).clicked() {
-                        combo = Some(vec![CTRL, ALT, DELETE]);
-                    }
-                });
-                if let Some(keys) = combo {
-                    self.send_combo(&keys);
-                }
-                ui.add_space(8.0);
-                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                    let (r, _) = ui.allocate_exact_size(vec2(10.0, 18.0), Sense::hover());
-                    ui.painter().circle_filled(r.center(), 4.0, dot);
-                    ui.add(egui::Label::new(egui::RichText::new(text).color(pal.ink_soft)).truncate()).on_hover_text(hint_full);
-                });
-            });
-        });
-        ui.add_space(6.0);
+        ui.add_space(8.0);
 
         let area = ui.available_rect_before_wrap();
         let area = Rect::from_min_max(area.min, pos2(area.max.x, area.max.y - 10.0));
@@ -996,6 +992,7 @@ impl ConsoleView {
         if let Some(demo) = self.demo.as_mut() {
             Self::demo_screen(ui, area, demo, focused, allow_keyboard);
             ui.allocate_rect(area, Sense::hover());
+            self.overlays(ui, area, pal, &status);
             return;
         }
         match &status {
@@ -1049,6 +1046,99 @@ impl ConsoleView {
         }
         if focused {
             ui.painter().rect_stroke(area, Rounding::same(4.0), Stroke::new(1.5, pal.accent));
+        }
+        self.overlays(ui, area, pal, &status);
+    }
+
+    /// Over the screen: a note while the console reconnects, and the controls when the tab row
+    /// had no room for them.
+    fn overlays(&mut self, ui: &mut Ui, area: Rect, pal: &Pal, status: &Status) {
+        if matches!(status, Status::Failed(_)) && self.retry_at.is_some() {
+            let text = "The VM's screen went away (it may be restarting). Connecting again…";
+            let g = ui.painter().layout(text.into(), FontId::proportional(13.0), Color32::from_gray(235), area.width() - 60.0);
+            let r = Rect::from_center_size(pos2(area.center().x, area.min.y + 30.0), g.size() + vec2(24.0, 12.0));
+            ui.painter().rect_filled(r, Rounding::same(6.0), Color32::from_black_alpha(200));
+            ui.painter().galley(r.min + vec2(12.0, 6.0), g, Color32::from_gray(235));
+        }
+        if self.overlay_controls {
+            let r = Rect::from_min_max(pos2(area.max.x - 80.0, area.min.y + 6.0), pos2(area.max.x - 6.0, area.min.y + 32.0));
+            let mut child = ui.new_child(egui::UiBuilder::new().max_rect(r).layout(egui::Layout::right_to_left(egui::Align::Center)));
+            self.controls(&mut child, pal, true);
+        }
+    }
+
+    /// The console's controls in the row of tabs, right-aligned in `free`: with their names when
+    /// there's room, otherwise as two icons (a keyboard for the keys, a monitor for Scale to fit),
+    /// or, without room even for those, over the screen's corner.
+    pub fn tab_controls(&mut self, ui: &mut Ui, free: Rect, pal: &Pal) {
+        let text_w = |t: &str| ui.painter().layout_no_wrap(t.to_string(), egui::TextStyle::Button.resolve(ui.style()), pal.ink).size().x;
+        let full = text_w("Send Ctrl+Alt+Del") + text_w("Send keys      ") + text_w("Scale to fit") + 3.0 * 22.0 + 2.0 * 8.0;
+        let icons = 2.0 * ICON_BUTTON.x + 8.0;
+        self.overlay_controls = free.width() < icons;
+        if !self.overlay_controls {
+            let mut child = ui.new_child(egui::UiBuilder::new().max_rect(free).layout(egui::Layout::right_to_left(egui::Align::Center)));
+            self.controls(&mut child, pal, free.width() < full);
+        }
+    }
+
+    fn controls(&mut self, ui: &mut Ui, pal: &Pal, compact: bool) {
+        ui.spacing_mut().item_spacing.x = 8.0;
+        let connected = self.status() == Status::Connected;
+        let mut combo: Option<Vec<(u32, u32)>> = None;
+        let menu = |ui: &mut Ui, combo: &mut Option<Vec<(u32, u32)>>, with_cad: bool| {
+            ui.set_min_width(230.0);
+            if with_cad && ui.button("Send Ctrl+Alt+Del").clicked() {
+                *combo = Some(vec![CTRL, ALT, DELETE]);
+                ui.close_menu();
+            }
+            if with_cad {
+                ui.separator();
+            }
+            for (label, keys) in KEY_MENU {
+                if ui.button(label).clicked() {
+                    *combo = Some(keys.to_vec());
+                    ui.close_menu();
+                }
+            }
+            ui.separator();
+            ui.menu_button("Linux text consoles", |ui| {
+                for n in 1..=12 {
+                    if ui.button(format!("Ctrl+Alt+F{}", n)).clicked() {
+                        *combo = Some(vec![CTRL, ALT, function_key(n)]);
+                        ui.close_menu();
+                    }
+                }
+            });
+        };
+        let framed = |b: egui::Button<'static>| b.stroke(Stroke::new(1.0, pal.border_strong)).rounding(Rounding::same(5.0));
+        if compact {
+            // a monitor: Scale to fit (filled in while on); a keyboard: every key combination
+            let fill = if self.fit { pal.nav_on } else { pal.surface };
+            let b = ui.add(framed(egui::Button::new("")).min_size(ICON_BUTTON).fill(fill)).on_hover_text(if self.fit { "Scale to fit: on" } else { "Scale to fit: off" });
+            paint_monitor(ui.painter(), b.rect, pal.ink_soft, self.fit);
+            if b.clicked() {
+                self.fit = !self.fit;
+            }
+            ui.add_enabled_ui(connected, |ui| {
+                let m = egui::menu::menu_custom_button(ui, framed(egui::Button::new("")).min_size(ICON_BUTTON), |ui| menu(ui, &mut combo, true));
+                paint_keyboard(ui.painter(), m.response.rect, if connected { pal.ink_soft } else { pal.ink_faint });
+                m.response.on_hover_text("Send keys to the VM");
+            });
+        } else {
+            ui.checkbox(&mut self.fit, "Scale to fit");
+            ui.add_enabled_ui(connected, |ui| {
+                let m = egui::menu::menu_custom_button(ui, framed(egui::Button::new("Send keys      ")), |ui| menu(ui, &mut combo, false));
+                let r = m.response.rect;
+                let c = pos2(r.right() - 13.0, r.center().y);
+                let col = if connected { pal.ink_soft } else { pal.ink_faint };
+                ui.painter().add(egui::Shape::line(vec![pos2(c.x - 3.5, c.y - 1.5), pos2(c.x, c.y + 2.0), pos2(c.x + 3.5, c.y - 1.5)], Stroke::new(1.4, col)));
+                if ui.add(framed(egui::Button::new("Send Ctrl+Alt+Del"))).clicked() {
+                    combo = Some(vec![CTRL, ALT, DELETE]);
+                }
+            });
+        }
+        if let Some(keys) = combo {
+            self.send_combo(&keys);
         }
     }
 

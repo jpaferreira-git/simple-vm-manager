@@ -17,9 +17,9 @@ affiliated with or endorsed by the makers of XenServer or XCP-ng.
 
 - **Servers and pools** — connect to a server by name or IP with your login; pool members redirect to the
   pool coordinator automatically. Earlier servers are remembered (passwords are never saved).
-- **Resource tree** — *Infrastructure* view (pool → hosts → VMs, storage, networks) or *Objects* view
-  (grouped by type), with a search box. The sidebar **folds** into a slim icon strip.
-- **Details** — General, Memory, Storage, Networking and Logs tabs for pools, hosts and VMs.
+- **Resource tree** — *Infrastructure* view (pool → servers → their VMs and storage; shared storage and
+  virtual networks in folders) or *Objects* view (grouped by type), with a search box. The sidebar **folds** into a slim icon strip.
+- **Details** — General, Memory, Storage, Networking, Console and Logs tabs for pools, hosts and VMs.
 - **Console** — see a running VM's screen and use it with your keyboard and mouse (the keyboard goes
   to the VM while the mouse is over its screen), with *Send Ctrl+Alt+Del*, a *Send keys* menu for the
   combinations your desktop keeps for itself (the Windows key, Alt+Tab…) and *Scale to fit*. It
@@ -28,8 +28,9 @@ affiliated with or endorsed by the makers of XenServer or XCP-ng.
   enabled only when the server allows them, with confirmations for the disruptive ones.
 - **Keyboard shortcuts** — Ctrl+B start · Ctrl+E shut down · Ctrl+R reboot · Ctrl+Y suspend/resume ·
   F5 refresh.
-- **Light / dark / system theme** — toolbar button or *View → Theme*; your choice is remembered.
-- **Demo server** — try everything without a real server (*File → Connect to Demo Server*).
+- **Light / dark / system theme** — the toolbar's theme button switches light / dark; right-click it to
+  follow the system instead. Your choice is remembered.
+- **Demo server** — try everything without a real server (*Try the Demo Server* on the Home page).
 - Live refresh every 15 s, automatic reconnect.
 
 ## Install on Arch Linux / Omarchy
@@ -82,7 +83,7 @@ building anything. You can also just run `./simple-vm-manager` directly.
   windowrulev2 = float, class:^(simple-vm-manager)$
   windowrulev2 = size 1180 740, class:^(simple-vm-manager)$
   ```
-- *View → Theme → Same as the system* follows your desktop's light/dark preference; on Omarchy's dark
+- *Same as the system* (right-click the theme button) follows your desktop's light/dark preference; on Omarchy's dark
   themes pick **Dark** if the system setting isn't detected.
 - Graphics: it draws with Vulkan (via `vulkan-icd-loader` + your Mesa/NVIDIA driver) and falls back to
   OpenGL automatically.

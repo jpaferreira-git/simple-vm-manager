@@ -54,7 +54,12 @@ pub struct VmInfo {
     pub uuid: String,
     pub name: String,
     pub description: String,
+    /// The server it's running on (also while paused or suspended there).
     pub host: Option<String>,
+    /// The server whose local storage holds its disks: the only one it can start on.
+    pub storage_host: Option<String>,
+    /// The home server chosen for it, if any.
+    pub affinity: Option<String>,
     pub os: String,
     pub ip: String,
     pub power: PowerState,
@@ -68,6 +73,12 @@ pub struct VmInfo {
 }
 
 impl VmInfo {
+    /// The server the VM belongs with: where it runs, or for a VM that's off, the server with its
+    /// disks, or else its home server (as the original's VM.Home). None: any server in the pool.
+    pub fn home(&self) -> Option<&str> {
+        self.host.as_deref().or(self.storage_host.as_deref()).or(self.affinity.as_deref())
+    }
+
     pub fn can(&self, op: &str) -> bool {
         self.allowed.iter().any(|a| a == op)
     }
@@ -99,6 +110,8 @@ pub struct SrInfo {
     pub size: i64,
     pub used: i64,
     pub shared: bool,
+    /// The server this storage belongs to (local disks, DVD drives, USB); None for shared storage.
+    pub host: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -118,6 +131,14 @@ pub struct PoolData {
     pub vms: Vec<VmInfo>,
     pub srs: Vec<SrInfo>,
     pub networks: Vec<NetInfo>,
+}
+
+impl SrInfo {
+    /// A server's "DVD drives" or "Removable storage" (type udev) with no disc or USB drive in it:
+    /// left out of the lists.
+    pub fn is_empty_drive(&self) -> bool {
+        self.kind == "udev" && self.size == 0
+    }
 }
 
 impl PoolData {

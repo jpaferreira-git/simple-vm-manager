@@ -20,7 +20,7 @@ struct Args {
 
 fn main() -> eframe::Result {
     // --screenshot <file.png>: start with the demo server, draw about 120 frames, save the window, exit.
-    // --show home|objects|vm|console|add-server|confirm|about picks what the screenshot shows (default:
+    // --show home|objects|networks|vm|console|add-server|confirm|about picks what the screenshot shows (default:
     // a VM's General tab; console shows its Console tab; the last three open that dialog over it).
     // --theme system|light|dark and --sidebar open|folded override the saved choices.
     let argv: Vec<String> = std::env::args().collect();

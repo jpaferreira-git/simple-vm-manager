@@ -359,7 +359,16 @@ impl Connection for RealConnection {
                 enabled: b(&r, "enabled"),
             });
         }
+        // Each storage is plugged into the servers that can use it (a PBD per server): local storage
+        // into one, shared storage into all of them.
+        let mut plugged: HashMap<String, Vec<String>> = HashMap::new();
+        for (_, r) in self.all("PBD", t)? {
+            plugged.entry(s(&r, "SR")).or_default().push(s(&r, "host"));
+        }
         for (k, r) in self.all("SR", t)? {
+            let shared = b(&r, "shared");
+            let hosts = plugged.get(&k).cloned().unwrap_or_default();
+            let host = if !shared && hosts.len() == 1 { Some(hosts[0].clone()) } else { None };
             pd.srs.push(SrInfo {
                 rref: k,
                 uuid: s(&r, "uuid"),
@@ -368,7 +377,8 @@ impl Connection for RealConnection {
                 kind: s(&r, "type"),
                 size: n(&r, "physical_size"),
                 used: n(&r, "physical_utilisation"),
-                shared: b(&r, "shared"),
+                shared,
+                host,
             });
         }
         for (k, r) in self.all("network", t)? {
@@ -387,6 +397,7 @@ impl Connection for RealConnection {
         let guests = self.all("VM_guest_metrics", t)?;
         let sr_names: HashMap<String, String> = pd.srs.iter().map(|x| (x.rref.clone(), x.name.clone())).collect();
         let net_names: HashMap<String, String> = pd.networks.iter().map(|x| (x.rref.clone(), x.name.clone())).collect();
+        let sr_hosts: HashMap<String, String> = pd.srs.iter().filter_map(|x| x.host.clone().map(|h| (x.rref.clone(), h))).collect();
         for (k, r) in self.all("VM", t)? {
             if b(&r, "is_a_template") || b(&r, "is_control_domain") || b(&r, "is_a_snapshot") {
                 continue;
@@ -394,12 +405,15 @@ impl Connection for RealConnection {
             let host = s(&r, "resident_on");
             let g = guests.get(&s(&r, "guest_metrics")).cloned().unwrap_or(Value::Null);
             let netmap = g.get("networks").cloned().unwrap_or(Value::Null);
+            let affinity = s(&r, "affinity");
             let mut vm = VmInfo {
                 rref: k,
                 uuid: s(&r, "uuid"),
                 name: s(&r, "name_label"),
                 description: s(&r, "name_description"),
                 host: if host.is_empty() || host == "OpaqueRef:NULL" { None } else { Some(host) },
+                storage_host: None,
+                affinity: if pd.hosts.iter().any(|h| h.rref == affinity) { Some(affinity) } else { None },
                 os: s(g.get("os_version").unwrap_or(&Value::Null), "name"),
                 ip: String::new(),
                 power: PowerState::parse(&s(&r, "power_state")),
@@ -416,6 +430,9 @@ impl Connection for RealConnection {
                 let cd = s(vbd, "type") == "CD";
                 let mut d = VmDisk { device: s(vbd, "userdevice"), kind: if cd { "DVD drive".into() } else { "Disk".into() }, ..Default::default() };
                 if let Some(vdi) = vdis.get(&s(vbd, "VDI")) {
+                    if vm.storage_host.is_none() {
+                        vm.storage_host = sr_hosts.get(&s(vdi, "SR")).cloned();
+                    }
                     d.name = s(vdi, "name_label");
                     d.size = n(vdi, "virtual_size");
                     d.sr_name = sr_names.get(&s(vdi, "SR")).cloned().unwrap_or_default();
@@ -558,20 +575,24 @@ impl DemoConnection {
         };
         d.hosts.push(host("host-a", "demo-host-01", "10.20.0.11", true));
         d.hosts.push(host("host-b", "demo-host-02", "10.20.0.12", false));
-        let sr = |r: &str, name: &str, kind: &str, size: i64, used: i64, shared: bool| SrInfo {
+        let sr = |r: &str, name: &str, kind: &str, size: i64, used: i64, host: Option<&str>| SrInfo {
             rref: r.into(),
             uuid: demo_uuid(),
             name: name.into(),
-            description: if shared { "Shared by every server in the pool".into() } else { "Disks on this server only".into() },
+            description: if host.is_none() { "Shared by every server in the pool".into() } else { "Disks on this server only".into() },
             kind: kind.into(),
             size,
             used,
-            shared,
+            shared: host.is_none(),
+            host: host.map(String::from),
         };
-        d.srs.push(sr("sr-local1", "Local storage on demo-host-01", "lvm", 900 * GB, 0, false));
-        d.srs.push(sr("sr-local2", "Local storage on demo-host-02", "lvm", 900 * GB, 0, false));
-        d.srs.push(sr("sr-nfs", "Shared NFS storage", "nfs", 4096 * GB, 0, true));
-        d.srs.push(sr("sr-iso", "ISO library", "iso", 250 * GB, 87 * GB, true));
+        d.srs.push(sr("sr-local1", "Local storage", "lvm", 900 * GB, 0, Some("host-a")));
+        d.srs.push(sr("sr-dvd1", "DVD drives", "udev", 4_700_000_000, 4_700_000_000, Some("host-a"))); // a disc in it
+        d.srs.push(sr("sr-local2", "Local storage", "lvm", 900 * GB, 0, Some("host-b")));
+        d.srs.push(sr("sr-dvd2", "DVD drives", "udev", 0, 0, Some("host-b"))); // empty: not listed
+        d.srs.push(sr("sr-usb2", "Removable storage", "udev", 0, 0, Some("host-b"))); // empty: not listed
+        d.srs.push(sr("sr-nfs", "Shared NFS storage", "nfs", 4096 * GB, 0, None));
+        d.srs.push(sr("sr-iso", "ISO library", "iso", 250 * GB, 87 * GB, None));
         d.networks.push(NetInfo { rref: "net-0".into(), uuid: demo_uuid(), name: "Pool-wide network 0".into(), description: String::new(), bridge: "xenbr0".into(), mtu: 1500 });
         d.networks.push(NetInfo { rref: "net-1".into(), uuid: demo_uuid(), name: "Storage network".into(), description: String::new(), bridge: "xenbr1".into(), mtu: 9000 });
 
@@ -585,6 +606,7 @@ impl DemoConnection {
         ];
         for (i, (r, name, desc, p, host, os, ip, cpus, mem, srr, disk)) in vms.iter().enumerate() {
             let sr_name = d.sr(srr).map(|x| x.name.clone()).unwrap_or_default();
+            let storage_host = d.sr(srr).and_then(|x| x.host.clone());
             if let Some(x) = d.srs.iter_mut().find(|x| x.rref == *srr) {
                 x.used += disk * GB;
             }
@@ -594,6 +616,8 @@ impl DemoConnection {
                 name: name.to_string(),
                 description: desc.to_string(),
                 host: host.map(|h| h.to_string()),
+                storage_host,
+                affinity: None,
                 os: os.to_string(),
                 ip: ip.to_string(),
                 power: *p,
@@ -682,13 +706,21 @@ impl Connection for DemoConnection {
         }
         let need = d.vms[idx].mem_dyn_max;
         match a.op {
-            "start" => match pick_host(&mut d, need) {
-                Some(h) => {
-                    d.vms[idx].power = PowerState::Running;
-                    d.vms[idx].host = Some(h);
-                }
-                None => return Err(ApiError { code: "HOST_NOT_ENOUGH_FREE_MEMORY".into(), details: vec![] }),
-            },
+            "start" => {
+                // A VM whose disks are on a server's local storage can only start on that server.
+                let target = match d.vms[idx].storage_host.clone() {
+                    Some(h) => {
+                        recompute(&mut d);
+                        d.host(&h).filter(|x| x.mem_free >= need).map(|x| x.rref.clone())
+                    }
+                    None => pick_host(&mut d, need),
+                };
+                let Some(h) = target else {
+                    return Err(ApiError { code: "HOST_NOT_ENOUGH_FREE_MEMORY".into(), details: vec![] });
+                };
+                d.vms[idx].power = PowerState::Running;
+                d.vms[idx].host = Some(h);
+            }
             "clean_shutdown" | "hard_shutdown" => {
                 d.vms[idx].power = PowerState::Halted;
                 d.vms[idx].host = None;

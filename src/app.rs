@@ -39,6 +39,11 @@ struct ServerEntry {
 }
 
 impl ServerEntry {
+    /// "–  Logged in as root", after the connection's name in the tree.
+    fn login_note(&self) -> String {
+        format!("–  Logged in as {}", self.conn.username())
+    }
+
     fn name(&self) -> String {
         match &self.data {
             Some(d) if !d.name.is_empty() => d.name.clone(),
@@ -73,6 +78,8 @@ enum Kind {
     Vm,
     Sr,
     Net,
+    /// "Shared Storage" or "Virtual Networks" in a pool (rref is "srs" or "nets").
+    Folder,
 }
 
 #[derive(Clone)]
@@ -83,12 +90,14 @@ struct Node {
     kind: Kind,
     sid: Option<u32>,
     rref: Option<String>,
+    /// Shown after the name in a softer colour, and not searched (who's logged in to a connection).
+    note: String,
     children: Vec<Node>,
 }
 
 impl Node {
     fn new(key: String, text: String, icon: IconKind, kind: Kind, sid: Option<u32>, rref: Option<String>) -> Node {
-        Node { key, text, icon, kind, sid, rref, children: vec![] }
+        Node { key, text, icon, kind, sid, rref, note: String::new(), children: vec![] }
     }
     fn find(&self, key: &str) -> Option<&Node> {
         if self.key == key {
@@ -149,7 +158,6 @@ enum Intent {
     Sidebar(bool),
     SearchFromRail,
     About,
-    Exit,
 }
 
 pub struct Startup {
@@ -179,7 +187,6 @@ pub struct App {
     closed_sections: HashSet<String>,
     dialog: Dialog,
     console: Option<ConsoleView>,
-    status: String,
     known_hosts: Vec<String>,
     shot_path: Option<String>,
     shot_show: String,
@@ -219,7 +226,6 @@ impl App {
             closed_sections: HashSet::new(),
             dialog: Dialog::None,
             console: None,
-            status: "Ready".into(),
             known_hosts: load_history(),
             shot_path: start.shot_path,
             shot_show: start.shot_show,
@@ -282,7 +288,6 @@ impl App {
             busy: HashMap::new(),
         });
         self.add_log(id, &host, None, &host, &format!("Connecting to {}", host), "In progress");
-        self.status = format!("Connecting to {}…", host);
         self.select(format!("srv:{}", id));
     }
 
@@ -354,7 +359,6 @@ impl App {
                             e.text = format!("{}: {}", e.text, er);
                         }
                     }
-                    self.status = if err.is_none() { format!("{}: done", text) } else { format!("{} failed", text) };
                     if let (Some(er), None) = (err, &self.shot_path) {
                         self.dialog = Dialog::Message { title: label.into(), text: format!("{} failed.\n\n{}", text, er) };
                     }
@@ -387,7 +391,6 @@ impl App {
                         e.status = "Done".into();
                     }
                     self.add_log(id, &name, None, &name, &format!("Connected to {}", name), "Done");
-                    self.status = format!("Connected to {}", name);
                     if !is_demo {
                         remember_host(&host, &user);
                         self.known_hosts = load_history();
@@ -397,6 +400,10 @@ impl App {
                     if shot && is_demo {
                         match self.shot_show.as_str() {
                             "home" => self.select("root".into()),
+                            "networks" => {
+                                self.expanded.insert(format!("folder:{}:nets", id));
+                                self.select(format!("folder:{}:nets", id));
+                            }
                             "objects" => {
                                 self.objects_view = true;
                                 self.expanded.insert("cat:vms".into());
@@ -424,7 +431,6 @@ impl App {
                         l.status = "Failed".into();
                     }
                     self.add_log(id, &host, None, &host, &format!("Couldn't connect to {}: {}", host, msg), "Failed");
-                    self.status = format!("Couldn't connect to {}", host);
                     if !shot {
                         if e.code == "SESSION_AUTHENTICATION_FAILED" {
                             self.remove_server(id, false);
@@ -444,7 +450,6 @@ impl App {
                     if first_loss {
                         self.add_log(id, &name, None, &name, &format!("Lost the connection to {}: {}", name, msg), "Reconnecting");
                     }
-                    self.status = format!("Lost the connection to {}; trying again…", name);
                 }
             }
         }
@@ -506,16 +511,22 @@ impl App {
                     continue;
                 };
                 if d.is_pool() {
-                    cats[0].children.push(Node::new(format!("srv:{}", id), s.name(), IconKind::Pool, Kind::Pool, Some(id), None));
+                    let mut pn = Node::new(format!("srv:{}", id), s.name(), IconKind::Pool, Kind::Pool, Some(id), None);
+                    pn.note = s.login_note();
+                    cats[0].children.push(pn);
                 }
                 for h in &d.hosts {
                     let icon = if h.enabled { IconKind::Host } else { IconKind::HostOff };
-                    cats[1].children.push(Node::new(format!("host:{}:{}", id, h.rref), h.name.clone(), icon, Kind::Host, Some(id), Some(h.rref.clone())));
+                    let mut hn = Node::new(format!("host:{}:{}", id, h.rref), h.name.clone(), icon, Kind::Host, Some(id), Some(h.rref.clone()));
+                    if !d.is_pool() {
+                        hn.note = s.login_note();
+                    }
+                    cats[1].children.push(hn);
                 }
                 for v in &d.vms {
                     cats[2].children.push(Node::new(format!("vm:{}:{}", id, v.rref), Self::vm_text(s, v), Self::vm_icon(s, v), Kind::Vm, Some(id), Some(v.rref.clone())));
                 }
-                for x in &d.srs {
+                for x in d.srs.iter().filter(|x| !x.is_empty_drive()) {
                     cats[3].children.push(Node::new(format!("sr:{}:{}", id, x.rref), x.name.clone(), IconKind::Sr, Kind::Sr, Some(id), Some(x.rref.clone())));
                 }
                 for n in &d.networks {
@@ -540,7 +551,20 @@ impl App {
                 let suffix = if s.state == ConnState::Reconnecting { "  (reconnecting…)" } else { "" };
                 let mut vms: Vec<&VmInfo> = d.vms.iter().collect();
                 vms.sort_by_key(|v| v.name.to_lowercase());
+                let mut srs: Vec<&SrInfo> = d.srs.iter().filter(|x| !x.is_empty_drive()).collect();
+                srs.sort_by_key(|x| x.name.to_lowercase());
+                let mut nets: Vec<&NetInfo> = d.networks.iter().collect();
+                nets.sort_by_key(|n| n.name.to_lowercase());
                 let vm_node = |v: &VmInfo| Node::new(format!("vm:{}:{}", id, v.rref), Self::vm_text(s, v), Self::vm_icon(s, v), Kind::Vm, Some(id), Some(v.rref.clone()));
+                let sr_node = |x: &SrInfo| Node::new(format!("sr:{}:{}", id, x.rref), x.name.clone(), IconKind::Sr, Kind::Sr, Some(id), Some(x.rref.clone()));
+                let folder = |what: &str, label: &str, kids: Vec<Node>| {
+                    let mut f = Node::new(format!("folder:{}:{}", id, what), format!("{} ({})", label, kids.len()), IconKind::Folder, Kind::Folder, Some(id), Some(what.to_string()));
+                    f.children = kids;
+                    f
+                };
+                // Each server holds its VMs and then its own storage (local disks, DVD drives, USB);
+                // the pool holds the VMs that aren't running anywhere, then the shared storage and the
+                // networks, each in a folder.
                 let mut top;
                 if d.is_pool() {
                     let icon = if s.state == ConnState::Reconnecting { IconKind::ServerDown } else { IconKind::Pool };
@@ -548,27 +572,26 @@ impl App {
                     for h in &d.hosts {
                         let icon = if h.enabled { IconKind::Host } else { IconKind::HostOff };
                         let mut hn = Node::new(format!("host:{}:{}", id, h.rref), h.name.clone(), icon, Kind::Host, Some(id), Some(h.rref.clone()));
-                        for v in vms.iter().filter(|v| v.host.as_deref() == Some(h.rref.as_str())) {
-                            hn.children.push(vm_node(v));
-                        }
+                        hn.children.extend(vms.iter().filter(|v| v.home() == Some(h.rref.as_str())).map(|v| vm_node(v)));
+                        hn.children.extend(srs.iter().filter(|x| x.host.as_deref() == Some(h.rref.as_str())).map(|x| sr_node(x)));
                         top.children.push(hn);
                     }
-                    for v in vms.iter().filter(|v| v.host.as_deref().and_then(|h| d.host(h)).is_none()) {
-                        top.children.push(vm_node(v));
+                    top.children.extend(vms.iter().filter(|v| v.home().and_then(|h| d.host(h)).is_none()).map(|v| vm_node(v)));
+                    let shared: Vec<Node> = srs.iter().filter(|x| x.host.as_deref().and_then(|h| d.host(h)).is_none()).map(|x| sr_node(x)).collect();
+                    if !shared.is_empty() {
+                        top.children.push(folder("srs", "Shared Storage", shared));
                     }
                 } else {
                     let h = &d.hosts[0];
                     let icon = if s.state == ConnState::Reconnecting { IconKind::ServerDown } else { IconKind::Host };
                     top = Node::new(skey, format!("{}{}", h.name, suffix), icon, Kind::Host, Some(id), Some(h.rref.clone()));
-                    for v in &vms {
-                        top.children.push(vm_node(v));
-                    }
+                    top.children.extend(vms.iter().map(|v| vm_node(v)));
+                    top.children.extend(srs.iter().map(|x| sr_node(x)));
                 }
-                for x in &d.srs {
-                    top.children.push(Node::new(format!("sr:{}:{}", id, x.rref), x.name.clone(), IconKind::Sr, Kind::Sr, Some(id), Some(x.rref.clone())));
-                }
-                for n in &d.networks {
-                    top.children.push(Node::new(format!("net:{}:{}", id, n.rref), n.name.clone(), IconKind::Net, Kind::Net, Some(id), Some(n.rref.clone())));
+                top.note = s.login_note();
+                if !nets.is_empty() {
+                    let kids = nets.iter().map(|n| Node::new(format!("net:{}:{}", id, n.rref), n.name.clone(), IconKind::Net, Kind::Net, Some(id), Some(n.rref.clone()))).collect();
+                    top.children.push(folder("nets", "Virtual Networks", kids));
                 }
                 root.children.push(top);
             }
@@ -585,12 +608,10 @@ impl App {
     fn request_action(&mut self, i: usize, sel: &Node) {
         let a = &ACTIONS[i];
         let Some((s, d, vm)) = self.vm_of(sel) else {
-            self.status = "Select a virtual machine first.".into();
             return;
         };
         let busy = s.busy.contains_key(&vm.rref);
         if busy && !a.can_run(vm, d, true) {
-            self.status = format!("'{}' is busy: {}", vm.name, s.busy[&vm.rref]);
             return;
         }
         if let Some(reason) = a.cant_run_reason(vm, d, busy) {
@@ -616,7 +637,6 @@ impl App {
         let text = format!("{} VM '{}'", a.verb, vm.name);
         let (vm_name, server_name, conn) = (vm.name.clone(), s.name(), s.conn.clone());
         let log = self.add_log(sid, &server_name, Some(&vref), &vm_name, &text, "In progress");
-        self.status = format!("{}…", text);
         if let Some(s) = self.server_mut(sid) {
             s.busy.insert(vref.clone(), format!("{}…", a.verb));
         }
@@ -692,7 +712,6 @@ impl App {
                         text: "Simple VM Manager\n\nA simpler console for virtualization servers: add servers, browse their pools, servers, virtual machines, storage and networks, and start, stop, restart, suspend or resume virtual machines.\n\nRuns on Windows, Linux and macOS, in a light or dark theme. It talks to servers over HTTPS (port 443) and accepts their certificates without asking.".into(),
                     }
                 }
-                Intent::Exit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             }
         }
     }
@@ -709,83 +728,6 @@ impl App {
     }
 
     // ------------------------------------------------------------------ drawing
-
-    fn menus(&self, ui: &mut Ui, sel: &Node, out: &mut Vec<Intent>) {
-        egui::menu::bar(ui, |ui| {
-            ui.menu_button("File", |ui| {
-                if ui.button("Connect…").clicked() {
-                    out.push(Intent::AddServer);
-                    ui.close_menu();
-                }
-                if ui.button("Connect to Demo Server").clicked() {
-                    out.push(Intent::Demo);
-                    ui.close_menu();
-                }
-                ui.separator();
-                if ui.button("Exit").clicked() {
-                    out.push(Intent::Exit);
-                    ui.close_menu();
-                }
-            });
-            ui.menu_button("View", |ui| {
-                if ui.radio(!self.objects_view, "Infrastructure").clicked() {
-                    out.push(Intent::View(false));
-                    ui.close_menu();
-                }
-                if ui.radio(self.objects_view, "Objects").clicked() {
-                    out.push(Intent::View(true));
-                    ui.close_menu();
-                }
-                ui.separator();
-                if ui.checkbox(&mut self.sidebar_open.clone(), "Show sidebar").clicked() {
-                    out.push(Intent::Sidebar(!self.sidebar_open));
-                    ui.close_menu();
-                }
-                ui.menu_button("Theme", |ui| {
-                    for m in [ThemeMode::System, ThemeMode::Light, ThemeMode::Dark] {
-                        if ui.radio(self.theme_mode == m, m.label()).clicked() {
-                            out.push(Intent::Theme(m));
-                            ui.close_menu();
-                        }
-                    }
-                });
-                ui.separator();
-                if ui.add(egui::Button::new("Refresh Now").shortcut_text("F5")).clicked() {
-                    out.push(Intent::Refresh(None));
-                    ui.close_menu();
-                }
-            });
-            ui.menu_button("Server", |ui| {
-                if ui.button("Connect…").clicked() {
-                    out.push(Intent::AddServer);
-                    ui.close_menu();
-                }
-                if ui.add_enabled(sel.sid.is_some(), egui::Button::new("Disconnect")).clicked() {
-                    if let Some(s) = sel.sid {
-                        out.push(Intent::Remove(s));
-                    }
-                    ui.close_menu();
-                }
-            });
-            ui.menu_button("VM", |ui| {
-                for (i, a) in ACTIONS.iter().enumerate() {
-                    if ui.add_enabled(self.can_run(a, sel), egui::Button::new(a.label).shortcut_text(a.shortcut.text())).clicked() {
-                        out.push(Intent::Action(i));
-                        ui.close_menu();
-                    }
-                    if a.op == "resume" {
-                        ui.separator();
-                    }
-                }
-            });
-            ui.menu_button("Help", |ui| {
-                if ui.button("About").clicked() {
-                    out.push(Intent::About);
-                    ui.close_menu();
-                }
-            });
-        });
-    }
 
     fn toolbar(&self, ui: &mut Ui, sel: &Node, out: &mut Vec<Intent>) {
         let pal = self.pal;
@@ -808,7 +750,7 @@ impl App {
                 out.push(Intent::Sidebar(!self.sidebar_open));
             }
             ui.add_space(4.0);
-            if tool_button(ui, "add", "Connect", true, compact(false), &pal) {
+            if tool_button(ui, "add", "Connect", true, compact(false), &pal).clicked() {
                 out.push(Intent::AddServer);
             }
             ui.separator();
@@ -818,14 +760,24 @@ impl App {
                     ui.separator();
                     force_group = true;
                 }
-                if tool_button(ui, a.op, a.label, self.can_run(a, sel), compact(a.is_force()), &pal) {
+                if tool_button(ui, a.op, a.label, self.can_run(a, sel), compact(a.is_force()), &pal).clicked() {
                     out.extend(ACTIONS.iter().position(|b| std::ptr::eq(b, *a)).map(Intent::Action));
                 }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if tool_button(ui, theme_op, theme_label, true, compact(true), &pal) {
+                // A click switches light / dark; a right-click also offers following the system.
+                let b = tool_button(ui, theme_op, theme_label, true, compact(true), &pal).on_hover_text("Right-click for more choices");
+                if b.clicked() {
                     out.push(Intent::ToggleTheme);
                 }
+                b.context_menu(|ui| {
+                    for m in [ThemeMode::Light, ThemeMode::Dark, ThemeMode::System] {
+                        if ui.radio(self.theme_mode == m, m.label()).clicked() {
+                            out.push(Intent::Theme(m));
+                            ui.close_menu();
+                        }
+                    }
+                });
             });
         });
     }
@@ -923,8 +875,12 @@ impl App {
         let has_kids = !node.children.is_empty();
         let open = has_kids && (self.expanded.contains(&node.key) || !self.search.trim().is_empty());
         let font = FontId::proportional(13.0);
-        let tw = p.layout_no_wrap(node.text.clone(), font.clone(), pal.ink).size().x;
-        let row = Rect::from_min_size(pos2(x0 + 14.0, rect.min.y + 1.0), vec2(tw + 32.0, row_h - 2.0));
+        let mut tw = p.layout_no_wrap(node.text.clone(), font.clone(), pal.ink).size().x;
+        let note_x = tw + 8.0;
+        if !node.note.is_empty() {
+            tw += 8.0 + p.layout_no_wrap(node.note.clone(), font.clone(), pal.ink_soft).size().x;
+        }
+        let row = Rect::from_min_size(pos2(x0 + 14.0, rect.min.y + 1.0), vec2((tw + 32.0).min(rect.max.x - x0 - 16.0), row_h - 2.0));
         let bg = if selected {
             pal.accent
         } else if resp.hovered() {
@@ -948,7 +904,16 @@ impl App {
         let icon_bg = if selected || resp.hovered() { bg } else { pal.sidebar };
         paint_icon(p, Rect::from_min_size(pos2(x0 + 18.0, rect.min.y + 3.0), vec2(16.0, 16.0)), node.icon, &pal, icon_bg);
         let text_col = if selected { pal.on_accent } else { pal.ink };
-        p.text(pos2(x0 + 40.0, rect.center().y), Align2::LEFT_CENTER, &node.text, font, text_col);
+        p.text(pos2(x0 + 40.0, rect.center().y), Align2::LEFT_CENTER, &node.text, font.clone(), text_col);
+        // The note is cut short with "…" when the sidebar is too narrow for it.
+        let note_room = rect.max.x - (x0 + 40.0 + note_x) - 6.0;
+        if !node.note.is_empty() && note_room > 24.0 {
+            let note_col = if selected { pal.on_accent.gamma_multiply(0.8) } else { pal.ink_soft };
+            let mut job = egui::text::LayoutJob::simple_singleline(node.note.clone(), font, note_col);
+            job.wrap = egui::text::TextWrapping { max_width: note_room, max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
+            let g = p.layout_job(job);
+            p.galley(pos2(x0 + 40.0 + note_x, rect.center().y - g.size().y / 2.0), g, note_col);
+        }
         if resp.clicked() {
             let on_chevron = has_kids && resp.interact_pointer_pos().map_or(false, |pp| pp.x < x0 + 13.0);
             out.push(if on_chevron { Intent::Toggle(node.key.clone()) } else { Intent::Select(node.key.clone()) });
@@ -1019,10 +984,6 @@ impl App {
         let w = g.size().x;
         p.galley(pos2(rect.min.x + 30.0, rect.center().y - g.size().y / 2.0), g, pal.ink);
         p.text(pos2(rect.min.x + 38.0 + w, rect.center().y), Align2::LEFT_CENTER, sub, FontId::proportional(13.0), pal.ink_soft);
-        if let Some(s) = sel.sid.and_then(|id| self.server(id)).filter(|s| s.data.is_some()) {
-            let who = format!("Logged in as: {}", if s.conn.is_demo() { "demo account".to_string() } else { s.conn.username() });
-            p.text(pos2(rect.max.x - 8.0, rect.center().y), Align2::RIGHT_CENTER, who, FontId::proportional(13.0), pal.ink_soft);
-        }
     }
 
     fn header_text(&self, sel: &Node) -> (String, String) {
@@ -1031,6 +992,10 @@ impl App {
         match (sel.kind, s.and_then(|s| s.data.as_ref().map(|d| (s, d)))) {
             (Kind::Root, _) => ("All servers".into(), String::new()),
             (Kind::Category, _) => (sel.text.clone(), String::new()),
+            (Kind::Folder, Some((s, _))) => {
+                let what = if sel.rref.as_deref() == Some("nets") { "Virtual Networks" } else { "Shared Storage" };
+                (what.into(), format!("in '{}'{}", s.name(), recon))
+            }
             (Kind::Vm, Some((s, d))) => {
                 let v = sel.rref.as_deref().and_then(|r| d.vm(r));
                 let title = match v {
@@ -1061,6 +1026,8 @@ impl App {
         let has_data = sel.sid.and_then(|id| self.server(id)).map_or(false, |s| s.data.is_some());
         match sel.kind {
             Kind::Root | Kind::Category => vec![Tab::Home, Tab::Search, Tab::Logs],
+            Kind::Folder if sel.rref.as_deref() == Some("nets") => vec![Tab::Networking],
+            Kind::Folder => vec![Tab::Storage],
             _ if !has_data => vec![Tab::General, Tab::Logs],
             Kind::Vm => vec![Tab::General, Tab::Memory, Tab::Storage, Tab::Networking, Tab::Console, Tab::Logs],
             Kind::Pool | Kind::Host => vec![Tab::General, Tab::Memory, Tab::Storage, Tab::Networking, Tab::Logs],
@@ -1068,7 +1035,8 @@ impl App {
         }
     }
 
-    fn tab_strip(&self, ui: &mut Ui, tabs: &[Tab], current: Tab, out: &mut Vec<Intent>) {
+    /// Draws the tabs; returns the room left on their right.
+    fn tab_strip(&self, ui: &mut Ui, tabs: &[Tab], current: Tab, out: &mut Vec<Intent>) -> Rect {
         let pal = self.pal;
         let (strip, _) = ui.allocate_exact_size(vec2(ui.available_width(), 27.0), Sense::hover());
         ui.painter().rect_filled(strip, 0.0, pal.tab_strip);
@@ -1097,6 +1065,7 @@ impl App {
             }
             x += w + 2.0;
         }
+        Rect::from_min_max(pos2(x + 10.0, strip.min.y + 2.0), pos2(strip.max.x - 6.0, strip.max.y - 1.0))
     }
 
     fn home(&self, ui: &mut Ui, out: &mut Vec<Intent>) {
@@ -1181,12 +1150,12 @@ impl App {
         });
     }
 
-    fn general_sections(&self, sel: &Node) -> (String, Vec<(String, Vec<(String, String)>)>) {
+    fn general_sections(&self, sel: &Node) -> Vec<(String, Vec<(String, String)>)> {
         let mut secs: Vec<(String, Vec<(String, String)>)> = vec![];
         fn row(a: &str, b: String) -> (String, String) {
             (a.to_string(), b)
         }
-        let Some(s) = sel.sid.and_then(|id| self.server(id)) else { return ("General Properties".into(), secs) };
+        let Some(s) = sel.sid.and_then(|id| self.server(id)) else { return secs };
         let Some(d) = &s.data else {
             let status = if s.state == ConnState::Connecting { "Connecting…" } else { "Not connected" };
             let mut g = vec![row("Server", s.conn.hostname()), row("Username", s.conn.username()), row("Status", status.into())];
@@ -1194,10 +1163,10 @@ impl App {
                 g.push(row("Problem", e.clone()));
             }
             secs.push(("General".into(), g));
-            return ("Server Connection".into(), secs);
+            return secs;
         };
         let r = sel.rref.as_deref().unwrap_or("");
-        let title = match sel.kind {
+        match sel.kind {
             Kind::Pool => {
                 let master = d.hosts.iter().find(|h| h.is_master);
                 let running = d.vms.iter().filter(|v| v.power == PowerState::Running).count();
@@ -1215,7 +1184,6 @@ impl App {
                 let status = format!("{:?}{}", s.state, s.error.as_ref().map(|e| format!(": {}", e)).unwrap_or_default());
                 secs.push(("Connection".into(), vec![row("Connected to", s.conn.hostname()), row("Logged in as", s.conn.username()), row("Status", status)]));
                 secs.push(("Resources".into(), vec![row("Storage repositories", d.srs.len().to_string()), row("Networks", d.networks.len().to_string())]));
-                "Pool General Properties"
             }
             Kind::Host => {
                 if let Some(h) = d.host(r) {
@@ -1236,11 +1204,10 @@ impl App {
                     secs.push(("CPUs".into(), vec![row("Count", h.cpu_count.to_string()), row("Model", h.cpu_model.clone())]));
                     secs.push(("Memory".into(), vec![row("Total", fmt_bytes(h.mem_total)), row("Free", fmt_bytes(h.mem_free))]));
                 }
-                "Server General Properties"
             }
             Kind::Vm => {
                 if let Some(v) = d.vm(r) {
-                    let home = v.host.as_deref().and_then(|h| d.host(h)).map(|h| h.name.clone()).unwrap_or_else(|| "<None>".into());
+                    let home = v.home().and_then(|h| d.host(h)).map(|h| h.name.clone()).unwrap_or_else(|| "<None>".into());
                     let state = s.busy.get(&v.rref).cloned().unwrap_or_else(|| v.power.label().into());
                     secs.push((
                         "General".into(),
@@ -1262,7 +1229,6 @@ impl App {
                     let text = if can.is_empty() { "Nothing right now".to_string() } else { can.join(", ") };
                     secs.push(("Available Actions".into(), vec![row("You can", text)]));
                 }
-                "VM General Properties"
             }
             Kind::Sr => {
                 if let Some(x) = d.sr(r) {
@@ -1273,7 +1239,6 @@ impl App {
                     let pct = if x.size > 0 { format!(" ({}%)", 100 * x.used / x.size) } else { String::new() };
                     secs.push(("Size".into(), vec![row("Size", fmt_bytes(x.size)), row("Used", format!("{}{}", fmt_bytes(x.used), pct)), row("Free", fmt_bytes((x.size - x.used).max(0)))]));
                 }
-                "Storage General Properties"
             }
             Kind::Net => {
                 if let Some(n) = d.net(r) {
@@ -1282,24 +1247,20 @@ impl App {
                         vec![row("Name", n.name.clone()), row("Description", n.description.clone()), row("Bridge", n.bridge.clone()), row("MTU", n.mtu.to_string()), row("UUID", n.uuid.clone())],
                     ));
                 }
-                "Network General Properties"
             }
-            _ => "General Properties",
-        };
-        (title.into(), secs)
+            _ => {}
+        }
+        secs
     }
 
-    /// The General tab, laid out like the original: a coloured title band and boxed sections.
+    /// The General tab: boxed sections that fold.
     fn general(&self, ui: &mut Ui, sel: &Node, out: &mut Vec<Intent>) {
         let pal = self.pal;
-        let (title, secs) = self.general_sections(sel);
+        let secs = self.general_sections(sel);
         egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
             let w = ui.available_width();
-            let (band, _) = ui.allocate_exact_size(vec2(w, 38.0), Sense::hover());
-            gradient(ui.painter(), band, pal.band_a, pal.band_b, true);
-            ui.painter().text(band.min + vec2(12.0, 19.0), Align2::LEFT_CENTER, title, FontId::new(15.0, FontFamily::Name("bold".into())), Color32::WHITE);
-            ui.add_space(16.0);
+            ui.add_space(14.0);
             let border = Stroke::new(1.0, pal.border);
             let chev_s = Stroke::new(1.3, pal.ink_soft);
             for (i, (name, rows)) in secs.iter().enumerate() {
@@ -1448,9 +1409,20 @@ impl App {
                 .unwrap_or_default();
             Self::table(ui, "disks", &["Position", "Name", "Size", "Storage", "Type"], rows);
         } else {
+            // A server's own storage and the shared storage; the Shared Storage folder only the latter.
+            let owner = match sel.kind {
+                Kind::Host => sel.rref.clone(),
+                Kind::Folder => Some(String::new()),
+                _ => None,
+            };
             let rows = d
                 .srs
                 .iter()
+                .filter(|x| !x.is_empty_drive())
+                .filter(|x| match &owner {
+                    None => true,
+                    Some(h) => x.host.as_deref().and_then(|xh| d.host(xh)).map_or(true, |xh| !h.is_empty() && xh.rref == *h),
+                })
                 .map(|x| {
                     let pct = if x.size > 0 { format!(" ({}%)", 100 * x.used / x.size) } else { String::new() };
                     vec![x.name.clone(), x.kind.clone(), fmt_bytes(x.size), format!("{}{}", fmt_bytes(x.used), pct), fmt_bytes((x.size - x.used).max(0)), if x.shared { "Yes".into() } else { "No".into() }]
@@ -1731,18 +1703,8 @@ impl eframe::App for App {
             }
         }
 
-        egui::TopBottomPanel::top("menu").frame(egui::Frame::none().fill(pal.toolbar).inner_margin(egui::Margin::symmetric(6.0, 2.0))).show(ctx, |ui| self.menus(ui, &sel, &mut out));
         let tools_frame = egui::Frame::none().fill(pal.toolbar).inner_margin(egui::Margin::symmetric(6.0, 4.0)).stroke(Stroke::new(1.0, pal.border));
         egui::TopBottomPanel::top("tools").frame(tools_frame).show(ctx, |ui| self.toolbar(ui, &sel, &mut out));
-        egui::TopBottomPanel::bottom("status").frame(egui::Frame::none().fill(pal.toolbar).inner_margin(egui::Margin::symmetric(8.0, 3.0))).show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(&self.status).color(pal.ink_soft));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let n = self.servers.iter().filter(|s| s.state == ConnState::Connected).count();
-                    ui.label(egui::RichText::new(format!("{} of {} server{} connected", n, self.servers.len(), if self.servers.len() == 1 { "" } else { "s" })).color(pal.ink_soft));
-                });
-            });
-        });
 
         // The sidebar folds to a narrow strip of icons, with a short animation.
         let rail = egui::SidePanel::left("rail").resizable(false).exact_width(RAIL_WIDTH).frame(egui::Frame::none().fill(pal.rail).stroke(Stroke::new(1.0, pal.border)));
@@ -1761,7 +1723,12 @@ impl eframe::App for App {
             self.header(ui, &sel);
             let tabs = self.tabs_for(&sel);
             let current = if tabs.contains(&self.tab) { self.tab } else { tabs[0] };
-            self.tab_strip(ui, &tabs, current, &mut out);
+            let free = self.tab_strip(ui, &tabs, current, &mut out);
+            if current == Tab::Console {
+                if let Some(c) = self.console.as_mut() {
+                    c.tab_controls(ui, free, &pal);
+                }
+            }
             ui.spacing_mut().item_spacing.y = 4.0;
             let margin = if current == Tab::General || current == Tab::Home { 0.0 } else { 10.0 };
             egui::Frame::none().inner_margin(egui::Margin::symmetric(margin, 0.0)).show(ui, |ui| match current {
@@ -1843,7 +1810,7 @@ fn tool_width(ui: &Ui, label: &str) -> f32 {
 
 /// A labelled toolbar button with a theme-coloured glyph; `compact` shows only the glyph, with the
 /// label as a tooltip.
-fn tool_button(ui: &mut Ui, op: &str, label: &str, enabled: bool, compact: bool, pal: &Pal) -> bool {
+fn tool_button(ui: &mut Ui, op: &str, label: &str, enabled: bool, compact: bool, pal: &Pal) -> egui::Response {
     let w = if compact { 32.0 } else { tool_width(ui, label) };
     let sense = if enabled { Sense::click() } else { Sense::hover() };
     let (rect, mut resp) = ui.allocate_exact_size(vec2(w, 30.0), sense);
@@ -1858,7 +1825,7 @@ fn tool_button(ui: &mut Ui, op: &str, label: &str, enabled: bool, compact: bool,
         paint_tool(p, Rect::from_min_size(rect.min + vec2(4.0, 4.0), vec2(22.0, 22.0)), op, enabled, pal);
         p.text(pos2(rect.min.x + 32.0, rect.center().y), Align2::LEFT_CENTER, label, FontId::proportional(13.0), if enabled { pal.ink } else { pal.ink_faint });
     }
-    enabled && resp.clicked()
+    resp
 }
 
 /// A square icon-only button (used for the sidebar toggle).

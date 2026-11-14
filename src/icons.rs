@@ -16,6 +16,7 @@ pub enum IconKind {
     Busy,
     Sr,
     Net,
+    Folder,
     Vm(PowerState),
 }
 
@@ -127,6 +128,10 @@ pub fn paint_icon(p: &Painter, rect: Rect, kind: IconKind, pal: &Pal, bg: Color3
             for c in [vec2(8.0, 3.0), vec2(3.5, 12.8), vec2(12.5, 12.8)] {
                 p.circle(o + c, 2.1, bg, s);
             }
+        }
+        IconKind::Folder => {
+            line(p, o, &[(1.5, 13.0), (1.5, 3.5), (6.0, 3.5), (7.5, 5.0), (14.5, 5.0), (14.5, 13.0), (1.5, 13.0)], s);
+            line(p, o, &[(1.5, 7.0), (14.5, 7.0)], Stroke::new(1.0, pal.icon.gamma_multiply(0.6)));
         }
         IconKind::Vm(state) => {
             rrect(p, o, 1.5, 2.0, 13.0, 9.0, 1.6, s);
