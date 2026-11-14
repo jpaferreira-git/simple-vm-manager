@@ -221,19 +221,13 @@ impl VmAction {
         }
     }
 
-    /// Which power buttons the toolbar shows (reference pictures 2 and 5, and ShowOnMainToolBarInternal
-    /// for the Force buttons). With no VM selected, Shut Down and Suspend show greyed out.
+    /// Which power buttons the toolbar shows: all of them, greyed out when they can't run, except
+    /// that Suspend and Resume share one place (Resume while the VM is suspended).
     pub fn on_toolbar(&self, vm: Option<&VmInfo>) -> bool {
-        let halted = vm.map_or(false, |v| v.power == PowerState::Halted);
         let suspended = vm.map_or(false, |v| v.power == PowerState::Suspended);
         match self.op {
-            "start" => halted,
-            "clean_shutdown" => !halted,
-            "clean_reboot" => vm.map_or(false, |v| matches!(v.power, PowerState::Running | PowerState::Paused)),
-            "suspend" => !suspended && !halted,
+            "suspend" => !suspended,
             "resume" => suspended,
-            "hard_shutdown" => vm.map_or(false, |v| !v.can("clean_shutdown")),
-            "hard_reboot" => vm.map_or(false, |v| !v.can("clean_reboot")),
             _ => true,
         }
     }

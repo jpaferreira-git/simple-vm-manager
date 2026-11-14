@@ -4,6 +4,8 @@
 use crate::model::*;
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -49,7 +51,83 @@ pub trait Connection: Send + Sync {
     fn is_demo(&self) -> bool;
     fn fetch(&self, timeout_ms: u64) -> Result<PoolData, ApiError>;
     fn run_action(&self, vm_ref: &str, action: &VmAction) -> Result<(), ApiError>;
+    /// A stream to the VM's screen, ready for the VNC (RFB) handshake (see console.rs).
+    fn open_console(&self, vm_ref: &str) -> Result<ConsoleStream, ApiError>;
     fn close(&self);
+}
+
+/// The connection to a VM's screen: TLS to a real server, plain TCP for a local test VNC server.
+pub enum ConsoleStream {
+    Tls(Box<native_tls::TlsStream<TcpStream>>),
+    Plain(TcpStream),
+}
+
+impl ConsoleStream {
+    pub fn set_read_timeout(&self, d: Option<Duration>) -> std::io::Result<()> {
+        match self {
+            ConsoleStream::Tls(s) => s.get_ref().set_read_timeout(d),
+            ConsoleStream::Plain(s) => s.set_read_timeout(d),
+        }
+    }
+}
+
+impl Read for ConsoleStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            ConsoleStream::Tls(s) => s.read(buf),
+            ConsoleStream::Plain(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for ConsoleStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            ConsoleStream::Tls(s) => s.write(buf),
+            ConsoleStream::Plain(s) => s.write(buf),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            ConsoleStream::Tls(s) => s.flush(),
+            ConsoleStream::Plain(s) => s.flush(),
+        }
+    }
+}
+
+/// For trying the Console tab without a real server: with SVM_DEBUG_CONSOLE=host:port the demo
+/// server's VMs show that plain VNC server instead of their pretend console (for example
+/// `qemu-system-x86_64 -vnc :1` listens on 127.0.0.1:5901).
+pub fn debug_console_address() -> Option<String> {
+    std::env::var("SVM_DEBUG_CONSOLE").ok().filter(|a| !a.trim().is_empty())
+}
+
+/// "host", "host:port", "[v6 address]:port" or a bare IPv6 address.
+fn split_host_port(a: &str) -> (String, Option<u16>) {
+    if let Some(rest) = a.strip_prefix('[') {
+        if let Some((h, p)) = rest.split_once(']') {
+            return (h.to_string(), p.strip_prefix(':').and_then(|p| p.parse().ok()));
+        }
+    }
+    match a.rsplit_once(':') {
+        Some((h, p)) if !h.contains(':') => (h.to_string(), p.parse().ok()),
+        _ => (a.to_string(), None),
+    }
+}
+
+fn tcp_connect(host: &str, port: u16) -> Result<TcpStream, ApiError> {
+    let addrs = (host, port).to_socket_addrs().map_err(|e| ApiError::other(format!("Couldn't find {}: {}", host, e)))?;
+    let mut last = String::from("no address");
+    for a in addrs {
+        match TcpStream::connect_timeout(&a, Duration::from_secs(10)) {
+            Ok(s) => {
+                let _ = s.set_nodelay(true);
+                return Ok(s);
+            }
+            Err(e) => last = e.to_string(),
+        }
+    }
+    Err(ApiError::other(format!("Couldn't reach {} for the console ({}).", host, last)))
 }
 
 // ---------------------------------------------------------------- real servers
@@ -107,7 +185,7 @@ impl RealConnection {
         let agent = ureq::AgentBuilder::new()
             .tls_connector(self.tls.clone())
             .timeout(Duration::from_millis(timeout_ms))
-            .user_agent("SimpleVMManager/1.0")
+            .user_agent(concat!("SimpleVMManager/", env!("CARGO_PKG_VERSION")))
             .build();
         let body = json!({"jsonrpc": "2.0", "method": method, "params": params, "id": id}).to_string();
         let text = match agent.post(&self.url(host)).set("Content-Type", "application/json").send_string(&body) {
@@ -377,6 +455,55 @@ impl Connection for RealConnection {
         self.call(a.method, args, ACTION_TIMEOUT_MS).map(|_| ())
     }
 
+    /// The VM's VNC console through an HTTP CONNECT tunnel on the server's HTTPS port, as the
+    /// original's console: CONNECT <console location>&session_id=<session> HTTP/1.0.
+    fn open_console(&self, vm_ref: &str) -> Result<ConsoleStream, ApiError> {
+        let t = 30_000;
+        let mut location = String::new();
+        for c in self.call("VM.get_consoles", vec![json!(vm_ref)], t)?.as_array().cloned().unwrap_or_default() {
+            let rec = self.call("console.get_record", vec![c], t)?;
+            if s(&rec, "protocol") == "rfb" {
+                location = s(&rec, "location");
+                break;
+            }
+        }
+        if location.is_empty() {
+            return Err(ApiError::other("This VM has no graphical console."));
+        }
+        let (session, conn_host) = {
+            let st = self.state.lock().unwrap();
+            (st.session.clone().unwrap_or_default(), st.host.clone())
+        };
+        // The location looks like https://<server address>/console?uuid=<console uuid>
+        let rest = location.split_once("://").map_or(location.as_str(), |x| x.1);
+        let (authority, path) = match rest.find('/') {
+            Some(i) => (&rest[..i], &rest[i..]),
+            None => (rest, "/"),
+        };
+        let (host, port) = split_host_port(authority);
+        let port = port.unwrap_or(if host == conn_host { self.port } else { DEFAULT_PORT });
+        let tcp = tcp_connect(&host, port)?;
+        let _ = tcp.set_read_timeout(Some(Duration::from_secs(15)));
+        let mut tls = self.tls.connect(&host, tcp).map_err(|e| ApiError::other(format!("Couldn't open a secure connection for the console ({}).", e)))?;
+        let sep = if path.contains('?') { '&' } else { '?' };
+        let request = format!("CONNECT {}{}session_id={} HTTP/1.0\r\n\r\n", path, sep, session);
+        tls.write_all(request.as_bytes()).and_then(|_| tls.flush()).map_err(|e| ApiError::other(format!("Couldn't ask for the console ({}).", e)))?;
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            match tls.read(&mut byte) {
+                Ok(1) if head.len() < 16 * 1024 => head.push(byte[0]),
+                Ok(_) => return Err(ApiError::other("The server closed the console connection.")),
+                Err(e) => return Err(ApiError::other(format!("The server didn't open the console ({}).", e))),
+            }
+        }
+        let status = String::from_utf8_lossy(&head).lines().next().unwrap_or_default().trim().to_string();
+        if status.split_whitespace().nth(1) != Some("200") {
+            return Err(ApiError::other(format!("The server refused to open the console ({}).", status)));
+        }
+        Ok(ConsoleStream::Tls(Box::new(tls)))
+    }
+
     fn close(&self) {
         let (host, session) = {
             let mut st = self.state.lock().unwrap();
@@ -577,6 +704,11 @@ impl Connection for DemoConnection {
         }
         recompute(&mut d);
         Ok(())
+    }
+    fn open_console(&self, _vm_ref: &str) -> Result<ConsoleStream, ApiError> {
+        let addr = debug_console_address().ok_or_else(|| ApiError::other("The demo server has no real consoles."))?;
+        let (host, port) = split_host_port(addr.trim());
+        Ok(ConsoleStream::Plain(tcp_connect(&host, port.unwrap_or(5900))?))
     }
     fn close(&self) {}
 }

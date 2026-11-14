@@ -2,6 +2,7 @@
 //! Every colour comes from the light or dark palette (theme.rs).
 
 use crate::conn::*;
+use crate::console::{self, ConsoleView};
 use crate::icons::*;
 use crate::model::*;
 use crate::theme::{self, Pal, ThemeMode};
@@ -105,6 +106,7 @@ enum Tab {
     Memory,
     Storage,
     Networking,
+    Console,
     Logs,
 }
 
@@ -117,6 +119,7 @@ impl Tab {
             Tab::Memory => "Memory",
             Tab::Storage => "Storage",
             Tab::Networking => "Networking",
+            Tab::Console => "Console",
             Tab::Logs => "Logs",
         }
     }
@@ -138,8 +141,6 @@ enum Intent {
     Remove(u32),
     Reconnect(u32),
     Refresh(Option<u32>),
-    Back,
-    Forward,
     View(bool),
     Tab(Tab),
     Section(String),
@@ -173,12 +174,11 @@ pub struct App {
     theme_mode: ThemeMode,
     pal: Pal,
     applied_dark: Option<bool>,
-    history: Vec<String>,
-    hist_pos: usize,
     tab: Tab,
     open_sections: HashSet<String>,
     closed_sections: HashSet<String>,
     dialog: Dialog,
+    console: Option<ConsoleView>,
     status: String,
     known_hosts: Vec<String>,
     shot_path: Option<String>,
@@ -186,6 +186,7 @@ pub struct App {
     frames: u64,
     shot_ready: bool,
     shot_requested: bool,
+    shot_dialog: bool,
     started: Instant,
 }
 
@@ -213,12 +214,11 @@ impl App {
             theme_mode,
             pal: theme::LIGHT,
             applied_dark: None,
-            history: vec!["root".into()],
-            hist_pos: 0,
             tab: Tab::Home,
             open_sections: HashSet::new(),
             closed_sections: HashSet::new(),
             dialog: Dialog::None,
+            console: None,
             status: "Ready".into(),
             known_hosts: load_history(),
             shot_path: start.shot_path,
@@ -226,6 +226,7 @@ impl App {
             frames: 0,
             shot_ready: false,
             shot_requested: false,
+            shot_dialog: false,
             started: Instant::now(),
         };
         app.apply_theme(&cc.egui_ctx);
@@ -429,7 +430,7 @@ impl App {
                             self.remove_server(id, false);
                             self.dialog = Dialog::AddServer { server: host, user, password: String::new(), error: msg };
                         } else {
-                            self.dialog = Dialog::Message { title: "Add New Server".into(), text: format!("Couldn't connect to {}.\n\n{}", host, msg) };
+                            self.dialog = Dialog::Message { title: "Connect to Server".into(), text: format!("Couldn't connect to {}.\n\n{}", host, msg) };
                         }
                     }
                 } else {
@@ -455,13 +456,7 @@ impl App {
         if key == self.selected {
             return;
         }
-        self.selected = key.clone();
-        self.history.truncate(self.hist_pos + 1);
-        self.history.push(key);
-        if self.history.len() > 50 {
-            self.history.remove(0);
-        }
-        self.hist_pos = self.history.len() - 1;
+        self.selected = key;
     }
 
     fn vm_of<'a>(&'a self, node: &Node) -> Option<(&'a ServerEntry, &'a PoolData, &'a VmInfo)> {
@@ -660,18 +655,6 @@ impl App {
                         }
                     }
                 }
-                Intent::Back => {
-                    if self.hist_pos > 0 {
-                        self.hist_pos -= 1;
-                        self.selected = self.history[self.hist_pos].clone();
-                    }
-                }
-                Intent::Forward => {
-                    if self.hist_pos + 1 < self.history.len() {
-                        self.hist_pos += 1;
-                        self.selected = self.history[self.hist_pos].clone();
-                    }
-                }
                 Intent::View(objects) => self.objects_view = objects,
                 Intent::Tab(t) => self.tab = t,
                 Intent::Section(name) => {
@@ -730,7 +713,7 @@ impl App {
     fn menus(&self, ui: &mut Ui, sel: &Node, out: &mut Vec<Intent>) {
         egui::menu::bar(ui, |ui| {
             ui.menu_button("File", |ui| {
-                if ui.button("Add New Server…").clicked() {
+                if ui.button("Connect…").clicked() {
                     out.push(Intent::AddServer);
                     ui.close_menu();
                 }
@@ -773,7 +756,7 @@ impl App {
                 }
             });
             ui.menu_button("Server", |ui| {
-                if ui.button("Add New Server…").clicked() {
+                if ui.button("Connect…").clicked() {
                     out.push(Intent::AddServer);
                     ui.close_menu();
                 }
@@ -806,6 +789,18 @@ impl App {
 
     fn toolbar(&self, ui: &mut Ui, sel: &Node, out: &mut Vec<Intent>) {
         let pal = self.pal;
+        let vm = self.vm_of(sel).map(|x| x.2);
+        let shown: Vec<&VmAction> = ACTIONS.iter().filter(|a| a.on_toolbar(vm)).collect();
+        let (theme_op, theme_label) = if pal.dark { ("theme-light", "Light") } else { ("theme-dark", "Dark") };
+        // When the window is too narrow for every label, buttons show only their icons (the label
+        // becomes a tooltip): first the Force buttons and the theme switch, then all of them.
+        let fits = |level: u8| {
+            let w = |l: &str, minor: bool| if level == 2 || (level == 1 && minor) { 32.0 } else { tool_width(ui, l) } + 2.0;
+            let buttons: f32 = w("Connect", false) + shown.iter().map(|a| w(a.label, a.is_force())).sum::<f32>() + w(theme_label, true);
+            36.0 + 2.0 * 10.0 + 16.0 + buttons <= ui.available_width()
+        };
+        let level = (0..2).find(|&l| fits(l)).unwrap_or(2);
+        let compact = |minor: bool| level == 2 || (level == 1 && minor);
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
             let tip = if self.sidebar_open { "Fold the sidebar" } else { "Show the sidebar" };
@@ -813,26 +808,22 @@ impl App {
                 out.push(Intent::Sidebar(!self.sidebar_open));
             }
             ui.add_space(4.0);
-            if tool_button(ui, "back", "Back", self.hist_pos > 0, &pal) {
-                out.push(Intent::Back);
-            }
-            if tool_button(ui, "forward", "Forward", self.hist_pos + 1 < self.history.len(), &pal) {
-                out.push(Intent::Forward);
-            }
-            ui.separator();
-            if tool_button(ui, "add", "Add New Server", true, &pal) {
+            if tool_button(ui, "add", "Connect", true, compact(false), &pal) {
                 out.push(Intent::AddServer);
             }
             ui.separator();
-            let vm = self.vm_of(sel).map(|x| x.2);
-            for (i, a) in ACTIONS.iter().enumerate() {
-                if a.on_toolbar(vm) && tool_button(ui, a.op, a.label, self.can_run(a, sel), &pal) {
-                    out.push(Intent::Action(i));
+            let mut force_group = false;
+            for a in &shown {
+                if a.is_force() && !force_group {
+                    ui.separator();
+                    force_group = true;
+                }
+                if tool_button(ui, a.op, a.label, self.can_run(a, sel), compact(a.is_force()), &pal) {
+                    out.extend(ACTIONS.iter().position(|b| std::ptr::eq(b, *a)).map(Intent::Action));
                 }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let (op, label) = if pal.dark { ("theme-light", "Light") } else { ("theme-dark", "Dark") };
-                if tool_button(ui, op, label, true, &pal) {
+                if tool_button(ui, theme_op, theme_label, true, compact(true), &pal) {
                     out.push(Intent::ToggleTheme);
                 }
             });
@@ -916,7 +907,7 @@ impl App {
                 out.push(Intent::Sidebar(true));
             }
             ui.add_space(4.0);
-            if rail_icon(ui, &pal, RailIcon::Tool("add"), false).on_hover_text("Add New Server").clicked() {
+            if rail_icon(ui, &pal, RailIcon::Tool("add"), false).on_hover_text("Connect").clicked() {
                 out.push(Intent::AddServer);
             }
         });
@@ -979,7 +970,7 @@ impl App {
                 }
             }
             Kind::Root | Kind::Category => {
-                if ui.button("Add New Server…").clicked() {
+                if ui.button("Connect…").clicked() {
                     out.push(Intent::AddServer);
                     ui.close_menu();
                 }
@@ -1071,7 +1062,8 @@ impl App {
         match sel.kind {
             Kind::Root | Kind::Category => vec![Tab::Home, Tab::Search, Tab::Logs],
             _ if !has_data => vec![Tab::General, Tab::Logs],
-            Kind::Pool | Kind::Host | Kind::Vm => vec![Tab::General, Tab::Memory, Tab::Storage, Tab::Networking, Tab::Logs],
+            Kind::Vm => vec![Tab::General, Tab::Memory, Tab::Storage, Tab::Networking, Tab::Console, Tab::Logs],
+            Kind::Pool | Kind::Host => vec![Tab::General, Tab::Memory, Tab::Storage, Tab::Networking, Tab::Logs],
             _ => vec![Tab::General, Tab::Logs],
         }
     }
@@ -1110,27 +1102,44 @@ impl App {
     fn home(&self, ui: &mut Ui, out: &mut Vec<Intent>) {
         let pal = self.pal;
         let avail = ui.available_size();
-        let (rect, _) = ui.allocate_exact_size(vec2(avail.x, avail.y.max(480.0)), Sense::hover());
+        // The bullet lines wrap to the page width, and the three links share it, so nothing is cut
+        // off in a narrow window.
+        let lines = ["Connect to a server and see its pool, VMs, storage and networks", "Start, shut down, reboot or suspend any virtual machine", "Try everything first with the demo server"];
+        let wrap = (avail.x - 72.0 - 24.0).max(120.0);
+        let galleys: Vec<_> = lines.iter().map(|l| ui.painter().layout(l.to_string(), FontId::proportional(15.0), pal.ink, wrap)).collect();
+        let links_top = 150.0 + galleys.iter().map(|g| g.size().y + 12.0).sum::<f32>() + 80.0;
+        let (rect, _) = ui.allocate_exact_size(vec2(avail.x, avail.y.max(links_top + 160.0)), Sense::hover());
         let p = ui.painter().clone();
         p.rect_filled(rect, 0.0, pal.surface);
         let o = rect.min;
         p.text(o + vec2(46.0, 24.0), Align2::LEFT_TOP, "Server Manager", FontId::new(40.0, FontFamily::Name("bold".into())), pal.ink);
         p.text(o + vec2(52.0, 86.0), Align2::LEFT_TOP, "A simple console for your virtualization servers\nand the virtual machines they run", FontId::proportional(17.0), pal.ink);
-        let lines = ["Add a server and see its pool, VMs, storage and networks", "Start, shut down, reboot or suspend any virtual machine", "Try everything first with the demo server"];
-        for (i, l) in lines.iter().enumerate() {
-            let y = 150.0 + i as f32 * 30.0;
+        let mut y = 150.0;
+        for g in galleys {
+            let h = g.size().y;
             p.circle_filled(o + vec2(60.0, y + 10.0), 2.2, pal.ink_soft);
-            p.text(o + vec2(72.0, y), Align2::LEFT_TOP, *l, FontId::proportional(15.0), pal.ink);
+            p.galley(o + vec2(72.0, y), g, pal.ink);
+            y += h + 12.0;
         }
-        paint_cloud(&p, o + vec2((rect.width() - 230.0).max(540.0), 60.0), &pal);
-        let step = ((rect.width() - 160.0) / 3.0).max(200.0);
-        let links = [("add", "Add a Server"), ("demo", "Try the Demo Server"), ("about", "About this app")];
+        if rect.width() >= 800.0 {
+            paint_cloud(&p, o + vec2(rect.width() - 230.0, 60.0), &pal); // only beside the text, never over it
+        }
+        // Three pictures with a link under each, side by side; when the page is too narrow for
+        // them, just the links, one per line.
+        let step = ((rect.width() - 46.0 - 16.0) / 3.0).min(260.0);
+        let pictures = step >= 150.0;
+        let links = [("add", "Connect to a Server"), ("demo", "Try the Demo Server"), ("about", "About this app")];
         for (i, (kind, label)) in links.iter().enumerate() {
-            let cx = o.x + 160.0 + i as f32 * step;
-            paint_home_icon(&p, pos2(cx - 40.0, o.y + 320.0), kind, &pal);
-            let lr = Rect::from_center_size(pos2(cx, o.y + 440.0), vec2(200.0, 24.0));
             let link = egui::Link::new(egui::RichText::new(*label).size(15.0).color(pal.link));
-            if ui.put(lr, link).clicked() {
+            let resp = if pictures {
+                let cx = o.x + 46.0 + (i as f32 + 0.5) * step;
+                paint_home_icon(&p, pos2(cx - 40.0, o.y + links_top), kind, &pal);
+                ui.put(Rect::from_center_size(pos2(cx, o.y + links_top + 120.0), vec2(step, 24.0)), link)
+            } else {
+                let lr = Rect::from_min_size(o + vec2(52.0, links_top - 40.0 + i as f32 * 32.0), vec2(rect.width() - 60.0, 24.0));
+                ui.allocate_new_ui(egui::UiBuilder::new().max_rect(lr), |ui| ui.add(link)).inner
+            };
+            if resp.clicked() {
                 out.push(match *kind {
                     "add" => Intent::AddServer,
                     "demo" => Intent::Demo,
@@ -1467,6 +1476,39 @@ impl App {
         }
     }
 
+    /// The VM's screen. A shut down or suspended VM has none: offer to start or resume it.
+    fn console_tab(&mut self, ui: &mut Ui, sel: &Node, out: &mut Vec<Intent>) {
+        let pal = self.pal;
+        let Some((s, _, vm)) = self.vm_of(sel) else { return };
+        let (sid, vref, name, os, power, conn) = (s.id, vm.rref.clone(), vm.name.clone(), vm.os.clone(), vm.power, s.conn.clone());
+        if !matches!(power, PowerState::Running | PowerState::Paused) {
+            self.console = None;
+            let (text, op) = match power {
+                PowerState::Suspended => ("This VM is suspended. Resume it to see its console.", "resume"),
+                _ => ("This VM is shut down. Start it to see its console.", "start"),
+            };
+            let action = ACTIONS.iter().position(|a| a.op == op);
+            ui.vertical_centered(|ui| {
+                ui.add_space(80.0);
+                ui.label(egui::RichText::new(text).size(15.0).color(pal.ink_soft));
+                ui.add_space(12.0);
+                if let Some(i) = action {
+                    if dialog_button(ui, &pal, ACTIONS[i].label, true, self.can_run(&ACTIONS[i], sel)) {
+                        out.push(Intent::Action(i));
+                    }
+                }
+            });
+            return;
+        }
+        if self.console.as_ref().map_or(true, |c| c.sid != sid || c.vm != vref) {
+            self.console = Some(ConsoleView::new(sid, vref, &name, &os, conn, ui.ctx().clone()));
+        }
+        if let Some(c) = self.console.as_mut() {
+            let allow_keyboard = matches!(self.dialog, Dialog::None);
+            c.ui(ui, &pal, allow_keyboard);
+        }
+    }
+
     fn logs(&self, ui: &mut Ui, sel: &Node) {
         let rows: Vec<Vec<String>> = self
             .log
@@ -1487,51 +1529,67 @@ impl App {
         let mut confirm: Option<(usize, u32, String)> = None;
         let hosts = self.known_hosts.clone();
         let red = self.pal.red;
+        let pal = self.pal;
         match &mut self.dialog {
             Dialog::None => {}
             Dialog::AddServer { server, user, password, error } => {
-                egui::Window::new("Add New Server").collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
+                dialog_window(ctx, "Connect to Server").show(ctx, |ui| {
                     ui.set_width(400.0);
+                    ui.spacing_mut().item_spacing.y = 8.0;
                     ui.label("Type the name or IP address of the server, and the account you use to sign in to it.");
-                    ui.add_space(6.0);
+                    ui.add_space(4.0);
                     ui.horizontal(|ui| {
-                        ui.add_sized([72.0, 20.0], egui::Label::new("Server:"));
-                        ui.add(egui::TextEdit::singleline(server).desired_width(270.0));
-                        ui.menu_button("▾", |ui| {
+                        // wider by the credentials box's inset, so every box starts at the same x
+                        field_label(ui, "Server:", LABEL_WIDTH + GROUP_INSET);
+                        let w = ui.available_width() - FIELD_HEIGHT - ui.spacing().item_spacing.x;
+                        let field = text_field(ui, &pal, server, w, false).rect;
+                        // Earlier servers: a small ▾ button opens the list under the box.
+                        let (r, resp) = ui.allocate_exact_size(vec2(FIELD_HEIGHT, FIELD_HEIGHT), Sense::click());
+                        let p = ui.painter();
+                        p.rect(r, Rounding::same(5.0), if resp.hovered() { pal.hover } else { pal.input }, Stroke::new(1.0, pal.border_strong));
+                        let c = r.center();
+                        p.add(egui::Shape::line(vec![pos2(c.x - 4.0, c.y - 2.0), pos2(c.x, c.y + 2.0), pos2(c.x + 4.0, c.y - 2.0)], Stroke::new(1.6, pal.ink_soft)));
+                        let popup = ui.make_persistent_id("known-hosts");
+                        if resp.on_hover_text("Earlier servers").clicked() {
+                            ui.memory_mut(|m| m.toggle_popup(popup));
+                        }
+                        let anchor = ui.interact(field.union(r), popup.with("anchor"), Sense::hover());
+                        egui::popup::popup_below_widget(ui, popup, &anchor, egui::PopupCloseBehavior::CloseOnClick, |ui| {
+                            ui.set_min_width(field.union(r).width() - 12.0);
                             for h in &hosts {
-                                if ui.button(h).clicked() {
+                                if ui.selectable_label(false, h).clicked() {
                                     *server = h.clone();
-                                    ui.close_menu();
                                 }
                             }
                             if hosts.is_empty() {
-                                ui.label("No earlier servers");
+                                ui.label(egui::RichText::new("No earlier servers").color(pal.ink_soft));
                             }
                         });
                     });
-                    ui.add_space(4.0);
-                    ui.group(|ui| {
-                        ui.label("User login credentials");
+                    egui::Frame::group(ui.style()).inner_margin(egui::Margin::same(GROUP_INSET - 1.0)).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.spacing_mut().item_spacing.y = 8.0;
+                        ui.label(egui::RichText::new("User login credentials").color(pal.ink_soft));
                         ui.horizontal(|ui| {
-                            ui.add_sized([72.0, 20.0], egui::Label::new("Username:"));
-                            ui.add(egui::TextEdit::singleline(user).desired_width(280.0));
+                            field_label(ui, "Username:", LABEL_WIDTH);
+                            text_field(ui, &pal, user, ui.available_width(), false);
                         });
                         ui.horizontal(|ui| {
-                            ui.add_sized([72.0, 20.0], egui::Label::new("Password:"));
-                            ui.add(egui::TextEdit::singleline(password).password(true).desired_width(280.0));
+                            field_label(ui, "Password:", LABEL_WIDTH);
+                            text_field(ui, &pal, password, ui.available_width(), true);
                         });
                     });
                     if !error.is_empty() {
                         ui.colored_label(red, error.as_str());
                     }
-                    ui.add_space(6.0);
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Cancel").clicked() {
+                    ui.add_space(4.0);
+                    dialog_buttons(ui, |ui| {
+                        if dialog_button(ui, &pal, "Cancel", false, true) {
                             close = true;
                         }
                         let ok = !server.trim().is_empty() && !user.trim().is_empty();
                         let enter = ui.input(|i| i.key_pressed(Key::Enter));
-                        if ui.add_enabled(ok, egui::Button::new("Add")).clicked() || (ok && enter) {
+                        if dialog_button(ui, &pal, "Connect", true, ok) || (ok && enter) {
                             if server.trim().contains(' ') {
                                 *error = "A server name can't contain spaces.".into();
                             } else {
@@ -1542,27 +1600,27 @@ impl App {
                 });
             }
             Dialog::Confirm { action, sid, vm, title, text } => {
-                egui::Window::new(title.as_str()).collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
+                dialog_window(ctx, title.as_str()).show(ctx, |ui| {
                     ui.set_max_width(420.0);
                     ui.label(text.as_str());
-                    ui.add_space(8.0);
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("No").clicked() {
+                    ui.add_space(12.0);
+                    dialog_buttons(ui, |ui| {
+                        if dialog_button(ui, &pal, "No", false, true) {
                             close = true;
                         }
-                        if ui.button("Yes").clicked() {
+                        if dialog_button(ui, &pal, "Yes", true, true) {
                             confirm = Some((*action, *sid, vm.clone()));
                         }
                     });
                 });
             }
             Dialog::Message { title, text } => {
-                egui::Window::new(title.as_str()).collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
+                dialog_window(ctx, title.as_str()).show(ctx, |ui| {
                     ui.set_max_width(420.0);
                     ui.label(text.as_str());
-                    ui.add_space(8.0);
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("OK").clicked() {
+                    ui.add_space(12.0);
+                    dialog_buttons(ui, |ui| {
+                        if dialog_button(ui, &pal, "OK", true, true) {
                             close = true;
                         }
                     });
@@ -1587,8 +1645,8 @@ impl App {
 
     fn shortcuts(&self, ctx: &egui::Context, sel: &Node) -> Vec<Intent> {
         let mut out = vec![];
-        if !matches!(self.dialog, Dialog::None) {
-            return out;
+        if !matches!(self.dialog, Dialog::None) || console::has_focus(ctx) {
+            return out; // keys go to the dialog, or to the VM's console
         }
         let keys = [(Key::B, Shortcut::CtrlB), (Key::E, Shortcut::CtrlE), (Key::R, Shortcut::CtrlR), (Key::Y, Shortcut::CtrlY)];
         for (k, sc) in keys {
@@ -1656,7 +1714,22 @@ impl eframe::App for App {
         if sel.key != self.selected {
             self.selected = sel.key.clone();
         }
+        // A VM's console stays connected while that VM is selected (on any of its tabs).
+        if self.console.as_ref().map_or(false, |c| sel.sid != Some(c.sid) || sel.rref.as_deref() != Some(c.vm.as_str())) {
+            self.console = None;
+        }
         let mut out = self.shortcuts(ctx, &sel);
+        // --show add-server | confirm | about: a check's screenshot with that dialog open.
+        if self.shot_ready && !self.shot_dialog {
+            self.shot_dialog = true;
+            match self.shot_show.as_str() {
+                "add-server" => out.push(Intent::AddServer),
+                "confirm" => out.extend(ACTIONS.iter().position(|a| a.confirm && self.can_run(a, &sel)).map(Intent::Action)),
+                "about" => out.push(Intent::About),
+                "console" => out.push(Intent::Tab(Tab::Console)),
+                _ => {}
+            }
+        }
 
         egui::TopBottomPanel::top("menu").frame(egui::Frame::none().fill(pal.toolbar).inner_margin(egui::Margin::symmetric(6.0, 2.0))).show(ctx, |ui| self.menus(ui, &sel, &mut out));
         let tools_frame = egui::Frame::none().fill(pal.toolbar).inner_margin(egui::Margin::symmetric(6.0, 4.0)).stroke(Stroke::new(1.0, pal.border));
@@ -1698,6 +1771,7 @@ impl eframe::App for App {
                 Tab::Memory => self.memory(ui, &sel),
                 Tab::Storage => self.storage(ui, &sel),
                 Tab::Networking => self.networking(ui, &sel),
+                Tab::Console => self.console_tab(ui, &sel, &mut out),
                 Tab::Logs => self.logs(ui, &sel),
             });
         });
@@ -1709,18 +1783,81 @@ impl eframe::App for App {
     }
 }
 
-/// A labelled toolbar button with a theme-coloured glyph.
-fn tool_button(ui: &mut Ui, op: &str, label: &str, enabled: bool, pal: &Pal) -> bool {
-    let font = FontId::proportional(13.0);
-    let tw = ui.painter().layout_no_wrap(label.to_string(), font.clone(), pal.ink).size().x;
+const FIELD_HEIGHT: f32 = 26.0;
+const LABEL_WIDTH: f32 = 80.0;
+const GROUP_INSET: f32 = 11.0; // a group box's margin plus its 1px border
+
+/// A dialog window: centred, fixed size, with room around its contents.
+fn dialog_window(ctx: &egui::Context, title: &str) -> egui::Window<'static> {
+    egui::Window::new(title.to_string())
+        .collapsible(false)
+        .resizable(false)
+        .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+        .frame(egui::Frame::window(&ctx.style()).inner_margin(egui::Margin::same(14.0)))
+}
+
+/// A left-aligned field label of fixed width, so the boxes after it line up.
+fn field_label(ui: &mut Ui, text: &str, width: f32) {
+    ui.allocate_ui_with_layout(vec2(width, FIELD_HEIGHT), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+        ui.set_min_size(vec2(width, FIELD_HEIGHT));
+        ui.label(text);
+    });
+}
+
+/// A one-line text box with a visible border (blue while typing), drawn like the sidebar's search
+/// box. egui's own box has no border until hovered, and its focus outline is white.
+fn text_field(ui: &mut Ui, pal: &Pal, text: &mut String, width: f32, password: bool) -> egui::Response {
+    let bg = ui.painter().add(egui::Shape::Noop);
+    let row = ui.text_style_height(&egui::TextStyle::Body);
+    let pad = egui::Margin::symmetric(7.0, ((FIELD_HEIGHT - row) / 2.0).max(0.0));
+    let mut edit = ui.add_sized([width, FIELD_HEIGHT], egui::TextEdit::singleline(text).password(password).frame(false).margin(pad));
+    edit.rect = edit.rect + pad; // egui reports the box without its margin
+    let stroke = Stroke::new(1.0, if edit.has_focus() { pal.accent } else { pal.border_strong });
+    ui.painter().set(bg, egui::epaint::RectShape::new(edit.rect, Rounding::same(5.0), pal.input, stroke));
+    edit
+}
+
+/// The row of buttons at the bottom of a dialog, right-aligned and one row tall. (A bare
+/// right-to-left layout would stretch an auto-sized window to the whole screen height.)
+fn dialog_buttons(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
+    ui.allocate_ui_with_layout(vec2(ui.available_width(), FIELD_HEIGHT), egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        ui.spacing_mut().item_spacing.x = 8.0;
+        add(ui);
+    });
+}
+
+/// A dialog button; the main one (Add, Yes, OK) is filled with the accent colour.
+fn dialog_button(ui: &mut Ui, pal: &Pal, label: &str, primary: bool, enabled: bool) -> bool {
+    let b = if primary && enabled {
+        egui::Button::new(egui::RichText::new(label).color(pal.on_accent)).fill(pal.accent)
+    } else {
+        egui::Button::new(label).stroke(Stroke::new(1.0, pal.border_strong))
+    };
+    ui.add_enabled(enabled, b.min_size(vec2(80.0, FIELD_HEIGHT)).rounding(Rounding::same(5.0))).clicked()
+}
+
+/// How wide a labelled toolbar button is.
+fn tool_width(ui: &Ui, label: &str) -> f32 {
+    32.0 + ui.painter().layout_no_wrap(label.to_string(), FontId::proportional(13.0), Color32::WHITE).size().x + 10.0
+}
+
+/// A labelled toolbar button with a theme-coloured glyph; `compact` shows only the glyph, with the
+/// label as a tooltip.
+fn tool_button(ui: &mut Ui, op: &str, label: &str, enabled: bool, compact: bool, pal: &Pal) -> bool {
+    let w = if compact { 32.0 } else { tool_width(ui, label) };
     let sense = if enabled { Sense::click() } else { Sense::hover() };
-    let (rect, resp) = ui.allocate_exact_size(vec2(32.0 + tw + 10.0, 30.0), sense);
+    let (rect, mut resp) = ui.allocate_exact_size(vec2(w, 30.0), sense);
     let p = ui.painter();
     if enabled && resp.hovered() {
         p.rect_filled(rect, Rounding::same(6.0), pal.hover);
     }
-    paint_tool(p, Rect::from_min_size(rect.min + vec2(4.0, 4.0), vec2(22.0, 22.0)), op, enabled, pal);
-    p.text(pos2(rect.min.x + 32.0, rect.center().y), Align2::LEFT_CENTER, label, font, if enabled { pal.ink } else { pal.ink_faint });
+    if compact {
+        paint_tool(p, Rect::from_center_size(rect.center(), vec2(22.0, 22.0)), op, enabled, pal);
+        resp = resp.on_hover_text(label);
+    } else {
+        paint_tool(p, Rect::from_min_size(rect.min + vec2(4.0, 4.0), vec2(22.0, 22.0)), op, enabled, pal);
+        p.text(pos2(rect.min.x + 32.0, rect.center().y), Align2::LEFT_CENTER, label, FontId::proportional(13.0), if enabled { pal.ink } else { pal.ink_faint });
+    }
     enabled && resp.clicked()
 }
 

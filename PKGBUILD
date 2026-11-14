@@ -8,9 +8,9 @@
 # Remove it again with:  sudo pacman -R simple-vm-manager
 
 pkgname=simple-vm-manager
-pkgver=1.0.0
+pkgver=1.1.0
 pkgrel=1
-pkgdesc="Simple desktop console for XenServer / XCP-ng pools: browse servers and VMs, start, shut down, reboot, suspend"
+pkgdesc="Simple desktop console for XenServer / XCP-ng pools: browse servers and VMs, use their consoles, start, shut down, reboot, suspend"
 arch=('x86_64' 'aarch64')
 url="https://github.com/jpaferreira-git/simple-vm-manager"
 license=('MIT')

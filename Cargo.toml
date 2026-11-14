@@ -1,8 +1,8 @@
 [package]
 name = "simple-vm-manager"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
-description = "A simple desktop console for XenServer / XCP-ng pools (Linux, Windows, macOS)"
+description = "A simple desktop console for XenServer / XCP-ng pools and their VMs' screens (Linux, Windows, macOS)"
 license = "MIT"
 readme = "README.md"
 keywords = ["xen", "xcp-ng", "virtualization", "egui", "desktop"]
@@ -17,6 +17,7 @@ eframe = { version = "0.29", default-features = false, features = ["default_font
 ureq = { version = "2", default-features = false, features = ["native-tls"] }
 native-tls = "0.2"
 serde_json = "1"
+flate2 = "1" # the VM console's ZRLE pictures
 image = { version = "0.25", default-features = false, features = ["png"] }
 
 # egui's wgpu comes without the DirectX 12 backend; Windows needs it (it also has a software fallback,

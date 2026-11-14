@@ -1,8 +1,8 @@
 # Simple VM Manager
 
-A small, fast desktop console for **XenServer** and **XCP-ng** pools. Add your servers, see their
-pools, hosts, virtual machines, storage and networks at a glance, and start, shut down, reboot,
-suspend or resume virtual machines — in a light or dark theme, on Linux, Windows or macOS.
+A small, fast desktop console for **XenServer** and **XCP-ng** pools. Connect to your servers, see their
+pools, hosts, virtual machines, storage and networks at a glance, use each VM's screen from its
+console, and start, shut down, reboot, suspend or resume virtual machines — in a light or dark theme, on Linux, Windows or macOS.
 
 It is an independent, simpler take on the classic Windows management console layout. It is not
 affiliated with or endorsed by the makers of XenServer or XCP-ng.
@@ -11,21 +11,26 @@ affiliated with or endorsed by the makers of XenServer or XCP-ng.
 |---|---|
 | ![Light theme](docs/screenshot-light-vm.png) | ![Dark theme](docs/screenshot-dark-vm.png) |
 | ![Home page, dark](docs/screenshot-dark-home.png) | ![Folded sidebar](docs/screenshot-folded.png) |
+| ![A VM's console](docs/screenshot-dark-console.png) | ![Connecting to a server](docs/screenshot-dark-connect.png) |
 
 ## Features
 
-- **Servers and pools** — add a server by name or IP with your login; pool members redirect to the
+- **Servers and pools** — connect to a server by name or IP with your login; pool members redirect to the
   pool coordinator automatically. Earlier servers are remembered (passwords are never saved).
 - **Resource tree** — *Infrastructure* view (pool → hosts → VMs, storage, networks) or *Objects* view
   (grouped by type), with a search box. The sidebar **folds** into a slim icon strip.
 - **Details** — General, Memory, Storage, Networking and Logs tabs for pools, hosts and VMs.
+- **Console** — see a running VM's screen and use it with your keyboard and mouse (the keyboard goes
+  to the VM while the mouse is over its screen), with *Send Ctrl+Alt+Del*, a *Send keys* menu for the
+  combinations your desktop keeps for itself (the Windows key, Alt+Tab…) and *Scale to fit*. It
+  reconnects by itself after the VM reboots.
 - **VM power actions** — Start, Shut Down, Reboot, Suspend, Resume, Force Shut Down, Force Reboot,
   enabled only when the server allows them, with confirmations for the disruptive ones.
 - **Keyboard shortcuts** — Ctrl+B start · Ctrl+E shut down · Ctrl+R reboot · Ctrl+Y suspend/resume ·
   F5 refresh.
 - **Light / dark / system theme** — toolbar button or *View → Theme*; your choice is remembered.
 - **Demo server** — try everything without a real server (*File → Connect to Demo Server*).
-- Back / Forward navigation, live refresh every 15 s, automatic reconnect.
+- Live refresh every 15 s, automatic reconnect.
 
 ## Install on Arch Linux / Omarchy
 
@@ -91,10 +96,11 @@ building anything. You can also just run `./simple-vm-manager` directly.
 
 ## Using it
 
-1. Click **Add New Server** (or the *Add a Server* link on the Home page), type the server's name or IP
-   address, your user name (usually `root`) and password, and press **Add**.
+1. Click **Connect** (or the *Connect to a Server* link on the Home page), type the server's name or IP
+   address, your user name (usually `root`) and password, and press **Connect**.
 2. The server appears in the sidebar. Expand it to see its hosts and virtual machines.
 3. Select a VM and use the toolbar or right-click it to start, stop, reboot or suspend it.
+   Its **Console** tab shows the VM's screen.
 4. Fold the sidebar with the panel button at the far left of the toolbar or the « button next to the
    search box; switch theme with the **Dark / Light** button at the far right.
 

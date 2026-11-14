@@ -3,6 +3,7 @@
 
 mod app;
 mod conn;
+mod console;
 mod icons;
 mod model;
 mod theme;
@@ -19,7 +20,8 @@ struct Args {
 
 fn main() -> eframe::Result {
     // --screenshot <file.png>: start with the demo server, draw about 120 frames, save the window, exit.
-    // --show home|objects|vm picks what the screenshot shows (default: a VM's General tab).
+    // --show home|objects|vm|console|add-server|confirm|about picks what the screenshot shows (default:
+    // a VM's General tab; console shows its Console tab; the last three open that dialog over it).
     // --theme system|light|dark and --sidebar open|folded override the saved choices.
     let argv: Vec<String> = std::env::args().collect();
     let mut args = Args { shot: None, show: "vm".into(), theme: None, sidebar_open: None };
@@ -56,8 +58,9 @@ fn main() -> eframe::Result {
         // Wayland app id / X11 class: matches packaging/simple-vm-manager.desktop (Hyprland, GNOME, KDE)
         .with_app_id("simple-vm-manager");
     if shot.is_some() {
-        // never take focus during a check; on Windows also sit behind other windows (it still draws there)
-        viewport = viewport.with_active(false);
+        // never take focus during a check; on Windows also sit behind other windows (it still draws there).
+        // A fixed size, so tiling window managers float it and every screenshot comes out the same.
+        viewport = viewport.with_active(false).with_min_inner_size([1180.0, 740.0]).with_max_inner_size([1180.0, 740.0]);
         if cfg!(windows) {
             viewport = viewport.with_window_level(egui::WindowLevel::AlwaysOnBottom);
         }

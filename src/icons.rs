@@ -149,7 +149,7 @@ pub fn paint_tool(p: &Painter, rect: Rect, op: &str, enabled: bool, pal: &Pal) {
         _ => pal.icon,
     };
     let col = if enabled { base } else { pal.ink_faint };
-    let neutral = matches!(op, "back" | "forward" | "sidebar" | "theme-dark" | "theme-light");
+    let neutral = matches!(op, "sidebar" | "theme-dark" | "theme-light");
     if !neutral {
         let tint = if enabled { col.gamma_multiply(if pal.dark { 0.22 } else { 0.14 }) } else { Color32::TRANSPARENT };
         p.rect_filled(rect.shrink(0.5), Rounding::same(6.0), tint);
@@ -185,8 +185,6 @@ pub fn paint_tool(p: &Painter, rect: Rect, op: &str, enabled: bool, pal: &Pal) {
             p.line_segment([o + vec2(13.4, 15.5), o + vec2(18.6, 15.5)], w);
             p.line_segment([o + vec2(16.0, 12.9), o + vec2(16.0, 18.1)], w);
         }
-        "back" => line(p, c, &[(3.0, -6.0), (-3.0, 0.0), (3.0, 6.0)], s),
-        "forward" => line(p, c, &[(-3.0, -6.0), (3.0, 0.0), (-3.0, 6.0)], s),
         "sidebar" => {
             let s = Stroke::new(1.6, col);
             p.rect_stroke(Rect::from_center_size(c, vec2(16.0, 13.0)), Rounding::same(2.5), s);
