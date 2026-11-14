@@ -319,6 +319,80 @@ fn list(o: &Value, k: &str) -> Vec<String> {
     o.get(k).and_then(|v| v.as_array()).map(|a| a.iter().map(val_str).collect()).unwrap_or_default()
 }
 
+/// The General tab's details of a VM, from its record, its guest tools' report and its metrics.
+fn vm_details(vm: &mut VmInfo, r: &Value, guest: &Value, metrics: &Value) {
+    let null = Value::Null;
+    let other = r.get("other_config").unwrap_or(&null);
+    vm.kernel = s(guest.get("os_version").unwrap_or(&null), "uname");
+    vm.tags = list(r, "tags");
+    vm.folder = s(other, "folder");
+    vm.auto_power_on = s(other, "auto_poweron") == "true";
+    let hvm = !s(r, "HVM_boot_policy").is_empty();
+    vm.virt_mode = match s(r, "domain_type").as_str() {
+        "hvm" => "HVM",
+        "pv" => "PV",
+        "pvh" => "PVH",
+        "pv_in_pvh" => "PV in PVH",
+        _ if hvm => "HVM",
+        _ => "PV",
+    }
+    .into();
+    if vm.virt_mode == "HVM" {
+        let boot = r.get("HVM_boot_params").unwrap_or(&null);
+        vm.firmware = if s(boot, "firmware") == "uefi" { "UEFI" } else { "BIOS" }.into();
+        let order: Vec<&str> = s(boot, "order").chars().filter_map(|c| match c {
+            'c' => Some("Disk"),
+            'd' => Some("DVD drive"),
+            'n' => Some("Network"),
+            _ => None,
+        }).collect();
+        vm.boot_order = order.join(", ");
+    }
+    if vm.firmware == "UEFI" {
+        vm.secure_boot = match s(r.get("platform").unwrap_or(&null), "secureboot").as_str() {
+            "true" => "On",
+            "auto" => "Automatic",
+            _ => "Off",
+        }
+        .into();
+    }
+    vm.ha = match s(r, "ha_restart_priority").as_str() {
+        "restart" => "Restart",
+        "best-effort" => "Best effort",
+        _ => "",
+    }
+    .into();
+    vm.snapshots = list(r, "snapshots").len();
+    vm.vcpus_max = n(r, "VCPUs_max");
+    vm.mem_static_min = n(r, "memory_static_min");
+    if matches!(vm.power, PowerState::Running | PowerState::Paused) {
+        vm.mem_actual = n(metrics, "memory_actual");
+        vm.started = parse_xen_time(&s(metrics, "start_time"));
+    }
+    let pv = guest.get("PV_drivers_version").unwrap_or(&null);
+    let version: Vec<String> = ["major", "minor", "micro"].iter().map(|k| s(pv, k)).filter(|x| !x.is_empty()).collect();
+    vm.tools = if !version.is_empty() {
+        version.join(".")
+    } else if b(guest, "PV_drivers_detected") {
+        "Installed".into()
+    } else {
+        String::new()
+    };
+    // every address the tools report ("0/ip", "0/ipv4/0", "0/ipv6/1"…), IPv4 first, no link-local
+    if let Some(m) = guest.get("networks").and_then(|v| v.as_object()) {
+        let mut ips: Vec<String> = m
+            .iter()
+            .filter(|(k, _)| k.ends_with("/ip") || k.contains("/ipv4/") || k.contains("/ipv6/"))
+            .map(|(_, v)| val_str(v))
+            .filter(|ip| !ip.is_empty() && !ip.to_ascii_lowercase().starts_with("fe80"))
+            .collect();
+        ips.sort();
+        ips.dedup();
+        ips.sort_by_key(|ip| ip.contains(':'));
+        vm.ips = ips;
+    }
+}
+
 impl Connection for RealConnection {
     fn hostname(&self) -> String {
         let h = self.state.lock().unwrap().host.clone();
@@ -395,6 +469,7 @@ impl Connection for RealConnection {
         let vdis = self.all("VDI", t)?;
         let vifs = self.all("VIF", t)?;
         let guests = self.all("VM_guest_metrics", t)?;
+        let vm_metrics = self.all("VM_metrics", t)?;
         let sr_names: HashMap<String, String> = pd.srs.iter().map(|x| (x.rref.clone(), x.name.clone())).collect();
         let net_names: HashMap<String, String> = pd.networks.iter().map(|x| (x.rref.clone(), x.name.clone())).collect();
         let sr_hosts: HashMap<String, String> = pd.srs.iter().filter_map(|x| x.host.clone().map(|h| (x.rref.clone(), h))).collect();
@@ -414,7 +489,8 @@ impl Connection for RealConnection {
                 host: if host.is_empty() || host == "OpaqueRef:NULL" { None } else { Some(host) },
                 storage_host: None,
                 affinity: if pd.hosts.iter().any(|h| h.rref == affinity) { Some(affinity) } else { None },
-                os: s(g.get("os_version").unwrap_or(&Value::Null), "name"),
+                // Windows guests add "|C:\Windows|…" after the name
+                os: s(g.get("os_version").unwrap_or(&Value::Null), "name").split('|').next().unwrap_or_default().trim().to_string(),
                 ip: String::new(),
                 power: PowerState::parse(&s(&r, "power_state")),
                 mem_static_max: n(&r, "memory_static_max"),
@@ -424,7 +500,9 @@ impl Connection for RealConnection {
                 allowed: list(&r, "allowed_operations"),
                 disks: vec![],
                 nics: vec![],
+                ..Default::default()
             };
+            vm_details(&mut vm, &r, &g, vm_metrics.get(&s(&r, "metrics")).unwrap_or(&Value::Null));
             for vbd_ref in list(&r, "VBDs") {
                 let Some(vbd) = vbds.get(&vbd_ref) else { continue };
                 let cd = s(vbd, "type") == "CD";
@@ -631,10 +709,46 @@ impl DemoConnection {
                     VmDisk { name: "(empty)".into(), device: "3".into(), sr_name: String::new(), kind: "DVD drive".into(), size: 0 },
                 ],
                 nics: vec![VmNic { device: "0".into(), mac: format!("aa:16:3e:{:02x}:10:{:02x}", i + 1, 0x20 + i), network: "Pool-wide network 0".into(), ip: ip.to_string() }],
+                ..Default::default()
             });
+            demo_details(d.vms.last_mut().unwrap());
         }
         recompute(&mut d);
         DemoConnection { data: Mutex::new(d) }
+    }
+}
+
+/// Made-up details for the demo VMs' General tab.
+fn demo_details(v: &mut VmInfo) {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    let windows = v.os.contains("Windows");
+    v.virt_mode = if v.rref == "vm-backup" { "PV" } else { "HVM" }.into();
+    if v.virt_mode == "HVM" {
+        v.firmware = if windows || v.rref == "vm-web" { "UEFI" } else { "BIOS" }.into();
+        v.boot_order = "Disk, DVD drive, Network".into();
+    }
+    if v.firmware == "UEFI" {
+        v.secure_boot = if windows { "On" } else { "Off" }.into();
+    }
+    v.vcpus_max = v.vcpus;
+    v.mem_static_min = v.mem_dyn_min;
+    let (tags, folder, days, snaps, auto, ha): (&[&str], &str, i64, usize, bool, &str) = match v.rref.as_str() {
+        "vm-web" => (&["web", "production"], "/Production", 12, 2, true, "Restart"),
+        "vm-db" => (&["database", "production"], "/Production", 31, 5, true, "Restart"),
+        "vm-mail" => (&["mail"], "/Production", 4, 0, true, "Best effort"),
+        "vm-build" => (&["ci"], "/Development", 0, 1, false, ""),
+        "vm-desk" => (&["testing"], "/Development", 0, 3, false, ""),
+        _ => (&["backup"], "", 0, 0, false, ""),
+    };
+    v.tags = tags.iter().map(|t| t.to_string()).collect();
+    v.folder = folder.into();
+    v.snapshots = snaps;
+    v.auto_power_on = auto;
+    v.ha = ha.into();
+    v.tools = if windows { "9.4.0" } else { "8.4.0" }.into();
+    v.kernel = if windows { String::new() } else { "6.8.0-45-generic".into() };
+    if v.power == PowerState::Running {
+        v.started = Some(now - days * 86_400 - 3 * 3600 - 17 * 60);
     }
 }
 
@@ -655,6 +769,15 @@ fn recompute(d: &mut PoolData) {
             v.ip.clear();
         } else if v.ip.is_empty() {
             v.ip = format!("10.20.1.{}", 30 + i);
+        }
+        v.ips = if v.ip.is_empty() { vec![] } else { vec![v.ip.clone()] };
+        if matches!(v.power, PowerState::Running | PowerState::Paused) {
+            v.mem_actual = v.mem_dyn_max;
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+            v.started.get_or_insert(now);
+        } else if v.power == PowerState::Halted {
+            v.mem_actual = 0;
+            v.started = None;
         }
         let ip = v.ip.clone();
         for nic in v.nics.iter_mut() {

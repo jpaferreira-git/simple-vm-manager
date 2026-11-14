@@ -1082,7 +1082,7 @@ impl ConsoleView {
     }
 
     fn controls(&mut self, ui: &mut Ui, pal: &Pal, compact: bool) {
-        ui.spacing_mut().item_spacing.x = 8.0;
+        ui.spacing_mut().item_spacing.x = 4.0;
         let connected = self.status() == Status::Connected;
         let mut combo: Option<Vec<(u32, u32)>> = None;
         let menu = |ui: &mut Ui, combo: &mut Option<Vec<(u32, u32)>>, with_cad: bool| {
@@ -1110,29 +1110,59 @@ impl ConsoleView {
                 }
             });
         };
-        let framed = |b: egui::Button<'static>| b.stroke(Stroke::new(1.0, pal.border_strong)).rounding(Rounding::same(5.0));
+        // Flat buttons: no frame, a soft background while hovered, while their menu is open, or (the
+        // monitor) while Scale to fit is on. The background goes into a slot reserved under the button.
+        let flat_bg = |ui: &Ui, slot: egui::layers::ShapeIdx, resp: &egui::Response, on: bool| {
+            let hovered = resp.hovered() && resp.enabled();
+            if hovered || on {
+                let fill = if hovered { pal.hover } else { pal.nav_on };
+                ui.painter().set(slot, egui::epaint::RectShape::filled(resp.rect, Rounding::same(5.0), fill));
+            }
+        };
+        ui.spacing_mut().button_padding = vec2(8.0, 3.0);
+        let row = vec2(0.0, 24.0);
         if compact {
-            // a monitor: Scale to fit (filled in while on); a keyboard: every key combination
-            let fill = if self.fit { pal.nav_on } else { pal.surface };
-            let b = ui.add(framed(egui::Button::new("")).min_size(ICON_BUTTON).fill(fill)).on_hover_text(if self.fit { "Scale to fit: on" } else { "Scale to fit: off" });
+            // a monitor: Scale to fit; a keyboard: every key combination
+            let slot = ui.painter().add(egui::Shape::Noop);
+            let b = ui.add(egui::Button::new("").frame(false).min_size(ICON_BUTTON)).on_hover_text(if self.fit { "Scale to fit: on" } else { "Scale to fit: off" });
+            flat_bg(ui, slot, &b, self.fit);
             paint_monitor(ui.painter(), b.rect, pal.ink_soft, self.fit);
             if b.clicked() {
                 self.fit = !self.fit;
             }
             ui.add_enabled_ui(connected, |ui| {
-                let m = egui::menu::menu_custom_button(ui, framed(egui::Button::new("")).min_size(ICON_BUTTON), |ui| menu(ui, &mut combo, true));
+                let slot = ui.painter().add(egui::Shape::Noop);
+                let m = egui::menu::menu_custom_button(ui, egui::Button::new("").frame(false).min_size(ICON_BUTTON), |ui| menu(ui, &mut combo, true));
+                flat_bg(ui, slot, &m.response, m.inner.is_some());
                 paint_keyboard(ui.painter(), m.response.rect, if connected { pal.ink_soft } else { pal.ink_faint });
                 m.response.on_hover_text("Send keys to the VM");
             });
         } else {
+            // egui gives frameless buttons no padding, so these draw their own label inside a sized,
+            // empty button: 10 points each side, and room for the menu's arrow.
+            let font = egui::TextStyle::Button.resolve(ui.style());
+            let label = |ui: &Ui, r: Rect, text: &str, arrow: bool| {
+                let col = if connected { pal.ink } else { pal.ink_faint };
+                ui.painter().text(pos2(r.min.x + 10.0, r.center().y), Align2::LEFT_CENTER, text, font.clone(), col);
+                if arrow {
+                    let c = pos2(r.max.x - 13.0, r.center().y);
+                    ui.painter().add(egui::Shape::line(vec![pos2(c.x - 3.5, c.y - 1.5), pos2(c.x, c.y + 2.0), pos2(c.x + 3.5, c.y - 1.5)], Stroke::new(1.4, if connected { pal.ink_soft } else { pal.ink_faint })));
+                }
+            };
+            let width = |ui: &Ui, text: &str| ui.painter().layout_no_wrap(text.to_string(), font.clone(), pal.ink).size().x + 20.0;
             ui.checkbox(&mut self.fit, "Scale to fit");
+            ui.add_space(6.0);
             ui.add_enabled_ui(connected, |ui| {
-                let m = egui::menu::menu_custom_button(ui, framed(egui::Button::new("Send keys      ")), |ui| menu(ui, &mut combo, false));
-                let r = m.response.rect;
-                let c = pos2(r.right() - 13.0, r.center().y);
-                let col = if connected { pal.ink_soft } else { pal.ink_faint };
-                ui.painter().add(egui::Shape::line(vec![pos2(c.x - 3.5, c.y - 1.5), pos2(c.x, c.y + 2.0), pos2(c.x + 3.5, c.y - 1.5)], Stroke::new(1.4, col)));
-                if ui.add(framed(egui::Button::new("Send Ctrl+Alt+Del"))).clicked() {
+                let slot = ui.painter().add(egui::Shape::Noop);
+                let size = vec2(width(ui, "Send keys") + 16.0, row.y);
+                let m = egui::menu::menu_custom_button(ui, egui::Button::new("").frame(false).min_size(size), |ui| menu(ui, &mut combo, false));
+                flat_bg(ui, slot, &m.response, m.inner.is_some());
+                label(ui, m.response.rect, "Send keys", true);
+                let slot = ui.painter().add(egui::Shape::Noop);
+                let b = ui.add(egui::Button::new("").frame(false).min_size(vec2(width(ui, "Send Ctrl+Alt+Del"), row.y)));
+                flat_bg(ui, slot, &b, false);
+                label(ui, b.rect, "Send Ctrl+Alt+Del", false);
+                if b.clicked() {
                     combo = Some(vec![CTRL, ALT, DELETE]);
                 }
             });

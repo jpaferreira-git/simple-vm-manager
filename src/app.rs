@@ -183,7 +183,6 @@ pub struct App {
     pal: Pal,
     applied_dark: Option<bool>,
     tab: Tab,
-    open_sections: HashSet<String>,
     closed_sections: HashSet<String>,
     dialog: Dialog,
     console: Option<ConsoleView>,
@@ -222,7 +221,6 @@ impl App {
             pal: theme::LIGHT,
             applied_dark: None,
             tab: Tab::Home,
-            open_sections: HashSet::new(),
             closed_sections: HashSet::new(),
             dialog: Dialog::None,
             console: None,
@@ -236,7 +234,9 @@ impl App {
             started: Instant::now(),
         };
         app.apply_theme(&cc.egui_ctx);
-        if shot {
+        if shot && app.shot_show == "welcome" {
+            app.shot_ready = true; // Home with nothing connected
+        } else if shot {
             app.add_server(Arc::new(DemoConnection::new()));
         }
         app
@@ -400,6 +400,8 @@ impl App {
                     if shot && is_demo {
                         match self.shot_show.as_str() {
                             "home" => self.select("root".into()),
+                            "storage" => self.select(format!("srv:{}", id)),
+                            "search" | "logs" => self.select("root".into()),
                             "networks" => {
                                 self.expanded.insert(format!("folder:{}:nets", id));
                                 self.select(format!("folder:{}:nets", id));
@@ -678,13 +680,8 @@ impl App {
                 Intent::View(objects) => self.objects_view = objects,
                 Intent::Tab(t) => self.tab = t,
                 Intent::Section(name) => {
-                    let open = self.open_sections.contains(&name) || (!self.closed_sections.contains(&name) && name == "General");
-                    if open {
-                        self.open_sections.remove(&name);
+                    if !self.closed_sections.remove(&name) {
                         self.closed_sections.insert(name);
-                    } else {
-                        self.closed_sections.remove(&name);
-                        self.open_sections.insert(name);
                     }
                 }
                 Intent::Theme(m) => {
@@ -717,14 +714,9 @@ impl App {
     }
 
     /// The first section starts open and the others closed, as in the original; clicks are remembered.
-    fn section_open(&self, name: &str, index: usize) -> bool {
-        if self.open_sections.contains(name) {
-            return true;
-        }
-        if self.closed_sections.contains(name) {
-            return false;
-        }
-        index == 0
+    /// Every section starts open; the ones folded are remembered.
+    fn section_open(&self, name: &str) -> bool {
+        !self.closed_sections.contains(name)
     }
 
     // ------------------------------------------------------------------ drawing
@@ -734,12 +726,19 @@ impl App {
         let vm = self.vm_of(sel).map(|x| x.2);
         let shown: Vec<&VmAction> = ACTIONS.iter().filter(|a| a.on_toolbar(vm)).collect();
         let (theme_op, theme_label) = if pal.dark { ("theme-light", "Light") } else { ("theme-dark", "Dark") };
+        // Force Shut Down / Force Reboot sit in a menu behind a small arrow next to Shut Down / Reboot.
+        let force_of = |op: &str| match op {
+            "clean_shutdown" => ACTIONS.iter().position(|a| a.op == "hard_shutdown"),
+            "clean_reboot" => ACTIONS.iter().position(|a| a.op == "hard_reboot"),
+            _ => None,
+        };
+        let arrows = shown.iter().filter(|a| force_of(a.op).is_some()).count() as f32 * (ARROW_W + 2.0);
         // When the window is too narrow for every label, buttons show only their icons (the label
-        // becomes a tooltip): first the Force buttons and the theme switch, then all of them.
+        // becomes a tooltip): first the theme switch, then all of them.
         let fits = |level: u8| {
             let w = |l: &str, minor: bool| if level == 2 || (level == 1 && minor) { 32.0 } else { tool_width(ui, l) } + 2.0;
-            let buttons: f32 = w("Connect", false) + shown.iter().map(|a| w(a.label, a.is_force())).sum::<f32>() + w(theme_label, true);
-            36.0 + 2.0 * 10.0 + 16.0 + buttons <= ui.available_width()
+            let buttons: f32 = w("Connect", false) + shown.iter().map(|a| w(a.label, false)).sum::<f32>() + w(theme_label, true) + arrows;
+            36.0 + 10.0 + 16.0 + buttons <= ui.available_width()
         };
         let level = (0..2).find(|&l| fits(l)).unwrap_or(2);
         let compact = |minor: bool| level == 2 || (level == 1 && minor);
@@ -754,14 +753,30 @@ impl App {
                 out.push(Intent::AddServer);
             }
             ui.separator();
-            let mut force_group = false;
             for a in &shown {
-                if a.is_force() && !force_group {
-                    ui.separator();
-                    force_group = true;
-                }
-                if tool_button(ui, a.op, a.label, self.can_run(a, sel), compact(a.is_force()), &pal).clicked() {
+                if tool_button(ui, a.op, a.label, self.can_run(a, sel), compact(false), &pal).clicked() {
                     out.extend(ACTIONS.iter().position(|b| std::ptr::eq(b, *a)).map(Intent::Action));
+                }
+                if let Some(fi) = force_of(a.op) {
+                    let force = &ACTIONS[fi];
+                    let enabled = self.can_run(force, sel);
+                    ui.add_enabled_ui(enabled, |ui| {
+                        let m = egui::menu::menu_custom_button(ui, egui::Button::new("").frame(false).min_size(vec2(ARROW_W, 30.0)), |ui| {
+                            ui.set_min_width(170.0);
+                            if ui.button(force.label).clicked() {
+                                out.push(Intent::Action(fi));
+                                ui.close_menu();
+                            }
+                        });
+                        let r = m.response.rect;
+                        if (m.response.hovered() && enabled) || m.inner.is_some() {
+                            ui.painter().rect_filled(r, Rounding::same(6.0), pal.hover);
+                        }
+                        let c = r.center();
+                        let col = if enabled { pal.ink_soft } else { pal.ink_faint };
+                        ui.painter().add(egui::Shape::line(vec![pos2(c.x - 3.5, c.y - 1.5), pos2(c.x, c.y + 2.0), pos2(c.x + 3.5, c.y - 1.5)], Stroke::new(1.4, col)));
+                        m.response.on_hover_text(force.label);
+                    });
                 }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -782,7 +797,7 @@ impl App {
         });
     }
 
-    /// The unfolded sidebar: search box, resource tree, and the Infrastructure / Objects buttons.
+    /// The unfolded sidebar: search box, the Infrastructure / Objects switch, and the resource tree.
     fn sidebar(&mut self, ui: &mut Ui, tree: &Node, out: &mut Vec<Intent>) {
         let pal = self.pal;
         ui.spacing_mut().item_spacing.y = 0.0;
@@ -810,31 +825,30 @@ impl App {
                     out.push(Intent::Sidebar(false));
                 }
             });
+            ui.add_space(8.0);
+            // Infrastructure | Objects: a two-part switch, the chosen half raised.
+            let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 28.0), Sense::hover());
+            ui.painter().rect_filled(r, Rounding::same(7.0), pal.rail);
+            let half = r.width() / 2.0;
+            for (i, (label, objects)) in [("Infrastructure", false), ("Objects", true)].into_iter().enumerate() {
+                let hr = Rect::from_min_size(pos2(r.min.x + i as f32 * half, r.min.y), vec2(half, r.height())).shrink(2.5);
+                let resp = ui.interact(hr, ui.id().with(("view", label)), Sense::click());
+                let on = self.objects_view == objects;
+                if on {
+                    ui.painter().rect(hr, Rounding::same(5.0), pal.surface, Stroke::new(1.0, pal.border));
+                }
+                let col = if on || resp.hovered() { pal.ink } else { pal.ink_soft };
+                ui.painter().text(hr.center(), Align2::CENTER_CENTER, label, FontId::proportional(12.5), col);
+                if resp.clicked() {
+                    out.push(Intent::View(objects));
+                }
+            }
         });
-        let nav_h = 72.0;
-        let tree_h = (ui.available_height() - nav_h).max(50.0);
+        let tree_h = ui.available_height().max(50.0);
         egui::ScrollArea::both().max_height(tree_h).min_scrolled_height(tree_h).auto_shrink([false; 2]).show(ui, |ui| {
             ui.add_space(2.0);
             self.tree_ui(ui, tree, 0, out);
         });
-        ui.painter().line_segment([ui.cursor().left_top(), ui.cursor().right_top()], Stroke::new(1.0, pal.border));
-        ui.add_space(4.0);
-        for (label, objects, icon) in [("Infrastructure", false, IconKind::Home), ("Objects", true, IconKind::Vm(PowerState::Running))] {
-            let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 32.0), Sense::click());
-            let r = r.shrink2(vec2(6.0, 2.0));
-            let on = self.objects_view == objects;
-            let p = ui.painter();
-            let fill = if on { pal.nav_on } else if resp.hovered() { pal.hover } else { Color32::TRANSPARENT };
-            p.rect_filled(r, Rounding::same(6.0), fill);
-            if on {
-                p.rect_filled(Rect::from_min_size(r.min + vec2(0.0, 6.0), vec2(3.0, r.height() - 12.0)), Rounding::same(1.5), pal.accent);
-            }
-            paint_icon(p, Rect::from_min_size(r.min + vec2(12.0, 6.0), vec2(16.0, 16.0)), icon, &pal, if on { pal.nav_on } else { pal.sidebar });
-            p.text(r.min + vec2(36.0, r.height() / 2.0), Align2::LEFT_CENTER, label, FontId::proportional(14.0), pal.ink);
-            if resp.clicked() {
-                out.push(Intent::View(objects));
-            }
-        }
     }
 
     /// The folded sidebar: a narrow strip of icon buttons.
@@ -972,51 +986,48 @@ impl App {
         }
     }
 
+    /// The selected item's name in bold with a few softer details beside it, on the window's own
+    /// background.
     fn header(&self, ui: &mut Ui, sel: &Node) {
         let pal = self.pal;
-        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 28.0), Sense::hover());
+        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 38.0), Sense::hover());
         let p = ui.painter();
-        gradient(p, rect, pal.header_a, pal.header_b, false);
-        p.line_segment([rect.left_bottom(), rect.right_bottom()], Stroke::new(1.0, pal.border_strong));
-        paint_icon(p, Rect::from_min_size(rect.min + vec2(8.0, 6.0), vec2(16.0, 16.0)), sel.icon, &pal, pal.header_a);
+        let mid = rect.center().y + 2.0;
+        paint_icon(p, Rect::from_center_size(pos2(rect.min.x + 20.0, mid), vec2(16.0, 16.0)), sel.icon, &pal, pal.window);
         let (title, sub) = self.header_text(sel);
-        let g = p.layout_no_wrap(title, FontId::new(14.0, FontFamily::Name("bold".into())), pal.ink);
+        let g = p.layout_no_wrap(title, FontId::new(16.0, FontFamily::Name("bold".into())), pal.ink);
         let w = g.size().x;
-        p.galley(pos2(rect.min.x + 30.0, rect.center().y - g.size().y / 2.0), g, pal.ink);
-        p.text(pos2(rect.min.x + 38.0 + w, rect.center().y), Align2::LEFT_CENTER, sub, FontId::proportional(13.0), pal.ink_soft);
+        p.galley(pos2(rect.min.x + 36.0, mid - g.size().y / 2.0), g, pal.ink);
+        p.text(pos2(rect.min.x + 46.0 + w, mid + 1.0), Align2::LEFT_CENTER, sub, FontId::proportional(13.0), pal.ink_soft);
     }
 
+    /// The header's title and the details shown beside it.
     fn header_text(&self, sel: &Node) -> (String, String) {
         let s = sel.sid.and_then(|id| self.server(id));
-        let recon = if s.map_or(false, |s| s.state == ConnState::Reconnecting) { "  (reconnecting…)" } else { "" };
+        let recon = s.map_or(false, |s| s.state == ConnState::Reconnecting).then(|| "reconnecting…".to_string());
+        let join = |parts: Vec<Option<String>>| parts.into_iter().flatten().filter(|p| !p.is_empty()).collect::<Vec<_>>().join("  ·  ");
         match (sel.kind, s.and_then(|s| s.data.as_ref().map(|d| (s, d)))) {
             (Kind::Root, _) => ("All servers".into(), String::new()),
             (Kind::Category, _) => (sel.text.clone(), String::new()),
             (Kind::Folder, Some((s, _))) => {
                 let what = if sel.rref.as_deref() == Some("nets") { "Virtual Networks" } else { "Shared Storage" };
-                (what.into(), format!("in '{}'{}", s.name(), recon))
+                (what.into(), join(vec![Some(format!("in {}", s.name())), recon]))
             }
             (Kind::Vm, Some((s, d))) => {
                 let v = sel.rref.as_deref().and_then(|r| d.vm(r));
-                let title = match v {
-                    Some(v) => match v.host.as_deref().and_then(|h| d.host(h)) {
-                        Some(h) => format!("{} on '{}'", v.name, h.name),
-                        None => v.name.clone(),
-                    },
-                    None => sel.text.clone(),
-                };
-                let busy = v.and_then(|v| s.busy.get(&v.rref)).map(|b| format!("({})", b)).unwrap_or_default();
-                (title, format!("{}{}", busy, recon))
+                let on = v.and_then(|v| v.host.as_deref()).and_then(|h| d.host(h)).map(|h| format!("on {}", h.name));
+                let busy = v.and_then(|v| s.busy.get(&v.rref)).cloned();
+                (v.map_or_else(|| sel.text.clone(), |v| v.name.clone()), join(vec![on, busy, recon]))
             }
-            (Kind::Pool, Some((s, d))) => (s.name(), format!("({} servers){}", d.hosts.len(), recon)),
+            (Kind::Pool, Some((s, d))) => (s.name(), join(vec![Some(format!("{} servers", d.hosts.len())), recon])),
             (Kind::Host, Some((_, d))) => {
                 let h = sel.rref.as_deref().and_then(|r| d.host(r));
-                let role = if h.map_or(false, |h| h.is_master) { "(pool coordinator)" } else { "" };
-                (h.map(|h| h.name.clone()).unwrap_or_default(), format!("{}{}", role, recon))
+                let role = h.filter(|h| h.is_master).map(|_| "pool coordinator".to_string());
+                (h.map(|h| h.name.clone()).unwrap_or_default(), join(vec![role, recon]))
             }
-            (_, Some(_)) => (sel.text.clone(), recon.to_string()),
+            (_, Some(_)) => (sel.text.clone(), join(vec![recon])),
             (_, None) => {
-                let what = if s.map_or(false, |s| s.state == ConnState::Connecting) { "Connecting…" } else { "Not connected" };
+                let what = if s.map_or(false, |s| s.state == ConnState::Connecting) { "connecting…" } else { "not connected" };
                 (s.map(|s| s.conn.hostname()).unwrap_or_default(), what.into())
             }
         }
@@ -1035,119 +1046,242 @@ impl App {
         }
     }
 
-    /// Draws the tabs; returns the room left on their right.
+    /// Draws the tabs (text, the current one underlined in the accent colour, a hairline under
+    /// them all); returns the room left on their right.
     fn tab_strip(&self, ui: &mut Ui, tabs: &[Tab], current: Tab, out: &mut Vec<Intent>) -> Rect {
         let pal = self.pal;
-        let (strip, _) = ui.allocate_exact_size(vec2(ui.available_width(), 27.0), Sense::hover());
-        ui.painter().rect_filled(strip, 0.0, pal.tab_strip);
-        let mut x = strip.min.x + 4.0;
+        let (strip, _) = ui.allocate_exact_size(vec2(ui.available_width(), 32.0), Sense::hover());
+        ui.painter().line_segment([strip.left_bottom() - vec2(0.0, 0.5), strip.right_bottom() - vec2(0.0, 0.5)], Stroke::new(1.0, pal.border));
+        let font = FontId::proportional(13.5);
+        let mut x = strip.min.x + 2.0;
         for t in tabs {
-            let font = FontId::proportional(13.0);
-            let w = ui.painter().layout_no_wrap(t.label().into(), font.clone(), pal.ink).size().x + 26.0;
-            let r = Rect::from_min_size(pos2(x, strip.min.y + 4.0), vec2(w, 23.0));
+            let tw = ui.painter().layout_no_wrap(t.label().into(), font.clone(), pal.ink).size().x;
+            let r = Rect::from_min_size(pos2(x, strip.min.y), vec2(tw + 20.0, strip.height()));
             let resp = ui.interact(r, ui.id().with(t.label()), Sense::click());
             let on = *t == current;
-            let fill = if on {
-                pal.tab_on
-            } else if resp.hovered() {
-                pal.hover
-            } else {
-                pal.tab_off
-            };
-            let rounding = Rounding { nw: 5.0, ne: 5.0, sw: 0.0, se: 0.0 };
-            ui.painter().rect(r, rounding, fill, Stroke::new(1.0, pal.border));
+            let col = if on || resp.hovered() { pal.ink } else { pal.ink_soft };
+            ui.painter().text(pos2(r.center().x, r.center().y - 1.0), Align2::CENTER_CENTER, t.label(), font.clone(), col);
             if on {
-                ui.painter().rect_filled(Rect::from_min_size(r.min + vec2(1.0, 0.0), vec2(r.width() - 2.0, 2.0)), Rounding::same(1.0), pal.accent);
+                let line = Rect::from_center_size(pos2(r.center().x, strip.max.y - 1.0), vec2(tw + 4.0, 2.5));
+                ui.painter().rect_filled(line, Rounding::same(1.25), pal.accent);
             }
-            ui.painter().text(r.center(), Align2::CENTER_CENTER, t.label(), font, if on { pal.ink } else { pal.ink_soft });
             if resp.clicked() {
                 out.push(Intent::Tab(*t));
             }
-            x += w + 2.0;
+            x += r.width();
         }
-        Rect::from_min_max(pos2(x + 10.0, strip.min.y + 2.0), pos2(strip.max.x - 6.0, strip.max.y - 1.0))
+        Rect::from_min_max(pos2(x + 10.0, strip.min.y + 2.0), pos2(strip.max.x - 6.0, strip.max.y - 3.0))
     }
 
+    /// The Home tab: an overview of everything connected, or a first step when nothing is.
     fn home(&self, ui: &mut Ui, out: &mut Vec<Intent>) {
+        if self.servers.is_empty() {
+            self.welcome(ui, out);
+            return;
+        }
         let pal = self.pal;
-        let avail = ui.available_size();
-        // The bullet lines wrap to the page width, and the three links share it, so nothing is cut
-        // off in a narrow window.
-        let lines = ["Connect to a server and see its pool, VMs, storage and networks", "Start, shut down, reboot or suspend any virtual machine", "Try everything first with the demo server"];
-        let wrap = (avail.x - 72.0 - 24.0).max(120.0);
-        let galleys: Vec<_> = lines.iter().map(|l| ui.painter().layout(l.to_string(), FontId::proportional(15.0), pal.ink, wrap)).collect();
-        let links_top = 150.0 + galleys.iter().map(|g| g.size().y + 12.0).sum::<f32>() + 80.0;
-        let (rect, _) = ui.allocate_exact_size(vec2(avail.x, avail.y.max(links_top + 160.0)), Sense::hover());
-        let p = ui.painter().clone();
-        p.rect_filled(rect, 0.0, pal.surface);
-        let o = rect.min;
-        p.text(o + vec2(46.0, 24.0), Align2::LEFT_TOP, "Server Manager", FontId::new(40.0, FontFamily::Name("bold".into())), pal.ink);
-        p.text(o + vec2(52.0, 86.0), Align2::LEFT_TOP, "A simple console for your virtualization servers\nand the virtual machines they run", FontId::proportional(17.0), pal.ink);
-        let mut y = 150.0;
-        for g in galleys {
-            let h = g.size().y;
-            p.circle_filled(o + vec2(60.0, y + 10.0), 2.2, pal.ink_soft);
-            p.galley(o + vec2(72.0, y), g, pal.ink);
-            y += h + 12.0;
+        let connected: Vec<&ServerEntry> = self.servers.iter().filter(|s| s.data.is_some()).collect();
+        let hosts: Vec<(&ServerEntry, &HostInfo)> = connected.iter().flat_map(|s| s.data.iter().flat_map(move |d| d.hosts.iter().map(move |h| (*s, h)))).collect();
+        let vms: Vec<&VmInfo> = connected.iter().flat_map(|s| s.data.iter().flat_map(|d| d.vms.iter())).collect();
+        let count = |p: PowerState| vms.iter().filter(|v| v.power == p).count();
+        let (mem_used, mem_total) = hosts.iter().fold((0i64, 0i64), |(u, t), (_, h)| (u + (h.mem_total - h.mem_free).max(0), t + h.mem_total));
+        let srs: Vec<&SrInfo> = connected.iter().flat_map(|s| s.data.iter().flat_map(|d| d.srs.iter())).filter(|x| x.size > 0 && x.kind != "iso" && x.kind != "udev").collect();
+        let (st_used, st_total) = srs.iter().fold((0i64, 0i64), |(u, t), x| (u + x.used, t + x.size));
+        let frac = |u: i64, t: i64| if t > 0 { (u as f32 / t as f32).clamp(0.0, 1.0) } else { 0.0 };
+        let not_connected = self.servers.len() - connected.len();
+        let pools = connected.len();
+        let mut server_note = format!("in {} {}", pools, if pools == 1 { "pool" } else { "pools" });
+        if not_connected > 0 {
+            server_note.push_str(&format!("  ·  {} not connected", not_connected));
         }
-        if rect.width() >= 800.0 {
-            paint_cloud(&p, o + vec2(rect.width() - 230.0, 60.0), &pal); // only beside the text, never over it
-        }
-        // Three pictures with a link under each, side by side; when the page is too narrow for
-        // them, just the links, one per line.
-        let step = ((rect.width() - 46.0 - 16.0) / 3.0).min(260.0);
-        let pictures = step >= 150.0;
-        let links = [("add", "Connect to a Server"), ("demo", "Try the Demo Server"), ("about", "About this app")];
-        for (i, (kind, label)) in links.iter().enumerate() {
-            let link = egui::Link::new(egui::RichText::new(*label).size(15.0).color(pal.link));
-            let resp = if pictures {
-                let cx = o.x + 46.0 + (i as f32 + 0.5) * step;
-                paint_home_icon(&p, pos2(cx - 40.0, o.y + links_top), kind, &pal);
-                ui.put(Rect::from_center_size(pos2(cx, o.y + links_top + 120.0), vec2(step, 24.0)), link)
-            } else {
-                let lr = Rect::from_min_size(o + vec2(52.0, links_top - 40.0 + i as f32 * 32.0), vec2(rect.width() - 60.0, 24.0));
-                ui.allocate_new_ui(egui::UiBuilder::new().max_rect(lr), |ui| ui.add(link)).inner
-            };
-            if resp.clicked() {
-                out.push(match *kind {
-                    "add" => Intent::AddServer,
-                    "demo" => Intent::Demo,
-                    _ => Intent::About,
-                });
-            }
-        }
-    }
+        let cards: [(&str, String, String, Option<f32>); 4] = [
+            ("Servers", hosts.len().to_string(), server_note, None),
+            ("Virtual machines", format!("{} running", count(PowerState::Running)), format!("{} in all  ·  {} off  ·  {} suspended", vms.len(), count(PowerState::Halted), count(PowerState::Suspended)), None),
+            ("Memory in use", format!("{}%", (frac(mem_used, mem_total) * 100.0).round()), format!("{} of {}", fmt_bytes(mem_used), fmt_bytes(mem_total)), Some(frac(mem_used, mem_total))),
+            ("Storage in use", format!("{}%", (frac(st_used, st_total) * 100.0).round()), format!("{} of {}", fmt_bytes(st_used), fmt_bytes(st_total)), Some(frac(st_used, st_total))),
+        ];
+        egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            let full = ui.available_width();
+            let (pad, gap) = (16.0, 12.0);
+            let w = full - 2.0 * pad;
+            ui.add_space(16.0);
 
-    fn search_tab(&self, ui: &mut Ui, out: &mut Vec<Intent>) {
-        let pal = self.pal;
-        egui::ScrollArea::both().auto_shrink([false; 2]).show(ui, |ui| {
-            ui.add_space(6.0);
-            egui::Grid::new("vms").striped(true).min_col_width(70.0).spacing([18.0, 6.0]).show(ui, |ui| {
-                for h in ["Name", "State", "Pool or server", "Running on", "CPUs", "Memory", "IP address"] {
-                    ui.strong(h);
+            // the summary cards, as many per row as fit
+            let cols = (((w + gap) / (190.0 + gap)).floor() as usize).clamp(1, 4);
+            let (card_w, card_h) = ((w - gap * (cols - 1) as f32) / cols as f32, 104.0);
+            let rows = (cards.len() + cols - 1) / cols;
+            let (area, _) = ui.allocate_exact_size(vec2(full, rows as f32 * (card_h + gap) - gap), Sense::hover());
+            let p = ui.painter().clone();
+            for (i, (title, value, note, bar)) in cards.iter().enumerate() {
+                let r = Rect::from_min_size(area.min + vec2(pad + (i % cols) as f32 * (card_w + gap), (i / cols) as f32 * (card_h + gap)), vec2(card_w, card_h));
+                p.rect(r, Rounding::same(10.0), pal.surface, Stroke::new(1.0, pal.border));
+                p.text(r.min + vec2(16.0, 16.0), Align2::LEFT_TOP, *title, FontId::proportional(12.5), pal.ink_soft);
+                p.text(r.min + vec2(16.0, 36.0), Align2::LEFT_TOP, value, FontId::new(24.0, FontFamily::Name("bold".into())), pal.ink);
+                let note_y = if bar.is_some() { r.max.y - 34.0 } else { r.max.y - 26.0 };
+                let mut job = egui::text::LayoutJob::simple_singleline(note.clone(), FontId::proportional(12.0), pal.ink_soft);
+                job.wrap = egui::text::TextWrapping { max_width: r.width() - 32.0, max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
+                p.galley(pos2(r.min.x + 16.0, note_y), p.layout_job(job), pal.ink_soft);
+                if let Some(f) = bar {
+                    usage_bar(&p, Rect::from_min_size(pos2(r.min.x + 16.0, r.max.y - 16.0), vec2(r.width() - 32.0, 5.0)), *f, &pal);
                 }
-                ui.end_row();
-                for s in &self.servers {
-                    let Some(d) = &s.data else { continue };
-                    for v in &d.vms {
-                        ui.horizontal(|ui| {
-                            let (r, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
-                            paint_icon(ui.painter(), r, Self::vm_icon(s, v), &pal, pal.window);
-                            if ui.link(&v.name).clicked() {
-                                out.push(Intent::Select(format!("vm:{}:{}", s.id, v.rref)));
-                            }
-                        });
-                        ui.label(v.power.label());
-                        ui.label(s.name());
-                        ui.label(v.host.as_deref().and_then(|h| d.host(h)).map(|h| h.name.clone()).unwrap_or_else(|| "—".into()));
-                        ui.label(v.vcpus.to_string());
-                        ui.label(fmt_bytes(v.mem_dyn_max));
-                        ui.label(or(&v.ip, "—"));
-                        ui.end_row();
+            }
+
+            // every server, with its load
+            ui.add_space(26.0);
+            home_title(ui, "Servers", pad, &pal);
+            let row_h = 44.0;
+            let listed = hosts.len() + not_connected;
+            let (list, _) = ui.allocate_exact_size(vec2(full, listed as f32 * row_h), Sense::hover());
+            let list = Rect::from_min_max(list.min + vec2(pad, 0.0), list.max - vec2(pad, 0.0));
+            ui.painter().rect(list, Rounding::same(10.0), pal.surface, Stroke::new(1.0, pal.border));
+            let mut y = list.min.y;
+            let mut divider = false;
+            for (s, h) in &hosts {
+                let r = Rect::from_min_size(pos2(list.min.x, y), vec2(list.width(), row_h));
+                let resp = ui.interact(r, ui.id().with(("home-host", s.id, h.rref.as_str())), Sense::click());
+                let p = ui.painter();
+                if divider {
+                    p.line_segment([pos2(r.min.x + 14.0, r.min.y), pos2(r.max.x - 14.0, r.min.y)], Stroke::new(1.0, pal.border));
+                }
+                divider = true;
+                if resp.hovered() {
+                    p.rect_filled(r.shrink(2.0), Rounding::same(8.0), pal.hover);
+                }
+                let icon = if h.enabled { IconKind::Host } else { IconKind::HostOff };
+                paint_icon(p, Rect::from_center_size(pos2(r.min.x + 24.0, r.center().y), vec2(16.0, 16.0)), icon, &pal, if resp.hovered() { pal.hover } else { pal.surface });
+                let g = p.layout_no_wrap(h.name.clone(), FontId::proportional(13.5), pal.ink);
+                let name_w = g.size().x;
+                p.galley(pos2(r.min.x + 42.0, r.center().y - g.size().y / 2.0), g, pal.ink);
+                let running = s.data.as_ref().map_or(0, |d| d.vms.iter().filter(|v| v.host.as_deref() == Some(h.rref.as_str()) && v.power == PowerState::Running).count());
+                let mf = frac((h.mem_total - h.mem_free).max(0), h.mem_total);
+                // on the right: the memory in use; then, when there's room, the pool and its VMs
+                let bar_w = (r.width() * 0.22).clamp(70.0, 140.0);
+                let pct = format!("{}%", (mf * 100.0).round());
+                p.text(pos2(r.max.x - 16.0, r.center().y), Align2::RIGHT_CENTER, &pct, FontId::proportional(12.5), pal.ink_soft);
+                let bar = Rect::from_min_size(pos2(r.max.x - 56.0 - bar_w, r.center().y - 2.5), vec2(bar_w, 5.0));
+                usage_bar(p, bar, mf, &pal);
+                let detail = format!("{}  ·  {} VM{} running", s.name(), running, if running == 1 { "" } else { "s" });
+                let room = bar.min.x - 20.0 - (r.min.x + 52.0 + name_w);
+                if room > 60.0 {
+                    let mut job = egui::text::LayoutJob::simple_singleline(detail, FontId::proportional(12.5), pal.ink_soft);
+                    job.wrap = egui::text::TextWrapping { max_width: room, max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
+                    let g = p.layout_job(job);
+                    p.galley(pos2(r.min.x + 52.0 + name_w, r.center().y - g.size().y / 2.0), g, pal.ink_soft);
+                }
+                if resp.on_hover_text(format!("Memory in use: {} of {}", fmt_bytes((h.mem_total - h.mem_free).max(0)), fmt_bytes(h.mem_total))).clicked() {
+                    out.push(Intent::Select(format!("host:{}:{}", s.id, h.rref)));
+                }
+                y += row_h;
+            }
+            for s in self.servers.iter().filter(|s| s.data.is_none()) {
+                let r = Rect::from_min_size(pos2(list.min.x, y), vec2(list.width(), row_h));
+                let p = ui.painter();
+                if divider {
+                    p.line_segment([pos2(r.min.x + 14.0, r.min.y), pos2(r.max.x - 14.0, r.min.y)], Stroke::new(1.0, pal.border));
+                }
+                divider = true;
+                paint_icon(p, Rect::from_center_size(pos2(r.min.x + 24.0, r.center().y), vec2(16.0, 16.0)), IconKind::ServerDown, &pal, pal.surface);
+                p.text(pos2(r.min.x + 42.0, r.center().y), Align2::LEFT_CENTER, s.conn.hostname(), FontId::proportional(13.5), pal.ink);
+                let what = if s.state == ConnState::Connecting { "Connecting…" } else { "Not connected" };
+                p.text(pos2(r.max.x - 16.0, r.center().y), Align2::RIGHT_CENTER, what, FontId::proportional(12.5), pal.ink_soft);
+                y += row_h;
+            }
+
+            // the latest things that happened
+            ui.add_space(26.0);
+            home_title(ui, "Recent activity", pad, &pal);
+            let recent: Vec<&LogEntry> = self.log.iter().rev().take(6).collect();
+            let (list, _) = ui.allocate_exact_size(vec2(full, recent.len().max(1) as f32 * 36.0), Sense::hover());
+            let list = Rect::from_min_max(list.min + vec2(pad, 0.0), list.max - vec2(pad, 0.0));
+            let p = ui.painter();
+            p.rect(list, Rounding::same(10.0), pal.surface, Stroke::new(1.0, pal.border));
+            if recent.is_empty() {
+                p.text(pos2(list.min.x + 16.0, list.center().y), Align2::LEFT_CENTER, "Nothing yet", FontId::proportional(13.0), pal.ink_soft);
+            }
+            for (i, e) in recent.iter().enumerate() {
+                let r = Rect::from_min_size(pos2(list.min.x, list.min.y + i as f32 * 36.0), vec2(list.width(), 36.0));
+                if i > 0 {
+                    p.line_segment([pos2(r.min.x + 14.0, r.min.y), pos2(r.max.x - 14.0, r.min.y)], Stroke::new(1.0, pal.border));
+                }
+                p.circle_filled(pos2(r.min.x + 20.0, r.center().y), 3.5, status_color(&e.status, &pal));
+                let tg = p.layout_no_wrap(e.time.clone(), FontId::proportional(12.0), pal.ink_soft);
+                let tw = tg.size().x;
+                p.galley(pos2(r.max.x - 16.0 - tw, r.center().y - tg.size().y / 2.0), tg, pal.ink_soft);
+                let mut job = egui::text::LayoutJob::simple_singleline(e.text.clone(), FontId::proportional(13.0), pal.ink);
+                job.wrap = egui::text::TextWrapping { max_width: (r.width() - 70.0 - tw).max(20.0), max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
+                let g = p.layout_job(job);
+                p.galley(pos2(r.min.x + 34.0, r.center().y - g.size().y / 2.0), g, pal.ink);
+            }
+
+            // ways in
+            ui.add_space(22.0);
+            ui.horizontal(|ui| {
+                ui.add_space(pad);
+                ui.spacing_mut().item_spacing.x = 18.0;
+                for (label, intent) in [("Connect to a server", Intent::AddServer), ("Try the demo server", Intent::Demo), ("About this app", Intent::About)] {
+                    if ui.link(egui::RichText::new(label).color(pal.link)).clicked() {
+                        out.push(intent);
                     }
                 }
             });
+            ui.add_space(20.0);
         });
+    }
+
+    /// Home with no servers at all: what the app does, and the ways to start.
+    fn welcome(&self, ui: &mut Ui, out: &mut Vec<Intent>) {
+        let pal = self.pal;
+        let avail = ui.available_rect_before_wrap();
+        let col_w = avail.width().min(440.0) - 32.0;
+        let top = avail.min.y + (avail.height() * 0.5 - 230.0).max(24.0);
+        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(Rect::from_min_size(pos2(avail.center().x - col_w / 2.0, top), vec2(col_w, 420.0))).layout(egui::Layout::top_down(egui::Align::Center)));
+        let ui = &mut child;
+        // the picture spans about 3..168 across and 5..181 down from where it's drawn
+        let (art, _) = ui.allocate_exact_size(vec2(172.0, 182.0), Sense::hover());
+        paint_cloud(ui.painter(), art.min + vec2(-1.0, -4.0), &pal);
+        ui.add_space(12.0);
+        ui.label(egui::RichText::new("Welcome to Simple VM Manager").font(FontId::new(20.0, FontFamily::Name("bold".into()))).color(pal.ink));
+        ui.add_space(8.0);
+        ui.label(egui::RichText::new("Connect to a XenServer or XCP-ng server to see its pools, servers, virtual machines, storage and networks, and to use your VMs' consoles.").color(pal.ink_soft));
+        ui.add_space(20.0);
+        if dialog_button(ui, &pal, "Connect to a server", true, true) {
+            out.push(Intent::AddServer);
+        }
+        ui.add_space(10.0);
+        if ui.link(egui::RichText::new("Try the demo server").color(pal.link)).clicked() {
+            out.push(Intent::Demo);
+        }
+        ui.add_space(4.0);
+        if ui.link(egui::RichText::new("About this app").color(pal.link)).clicked() {
+            out.push(Intent::About);
+        }
+    }
+
+    /// Every VM of every server; a click opens it.
+    fn search_tab(&self, ui: &mut Ui, out: &mut Vec<Intent>) {
+        let mut keys = vec![];
+        let mut rows = vec![];
+        for s in &self.servers {
+            let Some(d) = &s.data else { continue };
+            let mut vms: Vec<&VmInfo> = d.vms.iter().collect();
+            vms.sort_by_key(|v| v.name.to_lowercase());
+            for v in vms {
+                keys.push(format!("vm:{}:{}", s.id, v.rref));
+                rows.push(vec![
+                    Cell::Icon(Self::vm_icon(s, v), v.name.clone()),
+                    Cell::Text(v.power.label().into()),
+                    Cell::Text(s.name()),
+                    Cell::Text(v.host.as_deref().and_then(|h| d.host(h)).map(|h| h.name.clone()).unwrap_or_else(|| "—".into())),
+                    Cell::Text(v.vcpus.to_string()),
+                    Cell::Text(fmt_bytes(v.mem_dyn_max)),
+                    Cell::Text(or(&v.ip, "—").into()),
+                ]);
+            }
+        }
+        if let Some(i) = self.table(ui, "vms", &["Name", "State", "Pool or server", "Running on", "CPUs", "Memory", "IP address"], &rows, true) {
+            out.push(Intent::Select(keys[i].clone()));
+        }
     }
 
     fn general_sections(&self, sel: &Node) -> Vec<(String, Vec<(String, String)>)> {
@@ -1207,27 +1341,81 @@ impl App {
             }
             Kind::Vm => {
                 if let Some(v) = d.vm(r) {
-                    let home = v.home().and_then(|h| d.host(h)).map(|h| h.name.clone()).unwrap_or_else(|| "<None>".into());
+                    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|t| t.as_secs() as i64).unwrap_or(0);
+                    let running = matches!(v.power, PowerState::Running | PowerState::Paused);
+                    let mut g = vec![row("Name", v.name.clone())];
+                    if !v.description.is_empty() {
+                        g.push(row("Description", v.description.clone()));
+                    }
+                    if !v.tags.is_empty() {
+                        g.push(row("Tags", v.tags.join(", ")));
+                    }
+                    if !v.folder.is_empty() {
+                        g.push(row("Folder", v.folder.clone()));
+                    }
+                    g.push(row("Operating system", or(&v.os, "Unknown").into()));
+                    if !v.kernel.is_empty() {
+                        g.push(row("Kernel", v.kernel.clone()));
+                    }
+                    g.push(row("UUID", v.uuid.clone()));
+                    secs.push(("General".into(), g));
+
                     let state = s.busy.get(&v.rref).cloned().unwrap_or_else(|| v.power.label().into());
-                    secs.push((
-                        "General".into(),
-                        vec![
-                            row("Name", v.name.clone()),
-                            row("Description", v.description.clone()),
-                            row("Power state", state),
-                            row("Operating System", or(&v.os, "Unknown").into()),
-                            row("IP address", or(&v.ip, "<None>").into()),
-                            row("Home Server", home),
-                            row("UUID", v.uuid.clone()),
-                        ],
-                    ));
-                    secs.push(("CPUs and Memory".into(), vec![row("Virtual CPUs", v.vcpus.to_string()), row("Memory", fmt_bytes(v.mem_dyn_max))]));
-                    let disks = v.disks.iter().filter(|x| x.kind == "Disk").count();
-                    secs.push(("Devices".into(), vec![row("Disks", disks.to_string()), row("Network interfaces", v.nics.len().to_string())]));
-                    let busy = s.busy.contains_key(&v.rref);
-                    let can: Vec<&str> = ACTIONS.iter().filter(|a| a.can_run(v, d, busy)).map(|a| a.label).collect();
-                    let text = if can.is_empty() { "Nothing right now".to_string() } else { can.join(", ") };
-                    secs.push(("Available Actions".into(), vec![row("You can", text)]));
+                    let mut st = vec![row("Power state", state)];
+                    let host_name = |h: Option<&str>| h.and_then(|h| d.host(h)).map(|h| h.name.clone());
+                    if running {
+                        st.push(row("Running on", host_name(v.host.as_deref()).unwrap_or_default()));
+                        if let Some(t) = v.started {
+                            st.push(row("Up for", fmt_duration(now - t)));
+                        }
+                    } else {
+                        st.push(row("Home server", host_name(v.home()).unwrap_or_else(|| "Any server in the pool".into())));
+                    }
+                    st.push(row(if v.ips.len() > 1 { "IP addresses" } else { "IP address" }, if v.ips.is_empty() { or(&v.ip, "None").into() } else { v.ips.join(", ") }));
+                    st.push(row("Guest tools", if v.tools.is_empty() { "Not installed".into() } else { v.tools.clone() }));
+                    secs.push(("Status".into(), st));
+
+                    let cpus = if v.vcpus_max > v.vcpus { format!("{} (up to {})", v.vcpus, v.vcpus_max) } else { v.vcpus.to_string() };
+                    let memory = if v.mem_dyn_min > 0 && v.mem_dyn_min < v.mem_dyn_max { format!("{} – {} (dynamic)", fmt_bytes(v.mem_dyn_min), fmt_bytes(v.mem_dyn_max)) } else { fmt_bytes(v.mem_dyn_max) };
+                    let mut cm = vec![row("Virtual CPUs", cpus), row("Memory", memory)];
+                    if v.mem_static_max > v.mem_dyn_max {
+                        cm.push(row("Maximum memory", fmt_bytes(v.mem_static_max)));
+                    }
+                    if running && v.mem_actual > 0 {
+                        cm.push(row("Memory now", fmt_bytes(v.mem_actual)));
+                    }
+                    secs.push(("CPU and memory".into(), cm));
+
+                    let yes_no = |b: bool| if b { "Yes".to_string() } else { "No".to_string() };
+                    let mut boot = vec![];
+                    if !v.virt_mode.is_empty() {
+                        boot.push(row("Virtualization", v.virt_mode.clone()));
+                    }
+                    if !v.firmware.is_empty() {
+                        boot.push(row("Firmware", v.firmware.clone()));
+                    }
+                    if !v.secure_boot.is_empty() {
+                        boot.push(row("Secure Boot", v.secure_boot.clone()));
+                    }
+                    if !v.boot_order.is_empty() {
+                        boot.push(row("Boot order", v.boot_order.clone()));
+                    }
+                    boot.push(row("Starts with the server", yes_no(v.auto_power_on)));
+                    boot.push(row("High availability", if v.ha.is_empty() { "Off".into() } else { v.ha.clone() }));
+                    secs.push(("Boot and virtualization".into(), boot));
+
+                    let disks: Vec<&VmDisk> = v.disks.iter().filter(|x| x.kind == "Disk").collect();
+                    let total: i64 = disks.iter().map(|x| x.size).sum();
+                    let dvd = v.disks.iter().find(|x| x.kind != "Disk").map(|x| if x.name.is_empty() || x.name == "(empty)" { "Empty".to_string() } else { x.name.clone() });
+                    let mut nets: Vec<String> = v.nics.iter().map(|n| n.network.clone()).filter(|n| !n.is_empty()).collect();
+                    nets.dedup();
+                    let mut dev = vec![row("Disks", if disks.is_empty() { "None".into() } else { format!("{}  ·  {}", disks.len(), fmt_bytes(total)) })];
+                    if let Some(dvd) = dvd {
+                        dev.push(row("DVD drive", dvd));
+                    }
+                    dev.push(row("Network interfaces", if nets.is_empty() { v.nics.len().to_string() } else { format!("{}  ·  {}", v.nics.len(), nets.join(", ")) }));
+                    dev.push(row("Snapshots", v.snapshots.to_string()));
+                    secs.push(("Devices".into(), dev));
                 }
             }
             Kind::Sr => {
@@ -1253,52 +1441,75 @@ impl App {
         secs
     }
 
-    /// The General tab: boxed sections that fold.
+    /// The General tab: cards of details that fold, in two columns when there's room. Clicking a
+    /// value copies it.
     fn general(&self, ui: &mut Ui, sel: &Node, out: &mut Vec<Intent>) {
+        const HEAD: f32 = 40.0;
+        const ROW: f32 = 27.0;
         let pal = self.pal;
         let secs = self.general_sections(sel);
         egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
-            ui.spacing_mut().item_spacing.y = 0.0;
-            let w = ui.available_width();
-            ui.add_space(14.0);
-            let border = Stroke::new(1.0, pal.border);
-            let chev_s = Stroke::new(1.3, pal.ink_soft);
-            for (i, (name, rows)) in secs.iter().enumerate() {
-                let open = self.section_open(name, i);
-                let h = 36.0 + if open { rows.len() as f32 * 28.0 + 8.0 } else { 0.0 };
-                let (outer, _) = ui.allocate_exact_size(vec2(w, h), Sense::hover());
-                let bx = Rect::from_min_max(outer.min + vec2(14.0, 0.0), outer.max - vec2(14.0, 0.0));
-                let head = Rect::from_min_size(bx.min, vec2(bx.width(), 36.0));
+            let full = ui.available_width();
+            let (pad, gap) = (16.0, 14.0);
+            let cols = if full >= 880.0 { 2 } else { 1 };
+            let col_w = (full - 2.0 * pad - gap * (cols - 1) as f32) / cols as f32;
+            // each card goes into the shorter column
+            let origin = ui.cursor().min + vec2(pad, 14.0);
+            let mut heights = vec![0.0f32; cols];
+            let mut cards = vec![];
+            for (name, rows) in &secs {
+                let open = self.section_open(name);
+                let c = (0..cols).min_by(|a, b| heights[*a].total_cmp(&heights[*b])).unwrap_or(0);
+                let h = HEAD + if open { rows.len() as f32 * ROW + 10.0 } else { 0.0 };
+                cards.push((Rect::from_min_size(origin + vec2(c as f32 * (col_w + gap), heights[c]), vec2(col_w, h)), name, rows, open));
+                heights[c] += h + gap;
+            }
+            let total = heights.iter().cloned().fold(0.0, f32::max);
+            ui.allocate_exact_size(vec2(full, total + 24.0), Sense::hover());
+            let title_font = FontId::new(13.5, FontFamily::Name("bold".into()));
+            for (r, name, rows, open) in cards {
+                let p = ui.painter().clone();
+                p.rect(r, Rounding::same(8.0), pal.surface, Stroke::new(1.0, pal.border));
+                let head = Rect::from_min_size(r.min, vec2(r.width(), HEAD));
                 let hresp = ui.interact(head, ui.id().with(("sec", name.as_str())), Sense::click());
-                let p = ui.painter();
-                p.rect(bx, Rounding::same(6.0), pal.surface, border);
                 if hresp.hovered() {
-                    p.rect_filled(head.shrink(1.0), Rounding::same(5.0), pal.hover);
+                    let round = if open { Rounding { nw: 8.0, ne: 8.0, sw: 0.0, se: 0.0 } } else { Rounding::same(8.0) };
+                    p.rect_filled(head.shrink(1.0), round, pal.hover);
                 }
-                p.text(head.min + vec2(12.0, 18.0), Align2::LEFT_CENTER, name, FontId::proportional(17.0), pal.ink);
-                let c = pos2(bx.max.x - 24.0, head.center().y);
-                p.circle_stroke(c, 9.0, chev_s);
-                let chev = if open { vec![c + vec2(-4.0, 2.0), c + vec2(0.0, -2.0), c + vec2(4.0, 2.0)] } else { vec![c + vec2(-4.0, -2.0), c + vec2(0.0, 2.0), c + vec2(4.0, -2.0)] };
-                p.add(egui::Shape::line(chev, chev_s));
+                p.text(pos2(head.min.x + 16.0, head.center().y), Align2::LEFT_CENTER, name, title_font.clone(), pal.ink);
+                let c = pos2(head.max.x - 20.0, head.center().y);
+                let chev = if open { vec![c + vec2(-4.0, -2.0), c + vec2(0.0, 2.0), c + vec2(4.0, -2.0)] } else { vec![c + vec2(-2.0, -4.0), c + vec2(2.0, 0.0), c + vec2(-2.0, 4.0)] };
+                p.add(egui::Shape::line(chev, Stroke::new(1.4, pal.ink_soft)));
                 if hresp.clicked() {
                     out.push(Intent::Section(name.clone()));
                 }
-                if open {
-                    let mut y = head.max.y;
-                    for (ri, (k, v)) in rows.iter().enumerate() {
-                        let rr = Rect::from_min_size(pos2(bx.min.x + 1.0, y), vec2(bx.width() - 2.0, 28.0));
-                        let first = i == 0 && ri == 0;
-                        if first {
-                            p.rect_filled(rr, 0.0, pal.accent);
-                        }
-                        let (kc, vc) = if first { (pal.on_accent, pal.on_accent) } else { (pal.ink_soft, pal.ink) };
-                        p.text(pos2(bx.min.x + 20.0, rr.center().y), Align2::LEFT_CENTER, format!("{}:", k), FontId::proportional(13.0), kc);
-                        let clip = p.with_clip_rect(Rect::from_min_max(pos2(bx.min.x + 170.0, rr.min.y), pos2(bx.max.x - 8.0, rr.max.y)));
-                        clip.text(pos2(bx.min.x + 170.0, rr.center().y), Align2::LEFT_CENTER, v, FontId::proportional(13.0), vc);
-                        y += 28.0;
-                    }
+                if !open {
+                    continue;
                 }
-                ui.add_space(10.0);
+                p.line_segment([pos2(r.min.x + 16.0, head.max.y), pos2(r.max.x - 16.0, head.max.y)], Stroke::new(1.0, pal.border));
+                let label_w = (r.width() * 0.36).clamp(110.0, 170.0);
+                let mut y = head.max.y + 5.0;
+                for (k, v) in rows {
+                    let rr = Rect::from_min_size(pos2(r.min.x, y), vec2(r.width(), ROW));
+                    p.text(pos2(r.min.x + 16.0, rr.center().y), Align2::LEFT_CENTER, k, FontId::proportional(12.5), pal.ink_soft);
+                    let vx = r.min.x + 16.0 + label_w;
+                    let room = r.max.x - 14.0 - vx;
+                    let mut job = egui::text::LayoutJob::simple_singleline(v.clone(), FontId::proportional(13.0), pal.ink);
+                    job.wrap = egui::text::TextWrapping { max_width: room.max(10.0), max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
+                    let g = p.layout_job(job);
+                    let vr = Rect::from_min_size(pos2(vx, rr.center().y - g.size().y / 2.0), g.size());
+                    p.galley(vr.min, g, pal.ink);
+                    if !v.is_empty() {
+                        let vresp = ui.interact(vr, ui.id().with(("val", name.as_str(), k.as_str())), Sense::click()).on_hover_text(format!("{}\nClick to copy", v));
+                        if vresp.hovered() {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+                        if vresp.clicked() {
+                            ui.ctx().copy_text(v.clone());
+                        }
+                    }
+                    y += ROW;
+                }
             }
         });
     }
@@ -1380,22 +1591,93 @@ impl App {
         });
     }
 
-    fn table(ui: &mut Ui, id: &str, headers: &[&str], rows: Vec<Vec<String>>) {
-        egui::ScrollArea::both().auto_shrink([false; 2]).show(ui, |ui| {
-            ui.add_space(6.0);
-            egui::Grid::new(id).striped(true).min_col_width(60.0).spacing([20.0, 6.0]).show(ui, |ui| {
-                for h in headers {
-                    ui.strong(*h);
+    /// A table: muted headings over a hairline, rows that light up under the mouse, cells cut short
+    /// with "…"; the last column takes any room left. Returns the row clicked, when `clickable`.
+    fn table(&self, ui: &mut Ui, id: &str, headers: &[&str], rows: &[Vec<Cell>], clickable: bool) -> Option<usize> {
+        let pal = self.pal;
+        let (head_font, font) = (FontId::new(12.0, FontFamily::Name("bold".into())), FontId::proportional(13.0));
+        let measure = |t: &str, f: &FontId| ui.painter().layout_no_wrap(t.to_string(), f.clone(), pal.ink).size().x;
+        let mut widths: Vec<f32> = headers.iter().map(|h| measure(h, &head_font)).collect();
+        for r in rows {
+            for (i, c) in r.iter().enumerate().take(widths.len()) {
+                let w = match c {
+                    Cell::Text(t) => measure(t, &font),
+                    Cell::Usage(_, t) => 120.0 + measure(t, &font),
+                    Cell::Status(t) => 16.0 + measure(t, &font),
+                    Cell::Icon(_, t) => 24.0 + measure(t, &font),
+                };
+                widths[i] = widths[i].max(w.min(380.0));
+            }
+        }
+        let pad = 14.0;
+        let mut widths: Vec<f32> = widths.iter().map(|w| w + 2.0 * pad).collect();
+        let mut clicked = None;
+        egui::ScrollArea::both().id_salt(id).auto_shrink([false; 2]).show(ui, |ui| {
+            let avail = ui.available_width();
+            let sum: f32 = widths.iter().sum();
+            if sum < avail {
+                if let Some(last) = widths.last_mut() {
+                    *last += avail - sum;
                 }
-                ui.end_row();
-                for r in rows {
-                    for c in r {
-                        ui.label(c);
-                    }
-                    ui.end_row();
+            }
+            let total_w = widths.iter().sum::<f32>();
+            let (head_h, row_h) = (32.0, 34.0);
+            ui.add_space(4.0);
+            let (area, _) = ui.allocate_exact_size(vec2(total_w, head_h + rows.len().max(1) as f32 * row_h), Sense::hover());
+            let xs: Vec<f32> = widths.iter().scan(area.min.x, |x, w| {
+                let at = *x;
+                *x += w;
+                Some(at)
+            }).collect();
+            let p = ui.painter().clone();
+            for (i, h) in headers.iter().enumerate() {
+                p.text(pos2(xs[i] + pad, area.min.y + head_h / 2.0), Align2::LEFT_CENTER, *h, head_font.clone(), pal.ink_soft);
+            }
+            p.line_segment([pos2(area.min.x, area.min.y + head_h - 0.5), pos2(area.max.x, area.min.y + head_h - 0.5)], Stroke::new(1.0, pal.border));
+            if rows.is_empty() {
+                p.text(pos2(area.min.x + pad, area.min.y + head_h + row_h / 2.0), Align2::LEFT_CENTER, "Nothing to show", font.clone(), pal.ink_soft);
+            }
+            for (ri, r) in rows.iter().enumerate() {
+                let rr = Rect::from_min_size(pos2(area.min.x, area.min.y + head_h + ri as f32 * row_h), vec2(total_w, row_h));
+                let resp = ui.interact(rr, ui.id().with((id, ri)), if clickable { Sense::click() } else { Sense::hover() });
+                if resp.hovered() {
+                    p.rect_filled(rr.shrink2(vec2(2.0, 2.0)), Rounding::same(6.0), pal.hover);
+                } else if ri > 0 {
+                    p.line_segment([pos2(rr.min.x + pad, rr.min.y), pos2(rr.max.x - pad, rr.min.y)], Stroke::new(1.0, pal.border.gamma_multiply(0.6)));
                 }
-            });
+                if resp.clicked() {
+                    clicked = Some(ri);
+                }
+                for (i, c) in r.iter().enumerate().take(widths.len()) {
+                    let mut x = xs[i] + pad;
+                    let room = widths[i] - 2.0 * pad;
+                    let cy = rr.center().y;
+                    let text = match c {
+                        Cell::Text(t) => t,
+                        Cell::Usage(f, t) => {
+                            usage_bar(&p, Rect::from_min_size(pos2(x, cy - 2.5), vec2(110.0, 5.0)), *f, &pal);
+                            x += 120.0;
+                            t
+                        }
+                        Cell::Status(t) => {
+                            p.circle_filled(pos2(x + 4.0, cy), 3.5, status_color(t, &pal));
+                            x += 16.0;
+                            t
+                        }
+                        Cell::Icon(k, t) => {
+                            paint_icon(&p, Rect::from_center_size(pos2(x + 8.0, cy), vec2(16.0, 16.0)), *k, &pal, if resp.hovered() { pal.hover } else { pal.window });
+                            x += 24.0;
+                            t
+                        }
+                    };
+                    let mut job = egui::text::LayoutJob::simple_singleline(text.clone(), font.clone(), pal.ink);
+                    job.wrap = egui::text::TextWrapping { max_width: (room - (x - xs[i] - pad)).max(10.0), max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
+                    let g = p.layout_job(job);
+                    p.galley(pos2(x, cy - g.size().y / 2.0), g, pal.ink);
+                }
+            }
         });
+        clicked
     }
 
     fn storage(&self, ui: &mut Ui, sel: &Node) {
@@ -1407,7 +1689,7 @@ impl App {
                 .and_then(|r| d.vm(r))
                 .map(|v| v.disks.iter().map(|k| vec![k.device.clone(), k.name.clone(), if k.size > 0 { fmt_bytes(k.size) } else { "—".into() }, k.sr_name.clone(), k.kind.clone()]).collect())
                 .unwrap_or_default();
-            Self::table(ui, "disks", &["Position", "Name", "Size", "Storage", "Type"], rows);
+            self.table(ui, "disks", &["Position", "Name", "Size", "Storage", "Type"], &text_rows(rows), false);
         } else {
             // A server's own storage and the shared storage; the Shared Storage folder only the latter.
             let owner = match sel.kind {
@@ -1424,11 +1706,18 @@ impl App {
                     Some(h) => x.host.as_deref().and_then(|xh| d.host(xh)).map_or(true, |xh| !h.is_empty() && xh.rref == *h),
                 })
                 .map(|x| {
-                    let pct = if x.size > 0 { format!(" ({}%)", 100 * x.used / x.size) } else { String::new() };
-                    vec![x.name.clone(), x.kind.clone(), fmt_bytes(x.size), format!("{}{}", fmt_bytes(x.used), pct), fmt_bytes((x.size - x.used).max(0)), if x.shared { "Yes".into() } else { "No".into() }]
+                    // a drive with a disc in it is always "full": just its size
+                    let usage = if x.kind == "udev" {
+                        Cell::Text(fmt_bytes(x.size))
+                    } else if x.size > 0 {
+                        Cell::Usage((x.used as f32 / x.size as f32).clamp(0.0, 1.0), format!("{} of {}", fmt_bytes(x.used), fmt_bytes(x.size)))
+                    } else {
+                        Cell::Text("—".into())
+                    };
+                    vec![Cell::Text(x.name.clone()), Cell::Text(x.kind.clone()), usage, Cell::Text(fmt_bytes((x.size - x.used).max(0))), Cell::Text(if x.shared { "Yes".into() } else { "No".into() })]
                 })
-                .collect();
-            Self::table(ui, "srs", &["Name", "Type", "Size", "Used", "Free", "Shared"], rows);
+                .collect::<Vec<_>>();
+            self.table(ui, "srs", &["Name", "Type", "Used", "Free", "Shared"], &rows, false);
         }
     }
 
@@ -1441,10 +1730,10 @@ impl App {
                 .and_then(|r| d.vm(r))
                 .map(|v| v.nics.iter().map(|n| vec![n.device.clone(), n.mac.clone(), n.network.clone(), or(&n.ip, "—").to_string()]).collect())
                 .unwrap_or_default();
-            Self::table(ui, "nics", &["Device", "MAC address", "Network", "IP address"], rows);
+            self.table(ui, "nics", &["Device", "MAC address", "Network", "IP address"], &text_rows(rows), false);
         } else {
             let rows = d.networks.iter().map(|n| vec![n.name.clone(), n.bridge.clone(), n.mtu.to_string(), n.description.clone()]).collect();
-            Self::table(ui, "nets", &["Name", "Bridge", "MTU", "Description"], rows);
+            self.table(ui, "nets", &["Name", "Bridge", "MTU", "Description"], &text_rows(rows), false);
         }
     }
 
@@ -1482,7 +1771,7 @@ impl App {
     }
 
     fn logs(&self, ui: &mut Ui, sel: &Node) {
-        let rows: Vec<Vec<String>> = self
+        let rows = self
             .log
             .iter()
             .rev()
@@ -1490,9 +1779,9 @@ impl App {
                 Some(sid) => e.sid == sid && (sel.kind != Kind::Vm || e.obj_ref.as_deref() == sel.rref.as_deref()),
                 None => true,
             })
-            .map(|e| vec![e.time.clone(), e.server.clone(), e.obj.clone(), e.text.clone(), e.status.clone()])
-            .collect();
-        Self::table(ui, "logs", &["Time", "Server", "Object", "What happened", "Result"], rows);
+            .map(|e| vec![Cell::Text(e.time.clone()), Cell::Text(e.server.clone()), Cell::Text(e.obj.clone()), Cell::Text(e.text.clone()), Cell::Status(e.status.clone())])
+            .collect::<Vec<_>>();
+        self.table(ui, "logs", &["Time", "Server", "Object", "What happened", "Result"], &rows, false);
     }
 
     fn dialogs(&mut self, ctx: &egui::Context) {
@@ -1699,6 +1988,9 @@ impl eframe::App for App {
                 "confirm" => out.extend(ACTIONS.iter().position(|a| a.confirm && self.can_run(a, &sel)).map(Intent::Action)),
                 "about" => out.push(Intent::About),
                 "console" => out.push(Intent::Tab(Tab::Console)),
+                "storage" => out.push(Intent::Tab(Tab::Storage)),
+                "search" => out.push(Intent::Tab(Tab::Search)),
+                "logs" => out.push(Intent::Tab(Tab::Logs)),
                 _ => {}
             }
         }
@@ -1807,6 +2099,49 @@ fn dialog_button(ui: &mut Ui, pal: &Pal, label: &str, primary: bool, enabled: bo
 fn tool_width(ui: &Ui, label: &str) -> f32 {
     32.0 + ui.painter().layout_no_wrap(label.to_string(), FontId::proportional(13.0), Color32::WHITE).size().x + 10.0
 }
+
+/// A cell of a table.
+enum Cell {
+    Text(String),
+    /// A bar filled to the fraction, then a caption ("120 GB of 900 GB").
+    Usage(f32, String),
+    /// A log entry's result, after a coloured dot.
+    Status(String),
+    /// An icon, then the text.
+    Icon(IconKind, String),
+}
+
+fn text_rows(rows: Vec<Vec<String>>) -> Vec<Vec<Cell>> {
+    rows.into_iter().map(|r| r.into_iter().map(Cell::Text).collect()).collect()
+}
+
+/// A thin rounded bar filled to `frac`: accent blue, orange past 80%, red past 90%.
+fn usage_bar(p: &egui::Painter, r: Rect, frac: f32, pal: &Pal) {
+    let round = Rounding::same(r.height() / 2.0);
+    p.rect_filled(r, round, pal.border);
+    let col = if frac > 0.9 { pal.red } else if frac > 0.8 { pal.orange } else { pal.accent };
+    if frac > 0.0 {
+        p.rect_filled(Rect::from_min_size(r.min, vec2((r.width() * frac).max(r.height()), r.height())), round, col);
+    }
+}
+
+/// A Home section's small heading.
+fn home_title(ui: &mut Ui, text: &str, pad: f32, pal: &Pal) {
+    let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::hover());
+    ui.painter().text(pos2(r.min.x + pad + 2.0, r.min.y + 6.0), Align2::LEFT_TOP, text, FontId::new(13.5, FontFamily::Name("bold".into())), pal.ink);
+}
+
+/// The dot colour for a log entry's result.
+fn status_color(status: &str, pal: &Pal) -> Color32 {
+    match status {
+        "Done" => pal.green,
+        "Failed" => pal.red,
+        _ => pal.orange,
+    }
+}
+
+/// The width of the small arrow next to Shut Down and Reboot that opens their Force menu.
+const ARROW_W: f32 = 16.0;
 
 /// A labelled toolbar button with a theme-coloured glyph; `compact` shows only the glyph, with the
 /// label as a tooltip.
@@ -1971,22 +2306,23 @@ fn remember_host(host: &str, user: &str) {
     let _ = std::fs::write(f, lines.join("\n"));
 }
 
-/// Segoe UI (the original's font) when the system has it, otherwise egui's built-in font.
+/// Inter for all text, bundled so the app looks the same on every system (assets/fonts, SIL Open
+/// Font License); its SemiBold for titles. egui's own fonts stay behind it for symbols Inter lacks.
 fn setup_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
-    let mut bold_family = fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();
-    if cfg!(windows) {
-        let dir = std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".into());
-        if let Ok(bytes) = std::fs::read(format!("{}\\Fonts\\segoeui.ttf", dir)) {
-            fonts.font_data.insert("segoe".into(), egui::FontData::from_owned(bytes));
-            fonts.families.entry(FontFamily::Proportional).or_default().insert(0, "segoe".into());
-            bold_family.insert(0, "segoe".into());
-        }
-        if let Ok(bytes) = std::fs::read(format!("{}\\Fonts\\segoeuib.ttf", dir)) {
-            fonts.font_data.insert("segoe-bold".into(), egui::FontData::from_owned(bytes));
-            bold_family.insert(0, "segoe-bold".into());
-        }
-    }
-    fonts.families.insert(FontFamily::Name("bold".into()), bold_family);
+    fonts.font_data.insert("inter".into(), egui::FontData::from_static(include_bytes!("../assets/fonts/Inter-Regular.ttf")));
+    fonts.font_data.insert("inter-semibold".into(), egui::FontData::from_static(include_bytes!("../assets/fonts/Inter-SemiBold.ttf")));
+    let regular = fonts.families.entry(FontFamily::Proportional).or_default();
+    regular.insert(0, "inter".into());
+    let mut bold = regular.clone();
+    bold.insert(0, "inter-semibold".into());
+    fonts.families.insert(FontFamily::Name("bold".into()), bold);
     ctx.set_fonts(fonts);
+    ctx.style_mut(|s| {
+        use egui::TextStyle::*;
+        s.text_styles.insert(Body, FontId::proportional(13.0));
+        s.text_styles.insert(Button, FontId::proportional(13.0));
+        s.text_styles.insert(Small, FontId::proportional(11.0));
+        s.text_styles.insert(Heading, FontId::new(18.0, FontFamily::Name("bold".into())));
+    });
 }

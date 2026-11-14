@@ -19,7 +19,12 @@ affiliated with or endorsed by the makers of XenServer or XCP-ng.
   pool coordinator automatically. Earlier servers are remembered (passwords are never saved).
 - **Resource tree** — *Infrastructure* view (pool → servers → their VMs and storage; shared storage and
   virtual networks in folders) or *Objects* view (grouped by type), with a search box. The sidebar **folds** into a slim icon strip.
+- **Home overview** — servers, running VMs, memory and storage in use at a glance, each server's load
+  and the latest activity.
 - **Details** — General, Memory, Storage, Networking, Console and Logs tabs for pools, hosts and VMs.
+  A VM's General tab shows its tags, operating system, uptime, IP addresses, guest tools, CPUs and
+  memory, firmware and Secure Boot, boot order, high availability, disks and snapshots; click a value
+  to copy it.
 - **Console** — see a running VM's screen and use it with your keyboard and mouse (the keyboard goes
   to the VM while the mouse is over its screen), with *Send Ctrl+Alt+Del*, a *Send keys* menu for the
   combinations your desktop keeps for itself (the Windows key, Alt+Tab…) and *Scale to fit*. It
@@ -137,3 +142,6 @@ toolchain, Linux and macOS need none of this.
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+The app's typeface is [Inter](https://rsms.me/inter/) © The Inter Project Authors, bundled under the
+SIL Open Font License 1.1 ([assets/fonts/LICENSE-Inter.txt](assets/fonts/LICENSE-Inter.txt)).

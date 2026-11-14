@@ -29,7 +29,7 @@ jobs:
         run: |
           mkdir -p dist/simple-vm-manager
           cp target/release/simple-vm-manager dist/simple-vm-manager/
-          cp -r packaging install.sh README.md LICENSE dist/simple-vm-manager/
+          cp -r packaging install.sh README.md LICENSE assets/fonts/LICENSE-Inter.txt dist/simple-vm-manager/
           tar -C dist -czf simple-vm-manager-linux-x86_64.tar.gz simple-vm-manager
       - uses: actions/upload-artifact@v4
         with:

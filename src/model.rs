@@ -1,12 +1,13 @@
 //! Data the app shows, and the VM power-command rules read from the original
 //! (see MECHANICS.md for the method addresses each rule comes from).
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash, Default)]
 pub enum PowerState {
     Halted,
     Paused,
     Running,
     Suspended,
+    #[default]
     Unknown,
 }
 
@@ -48,7 +49,7 @@ pub struct VmNic {
     pub ip: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct VmInfo {
     pub rref: String,
     pub uuid: String,
@@ -70,6 +71,34 @@ pub struct VmInfo {
     pub allowed: Vec<String>,
     pub disks: Vec<VmDisk>,
     pub nics: Vec<VmNic>,
+    // details for the General tab
+    pub tags: Vec<String>,
+    /// XenCenter's folder for it, like "/Servers/Linux".
+    pub folder: String,
+    /// The guest's kernel, as its tools report it.
+    pub kernel: String,
+    /// "HVM", "PV", "PVH" or "PV in PVH".
+    pub virt_mode: String,
+    /// "BIOS" or "UEFI" (HVM guests).
+    pub firmware: String,
+    /// "On", "Off" or "Automatic" (UEFI guests).
+    pub secure_boot: String,
+    /// The boot order of an HVM guest, like "DVD drive, Disk".
+    pub boot_order: String,
+    pub auto_power_on: bool,
+    /// High availability: "Restart", "Best effort", or empty when off.
+    pub ha: String,
+    pub snapshots: usize,
+    pub vcpus_max: i64,
+    pub mem_static_min: i64,
+    /// The memory the VM has right now (while running).
+    pub mem_actual: i64,
+    /// When it last started, in seconds since 1970 (while running).
+    pub started: Option<i64>,
+    /// The guest tools' version; empty when they aren't installed.
+    pub tools: String,
+    /// Every IP address its tools report.
+    pub ips: Vec<String>,
 }
 
 impl VmInfo {
@@ -242,13 +271,14 @@ impl VmAction {
         }
     }
 
-    /// Which power buttons the toolbar shows: all of them, greyed out when they can't run, except
-    /// that Suspend and Resume share one place (Resume while the VM is suspended).
+    /// Which power buttons the toolbar shows, greyed out when they can't run: Suspend and Resume
+    /// share one place (Resume while the VM is suspended), and the Force ones aren't buttons.
     pub fn on_toolbar(&self, vm: Option<&VmInfo>) -> bool {
         let suspended = vm.map_or(false, |v| v.power == PowerState::Suspended);
         match self.op {
             "suspend" => !suspended,
             "resume" => suspended,
+            "hard_shutdown" | "hard_reboot" => false, // in the arrow menus next to Shut Down / Reboot
             _ => true,
         }
     }
@@ -275,6 +305,40 @@ impl VmAction {
         };
         Some(s.to_string())
     }
+}
+
+/// "12 days, 3 hours", "3 hours, 20 minutes", "5 minutes".
+pub fn fmt_duration(secs: i64) -> String {
+    let (d, h, m) = (secs / 86_400, (secs / 3600) % 24, (secs / 60) % 60);
+    let unit = |n: i64, what: &str| format!("{} {}{}", n, what, if n == 1 { "" } else { "s" });
+    if d > 0 {
+        format!("{}, {}", unit(d, "day"), unit(h, "hour"))
+    } else if h > 0 {
+        format!("{}, {}", unit(h, "hour"), unit(m, "minute"))
+    } else {
+        unit(m.max(1), "minute")
+    }
+}
+
+/// XenAPI's times, like "20261114T13:22:01Z", in seconds since 1970.
+pub fn parse_xen_time(t: &str) -> Option<i64> {
+    let t = t.trim().trim_end_matches('Z').replace('-', "");
+    let (date, time) = t.split_once('T')?;
+    if date.len() != 8 {
+        return None;
+    }
+    let (y, mo, d): (i64, i64, i64) = (date[0..4].parse().ok()?, date[4..6].parse().ok()?, date[6..8].parse().ok()?);
+    let mut hms = time.split(':').map(|x| x.split('.').next().unwrap_or("0").parse::<i64>().unwrap_or(0));
+    let (h, mi, s) = (hms.next()?, hms.next().unwrap_or(0), hms.next().unwrap_or(0));
+    // days from the civil date (Howard Hinnant's algorithm)
+    let y2 = if mo <= 2 { y - 1 } else { y };
+    let era = y2.div_euclid(400);
+    let yoe = y2 - era * 400;
+    let doy = (153 * (mo + if mo > 2 { -3 } else { 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    let secs = days * 86_400 + h * 3600 + mi * 60 + s;
+    (secs > 0).then_some(secs)
 }
 
 pub fn fmt_bytes(b: i64) -> String {

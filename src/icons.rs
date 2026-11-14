@@ -3,7 +3,7 @@
 
 use crate::model::PowerState;
 use crate::theme::Pal;
-use eframe::egui::{self, pos2, vec2, Color32, Painter, Pos2, Rect, Rounding, Shape, Stroke};
+use eframe::egui::{pos2, vec2, Color32, Painter, Pos2, Rect, Rounding, Shape, Stroke};
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum IconKind {
@@ -28,19 +28,6 @@ pub fn state_color(p: &Pal, s: PowerState) -> Color32 {
         PowerState::Paused => p.blue,
         PowerState::Unknown => p.grey,
     }
-}
-
-/// A horizontal (or vertical) colour gradient over a rectangle.
-pub fn gradient(p: &Painter, r: Rect, a: Color32, b: Color32, horizontal: bool) {
-    let mut m = egui::Mesh::default();
-    let (tl, tr, br, bl) = if horizontal { (a, b, b, a) } else { (a, a, b, b) };
-    m.colored_vertex(r.left_top(), tl);
-    m.colored_vertex(r.right_top(), tr);
-    m.colored_vertex(r.right_bottom(), br);
-    m.colored_vertex(r.left_bottom(), bl);
-    m.add_triangle(0, 1, 2);
-    m.add_triangle(0, 2, 3);
-    p.add(Shape::mesh(m));
 }
 
 pub fn arc(p: &Painter, c: Pos2, r: f32, start_deg: f32, end_deg: f32, stroke: Stroke) {
@@ -258,30 +245,3 @@ pub fn paint_monitor(p: &Painter, o: Pos2, w: f32, pal: &Pal) {
     p.line_segment([o + vec2(w / 2.0 - 10.0, h + 8.0), o + vec2(w / 2.0 + 10.0, h + 8.0)], s);
 }
 
-/// The three big pictures above the Home page's links.
-pub fn paint_home_icon(p: &Painter, o: Pos2, kind: &str, pal: &Pal) {
-    let s = Stroke::new(1.6, pal.art);
-    let r = Stroke::new(2.0, pal.red);
-    match kind {
-        "add" => {
-            p.circle_stroke(o + vec2(22.0, 28.0), 18.0, s);
-            p.circle_stroke(o + vec2(50.0, 25.0), 25.0, s);
-            p.circle_stroke(o + vec2(72.0, 30.0), 15.0, s);
-            p.rect_filled(Rect::from_min_size(o + vec2(10.0, 30.0), vec2(70.0, 24.0)), 0.0, pal.surface);
-            p.circle_stroke(o + vec2(41.0, 19.0), 11.0, r);
-            p.line_segment([o + vec2(41.0, 13.0), o + vec2(41.0, 25.0)], r);
-            p.line_segment([o + vec2(35.0, 19.0), o + vec2(47.0, 19.0)], r);
-            for i in 0..3 {
-                p.rect_stroke(Rect::from_min_size(o + vec2(18.0, 40.0 + i as f32 * 14.0), vec2(50.0, 12.0)), Rounding::same(2.0), s);
-                p.circle_filled(o + vec2(26.0, 46.0 + i as f32 * 14.0), 2.0, pal.art);
-            }
-        }
-        "demo" => paint_monitor(p, o + vec2(0.0, 4.0), 80.0, pal),
-        _ => {
-            p.circle_stroke(o + vec2(40.0, 30.0), 25.0, s);
-            p.text(o + vec2(40.0, 30.0), egui::Align2::CENTER_CENTER, "i", egui::FontId::proportional(28.0), pal.red);
-            p.circle_stroke(o + vec2(7.0, 69.0), 7.0, s);
-            p.circle_stroke(o + vec2(73.0, 69.0), 7.0, s);
-        }
-    }
-}

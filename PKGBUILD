@@ -8,12 +8,12 @@
 # Remove it again with:  sudo pacman -R simple-vm-manager
 
 pkgname=simple-vm-manager
-pkgver=1.2.0
+pkgver=1.3.0
 pkgrel=1
 pkgdesc="Simple desktop console for XenServer / XCP-ng pools: browse servers and VMs, use their consoles, start, shut down, reboot, suspend"
 arch=('x86_64' 'aarch64')
 url="https://github.com/jpaferreira-git/simple-vm-manager"
-license=('MIT')
+license=('MIT' 'OFL-1.1')
 depends=(
   'gcc-libs' 'glibc' 'openssl'
   'libxkbcommon' 'wayland' 'libx11' 'libxcursor' 'libxrandr' 'libxi'
@@ -47,5 +47,6 @@ package() {
   install -Dm644 packaging/simple-vm-manager.desktop "$pkgdir/usr/share/applications/simple-vm-manager.desktop"
   install -Dm644 packaging/simple-vm-manager.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/simple-vm-manager.svg"
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 assets/fonts/LICENSE-Inter.txt "$pkgdir/usr/share/licenses/$pkgname/LICENSE-Inter.txt"
   install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
 }

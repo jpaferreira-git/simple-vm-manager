@@ -4,3 +4,4 @@ PKGBUILD text eol=lf
 *.desktop text eol=lf
 *.png binary
 *.a binary
+*.ttf binary
