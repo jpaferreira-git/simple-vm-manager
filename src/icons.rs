@@ -137,7 +137,7 @@ pub fn paint_tool(p: &Painter, rect: Rect, op: &str, enabled: bool, pal: &Pal) {
         "clean_reboot" => pal.green,
         "hard_reboot" => pal.orange,
         "suspend" | "resume" => pal.blue,
-        "start" | "add" => pal.green,
+        "start" | "connect" => pal.green,
         _ => pal.icon,
     };
     let col = if enabled { base } else { pal.ink_faint };
@@ -169,13 +169,13 @@ pub fn paint_tool(p: &Painter, rect: Rect, op: &str, enabled: bool, pal: &Pal) {
             poly(p, c, &[(-1.5, -5.5), (5.5, 0.0), (-1.5, 5.5)], col);
         }
         "start" => poly(p, c, &[(-3.5, -6.0), (6.0, 0.0), (-3.5, 6.0)], col),
-        "add" => {
-            rrect(p, o, 4.0, 4.0, 10.0, 14.0, 2.0, Stroke::new(1.6, if enabled { pal.icon } else { pal.ink_faint }));
-            p.line_segment([o + vec2(6.5, 8.5), o + vec2(11.5, 8.5)], Stroke::new(1.4, if enabled { pal.icon } else { pal.ink_faint }));
-            p.circle(o + vec2(16.0, 15.5), 5.2, col, Stroke::NONE);
-            let w = Stroke::new(1.8, Color32::WHITE);
-            p.line_segment([o + vec2(13.4, 15.5), o + vec2(18.6, 15.5)], w);
-            p.line_segment([o + vec2(16.0, 12.9), o + vec2(16.0, 18.1)], w);
+        "connect" => {
+            // a plug: two pins, a rounded body and its cord
+            let s = Stroke::new(1.8, col);
+            line(p, o, &[(8.5, 3.5), (8.5, 7.5)], s);
+            line(p, o, &[(13.5, 3.5), (13.5, 7.5)], s);
+            line(p, o, &[(5.5, 7.5), (16.5, 7.5), (16.5, 10.5), (14.8, 13.6), (11.0, 15.0), (7.2, 13.6), (5.5, 10.5), (5.5, 7.5)], s);
+            line(p, o, &[(11.0, 15.0), (11.0, 19.0)], s);
         }
         "sidebar" => {
             let s = Stroke::new(1.6, col);

@@ -95,7 +95,8 @@ pub struct VmInfo {
     pub mem_actual: i64,
     /// When it last started, in seconds since 1970 (while running).
     pub started: Option<i64>,
-    /// The guest tools' version; empty when they aren't installed.
+    pub tools_installed: bool,
+    /// The guest tools' version, like "9.4.0"; empty when not known.
     pub tools: String,
     /// Every IP address its tools report.
     pub ips: Vec<String>,

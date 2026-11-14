@@ -16,7 +16,10 @@ affiliated with or endorsed by the makers of XenServer or XCP-ng.
 ## Features
 
 - **Servers and pools** — connect to a server by name or IP with your login; pool members redirect to the
-  pool coordinator automatically. Earlier servers are remembered (passwords are never saved).
+  pool coordinator automatically. Earlier servers are remembered. Tick *Remember password* to keep the
+  password in your system's keychain (GNOME Keyring, KWallet or KeePassXC on Linux; Credential Manager
+  on Windows; Keychain on macOS; never in the app's own files): the app then reconnects to that server
+  each time it starts. Right-click a server to *Forget saved password*.
 - **Resource tree** — *Infrastructure* view (pool → servers → their VMs and storage; shared storage and
   virtual networks in folders) or *Objects* view (grouped by type), with a search box. The sidebar **folds** into a slim icon strip.
 - **Home overview** — servers, running VMs, memory and storage in use at a glance, each server's load

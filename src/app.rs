@@ -3,6 +3,7 @@
 
 use crate::conn::*;
 use crate::console::{self, ConsoleView};
+use crate::secrets;
 use crate::icons::*;
 use crate::model::*;
 use crate::theme::{self, Pal, ThemeMode};
@@ -36,6 +37,9 @@ struct ServerEntry {
     ever: bool,
     failures: u32,
     busy: HashMap<String, String>,
+    /// Once the first login works: (true, password) keeps the password in the keychain and
+    /// reconnects at startup; (false, _) forgets any saved one. None: leave things as they are.
+    pending_save: Option<(bool, String)>,
 }
 
 impl ServerEntry {
@@ -55,6 +59,10 @@ impl ServerEntry {
 
 enum Msg {
     Fetched(u32, Result<PoolData, ApiError>),
+    /// At startup: whether there's a keychain, the passwords saved in it for earlier servers, and
+    /// the servers to reconnect to.
+    Keychain { available: bool, saved: Vec<(String, String, String)>, session: Vec<(String, String)> },
+    KeychainError(String),
     ActionDone { sid: u32, vm: String, log: usize, err: Option<String>, label: &'static str, text: String },
 }
 
@@ -136,7 +144,7 @@ impl Tab {
 
 enum Dialog {
     None,
-    AddServer { server: String, user: String, password: String, error: String },
+    AddServer { server: String, user: String, password: String, error: String, remember: bool },
     Confirm { action: usize, sid: u32, vm: String, title: String, text: String },
     Message { title: String, text: String },
 }
@@ -148,6 +156,7 @@ enum Intent {
     AddServer,
     Demo,
     Remove(u32),
+    ForgetPassword(u32),
     Reconnect(u32),
     Refresh(Option<u32>),
     View(bool),
@@ -186,7 +195,12 @@ pub struct App {
     closed_sections: HashSet<String>,
     dialog: Dialog,
     console: Option<ConsoleView>,
-    known_hosts: Vec<String>,
+    /// Earlier servers and the account used on each, newest first.
+    known_hosts: Vec<(String, String)>,
+    /// None while still asking the system whether it has a keychain.
+    keychain: Option<bool>,
+    /// Passwords saved in the keychain, by (server, user).
+    saved: HashMap<(String, String), String>,
     shot_path: Option<String>,
     shot_show: String,
     frames: u64,
@@ -225,6 +239,8 @@ impl App {
             dialog: Dialog::None,
             console: None,
             known_hosts: load_history(),
+            keychain: None,
+            saved: HashMap::new(),
             shot_path: start.shot_path,
             shot_show: start.shot_show,
             frames: 0,
@@ -234,6 +250,27 @@ impl App {
             started: Instant::now(),
         };
         app.apply_theme(&cc.egui_ctx);
+        if !shot {
+            // The keychain may take a moment (or ask to be unlocked): read it in the background.
+            let (tx, ctx) = (app.tx.clone(), cc.egui_ctx.clone());
+            let (hosts, session) = (app.known_hosts.clone(), load_session());
+            std::thread::spawn(move || {
+                let available = secrets::available();
+                let mut saved = vec![];
+                if available {
+                    let mut wanted: Vec<(String, String)> = hosts.into_iter().chain(session.iter().cloned()).collect();
+                    wanted.sort();
+                    wanted.dedup();
+                    for (h, u) in wanted {
+                        if let Some(p) = secrets::load(&h, &u) {
+                            saved.push((h, u, p));
+                        }
+                    }
+                }
+                let _ = tx.send(Msg::Keychain { available, saved, session });
+                ctx.request_repaint();
+            });
+        }
         if shot && app.shot_show == "welcome" {
             app.shot_ready = true; // Home with nothing connected
         } else if shot {
@@ -286,9 +323,36 @@ impl App {
             ever: false,
             failures: 0,
             busy: HashMap::new(),
+            pending_save: None,
         });
         self.add_log(id, &host, None, &host, &format!("Connecting to {}", host), "In progress");
         self.select(format!("srv:{}", id));
+    }
+
+    /// Keeps a server's password in the keychain and reconnects there at startup (Some), or forgets
+    /// it and doesn't (None). The keychain is written in the background.
+    fn keep_password(&mut self, host: &str, user: &str, password: Option<String>) {
+        let key = (host.to_string(), user.to_string());
+        let (h, u, tx) = (key.0.clone(), key.1.clone(), self.tx.clone());
+        match password {
+            Some(p) => {
+                session_add(host, user);
+                if self.saved.get(&key) != Some(&p) {
+                    self.saved.insert(key, p.clone());
+                    std::thread::spawn(move || {
+                        if let Err(e) = secrets::save(&h, &u, &p) {
+                            let _ = tx.send(Msg::KeychainError(e));
+                        }
+                    });
+                }
+            }
+            None => {
+                session_remove(host, user);
+                if self.saved.remove(&key).is_some() {
+                    std::thread::spawn(move || secrets::forget(&h, &u));
+                }
+            }
+        }
     }
 
     fn remove_server(&mut self, sid: u32, log: bool) {
@@ -348,6 +412,22 @@ impl App {
         while let Ok(m) = self.rx.try_recv() {
             match m {
                 Msg::Fetched(id, r) => self.on_fetched(id, r),
+                Msg::Keychain { available, saved, session } => {
+                    self.keychain = Some(available);
+                    self.saved = saved.into_iter().map(|(h, u, p)| ((h, u), p)).collect();
+                    // reconnect to the servers left connected last time, without moving the selection
+                    let selected = self.selected.clone();
+                    for (h, u) in session {
+                        let known = self.servers.iter().any(|s| !s.conn.is_demo() && s.conn.hostname().eq_ignore_ascii_case(&h));
+                        if let (false, Some(p)) = (known, self.saved.get(&(h.clone(), u.clone())).cloned()) {
+                            self.add_server(Arc::new(RealConnection::new(&h, &u, &p)));
+                        }
+                    }
+                    self.selected = selected;
+                }
+                Msg::KeychainError(e) => {
+                    self.dialog = Dialog::Message { title: "Remember password".into(), text: format!("Couldn't save the password in the system's keychain.\n\n{}", e) };
+                }
                 Msg::ActionDone { sid, vm, log, err, label, text } => {
                     if let Some(s) = self.server_mut(sid) {
                         s.busy.remove(&vm);
@@ -394,6 +474,11 @@ impl App {
                     if !is_demo {
                         remember_host(&host, &user);
                         self.known_hosts = load_history();
+                        if let Some((remember, password)) = self.servers[idx].pending_save.take() {
+                            if self.keychain != Some(false) {
+                                self.keep_password(&host, &user, remember.then_some(password));
+                            }
+                        }
                     }
                     self.expanded.insert(format!("srv:{}", id));
                     self.expanded.extend(host_keys);
@@ -436,7 +521,7 @@ impl App {
                     if !shot {
                         if e.code == "SESSION_AUTHENTICATION_FAILED" {
                             self.remove_server(id, false);
-                            self.dialog = Dialog::AddServer { server: host, user, password: String::new(), error: msg };
+                            self.dialog = Dialog::AddServer { server: host, user, password: String::new(), error: msg, remember: self.keychain != Some(false) };
                         } else {
                             self.dialog = Dialog::Message { title: "Connect to Server".into(), text: format!("Couldn't connect to {}.\n\n{}", host, msg) };
                         }
@@ -659,14 +744,26 @@ impl App {
                     }
                 }
                 Intent::Action(i) => self.request_action(i, sel),
-                Intent::AddServer => self.dialog = Dialog::AddServer { server: String::new(), user: "root".into(), password: String::new(), error: String::new() },
+                Intent::AddServer => self.dialog = Dialog::AddServer { server: String::new(), user: "root".into(), password: String::new(), error: String::new(), remember: self.keychain != Some(false) },
+                Intent::ForgetPassword(sid) => {
+                    if let Some(s) = self.server(sid) {
+                        let (h, u) = (s.conn.hostname(), s.conn.username());
+                        self.keep_password(&h, &u, None);
+                    }
+                }
                 Intent::Demo => self.connect_demo(),
-                Intent::Remove(sid) => self.remove_server(sid, true),
+                Intent::Remove(sid) => {
+                    if let Some(s) = self.server(sid).filter(|s| !s.conn.is_demo()) {
+                        session_remove(&s.conn.hostname(), &s.conn.username());
+                    }
+                    self.remove_server(sid, true);
+                }
                 Intent::Reconnect(sid) => {
                     if let Some(s) = self.server(sid) {
                         let (h, u) = (s.conn.hostname(), s.conn.username());
                         self.remove_server(sid, false);
-                        self.dialog = Dialog::AddServer { server: h, user: u, password: String::new(), error: String::new() };
+                        let password = self.saved.get(&(h.clone(), u.clone())).cloned().unwrap_or_default();
+                        self.dialog = Dialog::AddServer { server: h, user: u, password, error: String::new(), remember: self.keychain != Some(false) };
                     }
                 }
                 Intent::Refresh(only) => {
@@ -749,7 +846,7 @@ impl App {
                 out.push(Intent::Sidebar(!self.sidebar_open));
             }
             ui.add_space(4.0);
-            if tool_button(ui, "add", "Connect", true, compact(false), &pal).clicked() {
+            if tool_button(ui, "connect", "Connect", true, compact(false), &pal).clicked() {
                 out.push(Intent::AddServer);
             }
             ui.separator();
@@ -873,7 +970,7 @@ impl App {
                 out.push(Intent::Sidebar(true));
             }
             ui.add_space(4.0);
-            if rail_icon(ui, &pal, RailIcon::Tool("add"), false).on_hover_text("Connect").clicked() {
+            if rail_icon(ui, &pal, RailIcon::Tool("connect"), false).on_hover_text("Connect").clicked() {
                 out.push(Intent::AddServer);
             }
         });
@@ -971,6 +1068,11 @@ impl App {
                         out.push(Intent::Refresh(Some(sid)));
                         ui.close_menu();
                     }
+                    let has_saved = self.server(sid).map_or(false, |s| self.saved.contains_key(&(s.conn.hostname(), s.conn.username())));
+                    if has_saved && ui.button("Forget saved password").clicked() {
+                        out.push(Intent::ForgetPassword(sid));
+                        ui.close_menu();
+                    }
                     let label = if matches!(st, Some((ConnState::Disconnected, _))) { "Remove" } else { "Disconnect" };
                     if ui.button(label).clicked() {
                         out.push(Intent::Remove(sid));
@@ -986,19 +1088,39 @@ impl App {
         }
     }
 
-    /// The selected item's name in bold with a few softer details beside it, on the window's own
-    /// background.
-    fn header(&self, ui: &mut Ui, sel: &Node) {
+    /// The selected item's name (bold, with softer details beside it) and its tabs, on one line when
+    /// they fit and on two otherwise. Returns the room left right of the tabs.
+    fn header_and_tabs(&self, ui: &mut Ui, sel: &Node, tabs: &[Tab], current: Tab, out: &mut Vec<Intent>) -> Rect {
         let pal = self.pal;
-        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 38.0), Sense::hover());
-        let p = ui.painter();
-        let mid = rect.center().y + 2.0;
-        paint_icon(p, Rect::from_center_size(pos2(rect.min.x + 20.0, mid), vec2(16.0, 16.0)), sel.icon, &pal, pal.window);
         let (title, sub) = self.header_text(sel);
-        let g = p.layout_no_wrap(title, FontId::new(16.0, FontFamily::Name("bold".into())), pal.ink);
+        let (title_font, sub_font, tab_font) = (FontId::new(16.0, FontFamily::Name("bold".into())), FontId::proportional(13.0), FontId::proportional(13.5));
+        let width = |t: &str, f: &FontId| ui.painter().layout_no_wrap(t.to_string(), f.clone(), pal.ink).size().x;
+        let head_w = 36.0 + width(&title, &title_font) + if sub.is_empty() { 0.0 } else { 10.0 + width(&sub, &sub_font) };
+        let tabs_w: f32 = tabs.iter().map(|t| width(t.label(), &tab_font) + 20.0).sum();
+        let avail = ui.available_width();
+        let hairline = |ui: &Ui, r: Rect| ui.painter().line_segment([r.left_bottom() - vec2(0.0, 0.5), r.right_bottom() - vec2(0.0, 0.5)], Stroke::new(1.0, pal.border));
+        if head_w + 28.0 + tabs_w + 24.0 <= avail {
+            let (row, _) = ui.allocate_exact_size(vec2(avail, 46.0), Sense::hover());
+            hairline(ui, row);
+            self.paint_header(ui, row, sel, &title, &sub, row.center().y);
+            self.paint_tabs(ui, row, row.min.x + head_w + 28.0, tabs, current, out)
+        } else {
+            let (head, _) = ui.allocate_exact_size(vec2(avail, 38.0), Sense::hover());
+            self.paint_header(ui, head, sel, &title, &sub, head.center().y + 2.0);
+            let (strip, _) = ui.allocate_exact_size(vec2(avail, 32.0), Sense::hover());
+            hairline(ui, strip);
+            self.paint_tabs(ui, strip, strip.min.x + 2.0, tabs, current, out)
+        }
+    }
+
+    fn paint_header(&self, ui: &Ui, r: Rect, sel: &Node, title: &str, sub: &str, mid: f32) {
+        let pal = self.pal;
+        let p = ui.painter();
+        paint_icon(p, Rect::from_center_size(pos2(r.min.x + 20.0, mid), vec2(16.0, 16.0)), sel.icon, &pal, pal.window);
+        let g = p.layout_no_wrap(title.to_string(), FontId::new(16.0, FontFamily::Name("bold".into())), pal.ink);
         let w = g.size().x;
-        p.galley(pos2(rect.min.x + 36.0, mid - g.size().y / 2.0), g, pal.ink);
-        p.text(pos2(rect.min.x + 46.0 + w, mid + 1.0), Align2::LEFT_CENTER, sub, FontId::proportional(13.0), pal.ink_soft);
+        p.galley(pos2(r.min.x + 36.0, mid - g.size().y / 2.0), g, pal.ink);
+        p.text(pos2(r.min.x + 46.0 + w, mid + 1.0), Align2::LEFT_CENTER, sub, FontId::proportional(13.0), pal.ink_soft);
     }
 
     /// The header's title and the details shown beside it.
@@ -1046,23 +1168,21 @@ impl App {
         }
     }
 
-    /// Draws the tabs (text, the current one underlined in the accent colour, a hairline under
-    /// them all); returns the room left on their right.
-    fn tab_strip(&self, ui: &mut Ui, tabs: &[Tab], current: Tab, out: &mut Vec<Intent>) -> Rect {
+    /// The tabs as text from `x` along `row`, the current one underlined in the accent colour;
+    /// returns the room left on their right.
+    fn paint_tabs(&self, ui: &mut Ui, row: Rect, x: f32, tabs: &[Tab], current: Tab, out: &mut Vec<Intent>) -> Rect {
         let pal = self.pal;
-        let (strip, _) = ui.allocate_exact_size(vec2(ui.available_width(), 32.0), Sense::hover());
-        ui.painter().line_segment([strip.left_bottom() - vec2(0.0, 0.5), strip.right_bottom() - vec2(0.0, 0.5)], Stroke::new(1.0, pal.border));
         let font = FontId::proportional(13.5);
-        let mut x = strip.min.x + 2.0;
+        let mut x = x;
         for t in tabs {
             let tw = ui.painter().layout_no_wrap(t.label().into(), font.clone(), pal.ink).size().x;
-            let r = Rect::from_min_size(pos2(x, strip.min.y), vec2(tw + 20.0, strip.height()));
+            let r = Rect::from_min_size(pos2(x, row.min.y), vec2(tw + 20.0, row.height()));
             let resp = ui.interact(r, ui.id().with(t.label()), Sense::click());
             let on = *t == current;
             let col = if on || resp.hovered() { pal.ink } else { pal.ink_soft };
             ui.painter().text(pos2(r.center().x, r.center().y - 1.0), Align2::CENTER_CENTER, t.label(), font.clone(), col);
             if on {
-                let line = Rect::from_center_size(pos2(r.center().x, strip.max.y - 1.0), vec2(tw + 4.0, 2.5));
+                let line = Rect::from_center_size(pos2(r.center().x, row.max.y - 1.0), vec2(tw + 4.0, 2.5));
                 ui.painter().rect_filled(line, Rounding::same(1.25), pal.accent);
             }
             if resp.clicked() {
@@ -1070,7 +1190,7 @@ impl App {
             }
             x += r.width();
         }
-        Rect::from_min_max(pos2(x + 10.0, strip.min.y + 2.0), pos2(strip.max.x - 6.0, strip.max.y - 3.0))
+        Rect::from_min_max(pos2(x + 10.0, row.min.y + 2.0), pos2(row.max.x - 6.0, row.max.y - 3.0))
     }
 
     /// The Home tab: an overview of everything connected, or a first step when nothing is.
@@ -1372,7 +1492,12 @@ impl App {
                         st.push(row("Home server", host_name(v.home()).unwrap_or_else(|| "Any server in the pool".into())));
                     }
                     st.push(row(if v.ips.len() > 1 { "IP addresses" } else { "IP address" }, if v.ips.is_empty() { or(&v.ip, "None").into() } else { v.ips.join(", ") }));
-                    st.push(row("Guest tools", if v.tools.is_empty() { "Not installed".into() } else { v.tools.clone() }));
+                    let tools = match (v.tools_installed, v.tools.is_empty()) {
+                        (false, _) => "Not installed".to_string(),
+                        (true, true) => "Installed".to_string(),
+                        (true, false) => format!("Installed ({})", v.tools),
+                    };
+                    st.push(row("Guest tools", tools));
                     secs.push(("Status".into(), st));
 
                     let cpus = if v.vcpus_max > v.vcpus { format!("{} (up to {})", v.vcpus, v.vcpus_max) } else { v.vcpus.to_string() };
@@ -1441,30 +1566,27 @@ impl App {
         secs
     }
 
-    /// The General tab: cards of details that fold, in two columns when there's room. Clicking a
-    /// value copies it.
+    /// The General tab: cards of details that fold, one under another, no wider than reads well.
+    /// Clicking a value copies it.
     fn general(&self, ui: &mut Ui, sel: &Node, out: &mut Vec<Intent>) {
-        const HEAD: f32 = 40.0;
-        const ROW: f32 = 27.0;
+        const HEAD: f32 = 38.0;
+        const ROW: f32 = 25.0;
+        const MAX_W: f32 = 780.0;
         let pal = self.pal;
         let secs = self.general_sections(sel);
         egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
             let full = ui.available_width();
-            let (pad, gap) = (16.0, 14.0);
-            let cols = if full >= 880.0 { 2 } else { 1 };
-            let col_w = (full - 2.0 * pad - gap * (cols - 1) as f32) / cols as f32;
-            // each card goes into the shorter column
+            let (pad, gap) = (16.0, 12.0);
+            let card_w = (full - 2.0 * pad).min(MAX_W);
             let origin = ui.cursor().min + vec2(pad, 14.0);
-            let mut heights = vec![0.0f32; cols];
+            let mut total = 0.0;
             let mut cards = vec![];
             for (name, rows) in &secs {
                 let open = self.section_open(name);
-                let c = (0..cols).min_by(|a, b| heights[*a].total_cmp(&heights[*b])).unwrap_or(0);
                 let h = HEAD + if open { rows.len() as f32 * ROW + 10.0 } else { 0.0 };
-                cards.push((Rect::from_min_size(origin + vec2(c as f32 * (col_w + gap), heights[c]), vec2(col_w, h)), name, rows, open));
-                heights[c] += h + gap;
+                cards.push((Rect::from_min_size(origin + vec2(0.0, total), vec2(card_w, h)), name, rows, open));
+                total += h + gap;
             }
-            let total = heights.iter().cloned().fold(0.0, f32::max);
             ui.allocate_exact_size(vec2(full, total + 24.0), Sense::hover());
             let title_font = FontId::new(13.5, FontFamily::Name("bold".into()));
             for (r, name, rows, open) in cards {
@@ -1786,14 +1908,15 @@ impl App {
 
     fn dialogs(&mut self, ctx: &egui::Context) {
         let mut close = false;
-        let mut add: Option<(String, String, String)> = None;
+        let mut add: Option<(String, String, String, bool)> = None;
+        let (keychain, saved) = (self.keychain, self.saved.clone());
         let mut confirm: Option<(usize, u32, String)> = None;
         let hosts = self.known_hosts.clone();
         let red = self.pal.red;
         let pal = self.pal;
         match &mut self.dialog {
             Dialog::None => {}
-            Dialog::AddServer { server, user, password, error } => {
+            Dialog::AddServer { server, user, password, error, remember } => {
                 dialog_window(ctx, "Connect to Server").show(ctx, |ui| {
                     ui.set_width(400.0);
                     ui.spacing_mut().item_spacing.y = 8.0;
@@ -1817,9 +1940,19 @@ impl App {
                         let anchor = ui.interact(field.union(r), popup.with("anchor"), Sense::hover());
                         egui::popup::popup_below_widget(ui, popup, &anchor, egui::PopupCloseBehavior::CloseOnClick, |ui| {
                             ui.set_min_width(field.union(r).width() - 12.0);
-                            for h in &hosts {
-                                if ui.selectable_label(false, h).clicked() {
+                            for (h, u) in &hosts {
+                                let label = egui::RichText::new(format!("{}   ", h)).color(pal.ink);
+                                let resp = ui.horizontal(|ui| {
+                                    let r = ui.selectable_label(false, label);
+                                    ui.label(egui::RichText::new(u).color(pal.ink_soft));
+                                    r
+                                });
+                                if resp.inner.clicked() {
+                                    // the account used there, and its saved password
                                     *server = h.clone();
+                                    *user = u.clone();
+                                    *password = saved.get(&(h.clone(), u.clone())).cloned().unwrap_or_default();
+                                    ui.memory_mut(|m| m.close_popup());
                                 }
                             }
                             if hosts.is_empty() {
@@ -1840,6 +1973,21 @@ impl App {
                             text_field(ui, &pal, password, ui.available_width(), true);
                         });
                     });
+                    // Remember password: kept in the system's keychain, and the server reconnects at startup.
+                    let can_save = keychain != Some(false);
+                    ui.horizontal(|ui| {
+                        ui.add_space(GROUP_INSET);
+                        ui.add_enabled(can_save, egui::Checkbox::new(remember, "Remember password"));
+                    });
+                    let note = if can_save {
+                        "Saved in your system's keychain. The app connects to this server again each time it starts."
+                    } else {
+                        "There's no keychain on this system to keep it in (such as GNOME Keyring, KWallet or KeePassXC)."
+                    };
+                    ui.horizontal(|ui| {
+                        ui.add_space(GROUP_INSET + 24.0);
+                        ui.add(egui::Label::new(egui::RichText::new(note).size(12.0).color(pal.ink_soft)).wrap());
+                    });
                     if !error.is_empty() {
                         ui.colored_label(red, error.as_str());
                     }
@@ -1854,7 +2002,7 @@ impl App {
                             if server.trim().contains(' ') {
                                 *error = "A server name can't contain spaces.".into();
                             } else {
-                                add = Some((server.trim().to_string(), user.trim().to_string(), password.clone()));
+                                add = Some((server.trim().to_string(), user.trim().to_string(), password.clone(), *remember && can_save));
                             }
                         }
                     });
@@ -1891,12 +2039,16 @@ impl App {
         if close {
             self.dialog = Dialog::None;
         }
-        if let Some((h, u, p)) = add {
+        if let Some((h, u, p, remember)) = add {
             self.dialog = Dialog::None;
             if let Some(dup) = self.servers.iter().find(|s| !s.conn.is_demo() && s.conn.hostname().eq_ignore_ascii_case(&h)).map(|s| s.id) {
                 self.remove_server(dup, false);
             }
             self.add_server(Arc::new(RealConnection::new(&h, &u, &p)));
+            if let Some(s) = self.servers.last_mut() {
+                // (the keychain may still be being looked for; only a missing one rules saving out)
+                s.pending_save = (self.keychain != Some(false)).then_some((remember, p));
+            }
         }
         if let Some((a, sid, vm)) = confirm {
             self.dialog = Dialog::None;
@@ -2012,10 +2164,9 @@ impl eframe::App for App {
 
         egui::CentralPanel::default().frame(egui::Frame::none().fill(pal.window)).show(ctx, |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
-            self.header(ui, &sel);
             let tabs = self.tabs_for(&sel);
             let current = if tabs.contains(&self.tab) { self.tab } else { tabs[0] };
-            let free = self.tab_strip(ui, &tabs, current, &mut out);
+            let free = self.header_and_tabs(ui, &sel, &tabs, current, &mut out);
             if current == Tab::Console {
                 if let Some(c) = self.console.as_mut() {
                     c.tab_controls(ui, free, &pal);
@@ -2280,17 +2431,52 @@ fn save_settings(s: &Settings) {
     let _ = std::fs::write(dir.join("settings.txt"), text);
 }
 
-fn load_history() -> Vec<String> {
+/// Earlier servers and the account used on each, newest first.
+fn load_history() -> Vec<(String, String)> {
     let Some(dir) = config_dir() else { return vec![] };
     let text = std::fs::read_to_string(dir.join("servers.txt")).unwrap_or_default();
-    let mut out: Vec<String> = vec![];
+    let mut out: Vec<(String, String)> = vec![];
     for line in text.lines() {
-        let h = line.split('\t').next().unwrap_or("").trim().to_string();
-        if !h.is_empty() && !out.contains(&h) {
-            out.push(h);
+        let mut parts = line.split('\t');
+        let h = parts.next().unwrap_or("").trim().to_string();
+        let u = parts.next().unwrap_or("root").trim().to_string();
+        if !h.is_empty() && !out.iter().any(|(x, _)| *x == h) {
+            out.push((h, if u.is_empty() { "root".into() } else { u }));
         }
     }
     out
+}
+
+/// The servers to connect to at startup (their passwords are in the keychain, not here).
+fn load_session() -> Vec<(String, String)> {
+    let Some(dir) = config_dir() else { return vec![] };
+    std::fs::read_to_string(dir.join("session.txt"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.split_once('\t'))
+        .map(|(h, u)| (h.trim().to_string(), u.trim().to_string()))
+        .filter(|(h, u)| !h.is_empty() && !u.is_empty())
+        .collect()
+}
+
+fn save_session(list: &[(String, String)]) {
+    let Some(dir) = config_dir() else { return };
+    let _ = std::fs::create_dir_all(&dir);
+    let text: Vec<String> = list.iter().map(|(h, u)| format!("{}\t{}", h, u)).collect();
+    let _ = std::fs::write(dir.join("session.txt"), text.join("\n"));
+}
+
+fn session_add(host: &str, user: &str) {
+    let mut list = load_session();
+    list.retain(|(h, _)| !h.eq_ignore_ascii_case(host));
+    list.push((host.to_string(), user.to_string()));
+    save_session(&list);
+}
+
+fn session_remove(host: &str, user: &str) {
+    let mut list = load_session();
+    list.retain(|(h, u)| !(h.eq_ignore_ascii_case(host) && u == user));
+    save_session(&list);
 }
 
 fn remember_host(host: &str, user: &str) {

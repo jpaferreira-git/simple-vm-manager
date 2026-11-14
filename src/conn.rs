@@ -324,6 +324,10 @@ fn vm_details(vm: &mut VmInfo, r: &Value, guest: &Value, metrics: &Value) {
     let null = Value::Null;
     let other = r.get("other_config").unwrap_or(&null);
     vm.kernel = s(guest.get("os_version").unwrap_or(&null), "uname");
+    // Tools that don't name the operating system: the template the VM was made from does.
+    if vm.os.is_empty() {
+        vm.os = s(other, "base_template_name");
+    }
     vm.tags = list(r, "tags");
     vm.folder = s(other, "folder");
     vm.auto_power_on = s(other, "auto_poweron") == "true";
@@ -369,15 +373,12 @@ fn vm_details(vm: &mut VmInfo, r: &Value, guest: &Value, metrics: &Value) {
         vm.mem_actual = n(metrics, "memory_actual");
         vm.started = parse_xen_time(&s(metrics, "start_time"));
     }
+    // The tools report their version as major / minor / micro; without tools the server says -1.
     let pv = guest.get("PV_drivers_version").unwrap_or(&null);
-    let version: Vec<String> = ["major", "minor", "micro"].iter().map(|k| s(pv, k)).filter(|x| !x.is_empty()).collect();
-    vm.tools = if !version.is_empty() {
-        version.join(".")
-    } else if b(guest, "PV_drivers_detected") {
-        "Installed".into()
-    } else {
-        String::new()
-    };
+    let version: Vec<i64> = ["major", "minor", "micro"].iter().filter_map(|k| s(pv, k).trim().parse().ok()).collect();
+    let real = !version.is_empty() && version.iter().all(|&x| x >= 0);
+    vm.tools_installed = real || b(guest, "PV_drivers_detected");
+    vm.tools = if real && version.len() >= 2 { version.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(".") } else { String::new() };
     // every address the tools report ("0/ip", "0/ipv4/0", "0/ipv6/1"…), IPv4 first, no link-local
     if let Some(m) = guest.get("networks").and_then(|v| v.as_object()) {
         let mut ips: Vec<String> = m
@@ -745,7 +746,8 @@ fn demo_details(v: &mut VmInfo) {
     v.snapshots = snaps;
     v.auto_power_on = auto;
     v.ha = ha.into();
-    v.tools = if windows { "9.4.0" } else { "8.4.0" }.into();
+    v.tools_installed = v.rref != "vm-backup";
+    v.tools = if !v.tools_installed { "" } else if windows { "9.4.0" } else { "8.4.0" }.into();
     v.kernel = if windows { String::new() } else { "6.8.0-45-generic".into() };
     if v.power == PowerState::Running {
         v.started = Some(now - days * 86_400 - 3 * 3600 - 17 * 60);
@@ -866,4 +868,43 @@ impl Connection for DemoConnection {
         Ok(ConsoleStream::Plain(tcp_connect(&host, port.unwrap_or(5900))?))
     }
     fn close(&self) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tools(pv: Value, detected: bool) -> (bool, String) {
+        let mut vm = VmInfo::default();
+        vm_details(&mut vm, &json!({}), &json!({ "PV_drivers_version": pv, "PV_drivers_detected": detected }), &Value::Null);
+        (vm.tools_installed, vm.tools)
+    }
+
+    #[test]
+    fn guest_tools() {
+        assert_eq!(tools(json!({ "major": "-1", "minor": "-1", "micro": "-1" }), false), (false, String::new()));
+        assert_eq!(tools(json!({ "major": -1 }), false), (false, String::new()));
+        assert_eq!(tools(json!({ "major": "1" }), false), (true, String::new()));
+        assert_eq!(tools(json!({ "major": "9", "minor": "4", "micro": "0", "build": "12" }), true), (true, "9.4.0".into()));
+        assert_eq!(tools(json!({}), false), (false, String::new()));
+        assert_eq!(tools(json!({}), true), (true, String::new()));
+    }
+
+    #[test]
+    fn os_from_template_when_tools_dont_say() {
+        let mut vm = VmInfo::default();
+        vm_details(&mut vm, &json!({ "other_config": { "base_template_name": "Windows Server 2025 (64-bit)" } }), &json!({}), &Value::Null);
+        assert_eq!(vm.os, "Windows Server 2025 (64-bit)");
+        let mut vm = VmInfo { os: "Microsoft Windows Server 2025 Standard".into(), ..Default::default() };
+        vm_details(&mut vm, &json!({ "other_config": { "base_template_name": "Windows Server 2025 (64-bit)" } }), &json!({}), &Value::Null);
+        assert_eq!(vm.os, "Microsoft Windows Server 2025 Standard");
+    }
+
+    #[test]
+    fn xen_times() {
+        assert_eq!(parse_xen_time("19700101T00:00:01Z"), Some(1));
+        assert_eq!(parse_xen_time("20261114T13:22:01Z"), Some(1_794_662_521));
+        assert_eq!(parse_xen_time("2026-11-14T13:22:01Z"), Some(1_794_662_521));
+        assert_eq!(parse_xen_time("19700101T00:00:00Z"), None); // a VM that never started
+    }
 }

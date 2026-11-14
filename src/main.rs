@@ -6,6 +6,7 @@ mod conn;
 mod console;
 mod icons;
 mod model;
+mod secrets;
 mod theme;
 
 use eframe::egui;
