@@ -15,6 +15,12 @@ pub const DEFAULT_PORT: u16 = 443; // XenAPI.HTTP.DEFAULT_HTTPS_PORT
 pub const MAX_LOGIN_ATTEMPTS: u32 = 3; // XenConnection.DEFAULT_MAX_SESSION_LOGIN_ATTEMPTS
 pub const ACTION_TIMEOUT_MS: u64 = 86_400_000; // XenAPI.Session.STANDARD_TIMEOUT
 pub const DEMO_ACTION_MS: u64 = 1500; // estimated
+/// A storage check's error codes (see `Connection::check_sr`): it didn't answer in time; it isn't
+/// plugged into the server it's for. The storage's name is the first detail.
+pub const NOT_ANSWERING: &str = "SR_NOT_ANSWERING";
+pub const NOT_PLUGGED: &str = "SR_NOT_PLUGGED";
+/// How long a storage has to answer a check (a rescan takes a second or two).
+pub const CHECK_SECS: u64 = 15;
 
 #[derive(Debug, Clone)]
 pub struct ApiError {
@@ -62,9 +68,26 @@ pub trait Connection: Send + Sync {
     fn scan_sr(&self, sr_ref: &str) -> Result<(), ApiError>;
     /// Unplugs the storage from every server and forgets it; nothing on it is deleted.
     fn forget_sr(&self, sr_ref: &str) -> Result<(), ApiError>;
+    /// Whether a storage answers: plugged into `host` (any server, for None), then rescanned
+    /// within CHECK_SECS. A share that's gone away doesn't fail, the server waits for it for
+    /// ever: that's NOT_ANSWERING. Each call goes in `trace`, named from `names`.
+    fn check_sr(&self, sr_ref: &str, host: Option<&str>, names: &HashMap<String, String>, trace: &Trace) -> Result<(), ApiError>;
+    /// Makes a VM the way XenCenter does: a copy of the template, made into a VM, its CPUs,
+    /// memory and boot mode set, then its disk, a DVD drive with the ISO and a network card; then
+    /// started, if asked. Anything made before a failure is taken away again. A VM that's made but
+    /// won't start stays, with the reason.
+    /// Makes the VM (not started), each call in `trace`; its reference.
+    fn create_vm(&self, spec: &NewVm, trace: &Trace) -> Result<String, ApiError>;
+    /// Starts a VM, in `trace` as `label`, waiting as long as the server takes.
+    fn start_traced(&self, vm: &str, label: &str, trace: &Trace) -> Result<(), ApiError>;
     /// Deletes an ISO file: its disc, and the file on the share. Shut-down VMs that have it in a
     /// DVD drive get the drive emptied first, as destroying a disc also destroys the drives it's in.
     fn delete_iso(&self, vdi_ref: &str) -> Result<(), ApiError>;
+    /// Deletes a VM: turned off first if it isn't (forced), its snapshots, then the VM; with
+    /// `disks`, then the disks only it and its snapshots use (a disk another VM has stays). DVD
+    /// drives just go, the ISO files in them untouched. The disks that couldn't be deleted (the
+    /// VM is gone by then): each one's name and why.
+    fn delete_vm(&self, vm_ref: &str, disks: bool) -> Result<Vec<String>, ApiError>;
     /// Changes a disc's description (an ISO file's, in an ISO library).
     fn set_vdi_description(&self, vdi_ref: &str, text: &str) -> Result<(), ApiError>;
     /// Copies a file into an ISO library as `name` (see `iso_file_name`): a new disc in the library,
@@ -73,6 +96,92 @@ pub trait Connection: Send + Sync {
     /// one takes them on the pool coordinator. A failed or cancelled upload leaves nothing behind.
     fn upload_iso(&self, sr_ref: &str, address: Option<&str>, src: &Source, name: &str, t: &Arc<Transfer>) -> Result<(), ApiError>;
     fn close(&self);
+}
+
+/// What a job asked the server and what it answered, line by line, as it happens: the New VM
+/// dialog shows it in a terminal-like box. Shared with the thread doing the job.
+#[derive(Default)]
+pub struct Trace {
+    lines: Mutex<Vec<(Said, String)>>,
+    /// When the last line came.
+    last: Mutex<Option<Instant>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Said {
+    /// A call: its method and arguments.
+    Asked,
+    /// The server's answer to it.
+    Answer,
+    /// An error: its code, then its details.
+    Error,
+    /// The app's own remark ("carrying on", "undoing…").
+    Note,
+}
+
+impl Trace {
+    pub fn push(&self, k: Said, text: impl Into<String>) {
+        self.lines.lock().unwrap().push((k, text.into()));
+        *self.last.lock().unwrap() = Some(Instant::now());
+    }
+    pub fn lines(&self) -> Vec<(Said, String)> {
+        self.lines.lock().unwrap().clone()
+    }
+    /// How long the last call has gone unanswered (None when it has its answer).
+    pub fn waiting(&self) -> Option<Duration> {
+        let asked = self.lines.lock().unwrap().last().map_or(false, |(k, _)| *k == Said::Asked);
+        if asked {
+            self.last.lock().unwrap().map(|t| t.elapsed())
+        } else {
+            None
+        }
+    }
+    /// The whole of it to copy: each call after "> ", the answers under it, indented.
+    pub fn text(&self) -> String {
+        self.lines().iter().map(|(k, l)| if *k == Said::Asked { format!("> {}", l) } else { format!("  {}", l) }).collect::<Vec<_>>().join("\n")
+    }
+    /// A call's outcome: its answer (OK, a reference, a value) and how long it took, or its error.
+    fn outcome(&self, r: &Result<Value, ApiError>, took: Duration) {
+        match r {
+            Ok(v) => {
+                let what = match v {
+                    Value::Null => "OK".to_string(),
+                    Value::String(s) if s.is_empty() => "OK".to_string(),
+                    Value::String(s) => s.clone(),
+                    Value::Array(a) => format!("{} item{}", a.len(), if a.len() == 1 { "" } else { "s" }),
+                    Value::Object(_) => "OK (a record)".to_string(),
+                    other => other.to_string(),
+                };
+                self.push(Said::Answer, format!("{}  ({:.1} s)", what, took.as_secs_f32()));
+            }
+            Err(e) => {
+                self.push(Said::Error, format!("Error code: {}", e.code));
+                for d in e.details.iter().filter(|d| !d.trim().is_empty()) {
+                    self.push(Said::Error, d.trim());
+                }
+            }
+        }
+    }
+}
+
+/// How the trace names a reference: by what it's called, if known, else as it is.
+fn named(names: &HashMap<String, String>, r: &str) -> String {
+    names.get(r).map(|n| format!("\"{}\"", n)).unwrap_or_else(|| r.to_string())
+}
+
+/// The value of a template recommendation (<restriction field="…" value="…"/>), if it's there.
+fn restriction(xml: &str, field: &str) -> Option<String> {
+    let at = xml.find(&format!("field=\"{}\"", field))?;
+    let start = xml[..at].rfind('<')?;
+    let end = at + xml[at..].find('>')?;
+    let tag = &xml[start..end];
+    let v = tag.find("value=\"")? + 7;
+    Some(tag[v..].split('"').next()?.to_string())
+}
+
+/// The size of the first disk in a template's provisioning list (<disk … size="…"/>).
+fn provision_size(xml: &str) -> i64 {
+    xml.find("size=\"").and_then(|i| xml[i + 6..].split('"').next()?.parse().ok()).unwrap_or(0)
 }
 
 /// Where an upload's bytes come from.
@@ -587,6 +696,7 @@ impl Connection for RealConnection {
         for (_, r) in self.all("pool", t)? {
             pd.name = s(&r, "name_label");
             master = s(&r, "master");
+            pd.default_sr = Some(s(&r, "default_SR")).filter(|x| !x.is_empty() && x != "OpaqueRef:NULL");
         }
         let metrics = self.all("host_metrics", t)?;
         for (k, r) in self.all("host", t)? {
@@ -655,6 +765,29 @@ impl Connection for RealConnection {
         let vbds = self.all("VBD", t)?;
         let vdis = self.all("VDI", t)?;
         let vm_records = self.all("VM", t)?;
+        // the built-in templates (a copy made by someone has no default_template mark)
+        for (k, r) in vm_records.iter().filter(|(_, r)| b(r, "is_a_template") && !b(r, "is_a_snapshot")) {
+            let other = r.get("other_config").cloned().unwrap_or(Value::Null);
+            if s(&other, "default_template") != "true" {
+                continue;
+            }
+            let platform = r.get("platform").cloned().unwrap_or(Value::Null);
+            let boot = r.get("HVM_boot_params").cloned().unwrap_or(Value::Null);
+            let rec = s(r, "recommendations");
+            pd.templates.push(TemplateInfo {
+                rref: k.clone(),
+                name: s(r, "name_label"),
+                uefi: s(&boot, "firmware").eq_ignore_ascii_case("uefi"),
+                secure_boot: s(&platform, "secureboot").to_lowercase(),
+                vtpm: s(&platform, "vtpm").eq_ignore_ascii_case("true"),
+                supports_uefi: restriction(&rec, "supports-uefi").as_deref() == Some("yes"),
+                supports_secure_boot: restriction(&rec, "supports-secure-boot").as_deref() == Some("yes"),
+                mem_min: n(r, "memory_static_min"),
+                vcpus: n(r, "VCPUs_at_startup"),
+                disk: provision_size(&s(&other, "disks")),
+            });
+        }
+        pd.templates.sort_by_key(|t| (t.name != OTHER_MEDIA, t.name.to_lowercase()));
         // an ISO library's discs are its VDIs; the VMs with one in a DVD drive, through its VBDs
         let in_drives = |v: &Value| -> Vec<(String, bool)> {
             list(v, "VBDs")
@@ -789,9 +922,220 @@ impl Connection for RealConnection {
         }
         self.call("SR.forget", vec![json!(sr_ref)], t).map(|_| ())
     }
+    fn check_sr(&self, sr: &str, host: Option<&str>, names: &HashMap<String, String>, tr: &Trace) -> Result<(), ApiError> {
+        let t = 30_000;
+        let label = named(names, sr);
+        let gone = |code: &str| ApiError { code: code.into(), details: vec![names.get(sr).cloned().unwrap_or_default()] };
+        // plugged into the server it's for (or any)
+        tr.push(Said::Asked, format!("SR.get_PBDs  SR={}", label));
+        let started = Instant::now();
+        let plugged = (|| -> Result<Vec<(String, bool)>, ApiError> {
+            let mut out = vec![];
+            for p in self.call("SR.get_PBDs", vec![json!(sr)], t)?.as_array().cloned().unwrap_or_default() {
+                let r = self.call("PBD.get_record", vec![p], t)?;
+                out.push((s(&r, "host"), b(&r, "currently_attached")));
+            }
+            Ok(out)
+        })();
+        let plugged = plugged.map_err(|e| {
+            tr.outcome(&Err(e.clone()), started.elapsed());
+            e
+        })?;
+        let on = host.map(|h| named(names, h)).unwrap_or_else(|| "a server".into());
+        if !plugged.iter().any(|(h, attached)| *attached && host.map_or(true, |x| x == h)) {
+            tr.push(Said::Error, format!("not plugged in on {}", on));
+            return Err(gone(NOT_PLUGGED));
+        }
+        tr.push(Said::Answer, format!("plugged in on {}  ({:.1} s)", on, started.elapsed().as_secs_f32()));
+        // then looked at
+        tr.push(Said::Asked, format!("SR.scan  SR={}", label));
+        let started = Instant::now();
+        let task = self.call("Async.SR.scan", vec![json!(sr)], t).map_err(|e| {
+            tr.outcome(&Err(e.clone()), started.elapsed());
+            e
+        })?;
+        let task = task.as_str().unwrap_or_default().to_string();
+        match self.task_result(&task, Duration::from_secs(CHECK_SECS)) {
+            Ok(false) => {
+                // it goes on (on the server) till the share is back; asked to stop anyway
+                let _ = self.call("task.cancel", vec![json!(task)], t);
+                tr.push(Said::Error, format!("no answer in {} s", CHECK_SECS));
+                Err(gone(NOT_ANSWERING))
+            }
+            r => {
+                let _ = self.call("task.destroy", vec![json!(task)], t);
+                let r = r.map(|_| Value::Null);
+                tr.outcome(&r, started.elapsed());
+                r.map(|_| ())
+            }
+        }
+    }
 
     fn set_vdi_description(&self, vdi_ref: &str, text: &str) -> Result<(), ApiError> {
         self.call("VDI.set_name_description", vec![json!(vdi_ref), json!(text)], 30_000).map(|_| ())
+    }
+
+    fn create_vm(&self, v: &NewVm, tr: &Trace) -> Result<String, ApiError> {
+        let t = 120_000;
+        // each call goes in the trace, with its answer
+        let call = |shown: String, method: &str, args: Vec<Value>, timeout: u64| {
+            tr.push(Said::Asked, shown);
+            let started = Instant::now();
+            let r = self.call(method, args, timeout);
+            tr.outcome(&r, started.elapsed());
+            r
+        };
+        // a call whose failure doesn't matter
+        let may = |shown: String, method: &str, args: Vec<Value>| {
+            if call(shown, method, args, t).is_err() {
+                tr.push(Said::Note, "(not needed; carrying on)");
+            }
+        };
+        // first, that the ISO's library (and the disk's storage, if it's on the network) answers
+        for sr in &v.check {
+            self.check_sr(sr, v.host.as_deref(), &v.names, tr)?;
+        }
+        let mut names = v.names.clone();
+        let vm = call(format!("VM.clone  vm={}  new_name=\"{}\"", named(&names, &v.template), v.name), "VM.clone", vec![json!(v.template), json!(v.name)], 300_000)?;
+        let vm = vm.as_str().unwrap_or_default().to_string();
+        names.insert(vm.clone(), v.name.clone());
+        let me = named(&names, &vm);
+        let mut disk: Option<String> = None;
+        let made = (|| -> Result<(), ApiError> {
+            let tpl = call(format!("VM.get_record  vm={}", named(&names, &v.template)), "VM.get_record", vec![json!(v.template)], t)?;
+            // the vendor device (Windows gets its drivers through Windows Update), when the
+            // template recommends it and the pool's policy allows it; a licence may still say no
+            if restriction(&s(&tpl, "recommendations"), "has-vendor-device").as_deref() == Some("true") {
+                let pool = call("pool.get_all".into(), "pool.get_all", vec![], t)?.as_array().and_then(|a| a.first().cloned()).unwrap_or(Value::Null);
+                let shown = format!("pool.get_policy_no_vendor_device  pool={}", pool.as_str().unwrap_or_default());
+                let refused = call(shown, "pool.get_policy_no_vendor_device", vec![pool], t)?.as_bool().unwrap_or(true);
+                if !refused {
+                    may(format!("VM.set_has_vendor_device  vm={}  value=true", me), "VM.set_has_vendor_device", vec![json!(vm), json!(true)]);
+                }
+            }
+            // its disk is made below, not from the template's own list; provision also turns the
+            // copy of the template into a VM
+            may(format!("VM.remove_from_other_config  vm={}  key=\"disks\"", me), "VM.remove_from_other_config", vec![json!(vm), json!("disks")]);
+            call(format!("VM.provision  vm={}", me), "VM.provision", vec![json!(vm)], 300_000)?;
+            if !v.description.is_empty() {
+                call(format!("VM.set_name_description  vm={}  value=\"{}\"", me, v.description), "VM.set_name_description", vec![json!(vm), json!(v.description)], t)?;
+            }
+            // CPUs: raise the maximum before the count at start, or lower the count first
+            let (max, at_start) = ("VM.set_VCPUs_max", "VM.set_VCPUs_at_startup");
+            let order = if v.vcpus > n(&tpl, "VCPUs_max") { [max, at_start] } else { [at_start, max] };
+            for m in order {
+                call(format!("{}  vm={}  value={}", m, me, v.vcpus), m, vec![json!(vm), json!(v.vcpus)], t)?;
+            }
+            may(format!("VM.remove_from_platform  vm={}  key=\"cores-per-socket\"", me), "VM.remove_from_platform", vec![json!(vm), json!("cores-per-socket")]);
+            let shown = format!("VM.add_to_platform  vm={}  key=\"cores-per-socket\"  value=\"{}\"", me, v.cores_per_socket);
+            call(shown, "VM.add_to_platform", vec![json!(vm), json!("cores-per-socket"), json!(v.cores_per_socket.to_string())], t)?;
+            // memory: fixed at the chosen size
+            let floor = n(&tpl, "memory_static_min").min(v.memory);
+            let shown = format!("VM.set_memory_limits  vm={}  static_min={}  dynamic_min={}  dynamic_max={}  static_max={}", me, floor, v.memory, v.memory, v.memory);
+            call(shown, "VM.set_memory_limits", vec![json!(vm), json!(floor), json!(v.memory), json!(v.memory), json!(v.memory)], t)?;
+            // the boot mode, only when it isn't the template's
+            if let Some(boot) = v.boot {
+                let firmware = if boot == Boot::Bios { "bios" } else { "uefi" };
+                let secure = if boot == Boot::UefiSecure { "true" } else { "false" };
+                may(format!("VM.remove_from_HVM_boot_params  vm={}  key=\"firmware\"", me), "VM.remove_from_HVM_boot_params", vec![json!(vm), json!("firmware")]);
+                let shown = format!("VM.add_to_HVM_boot_params  vm={}  key=\"firmware\"  value=\"{}\"", me, firmware);
+                call(shown, "VM.add_to_HVM_boot_params", vec![json!(vm), json!("firmware"), json!(firmware)], t)?;
+                may(format!("VM.remove_from_platform  vm={}  key=\"secureboot\"", me), "VM.remove_from_platform", vec![json!(vm), json!("secureboot")]);
+                let shown = format!("VM.add_to_platform  vm={}  key=\"secureboot\"  value=\"{}\"", me, secure);
+                call(shown, "VM.add_to_platform", vec![json!(vm), json!("secureboot"), json!(secure)], t)?;
+            }
+            if let Some(h) = &v.host {
+                call(format!("VM.set_affinity  vm={}  host={}", me, named(&names, h)), "VM.set_affinity", vec![json!(vm), json!(h)], t)?;
+            }
+            // its disk
+            let label = format!("{} disk", v.name);
+            let shown = format!("VDI.create  SR={}  name_label=\"{}\"  virtual_size={}  type=system", named(&names, &v.sr), label, v.disk);
+            let record = json!({
+                "name_label": label, "name_description": "Created by Simple VM Manager", "SR": v.sr,
+                "virtual_size": v.disk, "type": "system", "sharable": false, "read_only": false,
+                "other_config": {}, "xenstore_data": {}, "sm_config": { "vmhint": vm }, "tags": [],
+            });
+            let vdi = call(shown, "VDI.create", vec![record], 300_000)?.as_str().unwrap_or_default().to_string();
+            names.insert(vdi.clone(), label);
+            disk = Some(vdi.clone());
+            let drive = |vdi: &str, device: &str, cd: bool| {
+                json!({
+                    "VM": vm, "VDI": vdi, "userdevice": device, "bootable": cd, "mode": if cd { "RO" } else { "RW" },
+                    "type": if cd { "CD" } else { "Disk" }, "unpluggable": true, "empty": false,
+                    "other_config": if cd { json!({}) } else { json!({ "owner": "" }) },
+                    "qos_algorithm_type": "", "qos_algorithm_params": {}, "device": "", "currently_attached": false,
+                })
+            };
+            let shown = format!("VBD.create  VM={}  VDI={}  userdevice=0  type=Disk  mode=RW  bootable=false", me, named(&names, &vdi));
+            call(shown, "VBD.create", vec![drive(&vdi, "0", false)], t)?;
+            // the DVD drive, with the ISO in it (one the template brought is used)
+            let mut cd = None;
+            for vbd in call(format!("VM.get_VBDs  vm={}", me), "VM.get_VBDs", vec![json!(vm)], t)?.as_array().cloned().unwrap_or_default() {
+                let id = vbd.as_str().unwrap_or_default().to_string();
+                let r = call(format!("VBD.get_record  vbd={}", id), "VBD.get_record", vec![vbd.clone()], t)?;
+                if s(&r, "type") == "CD" {
+                    if !b(&r, "empty") {
+                        call(format!("VBD.eject  vbd={}", id), "VBD.eject", vec![vbd.clone()], t)?;
+                    }
+                    cd = Some((vbd, id));
+                    break;
+                }
+            }
+            let iso = named(&names, &v.iso);
+            match cd {
+                Some((vbd, id)) => {
+                    call(format!("VBD.insert  vbd={}  vdi={}", id, iso), "VBD.insert", vec![vbd, json!(v.iso)], t)?;
+                }
+                None => {
+                    let shown = format!("VBD.create  VM={}  VDI={}  userdevice=3  type=CD  mode=RO  bootable=true", me, iso);
+                    call(shown, "VBD.create", vec![drive(&v.iso, "3", true)], t)?;
+                }
+            }
+            // its network card (any the template brought go)
+            for vif in call(format!("VM.get_VIFs  vm={}", me), "VM.get_VIFs", vec![json!(vm)], t)?.as_array().cloned().unwrap_or_default() {
+                call(format!("VIF.destroy  vif={}", vif.as_str().unwrap_or_default()), "VIF.destroy", vec![vif], t)?;
+            }
+            if let Some(net) = &v.network {
+                let mtu = call(format!("network.get_MTU  network={}", named(&names, net)), "network.get_MTU", vec![json!(net)], t).map(|m| n(&json!({ "m": m }), "m")).unwrap_or(1500);
+                let card = json!({
+                    "device": "0", "network": net, "VM": vm, "MAC": "", "MTU": mtu.max(68), "other_config": {},
+                    "qos_algorithm_type": "", "qos_algorithm_params": {}, "locking_mode": "network_default",
+                    "ipv4_allowed": [], "ipv6_allowed": [], "currently_attached": false,
+                });
+                call(format!("VIF.create  VM={}  network={}  device=0  MTU={}", me, named(&names, net), mtu.max(68)), "VIF.create", vec![card], t)?;
+            }
+            Ok(())
+        })();
+        if let Err(e) = made {
+            tr.push(Said::Note, "Undoing what was made:");
+            if let Some(d) = disk {
+                let _ = call(format!("VDI.destroy  vdi={}", named(&names, &d)), "VDI.destroy", vec![json!(d)], t);
+            }
+            let _ = call(format!("VM.destroy  vm={}", me), "VM.destroy", vec![json!(vm)], t); // with its drives and card
+            return Err(e);
+        }
+        Ok(vm)
+    }
+
+    /// As a task on the server (Async.VM.start), watched until it ends: a start can take a while
+    /// (the server may first have to free memory, or reach the ISO's share).
+    fn start_traced(&self, vm: &str, label: &str, tr: &Trace) -> Result<(), ApiError> {
+        tr.push(Said::Asked, format!("VM.start  vm={}  start_paused=false  force=false", label));
+        let started = Instant::now();
+        let r = self.call("Async.VM.start", vec![json!(vm), json!(false), json!(false)], 60_000).and_then(|task| {
+            let task = task.as_str().unwrap_or_default().to_string();
+            let r = self.task_result(&task, Duration::from_secs(600));
+            if !matches!(r, Ok(false)) {
+                let _ = self.call("task.destroy", vec![json!(task)], 30_000);
+            }
+            match r {
+                Ok(true) => Ok(Value::Null),
+                Ok(false) => Err(ApiError::other(format!("It's still starting after 10 minutes (the server's task {} goes on).", task))),
+                Err(e) => Err(e),
+            }
+        });
+        tr.outcome(&r, started.elapsed());
+        r.map(|_| ())
     }
 
     fn delete_iso(&self, vdi_ref: &str) -> Result<(), ApiError> {
@@ -809,6 +1153,49 @@ impl Connection for RealConnection {
             self.call("VBD.eject", vec![vbd], 120_000)?;
         }
         self.call("VDI.destroy", vec![json!(vdi_ref)], 120_000).map(|_| ())
+    }
+    fn delete_vm(&self, vm: &str, disks: bool) -> Result<Vec<String>, ApiError> {
+        let t = 60_000;
+        let strings = |v: Value| -> Vec<String> { v.as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default() };
+        // off, the hard way (a suspended VM's saved memory goes too)
+        if self.call("VM.get_power_state", vec![json!(vm)], t)?.as_str() != Some("Halted") {
+            self.call("VM.hard_shutdown", vec![json!(vm)], 300_000)?;
+        }
+        // the VM and its snapshots; then the disks that only they use, found before they go
+        let mut going = vec![vm.to_string()];
+        going.extend(strings(self.call("VM.get_snapshots", vec![json!(vm)], t)?));
+        let mut vdis: Vec<(String, String)> = vec![];
+        if disks {
+            for owner in &going {
+                for vbd in strings(self.call("VM.get_VBDs", vec![json!(owner)], t)?) {
+                    let r = self.call("VBD.get_record", vec![json!(vbd)], t)?;
+                    let vdi = s(&r, "VDI");
+                    if s(&r, "type") != "Disk" || vdi.is_empty() || vdi == "OpaqueRef:NULL" || vdis.iter().any(|(v, _)| *v == vdi) {
+                        continue;
+                    }
+                    let mut shared = false;
+                    for other in strings(self.call("VDI.get_VBDs", vec![json!(vdi)], t)?) {
+                        let user = self.call("VBD.get_VM", vec![json!(other)], t)?;
+                        shared |= !going.iter().any(|g| Some(g.as_str()) == user.as_str());
+                    }
+                    if !shared {
+                        let name = self.call("VDI.get_name_label", vec![json!(vdi)], t)?.as_str().unwrap_or_default().to_string();
+                        vdis.push((vdi, name));
+                    }
+                }
+            }
+        }
+        for snapshot in &going[1..] {
+            self.call("VM.destroy", vec![json!(snapshot)], t)?;
+        }
+        self.call("VM.destroy", vec![json!(vm)], t)?;
+        let mut left = vec![];
+        for (vdi, name) in vdis {
+            if let Err(e) = self.call("VDI.destroy", vec![json!(vdi)], 300_000) {
+                left.push(format!("{}: {}", if name.is_empty() { vdi } else { name }, e.message()));
+            }
+        }
+        Ok(left)
     }
 
     /// VDI.create in the library (sm_config "path" names the file on the share), then the bytes in
@@ -976,7 +1363,7 @@ pub struct DemoConnection {
 
 impl DemoConnection {
     pub fn new() -> DemoConnection {
-        let mut d = PoolData { name: "Demo Pool".into(), ..Default::default() };
+        let mut d = PoolData { name: "Demo Pool".into(), templates: demo_templates(), ..Default::default() };
         let host = |r: &str, name: &str, addr: &str, master: bool| HostInfo {
             rref: r.into(),
             uuid: demo_uuid(),
@@ -1057,6 +1444,33 @@ impl DemoConnection {
         recompute(&mut d);
         DemoConnection { data: Mutex::new(d) }
     }
+}
+
+/// Some of XenServer's built-in templates, with what they set up.
+fn demo_templates() -> Vec<TemplateInfo> {
+    let t = |name: &str, uefi: bool, sb: &str, vtpm: bool, mem_gb: i64, vcpus: i64, disk_gb: i64| TemplateInfo {
+        rref: format!("tpl-{}", name.to_lowercase().replace(|c: char| !c.is_ascii_alphanumeric(), "-")),
+        name: name.into(),
+        uefi,
+        secure_boot: sb.into(),
+        vtpm,
+        supports_uefi: true,
+        supports_secure_boot: name.starts_with("Windows") || name.starts_with("Ubuntu") || name.starts_with("Debian"),
+        mem_min: mem_gb * GB,
+        vcpus,
+        disk: disk_gb * GB,
+    };
+    vec![
+        t("Other install media", false, "", false, 1, 1, 0),
+        t("Debian Bookworm 12", false, "", false, 1, 1, 10),
+        t("Rocky Linux 9", false, "", false, 2, 1, 10),
+        t("Ubuntu Jammy Jellyfish 22.04", false, "", false, 2, 1, 10),
+        t("Ubuntu Noble Numbat 24.04", false, "", false, 2, 1, 10),
+        t("Windows 10 (64-bit)", false, "", false, 2, 2, 32),
+        t("Windows 11", true, "auto", true, 4, 2, 64),
+        t("Windows Server 2022 (64-bit)", true, "auto", false, 2, 2, 32),
+        t("Windows Server 2025 (64-bit)", true, "auto", false, 2, 2, 32),
+    ]
 }
 
 /// The discs in the demo's ISO library `sr`, two of them described.
@@ -1274,6 +1688,23 @@ impl Connection for DemoConnection {
         d.srs.retain(|x| x.rref != sr_ref);
         Ok(())
     }
+    /// Answers in under a second, but the storage named in SVM_DEMO_OFFLINE (a comma-separated
+    /// list of references, such as sr-iso) is offline, so the red box can be tried out.
+    fn check_sr(&self, sr: &str, host: Option<&str>, names: &HashMap<String, String>, tr: &Trace) -> Result<(), ApiError> {
+        let on = host.map(|h| named(names, h)).unwrap_or_else(|| "a server".into());
+        tr.push(Said::Asked, format!("SR.get_PBDs  SR={}", named(names, sr)));
+        std::thread::sleep(Duration::from_millis(150));
+        tr.push(Said::Answer, format!("plugged in on {}  (0.1 s)", on));
+        tr.push(Said::Asked, format!("SR.scan  SR={}", named(names, sr)));
+        if std::env::var("SVM_DEMO_OFFLINE").map_or(false, |v| v.split(',').any(|x| x.trim() == sr)) {
+            std::thread::sleep(Duration::from_millis(2500));
+            tr.push(Said::Error, format!("no answer in {} s", CHECK_SECS));
+            return Err(ApiError { code: NOT_ANSWERING.into(), details: vec![names.get(sr).cloned().unwrap_or_default()] });
+        }
+        std::thread::sleep(Duration::from_millis(250));
+        tr.push(Said::Answer, "OK  (0.3 s)");
+        Ok(())
+    }
     /// Pretends to send the file in about four seconds; a name already in the library is refused
     /// the way the server's ISO driver refuses it.
     fn upload_iso(&self, sr_ref: &str, _address: Option<&str>, src: &Source, name: &str, t: &Arc<Transfer>) -> Result<(), ApiError> {
@@ -1304,6 +1735,71 @@ impl Connection for DemoConnection {
         x.files.sort_by_key(|f| f.name.to_lowercase());
         Ok(())
     }
+    /// Adds the VM to the demo pool, started on the server with the most memory free if asked.
+    fn create_vm(&self, v: &NewVm, tr: &Trace) -> Result<String, ApiError> {
+        for sr in &v.check {
+            self.check_sr(sr, v.host.as_deref(), &v.names, tr)?;
+        }
+        // the calls a real server gets, a few of them, with made-up answers
+        let rref = format!("vm-new-{}", self.data.lock().unwrap().vms.len());
+        let me = format!("\"{}\"", v.name);
+        let steps = [
+            (format!("VM.clone  vm={}  new_name={}", named(&v.names, &v.template), me), format!("OpaqueRef:{}", rref)),
+            (format!("VM.provision  vm={}", me), "OK".into()),
+            (format!("VM.set_VCPUs_at_startup  vm={}  value={}", me, v.vcpus), "OK".into()),
+            (format!("VM.set_memory_limits  vm={}  static_min={}  dynamic_min={}  dynamic_max={}  static_max={}", me, v.memory, v.memory, v.memory, v.memory), "OK".into()),
+            (format!("VDI.create  SR={}  name_label=\"{} disk\"  virtual_size={}  type=system", named(&v.names, &v.sr), v.name, v.disk), "OpaqueRef:demo-disk".into()),
+            (format!("VBD.create  VM={}  VDI=\"{} disk\"  userdevice=0  type=Disk  mode=RW  bootable=false", me, v.name), "OpaqueRef:demo-vbd-0".into()),
+            (format!("VBD.create  VM={}  VDI={}  userdevice=3  type=CD  mode=RO  bootable=true", me, named(&v.names, &v.iso)), "OpaqueRef:demo-vbd-3".into()),
+        ];
+        for (asked, answer) in steps {
+            tr.push(Said::Asked, asked);
+            std::thread::sleep(Duration::from_millis(150));
+            tr.push(Said::Answer, format!("{}  (0.1 s)", answer));
+        }
+        if let Some(net) = &v.network {
+            tr.push(Said::Asked, format!("VIF.create  VM={}  network={}  device=0  MTU=1500", me, named(&v.names, net)));
+            tr.push(Said::Answer, "OpaqueRef:demo-vif-0  (0.1 s)");
+        }
+        let mut d = self.data.lock().unwrap();
+        let template = d.templates.iter().find(|t| t.rref == v.template).map(|t| t.name.clone()).unwrap_or_default();
+        let iso = d.srs.iter().flat_map(|x| x.files.iter().map(move |f| (x, f))).find(|(_, f)| f.vdi == v.iso).map(|(x, f)| (x.name.clone(), f.name.clone(), f.size));
+        let sr_name = d.sr(&v.sr).map(|x| x.name.clone()).unwrap_or_default();
+        let network = v.network.as_deref().and_then(|r| d.networks.iter().find(|n| n.rref == r)).map(|n| n.name.clone());
+        let mut vm = VmInfo {
+            rref: rref.clone(),
+            uuid: demo_uuid(),
+            name: v.name.clone(),
+            description: v.description.clone(),
+            os: if template == OTHER_MEDIA { String::new() } else { template },
+            power: PowerState::Halted,
+            vcpus: v.vcpus,
+            mem_static_max: v.memory,
+            mem_dyn_min: v.memory,
+            mem_dyn_max: v.memory,
+            affinity: v.host.clone(),
+            storage_host: d.sr(&v.sr).and_then(|x| x.host.clone()),
+            allowed: vec!["start".into(), "start_on".into()],
+            ..Default::default()
+        };
+        vm.disks.push(VmDisk { device: "0".into(), name: format!("{} disk", v.name), sr_name, kind: "Disk".into(), size: v.disk });
+        if let Some((lib, file, size)) = iso {
+            vm.disks.push(VmDisk { device: "3".into(), name: file, sr_name: lib, kind: "DVD drive".into(), size });
+        }
+        if let Some(net) = network {
+            vm.nics.push(VmNic { device: "0".into(), mac: "aa:bb:cc:00:11:22".into(), network: net, ip: String::new() });
+        }
+        d.vms.push(vm);
+        recompute(&mut d);
+        drop(d);
+        Ok(rref)
+    }
+    fn start_traced(&self, vm: &str, label: &str, tr: &Trace) -> Result<(), ApiError> {
+        tr.push(Said::Asked, format!("VM.start  vm={}  start_paused=false  force=false", label));
+        let r = self.run_action(vm, ACTIONS.iter().find(|a| a.op == "start").unwrap());
+        tr.outcome(&r.as_ref().map(|_| Value::Null).map_err(|e| e.clone()), Duration::from_millis(DEMO_ACTION_MS));
+        r
+    }
     /// A disc in a running VM's drive can't go, as on a real server.
     fn delete_iso(&self, vdi_ref: &str) -> Result<(), ApiError> {
         std::thread::sleep(Duration::from_millis(500));
@@ -1315,6 +1811,16 @@ impl Connection for DemoConnection {
         }
         x.files.retain(|f| f.vdi != vdi_ref);
         Ok(())
+    }
+    /// Takes the VM out of the demo pool (a running one is "turned off" first, taking longer).
+    fn delete_vm(&self, vm_ref: &str, _disks: bool) -> Result<Vec<String>, ApiError> {
+        let running = self.data.lock().unwrap().vm(vm_ref).map(|v| v.power != PowerState::Halted);
+        let Some(running) = running else {
+            return Err(ApiError { code: "HANDLE_INVALID".into(), details: vec!["VM".into(), vm_ref.into()] });
+        };
+        std::thread::sleep(Duration::from_millis(if running { 1500 } else { 700 }));
+        self.data.lock().unwrap().vms.retain(|v| v.rref != vm_ref);
+        Ok(vec![])
     }
     fn set_vdi_description(&self, vdi_ref: &str, text: &str) -> Result<(), ApiError> {
         std::thread::sleep(Duration::from_millis(400));
@@ -1396,6 +1902,61 @@ mod tests {
         assert_eq!(c.upload_iso("sr-iso", None, &file, "other.iso", &t).unwrap_err().code, CANCELLED);
         assert!(!has("other.iso"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn demo_create_vm() {
+        let c = DemoConnection::new();
+        let d = c.data.lock().unwrap().clone();
+        let tpl = d.templates.iter().find(|t| t.name == "Ubuntu Noble Numbat 24.04").unwrap().rref.clone();
+        let net = d.networks[0].rref.clone();
+        let spec = NewVm {
+            name: "Ubuntu 24.04".into(), template: tpl, iso: "sr-iso-vdi-2".into(), vcpus: 2, cores_per_socket: 2,
+            memory: 4 * GB, disk: 40 * GB, sr: "sr-nfs".into(), network: Some(net), start: true, ..Default::default()
+        };
+        let tr = Trace::default();
+        let made = c.create_vm(&spec, &tr).unwrap();
+        c.start_traced(&made, "\"Ubuntu 24.04\"", &tr).unwrap();
+        assert!(tr.text().starts_with("> VM.clone"), "{}", tr.text());
+        // the ISO's library checked first
+        let checked = NewVm { name: "Checked".into(), check: vec!["sr-iso".into()], start: false, ..spec.clone() };
+        let first = Trace::default();
+        c.create_vm(&checked, &first).unwrap();
+        assert!(first.text().starts_with("> SR.get_PBDs  SR=sr-iso"), "{}", first.text());
+        assert!(first.text().contains("> SR.scan") && first.text().contains("> VM.clone"));
+        assert!(tr.text().contains("> VM.start"));
+        assert!(tr.waiting().is_none());
+        let d = c.data.lock().unwrap().clone();
+        let vm = d.vm(&made).unwrap();
+        assert_eq!((vm.name.as_str(), vm.power, vm.vcpus, vm.mem_dyn_max), ("Ubuntu 24.04", PowerState::Running, 2, 4 * GB));
+        assert_eq!(vm.os, "Ubuntu Noble Numbat 24.04");
+        let drives: Vec<(&str, &str)> = vm.disks.iter().map(|k| (k.kind.as_str(), k.name.as_str())).collect();
+        assert_eq!(drives, vec![("Disk", "Ubuntu 24.04 disk"), ("DVD drive", "ubuntu-24.04.1-live-server-amd64.iso")]);
+        assert_eq!(vm.nics.len(), 1);
+        // without a network, and left off
+        let made = c.create_vm(&NewVm { name: "Quiet".into(), network: None, start: false, ..spec }, &Trace::default()).unwrap();
+        let d = c.data.lock().unwrap().clone();
+        let vm = d.vm(&made).unwrap();
+        assert_eq!((vm.power, vm.nics.len()), (PowerState::Halted, 0));
+    }
+
+    #[test]
+    fn demo_delete_vm() {
+        let c = DemoConnection::new();
+        // running: turned off, then gone
+        assert_eq!(c.delete_vm("vm-web", true).unwrap(), Vec::<String>::new());
+        assert!(c.data.lock().unwrap().vm("vm-web").is_none());
+        assert_eq!(c.delete_vm("vm-web", true).unwrap_err().code, "HANDLE_INVALID");
+    }
+
+    #[test]
+    fn template_recommendations() {
+        let rec = "<restrictions><restriction field=\"memory-static-max\" max=\"1649267441664\"/><restriction field=\"supports-uefi\" value=\"yes\"/><restriction field=\"has-vendor-device\" value=\"true\"/></restrictions>";
+        assert_eq!(restriction(rec, "supports-uefi").as_deref(), Some("yes"));
+        assert_eq!(restriction(rec, "has-vendor-device").as_deref(), Some("true"));
+        assert_eq!(restriction(rec, "supports-secure-boot"), None);
+        assert_eq!(provision_size("<provision><disk device=\"0\" size=\"34359738368\" sr=\"\" bootable=\"true\" type=\"system\"/></provision>"), 34359738368);
+        assert_eq!(provision_size(""), 0);
     }
 
     #[test]

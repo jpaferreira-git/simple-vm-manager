@@ -146,6 +146,7 @@ pub fn paint_tool(p: &Painter, rect: Rect, op: &str, enabled: bool, pal: &Pal) {
         "hard_reboot" => pal.orange,
         "suspend" | "resume" => pal.blue,
         "start" | "connect" => pal.green,
+        "newvm" => pal.blue,
         "iso" => pal.orange,
         _ => pal.icon,
     };
@@ -183,6 +184,15 @@ pub fn paint_tool(p: &Painter, rect: Rect, op: &str, enabled: bool, pal: &Pal) {
             p.circle_stroke(c, 7.2, Stroke::new(1.8, col));
             p.circle_stroke(c, 2.0, Stroke::new(1.5, col));
             arc(p, c, 4.7, 200.0, 265.0, Stroke::new(1.3, col));
+        }
+        "newvm" => {
+            // a screen on its stand, a plus on it
+            let s = Stroke::new(1.8, col);
+            rrect(p, o, 3.5, 4.0, 15.0, 10.5, 2.0, s);
+            line(p, o, &[(8.0, 18.0), (14.0, 18.0)], s);
+            line(p, o, &[(11.0, 14.5), (11.0, 18.0)], s);
+            line(p, o, &[(11.0, 6.6), (11.0, 11.9)], Stroke::new(1.7, col));
+            line(p, o, &[(8.3, 9.25), (13.7, 9.25)], Stroke::new(1.7, col));
         }
         "connect" => {
             // a plug: two pins, a rounded body and its cord
@@ -328,6 +338,13 @@ pub fn paint_glyph_on(p: &Painter, rect: Rect, name: &str, col: Color32, bg: Col
             line(p, c, &[(-5.2, -3.4), (5.2, -3.4)], Stroke::new(1.0, col));
             line(p, c, &[(-5.2, 3.4), (5.2, 3.4)], Stroke::new(1.0, col));
         }
+        "newvm" => {
+            // a screen with a plus
+            p.rect_stroke(Rect::from_min_max(c + vec2(-6.5, -5.5), c + vec2(6.5, 3.5)), Rounding::same(1.5), s);
+            line(p, c, &[(-3.0, 6.3), (3.0, 6.3)], s);
+            line(p, c, &[(0.0, -3.5), (0.0, 1.5)], Stroke::new(1.4, col));
+            line(p, c, &[(-2.5, -1.0), (2.5, -1.0)], Stroke::new(1.4, col));
+        }
         "trash" => {
             // a bin: its lid and handle, the can, two grooves
             line(p, c, &[(-6.0, -4.0), (6.0, -4.0)], s);
@@ -337,6 +354,19 @@ pub fn paint_glyph_on(p: &Painter, rect: Rect, name: &str, col: Color32, bg: Col
             line(p, c, &[(1.4, -1.5), (1.4, 3.6)], Stroke::new(1.1, col));
         }
         "check" => line(p, c, &[(-5.0, 0.3), (-1.6, 3.8), (5.0, -3.6)], Stroke::new(1.7, col)),
+        "warning" => {
+            // a triangle with an exclamation mark
+            line(p, c, &[(0.0, -6.5), (7.0, 5.5), (-7.0, 5.5), (0.0, -6.5)], Stroke::new(1.4, col));
+            line(p, c, &[(0.0, -2.2), (0.0, 1.6)], Stroke::new(1.6, col));
+            p.circle_filled(c + vec2(0.0, 3.7), 0.95, col);
+        }
+        "error" => {
+            // a cross in a circle
+            p.circle_stroke(c, 6.8, Stroke::new(1.4, col));
+            let s = Stroke::new(1.5, col);
+            line(p, c, &[(-2.6, -2.6), (2.6, 2.6)], s);
+            line(p, c, &[(2.6, -2.6), (-2.6, 2.6)], s);
+        }
         "close" => {
             let s = Stroke::new(1.7, col);
             line(p, c, &[(-4.0, -4.0), (4.0, 4.0)], s);

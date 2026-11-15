@@ -189,6 +189,75 @@ pub struct PoolData {
     pub vms: Vec<VmInfo>,
     pub srs: Vec<SrInfo>,
     pub networks: Vec<NetInfo>,
+    /// The built-in templates new VMs are made from.
+    pub templates: Vec<TemplateInfo>,
+    /// The pool's default storage, if set.
+    pub default_sr: Option<String>,
+}
+
+/// A built-in VM template: what it sets up and recommends.
+#[derive(Clone, Debug, Default)]
+pub struct TemplateInfo {
+    pub rref: String,
+    pub name: String,
+    /// It boots with UEFI unless told otherwise.
+    pub uefi: bool,
+    /// Its platform:secureboot ("true", "false", "auto" = when the pool has the certificates).
+    pub secure_boot: String,
+    /// It brings a virtual TPM (Windows 11): UEFI only.
+    pub vtpm: bool,
+    pub supports_uefi: bool,
+    pub supports_secure_boot: bool,
+    /// Its minimum memory, and its usual CPUs and disk size.
+    pub mem_min: i64,
+    pub vcpus: i64,
+    pub disk: i64,
+}
+
+impl TemplateInfo {
+    pub fn is_windows(&self) -> bool {
+        self.name.to_lowercase().starts_with("windows")
+    }
+}
+
+/// The name of the template used when the ISO isn't recognised: BIOS, nothing assumed.
+pub const OTHER_MEDIA: &str = "Other install media";
+
+/// How a new VM boots.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Boot {
+    Bios,
+    Uefi,
+    UefiSecure,
+}
+
+/// Everything needed to create a VM, as chosen in the New VM dialog.
+#[derive(Clone, Debug, Default)]
+pub struct NewVm {
+    pub name: String,
+    pub description: String,
+    pub template: String,
+    /// The ISO file's disc, put in the DVD drive.
+    pub iso: String,
+    pub vcpus: i64,
+    pub cores_per_socket: i64,
+    pub memory: i64,
+    pub disk: i64,
+    /// The storage for its disk.
+    pub sr: String,
+    /// The network for its one network card; None for none.
+    pub network: Option<String>,
+    /// Its home server (required when its disk or ISO is on one server's own storage).
+    pub host: Option<String>,
+    /// The boot mode, when it differs from the template's.
+    pub boot: Option<Boot>,
+    pub start: bool,
+    /// What the references above are called (the template, storage, ISO, network, server), for
+    /// the steps shown while it's made.
+    pub names: std::collections::HashMap<String, String>,
+    /// Storage to make sure answers before anything is made: the ISO's library, and the disk's
+    /// storage when it's reached over the network.
+    pub check: Vec<String>,
 }
 
 impl SrInfo {
@@ -201,6 +270,13 @@ impl SrInfo {
     /// left out of the lists.
     pub fn is_empty_drive(&self) -> bool {
         self.kind == "udev" && self.size == 0
+    }
+
+    /// Storage that can go away under the pool: shared storage, and anything reached over the
+    /// network or a SAN (NFS, SMB, iSCSI, Fibre Channel, GFS2). A share that's gone doesn't
+    /// fail, it never answers, so it's checked before it's used.
+    pub fn can_go_offline(&self) -> bool {
+        self.shared || matches!(self.kind.as_str(), "iso" | "nfs" | "smb" | "cifs" | "lvmoiscsi" | "lvmohba" | "gfs2")
     }
 }
 
@@ -440,6 +516,144 @@ pub fn iso_file_name(name: &str) -> String {
     format!("{}{}", if stem.is_empty() { "disc" } else { stem }, ext)
 }
 
+/// A name's words for matching: lower case, letters and digits apart ("Win11_24H2" → win 11 24 h 2).
+fn words(name: &str) -> Vec<String> {
+    let mut out = vec![];
+    for run in name.to_lowercase().split(|c: char| !c.is_ascii_alphanumeric()).filter(|r| !r.is_empty()) {
+        let mut cur = String::new();
+        for c in run.chars() {
+            if !cur.is_empty() && cur.chars().last().map_or(false, |l| l.is_ascii_digit() != c.is_ascii_digit()) {
+                out.push(std::mem::take(&mut cur));
+            }
+            cur.push(c);
+        }
+        out.push(cur);
+    }
+    out
+}
+
+/// The built-in template that fits an ISO, from its file name: the same family (Windows,
+/// Ubuntu, Debian…) and every version number in the template's name. Microsoft's ISOs often carry
+/// only a build number ("26100.1742…CLIENT…"), which says which Windows it is. None when nothing
+/// fits (then: Other install media).
+pub fn detect_template<'a>(iso: &str, templates: &'a [TemplateInfo]) -> Option<&'a TemplateInfo> {
+    let mut w = words(iso);
+    let server = w.iter().any(|x| x == "server");
+    let build: Option<&str> = w.iter().find(|x| x.len() == 5 && x.chars().all(|c| c.is_ascii_digit())).map(|x| x.as_str());
+    let from_build: &[&str] = match (build, server) {
+        (Some("26100"), true) => &["windows", "server", "2025"],
+        (Some("20348"), true) => &["windows", "server", "2022"],
+        (Some("17763"), true) => &["windows", "server", "2019"],
+        (Some("14393"), true) => &["windows", "server", "2016"],
+        (Some("26100" | "22631" | "22621" | "22000"), false) => &["windows", "11"],
+        (Some("19041" | "19042" | "19043" | "19044" | "19045"), false) => &["windows", "10"],
+        _ => &[],
+    };
+    w.extend(from_build.iter().map(|s| s.to_string()));
+    let alias = |x: &str| match x {
+        "win" => "windows",
+        "alma" => "almalinux",
+        "rhel" => "red",
+        "sles" | "sle" => "suse",
+        other => other,
+    }
+    .to_string();
+    let families: Vec<String> = w.iter().map(|x| alias(x)).collect();
+    let numbers: Vec<&String> = w.iter().filter(|x| x.chars().all(|c| c.is_ascii_digit())).collect();
+    templates
+        .iter()
+        .filter(|t| !t.name.contains("32-bit"))
+        .filter_map(|t| {
+            let bare = t.name.split('(').next().unwrap_or("");
+            let tw = words(bare);
+            let family = tw.first()?;
+            let versions: Vec<&String> = tw.iter().filter(|x| x.chars().all(|c| c.is_ascii_digit())).collect();
+            let fits = families.contains(family)
+                && !versions.is_empty()
+                && versions.iter().all(|v| numbers.contains(v))
+                && (family != "windows" || tw.iter().any(|x| x == "server") == server);
+            fits.then_some((versions.len(), t))
+        })
+        .max_by_key(|(n, _)| *n)
+        .map(|(_, t)| t)
+}
+
+/// A new VM's suggested name: its system's ("Ubuntu 24.04", "Windows 11"), or else the ISO's.
+pub fn vm_name_for(template: Option<&TemplateInfo>, iso: &str) -> String {
+    match template.filter(|t| t.name != OTHER_MEDIA) {
+        Some(t) => {
+            let bare = t.name.split('(').next().unwrap_or("").trim();
+            let parts: Vec<&str> = bare.split_whitespace().collect();
+            match parts.first().map(|f| f.to_lowercase()) {
+                // "Ubuntu Noble Numbat 24.04" → "Ubuntu 24.04"; "Debian Bookworm 12" → "Debian 12"
+                Some(f) if (f == "ubuntu" || f == "debian") && parts.len() > 2 => format!("{} {}", parts[0], parts[parts.len() - 1]),
+                _ => bare.to_string(),
+            }
+        }
+        None => {
+            let stem = iso.rsplit_once('.').map_or(iso, |(s, ext)| if ext.eq_ignore_ascii_case("iso") || ext.eq_ignore_ascii_case("img") { s } else { iso });
+            readable_name(stem).unwrap_or_else(|| stem.chars().take(40).collect())
+        }
+    }
+}
+
+/// A file name's product and version, as a VM name: "fedora-coreos-44.20260928.3.1-live-iso.x86_64"
+/// → "Fedora CoreOS 44", "ubuntu-26.04.1-live-server-amd64" → "Ubuntu 26.04". The words before
+/// the first version, in their usual spelling, then that version's first one or two short
+/// parts; the rest (builds, architectures, "live", "server") left out. None without a word.
+fn readable_name(stem: &str) -> Option<String> {
+    const SPELLED: [(&str, &str); 17] = [
+        ("coreos", "CoreOS"), ("truenas", "TrueNAS"), ("freebsd", "FreeBSD"), ("opnsense", "OPNsense"), ("pfsense", "pfSense"),
+        ("nixos", "NixOS"), ("almalinux", "AlmaLinux"), ("centos", "CentOS"), ("opensuse", "openSUSE"), ("rhel", "RHEL"),
+        ("sles", "SLES"), ("vyos", "VyOS"), ("ipfire", "IPFire"), ("xcp", "XCP"), ("ng", "ng"), ("os", "OS"),
+        ("archlinux", "Arch Linux"),
+    ];
+    let mut words: Vec<String> = vec![];
+    let mut version = String::new();
+    for tok in stem.split(|c: char| c == '-' || c == '_' || c == ' ').filter(|t| !t.is_empty()) {
+        if tok.starts_with(|c: char| c.is_ascii_digit()) {
+            // "44.20260928.3.1" → "44"; "26.04.1" → "26.04"; "2025" → "2025"
+            if tok.chars().all(|c| c.is_ascii_digit() || c == '.') {
+                let parts: Vec<&str> = tok.split('.').filter(|p| !p.is_empty()).collect();
+                let mut keep = vec![parts[0]];
+                if let Some(p) = parts.get(1).filter(|p| p.len() <= 2 && parts[0].len() <= 2) {
+                    keep.push(p);
+                }
+                version = keep.join(".");
+            }
+            break;
+        }
+        if !tok.chars().any(|c| c.is_alphabetic()) {
+            break;
+        }
+        let lower = tok.to_lowercase();
+        let word = match SPELLED.iter().find(|(k, _)| *k == lower) {
+            Some((_, v)) => v.to_string(),
+            // as written when it has capitals ("eLux"), else capitalised ("fedora" → "Fedora")
+            None if tok.chars().any(|c| c.is_uppercase()) => tok.to_string(),
+            None => {
+                let mut c = tok.chars();
+                c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default()
+            }
+        };
+        words.push(word);
+    }
+    if words.is_empty() {
+        return None;
+    }
+    let name = if version.is_empty() { words.join(" ") } else { format!("{} {}", words.join(" "), version) };
+    Some(name.chars().take(40).collect())
+}
+
+/// `base`, or "base (2)", "base (3)"… whichever no VM has yet.
+pub fn unique_name(base: &str, taken: &[String]) -> String {
+    let used = |n: &str| taken.iter().any(|t| t.eq_ignore_ascii_case(n));
+    if !used(base) {
+        return base.to_string();
+    }
+    (2..).map(|i| format!("{} ({})", base, i)).find(|n| !used(n)).unwrap_or_default()
+}
+
 impl IsoLibrary {
     /// "\\nas\isos" or "nas/isos" as "//nas/isos"; NFS locations as typed.
     pub fn normalise_location(nfs: bool, typed: &str) -> String {
@@ -506,6 +720,64 @@ impl IsoLibrary {
 #[cfg(test)]
 mod iso_tests {
     use super::*;
+
+    fn templates() -> Vec<TemplateInfo> {
+        [
+            "Other install media", "Windows 10 (64-bit)", "Windows 11", "Windows Server 2019 (64-bit)", "Windows Server 2022 (64-bit)",
+            "Windows Server 2025 (64-bit)", "Ubuntu Jammy Jellyfish 22.04", "Ubuntu Noble Numbat 24.04", "Debian Bullseye 11",
+            "Debian Bookworm 12", "Rocky Linux 8", "Rocky Linux 9", "AlmaLinux 9", "CentOS Stream 9", "Red Hat Enterprise Linux 9",
+        ]
+        .iter()
+        .map(|n| TemplateInfo { name: n.to_string(), ..Default::default() })
+        .collect()
+    }
+
+    #[test]
+    fn templates_from_iso_names() {
+        let t = templates();
+        let pick = |iso: &str| detect_template(iso, &t).map(|t| t.name.clone()).unwrap_or_default();
+        assert_eq!(pick("ubuntu-24.04.3-live-server-amd64.iso"), "Ubuntu Noble Numbat 24.04");
+        assert_eq!(pick("ubuntu-22.04.5-desktop-amd64.iso"), "Ubuntu Jammy Jellyfish 22.04");
+        assert_eq!(pick("ubuntu-26.04.1-live-server-amd64.iso"), ""); // no template yet: Other install media
+        assert_eq!(pick("debian-12.7.0-amd64-netinst.iso"), "Debian Bookworm 12");
+        assert_eq!(pick("rocky-9.4-x86_64-minimal.iso"), "Rocky Linux 9");
+        assert_eq!(pick("Rocky-8.10-x86_64-dvd1.iso"), "Rocky Linux 8");
+        assert_eq!(pick("AlmaLinux-9.4-x86_64-boot.iso"), "AlmaLinux 9");
+        assert_eq!(pick("CentOS-Stream-9-latest-x86_64-dvd1.iso"), "CentOS Stream 9");
+        assert_eq!(pick("rhel-9.4-x86_64-dvd.iso"), "Red Hat Enterprise Linux 9");
+        assert_eq!(pick("Win11_24H2_English_x64.iso"), "Windows 11");
+        assert_eq!(pick("Win10_22H2_English_x64v1.iso"), "Windows 10 (64-bit)");
+        assert_eq!(pick("windows-server-2025.iso"), "Windows Server 2025 (64-bit)");
+        assert_eq!(pick("en-us_windows_server_2022_updated_x64_dvd.iso"), "Windows Server 2022 (64-bit)");
+        // Microsoft's build-number names
+        assert_eq!(pick("26100.1742.240906-0331.ge_release_svc_refresh_CLIENT_CONSUMER_x64FRE_en-us.iso"), "Windows 11");
+        assert_eq!(pick("26100.1742.240906-0331.ge_release_svc_refresh_SERVER_EVAL_x64FRE_en-us.iso"), "Windows Server 2025 (64-bit)");
+        assert_eq!(pick("17763.737.190906-2324.rs5_release_svc_refresh_SERVER_EVAL_x64FRE_en-us_1.iso"), "Windows Server 2019 (64-bit)");
+        assert_eq!(pick("eLux-7.2609.0-5.iso"), "");
+        assert_eq!(pick("debian-13.1.0-amd64-netinst.iso"), "");
+    }
+
+    #[test]
+    fn suggested_vm_names() {
+        let t = templates();
+        let named = |n: &str| t.iter().find(|x| x.name == n);
+        assert_eq!(vm_name_for(named("Ubuntu Noble Numbat 24.04"), "x.iso"), "Ubuntu 24.04");
+        assert_eq!(vm_name_for(named("Debian Bookworm 12"), "x.iso"), "Debian 12");
+        assert_eq!(vm_name_for(named("Windows Server 2025 (64-bit)"), "x.iso"), "Windows Server 2025");
+        assert_eq!(vm_name_for(named("Rocky Linux 9"), "x.iso"), "Rocky Linux 9");
+        assert_eq!(vm_name_for(named("Other install media"), "eLux-7.2609.0-5.iso"), "eLux 7");
+        assert_eq!(vm_name_for(None, "ubuntu-26.04.1-live-server-amd64.iso"), "Ubuntu 26.04");
+        assert_eq!(vm_name_for(None, "fedora-coreos-44.20260928.3.1-live-iso.x86_64.iso"), "Fedora CoreOS 44");
+        assert_eq!(vm_name_for(None, "TrueNAS-SCALE-25.04.2.iso"), "TrueNAS SCALE 25.04");
+        assert_eq!(vm_name_for(None, "alpine-virt-3.22.1-x86_64.iso"), "Alpine Virt 3.22");
+        assert_eq!(vm_name_for(None, "OPNsense-25.7-dvd-amd64.iso"), "OPNsense 25.7");
+        assert_eq!(vm_name_for(None, "archlinux-2026.11.01-x86_64.iso"), "Arch Linux 2026");
+        // no words to go by: the file's name
+        assert_eq!(vm_name_for(None, "26100.1742.240906-0331.iso"), "26100.1742.240906-0331");
+        let taken = vec!["Ubuntu 24.04".to_string(), "Ubuntu 24.04 (2)".to_string()];
+        assert_eq!(unique_name("Ubuntu 24.04", &taken), "Ubuntu 24.04 (3)");
+        assert_eq!(unique_name("Debian 12", &taken), "Debian 12");
+    }
 
     #[test]
     fn uploaded_file_names() {

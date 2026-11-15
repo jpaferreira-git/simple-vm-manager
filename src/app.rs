@@ -4,6 +4,7 @@
 use crate::conn::*;
 use crate::console::{self, ConsoleView};
 use crate::isolib::{IsoAction, IsoDialog};
+use crate::newvm::{NewVmAction, NewVmDialog};
 use crate::upload::{UploadAction, UploadDialog};
 use crate::secrets;
 use crate::icons::*;
@@ -70,8 +71,17 @@ enum Msg {
     IsoDone { sid: u32, lib: IsoLibrary, result: Result<(), ApiError> },
     /// A rescan (forget false) or disconnect (forget true) of a storage ended.
     SrDone { sid: u32, sr: String, name: String, forget: bool, result: Result<(), ApiError> },
+    /// Making a new VM ended: its name, and whether it was to start.
+    /// A new VM made (its reference), or why not; `start`: it's being started next.
+    VmCreated { sid: u32, name: String, start: bool, result: Result<String, ApiError> },
+    /// The new VM `vm` started, or why not.
+    VmStarted { sid: u32, vm: String, name: String, result: Result<(), ApiError> },
+    /// Whether a storage answered, for the New VM dialog.
+    SrChecked { sid: u32, sr: String, host: Option<String>, result: Result<(), ApiError> },
     /// Deleting an ISO file ended.
     IsoDeleted { sid: u32, sr: String, vdi: String, name: String, result: Result<(), ApiError> },
+    /// Deleting a VM ended: the disks left behind, or why it wasn't deleted.
+    VmDeleted { sid: u32, vm: String, name: String, result: Result<Vec<String>, ApiError> },
     /// A link in the Upload dialog was checked.
     LinkChecked { url: String, result: Result<WebFile, String> },
     /// The file chooser closed: the file picked to upload to library `sr`, if any.
@@ -204,10 +214,14 @@ enum Dialog {
     Message { title: String, text: String },
     Iso(Box<IsoDialog>),
     Upload(Box<UploadDialog>),
+    NewVm(Box<NewVmDialog>),
     /// Disconnect (forget) an ISO library?
     ConfirmSr { sid: u32, sr: String, text: String },
     /// Deleting an ISO file: server, library, disc, its name, the question.
     ConfirmDeleteIso { sid: u32, sr: String, vdi: String, name: String, text: String },
+    /// Deleting a VM: whether it's on (turned off first), its disks, how many snapshots it has,
+    /// and whether its disks go too (ticked to begin with).
+    ConfirmDeleteVm { sid: u32, vm: String, name: String, running: bool, disks: Vec<VmDisk>, snapshots: usize, delete_disks: bool },
 }
 
 enum Intent {
@@ -223,8 +237,12 @@ enum Intent {
     AskForgetSr(u32, String),
     /// Open the Upload dialog of an ISO library.
     Upload(u32, String),
+    /// Open the New VM dialog: for this pool (else the selected one), with this ISO's disc.
+    NewVm(Option<u32>, Option<String>),
     /// Ask before deleting an ISO file: server, library, disc.
     AskDeleteIso(u32, String, String),
+    /// Ask before deleting a VM: server, VM.
+    AskDeleteVm(u32, String),
     /// Hide a finished upload's card.
     DismissUpload(String),
     /// Files dropped on the window.
@@ -277,12 +295,20 @@ pub struct App {
     keychain: Option<bool>,
     /// Storage being rescanned or disconnected right now.
     sr_busy: HashSet<String>,
+    /// Storage checks under way for the New VM dialog: pool, storage, server.
+    sr_checking: HashSet<(u32, String, Option<String>)>,
     /// The ISO file whose description is being typed in, if any.
     iso_edit: Option<IsoEdit>,
     /// Descriptions being saved, by disc, shown until the server answers.
     iso_saving: HashMap<String, String>,
     /// ISO files being deleted, by disc.
     iso_deleting: HashSet<String>,
+    /// VMs being deleted right now.
+    vm_deleting: HashSet<String>,
+    /// A new VM to select (and the tab to show) once it's in the tree.
+    pending_select: Option<(String, Tab)>,
+    /// VMs being made right now (a check's screenshot waits for them).
+    creating: u32,
     /// Files being uploaded, by ISO library (one at a time each).
     uploads: HashMap<String, Upload>,
     /// Passwords saved in the keychain, by (server, user).
@@ -328,9 +354,13 @@ impl App {
             keychain: None,
             saved: HashMap::new(),
             sr_busy: HashSet::new(),
+            sr_checking: HashSet::new(),
             iso_edit: None,
             iso_saving: HashMap::new(),
             iso_deleting: HashSet::new(),
+            vm_deleting: HashSet::new(),
+            pending_select: None,
+            creating: 0,
             uploads: HashMap::new(),
             shot_path: start.shot_path,
             shot_show: start.shot_show,
@@ -483,6 +513,57 @@ impl App {
         std::thread::spawn(move || {
             let result = conn.upload_iso(&sr, address.as_deref(), &src, &name, &t);
             let _ = tx.send(Msg::UploadDone { sr, result });
+            ctx.request_repaint();
+        });
+    }
+
+    /// Checks in the background that a storage answers on a server, for the New VM dialog (one
+    /// check at a time for each: a dialog opened again meanwhile gets the same one's answer).
+    fn check_sr(&mut self, sid: u32, sr: String, host: Option<String>, ctx: &egui::Context) {
+        let Some(conn) = self.server(sid).map(|s| s.conn.clone()) else { return };
+        if !self.sr_checking.insert((sid, sr.clone(), host.clone())) {
+            return;
+        }
+        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let result = conn.check_sr(&sr, host.as_deref(), &HashMap::new(), &Trace::default());
+            let _ = tx.send(Msg::SrChecked { sid, sr, host, result });
+            ctx.request_repaint();
+        });
+    }
+
+    /// Makes a VM in the background (the dialog waits, showing each call in `trace`).
+    fn create_vm(&mut self, sid: u32, spec: NewVm, trace: Arc<Trace>, ctx: &egui::Context) {
+        let Some(s) = self.server(sid) else {
+            if let Dialog::NewVm(d) = &mut self.dialog {
+                d.failed("This pool isn't connected any more. Connect to it again, then try again.".into());
+            }
+            return;
+        };
+        let (conn, tx, ctx) = (s.conn.clone(), self.tx.clone(), ctx.clone());
+        self.creating += 1;
+        std::thread::spawn(move || {
+            let result = conn.create_vm(&spec, &trace);
+            let made = result.as_ref().ok().cloned();
+            let _ = tx.send(Msg::VmCreated { sid, name: spec.name.clone(), start: spec.start, result });
+            ctx.request_repaint();
+            // then started, which can take a while: the dialog can close meanwhile
+            if let (Some(vm), true) = (made, spec.start) {
+                let result = conn.start_traced(&vm, &format!("\"{}\"", spec.name), &trace);
+                let _ = tx.send(Msg::VmStarted { sid, vm, name: spec.name.clone(), result });
+                ctx.request_repaint();
+            }
+        });
+    }
+
+    /// Deletes a VM (and, with `disks`, its disks) in the background.
+    fn delete_vm(&mut self, sid: u32, vm: String, name: String, disks: bool, ctx: &egui::Context) {
+        let Some(conn) = self.server(sid).map(|s| s.conn.clone()) else { return };
+        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+        self.vm_deleting.insert(vm.clone());
+        std::thread::spawn(move || {
+            let result = conn.delete_vm(&vm, disks);
+            let _ = tx.send(Msg::VmDeleted { sid, vm, name, result });
             ctx.request_repaint();
         });
     }
@@ -674,6 +755,77 @@ impl App {
                         self.start_upload(sid, sr, Source::File(p), None, &ctx);
                     }
                 }
+                Msg::VmCreated { sid, name, start, result } => {
+                    let server = self.server(sid).map(|s| s.name()).unwrap_or_default();
+                    if result.is_err() || !start {
+                        self.creating = self.creating.saturating_sub(1);
+                    }
+                    match result {
+                        Ok(vm) => {
+                            self.add_log(sid, &server, Some(&vm), &name, &format!("Created VM '{}'", name), "Done");
+                            if start {
+                                // the dialog waits for the start, but can be closed
+                                if let Dialog::NewVm(d) = &mut self.dialog {
+                                    d.starting(vm.clone());
+                                }
+                            } else {
+                                self.dialog = Dialog::None;
+                            }
+                            // shown once the next refresh brings it
+                            self.pending_select = Some((format!("vm:{}:{}", sid, vm), Tab::General));
+                        }
+                        Err(e) => {
+                            let why = create_problem(&e);
+                            self.add_log(sid, &server, None, &name, &format!("Couldn't create VM '{}': {}", name, why), "Failed");
+                            if let Dialog::NewVm(d) = &mut self.dialog {
+                                d.failed(why);
+                            }
+                        }
+                    }
+                    if let Some(s) = self.server_mut(sid) {
+                        s.next_refresh = Instant::now();
+                    }
+                }
+                Msg::SrChecked { sid, sr, host, result } => {
+                    self.sr_checking.remove(&(sid, sr.clone(), host.clone()));
+                    if let Dialog::NewVm(d) = &mut self.dialog {
+                        if d.sid == sid {
+                            d.checked(sr, host, result);
+                        }
+                    }
+                }
+                Msg::VmStarted { sid, vm, name, result } => {
+                    self.creating = self.creating.saturating_sub(1);
+                    let server = self.server(sid).map(|s| s.name()).unwrap_or_default();
+                    // still watching it in the dialog?
+                    let watching = matches!(&self.dialog, Dialog::NewVm(d) if d.made_vm() == Some(vm.as_str()));
+                    match result {
+                        Ok(()) => {
+                            self.add_log(sid, &server, Some(&vm), &name, &format!("Started VM '{}'", name), "Done");
+                            // running now, before the refresh says so (its console opens straight away)
+                            if let Some(v) = self.server_mut(sid).and_then(|s| s.data.as_mut()).and_then(|d| d.vms.iter_mut().find(|v| v.rref == vm)) {
+                                v.power = PowerState::Running;
+                            }
+                            if watching {
+                                self.dialog = Dialog::None;
+                                self.pending_select = Some((format!("vm:{}:{}", sid, vm), Tab::Console));
+                            }
+                        }
+                        Err(e) => {
+                            let why = create_problem(&e);
+                            self.add_log(sid, &server, Some(&vm), &name, &format!("Couldn't start VM '{}': {}", name, why), "Failed");
+                            match &mut self.dialog {
+                                Dialog::NewVm(d) if watching => d.not_started(why),
+                                // its dialog was closed: said here, unless another dialog is open
+                                Dialog::None => self.dialog = Dialog::Message { title: "New VM".into(), text: format!("'{}' was created, but it couldn't start.\n\n{}", name, why) },
+                                _ => {}
+                            }
+                        }
+                    }
+                    if let Some(s) = self.server_mut(sid) {
+                        s.next_refresh = Instant::now();
+                    }
+                }
                 Msg::IsoDeleted { sid, sr, vdi, name, result } => {
                     self.iso_deleting.remove(&vdi);
                     let server = self.server(sid).map(|s| s.name()).unwrap_or_default();
@@ -690,6 +842,36 @@ impl App {
                             let why = delete_problem(&e);
                             self.add_log(sid, &server, Some(&sr), &lib, &format!("Couldn't delete '{}' from '{}': {}", name, lib, why), "Failed");
                             self.dialog = Dialog::Message { title: "Delete ISO File".into(), text: format!("Couldn't delete '{}'.\n\n{}", name, why) };
+                        }
+                    }
+                    if let Some(s) = self.server_mut(sid) {
+                        s.next_refresh = Instant::now();
+                    }
+                }
+                Msg::VmDeleted { sid, vm, name, result } => {
+                    self.vm_deleting.remove(&vm);
+                    let server = self.server(sid).map(|s| s.name()).unwrap_or_default();
+                    match result {
+                        Ok(left) => {
+                            // gone from the tree right away (the next refresh agrees), its server shown
+                            if let Some(d) = self.server_mut(sid).and_then(|s| s.data.as_mut()) {
+                                d.vms.retain(|v| v.rref != vm);
+                            }
+                            if self.selected == format!("vm:{}:{}", sid, vm) {
+                                self.select(format!("srv:{}", sid));
+                            }
+                            if left.is_empty() {
+                                self.add_log(sid, &server, None, &name, &format!("Deleted VM '{}'", name), "Done");
+                            } else {
+                                let text = format!("Deleted VM '{}', but not all its disks: {}", name, left.join("; "));
+                                self.add_log(sid, &server, None, &name, &text, "Done");
+                                self.dialog = Dialog::Message { title: "Delete VM".into(), text: format!("'{}' was deleted, but these disks couldn't be:\n\n{}", name, left.join("\n")) };
+                            }
+                        }
+                        Err(e) => {
+                            let why = delete_vm_problem(&e);
+                            self.add_log(sid, &server, Some(&vm), &name, &format!("Couldn't delete VM '{}': {}", name, why), "Failed");
+                            self.dialog = Dialog::Message { title: "Delete VM".into(), text: format!("Couldn't delete '{}'.\n\n{}", name, why) };
                         }
                     }
                     if let Some(s) = self.server_mut(sid) {
@@ -1089,6 +1271,13 @@ impl App {
                         self.dialog = Dialog::Upload(Box::new(UploadDialog::new(sid, sr, x.name.clone(), existing)));
                     }
                 }
+                Intent::NewVm(sid, iso) => {
+                    let sid = sid.or(sel.sid).filter(|id| self.server(*id).map_or(false, |s| s.data.is_some()));
+                    let sid = sid.or_else(|| self.servers.iter().find(|s| s.data.is_some()).map(|s| s.id));
+                    if let Some(d) = sid.and_then(|id| self.server(id)).and_then(|s| s.data.as_ref()) {
+                        self.dialog = Dialog::NewVm(Box::new(NewVmDialog::new(sid.unwrap_or_default(), d, iso.as_deref())));
+                    }
+                }
                 Intent::AskDeleteIso(sid, sr, vdi) => {
                     let found = self.server(sid).and_then(|s| s.data.as_ref()).and_then(|d| d.sr(&sr)).and_then(|x| x.files.iter().find(|f| f.vdi == vdi).map(|f| (x, f)));
                     if let Some((x, f)) = found {
@@ -1100,6 +1289,13 @@ impl App {
                             text.push_str(&format!("\n\nIt's in the DVD drive of {}, {}: the drive is left empty.", parked.join(", "), which));
                         }
                         self.dialog = Dialog::ConfirmDeleteIso { sid, sr, vdi, name: f.name.clone(), text };
+                    }
+                }
+                Intent::AskDeleteVm(sid, vm) => {
+                    if let Some(v) = self.server(sid).and_then(|s| s.data.as_ref()).and_then(|d| d.vm(&vm)) {
+                        let disks: Vec<VmDisk> = v.disks.iter().filter(|k| k.kind == "Disk").cloned().collect();
+                        let running = v.power != PowerState::Halted;
+                        self.dialog = Dialog::ConfirmDeleteVm { sid, vm, name: v.name.clone(), running, disks, snapshots: v.snapshots, delete_disks: true };
                     }
                 }
                 Intent::DismissUpload(sr) => {
@@ -1220,14 +1416,15 @@ impl App {
         };
         let arrows = shown.iter().filter(|a| force_of(a.op).is_some()).count() as f32 * (ARROW_W + 2.0);
         // When the window is too narrow for every label, buttons show only their icons (the label
-        // becomes a tooltip): first the theme switch, then all of them.
+        // becomes a tooltip): first the theme switch (rank 1), then New VM and ISO Library (rank 2),
+        // then all of them.
         let fits = |level: u8| {
-            let w = |l: &str, minor: bool| if level == 2 || (level == 1 && minor) { 32.0 } else { tool_width(ui, l) } + 2.0;
-            let buttons: f32 = w("Connect", false) + shown.iter().map(|a| w(a.label, false)).sum::<f32>() + w("ISO Library", false) + w(theme_label, true) + arrows;
+            let w = |l: &str, rank: u8| if level >= rank { 32.0 } else { tool_width(ui, l) } + 2.0;
+            let buttons: f32 = w("Connect", 3) + shown.iter().map(|a| w(a.label, 3)).sum::<f32>() + w("New VM", 2) + w("ISO Library", 2) + w(theme_label, 1) + arrows;
             36.0 + 2.0 * 10.0 + 16.0 + buttons <= ui.available_width()
         };
-        let level = (0..2).find(|&l| fits(l)).unwrap_or(2);
-        let compact = |minor: bool| level == 2 || (level == 1 && minor);
+        let level = (0..3).find(|&l| fits(l)).unwrap_or(3);
+        let compact = |rank: u8| level >= rank;
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
             let tip = if self.sidebar_open { "Fold the sidebar" } else { "Show the sidebar" };
@@ -1235,12 +1432,12 @@ impl App {
                 out.push(Intent::Sidebar(!self.sidebar_open));
             }
             ui.add_space(4.0);
-            if tool_button(ui, "connect", "Connect", true, compact(false), &pal).clicked() {
+            if tool_button(ui, "connect", "Connect", true, compact(3), &pal).clicked() {
                 out.push(Intent::AddServer);
             }
             ui.separator();
             for a in &shown {
-                if tool_button(ui, a.op, a.label, self.can_run(a, sel), compact(false), &pal).clicked() {
+                if tool_button(ui, a.op, a.label, self.can_run(a, sel), compact(3), &pal).clicked() {
                     out.extend(ACTIONS.iter().position(|b| std::ptr::eq(b, *a)).map(Intent::Action));
                 }
                 if let Some(fi) = force_of(a.op) {
@@ -1267,12 +1464,15 @@ impl App {
             }
             ui.separator();
             let has_pool = self.servers.iter().any(|s| s.data.is_some());
-            if tool_button(ui, "iso", "ISO Library", has_pool, compact(false), &pal).on_hover_text("Add a library of installation discs (.iso files) from a Windows or NFS share").clicked() {
+            if tool_button(ui, "newvm", "New VM", has_pool, compact(2), &pal).on_hover_text("Create a virtual machine that installs from an ISO file").clicked() {
+                out.push(Intent::NewVm(sel.sid, None));
+            }
+            if tool_button(ui, "iso", "ISO Library", has_pool, compact(2), &pal).on_hover_text("Add a library of installation discs (.iso files) from a Windows or NFS share").clicked() {
                 out.push(Intent::IsoLibrary);
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 // A click switches light / dark; a right-click also offers following the system.
-                let b = tool_button(ui, theme_op, theme_label, true, compact(true), &pal).on_hover_text("Right-click for more choices");
+                let b = tool_button(ui, theme_op, theme_label, true, compact(1), &pal).on_hover_text("Right-click for more choices");
                 if b.clicked() {
                     out.push(Intent::ToggleTheme);
                 }
@@ -1438,6 +1638,16 @@ impl App {
                         ui.close_menu();
                     }
                 }
+                if let (Some(sid), Some(vm)) = (node.sid, node.rref.clone()) {
+                    ui.separator();
+                    let pal = self.pal;
+                    let deleting = self.vm_deleting.contains(&vm);
+                    if ui.add_enabled(!deleting, egui::Button::new(egui::RichText::new("Delete VM…").color(pal.red))).clicked() {
+                        out.push(Intent::Select(node.key.clone()));
+                        out.push(Intent::AskDeleteVm(sid, vm));
+                        ui.close_menu();
+                    }
+                }
             }
             Kind::Root | Kind::Category => {
                 if ui.button("Connect…").clicked() {
@@ -1457,6 +1667,11 @@ impl App {
                             out.push(Intent::Reconnect(sid));
                             ui.close_menu();
                         }
+                    }
+                    let has_data = self.server(sid).map_or(false, |s| s.data.is_some());
+                    if has_data && ui.button("New VM…").clicked() {
+                        out.push(Intent::NewVm(Some(sid), None));
+                        ui.close_menu();
                     }
                     if ui.button("Refresh Now").clicked() {
                         out.push(Intent::Refresh(Some(sid)));
@@ -2314,11 +2529,11 @@ impl App {
             .map(|f| {
                 let editing = self.iso_edit.as_ref().map_or(false, |e| e.vdi == f.vdi);
                 let desc_w = if editing { 240.0 } else { (measure(&f.description) + 34.0).min(380.0) };
-                vec![Cell::Icon(IconKind::IsoSr, f.name.clone()), Cell::Text(fmt_bytes(f.size)), Cell::Custom(desc_w), Cell::Custom(26.0)]
+                vec![Cell::Icon(IconKind::IsoSr, f.name.clone()), Cell::Text(fmt_bytes(f.size)), Cell::Custom(desc_w), Cell::Custom(56.0)]
             })
             .collect();
         let mut edit = self.iso_edit.take();
-        let (mut close, mut save, mut delete) = (false, None, None);
+        let (mut close, mut save, mut delete, mut new_from) = (false, None, None, None);
         let (saving, deleting) = (&self.iso_saving, &self.iso_deleting);
         self.table_with(ui, "isos", &["Name", "Size", "Description", ""], &rows, false, &mut |ui, row, col, r, hot| {
             let f = &files[row];
@@ -2327,6 +2542,16 @@ impl App {
                 // the bin, at the row's end: faint, red under the mouse; off while a running VM holds the disc
                 if gone {
                     return;
+                }
+                // a new VM that installs from this ISO
+                let nb = Rect::from_center_size(pos2(r.max.x - 43.0, r.center().y), vec2(26.0, 26.0));
+                let nresp = ui.interact(nb, ui.id().with(("newvm", &f.vdi)), Sense::click()).on_hover_text("Create a VM that installs from this ISO");
+                if nresp.hovered() {
+                    ui.painter().rect_filled(nb, Rounding::same(5.0), pal.border);
+                }
+                paint_glyph(ui.painter(), Rect::from_center_size(nb.center(), vec2(16.0, 16.0)), "newvm", if nresp.hovered() { pal.accent } else if hot { pal.ink_soft } else { pal.ink_faint });
+                if nresp.clicked() {
+                    new_from = Some(f.vdi.clone());
                 }
                 let held = f.held_by();
                 let can = f.can_delete && held.is_empty();
@@ -2414,6 +2639,9 @@ impl App {
         }
         if let Some(vdi) = delete {
             out.push(Intent::AskDeleteIso(sid, sr, vdi));
+        }
+        if let Some(vdi) = new_from {
+            out.push(Intent::NewVm(Some(sid), Some(vdi)));
         }
     }
 
@@ -2533,6 +2761,11 @@ impl App {
         let mut iso: Option<(u32, IsoLibrary)> = None;
         let mut forget_sr: Option<(u32, String)> = None;
         let mut delete_iso: Option<(u32, String, String, String)> = None;
+        // from the Delete VM question: server, VM, its name, whether its disks go too
+        let mut delete_vm: Option<(u32, String, String, bool)> = None;
+        let mut new_vm: Option<(u32, NewVm, Arc<Trace>)> = None;
+        // storage the New VM dialog wants checked: pool, storage, server
+        let mut checks: Vec<(u32, String, Option<String>)> = vec![];
         // from the Upload dialog: the file chooser (None), or a link's file and its name
         let mut upload: Option<(u32, String, Option<(Source, String)>)> = None;
         let (keychain, saved) = (self.keychain, self.saved.clone());
@@ -2654,6 +2887,19 @@ impl App {
                 IsoAction::Create(sid, lib) => iso = Some((sid, lib)),
                 IsoAction::None => {}
             },
+            Dialog::NewVm(d) => {
+                match d.ui(ctx, &pal) {
+                    NewVmAction::None => {}
+                    NewVmAction::Close => close = true,
+                    NewVmAction::Create(sid, spec) => {
+                        let trace = Arc::new(Trace::default());
+                        d.creating(trace.clone());
+                        new_vm = Some((sid, spec, trace));
+                    }
+                }
+                let sid = d.sid;
+                checks.extend(d.wanted_checks().into_iter().map(|(sr, host)| (sid, sr, host)));
+            }
             Dialog::Upload(d) => {
                 let (sid, sr) = (d.sid, d.sr.clone());
                 match d.ui(ctx, &pal) {
@@ -2683,6 +2929,43 @@ impl App {
                         }
                         if dialog_button(ui, &pal, "trash", "Delete", Look::Danger, true) {
                             delete_iso = Some((*sid, sr.clone(), vdi.clone(), name.clone()));
+                        }
+                    });
+                });
+            }
+            Dialog::ConfirmDeleteVm { sid, vm, name, running, disks, snapshots, delete_disks } => {
+                dialog_window(ctx, "Delete VM").show(ctx, |ui| {
+                    ui.set_max_width(420.0);
+                    ui.label(format!("Are you sure you want to delete '{}'?", name));
+                    if *running {
+                        ui.add_space(8.0);
+                        ui.label("It's on: it's turned off first, the way pulling the plug would, without shutting its system down.");
+                    }
+                    if !disks.is_empty() {
+                        ui.add_space(8.0);
+                        let size = fmt_bytes(disks.iter().map(|k| k.size).sum());
+                        let text = match disks.as_slice() {
+                            [one] if !one.sr_name.is_empty() => format!("Delete its disk too ({}, on {})", size, one.sr_name),
+                            [_] => format!("Delete its disk too ({})", size),
+                            many => format!("Delete its {} disks too ({} in all)", many.len(), size),
+                        };
+                        ui.checkbox(delete_disks, text);
+                    }
+                    ui.add_space(8.0);
+                    let mut rest = vec![];
+                    if *snapshots > 0 {
+                        rest.push(if *snapshots == 1 { "Its snapshot is deleted too.".to_string() } else { format!("Its {} snapshots are deleted too.", snapshots) });
+                    }
+                    rest.push("ISO files in its DVD drive aren't touched. This can't be undone.".into());
+                    ui.label(egui::RichText::new(rest.join(" ")).color(pal.ink_soft));
+                    ui.add_space(12.0);
+                    dialog_buttons(ui, |ui| {
+                        // Esc or Cancel keep it; only a click on the red button deletes
+                        if dialog_button(ui, &pal, "close", "Cancel", Look::Plain, true) || ui.input(|i| i.key_pressed(Key::Escape)) {
+                            close = true;
+                        }
+                        if dialog_button(ui, &pal, "trash", if *running { "Shut down and delete" } else { "Delete" }, Look::Danger, true) {
+                            delete_vm = Some((*sid, vm.clone(), name.clone(), *delete_disks && !disks.is_empty()));
                         }
                     });
                 });
@@ -2740,9 +3023,19 @@ impl App {
                 Some((src, name)) => self.start_upload(sid, sr, src, Some(name), ctx),
             }
         }
+        if let Some((sid, spec, trace)) = new_vm {
+            self.create_vm(sid, spec, trace, ctx);
+        }
+        for (sid, sr, host) in checks {
+            self.check_sr(sid, sr, host, ctx);
+        }
         if let Some((sid, sr, vdi, name)) = delete_iso {
             self.dialog = Dialog::None;
             self.delete_iso(sid, sr, vdi, name, ctx);
+        }
+        if let Some((sid, vm, name, disks)) = delete_vm {
+            self.dialog = Dialog::None;
+            self.delete_vm(sid, vm, name, disks, ctx);
         }
         if let Some((sid, sr)) = forget_sr {
             self.dialog = Dialog::None;
@@ -2781,7 +3074,8 @@ impl App {
         ctx.request_repaint();
         self.frames += 1;
         let timed_out = self.started.elapsed() > Duration::from_secs(20);
-        if !self.shot_requested && ((self.shot_ready && self.frames >= 120) || timed_out) {
+        let settled = self.creating == 0 && self.pending_select.is_none() && self.sr_checking.is_empty();
+        if !self.shot_requested && ((self.shot_ready && self.frames >= 120 && settled) || timed_out) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot);
             self.shot_requested = true;
         }
@@ -2821,6 +3115,13 @@ impl eframe::App for App {
         let pal = self.pal;
         self.tick(ctx);
         let tree = self.build_tree();
+        if let Some((key, tab)) = self.pending_select.clone() {
+            if tree.find(&key).is_some() {
+                self.pending_select = None;
+                self.select(key);
+                self.tab = tab;
+            }
+        }
         let sel = tree.find(&self.selected).cloned().unwrap_or_else(|| tree.clone());
         if sel.key != self.selected {
             self.selected = sel.key.clone();
@@ -2911,6 +3212,34 @@ impl eframe::App for App {
                         self.uploads.insert("sr-iso".into(), u);
                     }
                 }
+                "new-vm" | "new-vm-advanced" | "new-vm-custom" | "new-vm-no-start" | "new-vm-created" | "new-vm-offline" => {
+                    if self.shot_show == "new-vm-offline" {
+                        // the demo's ISO library doesn't answer
+                        std::env::set_var("SVM_DEMO_OFFLINE", "sr-iso");
+                    }
+                    if let Some(sid) = sel.sid {
+                        if let Some(d) = self.server(sid).and_then(|s| s.data.as_ref()) {
+                            let iso = d.sr("sr-iso").and_then(|x| x.files.get(2)).map(|f| f.vdi.clone());
+                            let dlg = NewVmDialog::new(sid, d, iso.as_deref());
+                            let dlg = match self.shot_show.as_str() {
+                                "new-vm-advanced" => dlg.with_advanced(),
+                                // more memory than a server has free
+                                "new-vm-custom" => dlg.with_custom(4, 160, 80),
+                                // Create clicked with that: made, but it can't start
+                                "new-vm-no-start" => dlg.with_custom(4, 160, 80).pressed(),
+                                // Create clicked as it comes: made, started, its console open
+                                "new-vm-created" => dlg.pressed(),
+                                _ => dlg,
+                            };
+                            self.dialog = Dialog::NewVm(Box::new(dlg));
+                        }
+                    }
+                }
+                "vm-delete" => {
+                    if let Some(sid) = sel.sid {
+                        out.push(Intent::AskDeleteVm(sid, "vm-web".into()));
+                    }
+                }
                 "iso-delete" => {
                     out.push(Intent::Tab(Tab::IsoFiles));
                     if let Some(sid) = sel.sid {
@@ -2948,6 +3277,15 @@ impl eframe::App for App {
             if current == Tab::Console {
                 if let Some(c) = self.console.as_mut() {
                     c.tab_controls(ui, free, &pal);
+                }
+            } else if let Some((s, _, v)) = self.vm_of(&sel) {
+                // deleting it, next to its tabs (the power actions are up on the toolbar)
+                let (sid, vm) = (s.id, v.rref.clone());
+                let deleting = self.vm_deleting.contains(&vm);
+                let mut child = ui.new_child(egui::UiBuilder::new().max_rect(free).layout(egui::Layout::right_to_left(egui::Align::Center)));
+                let compact = free.width() < flat_button_width(&child, "Deleting…") + 8.0;
+                if flat_button(&mut child, "trash", if deleting { "Deleting…" } else { "Delete" }, Some(pal.red), !deleting, compact, &pal).on_hover_text("Delete this VM (asks first)").clicked() {
+                    out.push(Intent::AskDeleteVm(sid, vm));
                 }
             } else if let Some((s, x)) = self.sr_of(&sel).filter(|(_, x)| x.is_iso()) {
                 // an ISO library's actions, next to its tabs
@@ -3104,6 +3442,36 @@ fn fmt_took(d: Duration) -> String {
         0..=59 => format!("{} s", s.max(1)),
         60..=3599 => format!("{} min {} s", s / 60, s % 60),
         _ => format!("{} h {:02} min", s / 3600, s % 3600 / 60),
+    }
+}
+
+/// Why making or starting a VM failed, in plain words where the server's answer is a known one.
+fn create_problem(e: &ApiError) -> String {
+    let all = format!("{} {}", e.code, e.details.join(" ")).to_lowercase();
+    match e.code.as_str() {
+        "HOST_NOT_ENOUGH_FREE_MEMORY" => "No server has enough free memory for it right now. Pick a smaller size, or stop another VM, then start it.".into(),
+        NOT_ANSWERING => format!("{} is offline: it didn't answer in {} seconds, so nothing was made. Turn it on, or pick another, then try again.", e.details.first().map_or("The storage", |n| n.as_str()), CHECK_SECS),
+        NOT_PLUGGED => format!("{} isn't plugged in on the server the VM is for, so nothing was made. Pick another server, then try again.", e.details.first().map_or("The storage", |n| n.as_str())),
+        "SR_FULL" => "There isn't enough room on the storage for its disk.".into(),
+        "RBAC_PERMISSION_DENIED" | "PERMISSION_DENIED" => "Your account isn't allowed to do that.".into(),
+        "VM_SECUREBOOT_CERTIFICATES_MISSING" | "POOL_SECURE_BOOT_CERTIFICATES_MISSING" => {
+            "UEFI Secure Boot needs the pool's certificates, which aren't installed. Choose plain UEFI under Advanced, or install them on the pool (secureboot-certs install).".into()
+        }
+        _ if all.contains("secureboot") || all.contains("secure boot") => {
+            "UEFI Secure Boot couldn't be set up on this pool. Choose plain UEFI under Advanced, or install the pool's certificates (secureboot-certs install).".into()
+        }
+        _ if all.contains("no space") || all.contains("insufficient space") => "There isn't enough room on the storage for its disk.".into(),
+        _ => e.message(),
+    }
+}
+
+/// Why deleting a VM failed, in plain words where the server's answer is a known one.
+fn delete_vm_problem(e: &ApiError) -> String {
+    match e.code.as_str() {
+        "OPERATION_BLOCKED" => "This VM is protected from being deleted (its blocked operations include destroy). Lift that first, in XenCenter or with xe vm-param-clear, then try again.".into(),
+        "VM_BAD_POWER_STATE" => "It couldn't be turned off first. Shut it down, then try again.".into(),
+        "OTHER_OPERATION_IN_PROGRESS" => "The server is busy with something else on this VM. Wait a moment, then try again.".into(),
+        _ => e.message(),
     }
 }
 

@@ -63,6 +63,12 @@ pub struct Pal {
     pub blue: Color32,
     pub grey: Color32,
     pub stripe: Color32,
+    /// A caution's background and its text: not enough memory, and the like.
+    pub caution: Color32,
+    pub caution_ink: Color32,
+    /// A stop's background and its text: storage that's offline, and the like.
+    pub danger: Color32,
+    pub danger_ink: Color32,
 }
 
 pub const LIGHT: Pal = Pal {
@@ -92,6 +98,10 @@ pub const LIGHT: Pal = Pal {
     blue: Color32::from_rgb(30, 110, 210),
     grey: Color32::from_rgb(120, 128, 140),
     stripe: Color32::from_rgb(244, 246, 249),
+    caution: Color32::from_rgb(255, 235, 156),
+    caution_ink: Color32::from_rgb(156, 87, 0),
+    danger: Color32::from_rgb(255, 199, 206),
+    danger_ink: Color32::from_rgb(156, 0, 6),
 };
 
 pub const DARK: Pal = Pal {
@@ -121,6 +131,10 @@ pub const DARK: Pal = Pal {
     blue: Color32::from_rgb(88, 166, 255),
     grey: Color32::from_rgb(140, 148, 160),
     stripe: Color32::from_rgb(38, 42, 50),
+    caution: Color32::from_rgb(255, 235, 156),
+    caution_ink: Color32::from_rgb(156, 87, 0),
+    danger: Color32::from_rgb(255, 199, 206),
+    danger_ink: Color32::from_rgb(156, 0, 6),
 };
 
 /// egui's own widgets (menus, text boxes, dialogs, tables) in the same colours.

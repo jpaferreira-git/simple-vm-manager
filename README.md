@@ -13,6 +13,7 @@ affiliated with or endorsed by the makers of XenServer or XCP-ng.
 | ![Home page, dark](docs/screenshot-dark-home.png) | ![Folded sidebar](docs/screenshot-folded.png) |
 | ![A VM's console](docs/screenshot-dark-console.png) | ![Connecting to a server](docs/screenshot-dark-connect.png) |
 | ![An ISO library's files](docs/screenshot-dark-isos.png) | ![Uploading an ISO from a link](docs/screenshot-dark-upload.png) |
+| ![Creating a VM](docs/screenshot-dark-new-vm.png) | ![A new VM's advanced options](docs/screenshot-dark-new-vm-advanced.png) |
 
 ## Features
 
@@ -47,6 +48,26 @@ affiliated with or endorsed by the makers of XenServer or XCP-ng.
   left and Cancel; the share must be writable by the account the library uses, and names keep only
   letters, digits, dots and hyphens (the ISO driver's rule). Dropping an .iso on the window uploads
   it too, except on Wayland, where the window toolkit doesn't receive dropped files yet.
+- **New VM** — on the toolbar, on a pool's or server's right-click menu, or from an ISO in an ISO
+  library: pick the ISO, a size (Small, Medium, Large or your own numbers), the server it runs on
+  (or any), where the disk goes (the storage that server sees) and the network (or none). The rest is worked out: the system's template from the ISO's name
+  (Windows 11 gets UEFI, Secure Boot and its virtual TPM; an ISO that isn't recognised gets
+  "Other install media", plain BIOS), the name ("Ubuntu 24.04"), all CPUs in one socket. Advanced
+  has the system, boot mode, CPU layout and a description. It's made the way XenCenter makes
+  one, checked first against the storage's free space and the server's CPUs (a yellow note when
+  the server hasn't the memory free to start it), and then started with its console open, ready
+  to install. The ISO's library, and the disk's storage when it's on the network, are checked as
+  they're picked: a NAS that's off doesn't fail, the server waits for it for ever, so a library
+  that doesn't answer in 15 seconds shows in a red box ("Minisforum is offline", with Try again)
+  and Create waits; they're checked once more when Create is clicked, before anything is made. While it's made, the dialog shows each call to the server and its answer, as in a
+  terminal (with Copy), and how long an answer has been awaited; if the server turns something
+  down, what was made is undone and its answer stays there. Once made, the dialog can be closed
+  while the VM starts (which can take a while). An ISO the app doesn't recognise still gives a
+  readable name ("fedora-coreos-44.20260928.3.1-live-iso.x86_64.iso" → "Fedora CoreOS 44").
+- **Delete VM** — next to a VM's tabs (an icon when the window is narrow) or on its right-click
+  menu. It asks first, and its disks go too unless unticked (a disk another VM also uses stays);
+  its snapshots go with it, and ISO files in its DVD drive aren't touched. A VM that's on is
+  turned off first, the button saying so ("Shut down and delete").
 - **VM power actions** — Start, Shut Down, Reboot, Suspend, Resume, Force Shut Down, Force Reboot,
   enabled only when the server allows them, with confirmations for the disruptive ones.
 - **Keyboard shortcuts** — Ctrl+B start · Ctrl+E shut down · Ctrl+R reboot · Ctrl+Y suspend/resume ·
