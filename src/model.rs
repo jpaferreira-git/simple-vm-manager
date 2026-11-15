@@ -128,6 +128,8 @@ pub struct HostInfo {
     pub mem_free: i64,
     pub enabled: bool,
     pub is_master: bool,
+    /// Its control domain (dom0): the VM whose console is the server's own text console.
+    pub control_domain: String,
 }
 
 #[derive(Clone, Debug, Default)]

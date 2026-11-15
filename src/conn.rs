@@ -12,13 +12,21 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub const DEFAULT_PORT: u16 = 443; // XenAPI.HTTP.DEFAULT_HTTPS_PORT
-pub const MAX_LOGIN_ATTEMPTS: u32 = 3; // XenConnection.DEFAULT_MAX_SESSION_LOGIN_ATTEMPTS
+/// How many servers a login tries (the address given, the pool's other servers, and where they
+/// point as their coordinator), each once.
+pub const MAX_LOGIN_ATTEMPTS: usize = 8;
+/// How long reaching a server may take: a server that's off doesn't refuse, it just never
+/// answers, so without this each try would wait for the whole call's time.
+pub const CONNECT_TIMEOUT_MS: u64 = 6_000;
 pub const ACTION_TIMEOUT_MS: u64 = 86_400_000; // XenAPI.Session.STANDARD_TIMEOUT
 pub const DEMO_ACTION_MS: u64 = 1500; // estimated
 /// A storage check's error codes (see `Connection::check_sr`): it didn't answer in time; it isn't
 /// plugged into the server it's for. The storage's name is the first detail.
 pub const NOT_ANSWERING: &str = "SR_NOT_ANSWERING";
 pub const NOT_PLUGGED: &str = "SR_NOT_PLUGGED";
+/// A login's error code when the pool's servers point to a coordinator that doesn't answer; its
+/// address is the detail.
+pub const COORDINATOR_DOWN: &str = "COORDINATOR_DOWN";
 /// How long a storage has to answer a check (a rescan takes a second or two).
 pub const CHECK_SECS: u64 = 15;
 
@@ -42,6 +50,10 @@ impl ApiError {
             "VM_MISSING_PV_DRIVERS" => "The VM needs its guest tools installed for a clean shut down or suspend.".into(),
             "HOST_NOT_ENOUGH_FREE_MEMORY" => "No server has enough free memory to start the VM.".into(),
             "CONNECTION" => self.details.join(" "),
+            COORDINATOR_DOWN => format!(
+                "The pool's coordinator ({}) isn't answering, and its other servers can't be managed without it. Turn it back on. If it's gone for good, make another server the coordinator: on that server's console, run xe pool-emergency-transition-to-master.",
+                self.details.first().map(String::as_str).unwrap_or("its main server")
+            ),
             _ => {
                 if self.details.is_empty() {
                     format!("The server said: {}", self.code)
@@ -392,14 +404,21 @@ fn tcp_connect(host: &str, port: u16) -> Result<TcpStream, ApiError> {
 struct RealState {
     host: String,
     session: Option<String>,
-    id: u64,
+    /// The pool's servers' addresses, from the last look at it: where to log in when `host`
+    /// doesn't answer.
+    members: Vec<String>,
 }
 
 pub struct RealConnection {
     port: u16,
     user: String,
     password: String,
+    /// Only ever held for a moment (the window asks it for the server's name as it draws), never
+    /// while waiting on the network.
     state: Mutex<RealState>,
+    /// Held while logging in, so only one login happens at a time.
+    login: Mutex<()>,
+    id: AtomicU64,
     tls: Arc<native_tls::TlsConnector>,
 }
 
@@ -425,9 +444,18 @@ impl RealConnection {
             port,
             user: user.into(),
             password: password.into(),
-            state: Mutex::new(RealState { host, session: None, id: 0 }),
+            state: Mutex::new(RealState { host, session: None, members: vec![] }),
+            login: Mutex::new(()),
+            id: AtomicU64::new(0),
             tls: Arc::new(tls),
         }
+    }
+
+    /// The pool's servers' addresses, remembered from last time: tried when the address given
+    /// doesn't answer.
+    pub fn with_members(self, members: Vec<String>) -> RealConnection {
+        self.state.lock().unwrap().members = members;
+        self
     }
 
     fn url(&self, host: &str) -> String {
@@ -441,6 +469,7 @@ impl RealConnection {
     fn rpc(&self, host: &str, id: u64, method: &str, params: Vec<Value>, timeout_ms: u64) -> Result<Value, ApiError> {
         let agent = ureq::AgentBuilder::new()
             .tls_connector(self.tls.clone())
+            .timeout_connect(Duration::from_millis(CONNECT_TIMEOUT_MS.min(timeout_ms)))
             .timeout(Duration::from_millis(timeout_ms))
             .user_agent(concat!("SimpleVMManager/", env!("CARGO_PKG_VERSION")))
             .build();
@@ -473,25 +502,85 @@ impl RealConnection {
         Ok(result)
     }
 
-    fn login(&self, st: &mut RealState, timeout_ms: u64) -> Result<(), ApiError> {
+    /// Logs in: at the address given, else at the pool's other servers; a pool member points to
+    /// its coordinator, which is tried next. The server and session it got, or why not. Holds no
+    /// lock on `state` while it waits.
+    fn log_in(&self, timeout_ms: u64) -> Result<(String, String), ApiError> {
+        let (first, members) = {
+            let st = self.state.lock().unwrap();
+            (st.host.clone(), st.members.clone())
+        };
+        let mut queue: std::collections::VecDeque<String> = std::iter::once(first.clone()).chain(members).collect();
+        let mut tried: Vec<String> = vec![];
+        let mut unreachable: Vec<String> = vec![];
+        // the coordinators the pool's servers pointed to
+        let mut pointed: Vec<String> = vec![];
         let mut last = ApiError::other("Couldn't log in.");
-        for _ in 0..MAX_LOGIN_ATTEMPTS {
-            st.id += 1;
+        while let Some(host) = queue.pop_front() {
+            if host.is_empty() || tried.iter().any(|t| t.eq_ignore_ascii_case(&host)) {
+                continue;
+            }
+            if tried.len() >= MAX_LOGIN_ATTEMPTS {
+                break;
+            }
+            tried.push(host.clone());
+            let id = self.id.fetch_add(1, Ordering::Relaxed) + 1;
             let params = vec![json!(self.user), json!(self.password), json!("2.0"), json!("SimpleVMManager")];
-            match self.rpc(&st.host.clone(), st.id, "session.login_with_password", params, timeout_ms) {
-                Ok(v) => {
-                    st.session = v.as_str().map(|s| s.to_string());
-                    return Ok(());
-                }
+            match self.rpc(&host, id, "session.login_with_password", params, timeout_ms) {
+                Ok(v) => return Ok((host, v.as_str().unwrap_or_default().to_string())),
                 Err(e) if e.code == "HOST_IS_SLAVE" && !e.details.is_empty() => {
-                    st.host = e.details[0].clone();
+                    let coordinator = e.details[0].clone();
+                    if !pointed.contains(&coordinator) {
+                        pointed.push(coordinator.clone());
+                    }
+                    queue.push_front(coordinator);
                     last = e;
                 }
-                Err(e) if e.code == "CONNECTION" => last = e,
-                Err(e) => return Err(e), // wrong password etc.: no point retrying
+                Err(e) if e.code == "CONNECTION" => {
+                    unreachable.push(host);
+                    last = e;
+                }
+                Err(e) => return Err(e), // wrong password etc.: no point trying elsewhere
             }
         }
+        if let Some(c) = pointed.iter().find(|c| unreachable.iter().any(|u| u.eq_ignore_ascii_case(c))) {
+            return Err(ApiError { code: COORDINATOR_DOWN.into(), details: vec![c.clone()] });
+        }
+        if last.code == "CONNECTION" {
+            let what = if tried.len() > 1 { format!("{} (nor the pool's other servers)", first) } else { first };
+            return Err(ApiError::other(format!("{} isn't answering. It may be off, or out of reach from this computer.", what)));
+        }
         Err(last)
+    }
+
+    /// A session to call with, and the server it's on: the one there is, or a new login (one at a
+    /// time; a login that another call just made is used as it is).
+    fn session(&self, timeout_ms: u64) -> Result<(String, String), ApiError> {
+        let current = || {
+            let st = self.state.lock().unwrap();
+            st.session.clone().map(|s| (st.host.clone(), s))
+        };
+        if let Some(x) = current() {
+            return Ok(x);
+        }
+        let _one = self.login.lock().unwrap();
+        if let Some(x) = current() {
+            return Ok(x);
+        }
+        let (host, session) = self.log_in(timeout_ms)?;
+        let mut st = self.state.lock().unwrap();
+        st.host = host.clone();
+        st.session = Some(session.clone());
+        Ok((host, session))
+    }
+
+    /// Forgets `session` (expired, or its server stopped answering), unless another call already
+    /// replaced it: the next call logs in again.
+    fn drop_session(&self, session: &str) {
+        let mut st = self.state.lock().unwrap();
+        if st.session.as_deref() == Some(session) {
+            st.session = None;
+        }
     }
 
     /// Waits for a task to end: Ok(true) when it succeeded, Ok(false) when it's still going at the
@@ -518,28 +607,23 @@ impl RealConnection {
     }
 
     fn call(&self, method: &str, extra: Vec<Value>, timeout_ms: u64) -> Result<Value, ApiError> {
-        let (host, session, id) = {
-            let mut st = self.state.lock().unwrap();
-            if st.session.is_none() {
-                self.login(&mut st, timeout_ms.min(60_000))?;
-            }
-            st.id += 1;
-            (st.host.clone(), st.session.clone().unwrap_or_default(), st.id)
-        };
+        let (host, session) = self.session(timeout_ms.min(60_000))?;
         let mut params = vec![json!(session)];
         params.extend(extra.iter().cloned());
+        let id = self.id.fetch_add(1, Ordering::Relaxed) + 1;
         match self.rpc(&host, id, method, params, timeout_ms) {
             Err(e) if e.code == "SESSION_INVALID" => {
-                let (host, session, id) = {
-                    let mut st = self.state.lock().unwrap();
-                    st.session = None;
-                    self.login(&mut st, timeout_ms.min(60_000))?;
-                    st.id += 1;
-                    (st.host.clone(), st.session.clone().unwrap_or_default(), st.id)
-                };
+                self.drop_session(&session);
+                let (host, session) = self.session(timeout_ms.min(60_000))?;
                 let mut params = vec![json!(session)];
                 params.extend(extra);
+                let id = self.id.fetch_add(1, Ordering::Relaxed) + 1;
                 self.rpc(&host, id, method, params, timeout_ms)
+            }
+            Err(e) if e.code == "CONNECTION" => {
+                // its server may be gone (shut down): the next call logs in again, elsewhere if need be
+                self.drop_session(&session);
+                Err(e)
             }
             other => other,
         }
@@ -717,6 +801,7 @@ impl Connection for RealConnection {
                 mem_total: n(&m, "memory_total"),
                 mem_free: n(&m, "memory_free"),
                 enabled: b(&r, "enabled"),
+                control_domain: String::new(), // filled in from the VMs below
             });
         }
         // Each storage is plugged into the servers that can use it (a PBD per server): local storage
@@ -822,7 +907,12 @@ impl Connection for RealConnection {
         let sr_names: HashMap<String, String> = pd.srs.iter().map(|x| (x.rref.clone(), x.name.clone())).collect();
         let net_names: HashMap<String, String> = pd.networks.iter().map(|x| (x.rref.clone(), x.name.clone())).collect();
         let sr_hosts: HashMap<String, String> = pd.srs.iter().filter_map(|x| x.host.clone().map(|h| (x.rref.clone(), h))).collect();
+        // each server's control domain (dom0), for its console
+        let mut dom0: HashMap<String, String> = HashMap::new();
         for (k, r) in vm_records {
+            if b(&r, "is_control_domain") && !b(&r, "is_a_snapshot") {
+                dom0.insert(s(&r, "resident_on"), k.clone());
+            }
             if b(&r, "is_a_template") || b(&r, "is_control_domain") || b(&r, "is_a_snapshot") {
                 continue;
             }
@@ -884,6 +974,11 @@ impl Connection for RealConnection {
             vm.nics.sort_by(|a, b| a.device.cmp(&b.device));
             pd.vms.push(vm);
         }
+        for h in pd.hosts.iter_mut() {
+            h.control_domain = dom0.remove(&h.rref).unwrap_or_default();
+        }
+        // where to log in next time, should this server stop answering
+        self.state.lock().unwrap().members = pd.hosts.iter().map(|h| h.address.clone()).filter(|a| !a.is_empty()).collect();
         if pd.name.is_empty() && pd.hosts.len() > 1 {
             pd.name = "Pool".into();
         }
@@ -1290,7 +1385,7 @@ impl Connection for RealConnection {
             }
         }
         if location.is_empty() {
-            return Err(ApiError::other("This VM has no graphical console."));
+            return Err(ApiError::other("There's no console to show here."));
         }
         let (session, conn_host) = {
             let st = self.state.lock().unwrap();
@@ -1377,6 +1472,7 @@ impl DemoConnection {
             mem_free: 0,
             enabled: true,
             is_master: master,
+            control_domain: format!("dom0-{}", r),
         };
         d.hosts.push(host("host-a", "demo-host-01", "10.20.0.11", true));
         d.hosts.push(host("host-b", "demo-host-02", "10.20.0.12", false));
@@ -1938,6 +2034,27 @@ mod tests {
         let d = c.data.lock().unwrap().clone();
         let vm = d.vm(&made).unwrap();
         assert_eq!((vm.power, vm.nics.len()), (PowerState::Halted, 0));
+    }
+
+    #[test]
+    fn name_answers_while_logging_in() {
+        // 192.0.2.1 is a documentation address: nothing answers there, like a server that's off
+        let c = Arc::new(RealConnection::new("192.0.2.1", "root", "x"));
+        let worker = c.clone();
+        let started = Instant::now();
+        let job = std::thread::spawn(move || worker.fetch(60_000));
+        std::thread::sleep(Duration::from_millis(300));
+        // the window asks for the name as it draws: it mustn't wait for the login
+        while started.elapsed() < Duration::from_secs(2) {
+            let asked = Instant::now();
+            assert_eq!(c.hostname(), "192.0.2.1");
+            assert!(asked.elapsed() < Duration::from_millis(100), "hostname() waited {:?}", asked.elapsed());
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // and the login gives up in about CONNECT_TIMEOUT_MS, not the call's 60 s
+        let e = job.join().unwrap().unwrap_err();
+        assert!(started.elapsed() < Duration::from_millis(CONNECT_TIMEOUT_MS + 4_000), "took {:?}", started.elapsed());
+        assert!(e.message().contains("isn't answering"), "{}", e.message());
     }
 
     #[test]

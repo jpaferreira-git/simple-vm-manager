@@ -26,14 +26,15 @@ affiliated with or endorsed by the makers of XenServer or XCP-ng.
   virtual networks in folders) or *Objects* view (grouped by type), with a search box. The sidebar **folds** into a slim icon strip.
 - **Home overview** — servers, running VMs, memory and storage in use at a glance, each server's load
   and the latest activity.
-- **Details** — General, Memory, Storage, Networking, Console and Logs tabs for pools, hosts and VMs.
+- **Details** — General, Memory, Storage, Networking and Logs tabs for pools, hosts and VMs, and Console for hosts and VMs.
   A VM's General tab shows its tags, operating system, uptime, IP addresses, guest tools, CPUs and
   memory, firmware and Secure Boot, boot order, high availability, disks and snapshots; click a value
   to copy it.
 - **Console** — see a running VM's screen and use it with your keyboard and mouse (the keyboard goes
   to the VM while the mouse is over its screen), with *Send Ctrl+Alt+Del*, a *Send keys* menu for the
   combinations your desktop keeps for itself (the Windows key, Alt+Tab…) and *Scale to fit*. It
-  reconnects by itself after the VM reboots.
+  reconnects by itself after the VM reboots. A server has a Console tab too: its own text console
+  (the control domain's, as in XenCenter), where you log in as root.
 - **ISO libraries** — *ISO Library* on the toolbar adds a Windows (SMB) or NFS share of installation
   discs to a pool: just the address (and a login for SMB) up front, protocol versions under
   *Advanced* (SMB 3.0 and NFSv3 by default). The server mounts the share right away; if that fails
@@ -75,7 +76,10 @@ affiliated with or endorsed by the makers of XenServer or XCP-ng.
 - **Light / dark / system theme** — the toolbar's theme button switches light / dark; right-click it to
   follow the system instead. Your choice is remembered.
 - **Demo server** — try everything without a real server (*Try the Demo Server* on the Home page).
-- Live refresh every 15 s, automatic reconnect.
+- Live refresh every 15 s, automatic reconnect. A server that's off is given up on after 6 s
+  (the window never waits for it); if it's the one the app logs in through, the pool's other
+  servers are tried, and if they all point to a coordinator that's off, the app says so and how to
+  make another server the coordinator.
 
 ## Install on Arch Linux / Omarchy
 

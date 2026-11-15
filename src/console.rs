@@ -219,7 +219,7 @@ fn read_reason(s: &mut ConsoleStream) -> String {
 fn handshake(s: &mut ConsoleStream) -> Result<(u16, u16), String> {
     let v = read_n(s, 12)?;
     if !v.starts_with(b"RFB ") {
-        return Err("The server didn't answer like a VM console.".into());
+        return Err("The server didn't answer like a console.".into());
     }
     let num = |b: &[u8]| std::str::from_utf8(b).ok().and_then(|t| t.parse::<u32>().ok()).unwrap_or(0);
     let (major, minor) = (num(&v[4..7]), num(&v[8..11]));
@@ -835,7 +835,7 @@ impl DemoTerm {
             DemoStage::Password => {
                 self.lines.push(String::new());
                 self.lines.push("Welcome! This is the demo server: any password works here.".into());
-                self.lines.push("Type 'help' to see what this pretend VM understands.".into());
+                self.lines.push("Type 'help' to see what this pretend system understands.".into());
                 self.lines.push(String::new());
                 self.stage = DemoStage::Shell;
             }
@@ -978,7 +978,7 @@ impl ConsoleView {
                 ui.allocate_new_ui(egui::UiBuilder::new().max_rect(area.shrink(24.0)), |ui| {
                     ui.vertical_centered(|ui| {
                         ui.add_space((area.height() / 2.0 - 60.0).max(0.0));
-                        ui.label(egui::RichText::new("Couldn't show the VM's console").size(16.0).color(Color32::from_gray(225)));
+                        ui.label(egui::RichText::new("Couldn't show the console").size(16.0).color(Color32::from_gray(225)));
                         ui.add_space(6.0);
                         ui.label(egui::RichText::new(msg).color(Color32::from_gray(170)));
                         ui.add_space(12.0);
@@ -1026,7 +1026,7 @@ impl ConsoleView {
     /// had no room for them.
     fn overlays(&mut self, ui: &mut Ui, area: Rect, pal: &Pal, status: &Status) {
         if matches!(status, Status::Failed(_)) && self.retry_at.is_some() {
-            let text = "The VM's screen went away (it may be restarting). Connecting again…";
+            let text = "The screen went away (it may be restarting). Connecting again…";
             let g = ui.painter().layout(text.into(), FontId::proportional(13.0), Color32::from_gray(235), area.width() - 60.0);
             let r = Rect::from_center_size(pos2(area.center().x, area.min.y + 30.0), g.size() + vec2(24.0, 12.0));
             ui.painter().rect_filled(r, Rounding::same(6.0), Color32::from_black_alpha(200));
@@ -1108,7 +1108,7 @@ impl ConsoleView {
                 let m = egui::menu::menu_custom_button(ui, egui::Button::new("").frame(false).min_size(ICON_BUTTON), |ui| menu(ui, &mut combo, true));
                 flat_bg(ui, slot, &m.response, m.inner.is_some());
                 paint_glyph(ui.painter(), m.response.rect, "keyboard", if connected { pal.ink_soft } else { pal.ink_faint });
-                m.response.on_hover_text("Send keys to the VM");
+                m.response.on_hover_text("Send keys to the screen");
             });
         } else {
             // egui gives frameless buttons no padding, so these draw their own icon and label inside a
@@ -1188,7 +1188,7 @@ impl ConsoleView {
     /// Presses the keys in order, then lets go of them in reverse.
     fn send_combo(&mut self, keys: &[(u32, u32)]) {
         if let Some(d) = self.demo.as_mut() {
-            d.lines.push("(The demo VM ignores key combinations.)".into());
+            d.lines.push("(The demo ignores key combinations.)".into());
             return;
         }
         for &(k, s) in keys {

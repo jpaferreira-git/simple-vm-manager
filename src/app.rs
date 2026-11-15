@@ -697,7 +697,7 @@ impl App {
                     for (h, u) in session {
                         let known = self.servers.iter().any(|s| !s.conn.is_demo() && s.conn.hostname().eq_ignore_ascii_case(&h));
                         if let (false, Some(p)) = (known, self.saved.get(&(h.clone(), u.clone())).cloned()) {
-                            self.add_server(Arc::new(RealConnection::new(&h, &u, &p)));
+                            self.add_server(Arc::new(RealConnection::new(&h, &u, &p).with_members(load_members(&h))));
                         }
                     }
                     self.selected = selected;
@@ -961,6 +961,12 @@ impl App {
                 let first = !s.ever;
                 let was_reconnecting = s.state == ConnState::Reconnecting;
                 let host_keys: Vec<String> = d.hosts.iter().map(|h| format!("host:{}:{}", id, h.rref)).collect();
+                // the pool's servers' addresses, kept for logging in elsewhere should this one go
+                let members: Vec<String> = d.hosts.iter().map(|h| h.address.clone()).filter(|a| !a.is_empty()).collect();
+                let members_changed = s.data.as_ref().map_or(true, |old| old.hosts.iter().map(|h| h.address.clone()).filter(|a| !a.is_empty()).collect::<Vec<_>>() != members);
+                if members_changed && !s.conn.is_demo() && !shot {
+                    save_members(&s.conn.hostname(), &members);
+                }
                 s.data = Some(d);
                 s.state = ConnState::Connected;
                 s.error = None;
@@ -1067,6 +1073,25 @@ impl App {
         }
         let s = self.server(node.sid?)?;
         Some((s, s.data.as_ref()?.sr(node.rref.as_deref()?)?))
+    }
+
+    fn host_of<'a>(&'a self, node: &Node) -> Option<(&'a ServerEntry, &'a HostInfo)> {
+        if node.kind != Kind::Host {
+            return None;
+        }
+        let s = self.server(node.sid?)?;
+        Some((s, s.data.as_ref()?.host(node.rref.as_deref()?)?))
+    }
+
+    /// What the Console tab shows for a node: a VM's own screen, or a server's text console (its
+    /// control domain's): the pool, the VM to connect to, a name and system for the demo's
+    /// screen, and whether it's on (a server always is).
+    fn console_target(&self, node: &Node) -> Option<(u32, String, String, String, PowerState)> {
+        if let Some((s, _, vm)) = self.vm_of(node) {
+            return Some((s.id, vm.rref.clone(), vm.name.clone(), vm.os.clone(), vm.power));
+        }
+        let (s, h) = self.host_of(node)?;
+        Some((s.id, h.control_domain.clone(), h.name.clone(), format!("XenServer {}", h.version), PowerState::Running))
     }
 
     fn vm_of<'a>(&'a self, node: &Node) -> Option<(&'a ServerEntry, &'a PoolData, &'a VmInfo)> {
@@ -1773,7 +1798,8 @@ impl App {
             Kind::Folder => vec![Tab::Storage],
             _ if !has_data => vec![Tab::General, Tab::Logs],
             Kind::Vm => vec![Tab::General, Tab::Memory, Tab::Storage, Tab::Networking, Tab::Console, Tab::Logs],
-            Kind::Pool | Kind::Host => vec![Tab::General, Tab::Memory, Tab::Storage, Tab::Networking, Tab::Logs],
+            Kind::Host => vec![Tab::General, Tab::Memory, Tab::Storage, Tab::Networking, Tab::Console, Tab::Logs],
+            Kind::Pool => vec![Tab::General, Tab::Memory, Tab::Storage, Tab::Networking, Tab::Logs],
             _ => vec![Tab::General, Tab::Logs],
         }
     }
@@ -2711,8 +2737,17 @@ impl App {
     /// The VM's screen. A shut down or suspended VM has none: offer to start or resume it.
     fn console_tab(&mut self, ui: &mut Ui, sel: &Node, out: &mut Vec<Intent>) {
         let pal = self.pal;
-        let Some((s, _, vm)) = self.vm_of(sel) else { return };
-        let (sid, vref, name, os, power, conn) = (s.id, vm.rref.clone(), vm.name.clone(), vm.os.clone(), vm.power, s.conn.clone());
+        let Some((sid, vref, name, os, power)) = self.console_target(sel) else { return };
+        let Some(conn) = self.server(sid).map(|s| s.conn.clone()) else { return };
+        if vref.is_empty() {
+            // a server whose control domain the pool didn't list
+            self.console = None;
+            ui.vertical_centered(|ui| {
+                ui.add_space(80.0);
+                ui.label(egui::RichText::new("This server's console isn't available.").size(15.0).color(pal.ink_soft));
+            });
+            return;
+        }
         if !matches!(power, PowerState::Running | PowerState::Paused) {
             self.console = None;
             let (text, op) = match power {
@@ -3007,7 +3042,7 @@ impl App {
             if let Some(dup) = self.servers.iter().find(|s| !s.conn.is_demo() && s.conn.hostname().eq_ignore_ascii_case(&h)).map(|s| s.id) {
                 self.remove_server(dup, false);
             }
-            self.add_server(Arc::new(RealConnection::new(&h, &u, &p)));
+            self.add_server(Arc::new(RealConnection::new(&h, &u, &p).with_members(load_members(&h))));
             if let Some(s) = self.servers.last_mut() {
                 // (the keychain may still be being looked for; only a missing one rules saving out)
                 s.pending_save = (self.keychain != Some(false)).then_some((remember, p));
@@ -3126,8 +3161,9 @@ impl eframe::App for App {
         if sel.key != self.selected {
             self.selected = sel.key.clone();
         }
-        // A VM's console stays connected while that VM is selected (on any of its tabs).
-        if self.console.as_ref().map_or(false, |c| sel.sid != Some(c.sid) || sel.rref.as_deref() != Some(c.vm.as_str())) {
+        // A console stays connected while its VM or server is selected (on any of its tabs).
+        let target = self.console_target(&sel).map(|t| (t.0, t.1));
+        if self.console.as_ref().map_or(false, |c| target.as_ref() != Some(&(c.sid, c.vm.clone()))) {
             self.console = None;
         }
         let mut out = self.shortcuts(ctx, &sel);
@@ -3158,6 +3194,12 @@ impl eframe::App for App {
                 "confirm" => out.extend(ACTIONS.iter().position(|a| a.confirm && self.can_run(a, &sel)).map(Intent::Action)),
                 "about" => out.push(Intent::About),
                 "console" => out.push(Intent::Tab(Tab::Console)),
+                "host-console" => {
+                    if let Some(sid) = sel.sid {
+                        out.push(Intent::Select(format!("host:{}:host-a", sid)));
+                        out.push(Intent::Tab(Tab::Console));
+                    }
+                }
                 "iso" => out.push(Intent::IsoLibrary),
                 "iso-advanced" | "iso-error" => {
                     let pools: Vec<(u32, String)> = self.servers.iter().filter(|s| s.data.is_some()).map(|s| (s.id, s.name())).collect();
@@ -3769,6 +3811,32 @@ fn session_remove(host: &str, user: &str) {
     let mut list = load_session();
     list.retain(|(h, u)| !(h.eq_ignore_ascii_case(host) && u == user));
     save_session(&list);
+}
+
+/// The pool servers' addresses last seen through `host` (members.txt: the server, a tab, the
+/// addresses with commas).
+fn load_members(host: &str) -> Vec<String> {
+    let Some(dir) = config_dir() else { return vec![] };
+    std::fs::read_to_string(dir.join("members.txt"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.split_once('\t'))
+        .find(|(h, _)| h.trim().eq_ignore_ascii_case(host))
+        .map(|(_, m)| m.split(',').map(|a| a.trim().to_string()).filter(|a| !a.is_empty()).collect())
+        .unwrap_or_default()
+}
+
+fn save_members(host: &str, members: &[String]) {
+    let Some(dir) = config_dir() else { return };
+    let _ = std::fs::create_dir_all(&dir);
+    let f = dir.join("members.txt");
+    let mut lines = vec![format!("{}\t{}", host, members.join(","))];
+    for line in std::fs::read_to_string(&f).unwrap_or_default().lines() {
+        if !line.split('\t').next().unwrap_or("").trim().eq_ignore_ascii_case(host) && lines.len() < 20 {
+            lines.push(line.to_string());
+        }
+    }
+    let _ = std::fs::write(f, lines.join("\n"));
 }
 
 fn remember_host(host: &str, user: &str) {
