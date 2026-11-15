@@ -142,6 +142,34 @@ pub struct SrInfo {
     pub shared: bool,
     /// The server this storage belongs to (local disks, DVD drives, USB); None for shared storage.
     pub host: Option<String>,
+    /// Where it lives, like "//nas/isos" or "nas:/mnt/tank/isos" (from its device configuration).
+    pub location: String,
+    /// How it's reached, in words: "Windows share (SMB 3.0)", "NFS (v3)"…
+    pub share: String,
+    /// An ISO library's discs.
+    pub files: Vec<IsoFile>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct IsoFile {
+    /// The file's disc (VDI) on the server.
+    pub vdi: String,
+    pub name: String,
+    pub size: i64,
+    /// The disc's description (VDI name_description), kept by the pool, not on the share.
+    pub description: String,
+    /// The VMs that have it in a DVD drive, each with whether that holds on to it (running or
+    /// suspended); a shut-down VM's drive can be emptied.
+    pub in_drives: Vec<(String, bool)>,
+    /// The server allows deleting it (its allowed_operations has destroy).
+    pub can_delete: bool,
+}
+
+impl IsoFile {
+    /// The running (or suspended) VMs that keep it from being deleted.
+    pub fn held_by(&self) -> Vec<&str> {
+        self.in_drives.iter().filter(|d| d.1).map(|d| d.0.as_str()).collect()
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -164,6 +192,11 @@ pub struct PoolData {
 }
 
 impl SrInfo {
+    /// A library of installation discs.
+    pub fn is_iso(&self) -> bool {
+        self.kind == "iso"
+    }
+
     /// A server's "DVD drives" or "Removable storage" (type udev) with no disc or USB drive in it:
     /// left out of the lists.
     pub fn is_empty_drive(&self) -> bool {
@@ -367,5 +400,155 @@ pub fn or<'a>(s: &'a str, fallback: &'a str) -> &'a str {
         fallback
     } else {
         s
+    }
+}
+
+// ---------------------------------------------------------------- ISO libraries
+
+/// A new ISO library: a Windows (SMB) or NFS share the servers mount to find installation discs.
+#[derive(Clone, Debug, Default)]
+pub struct IsoLibrary {
+    pub name: String,
+    pub description: String,
+    pub nfs: bool,
+    /// "//server/share/folder" for SMB, "server:/path" for NFS.
+    pub location: String,
+    pub username: String,
+    pub password: String,
+    /// "3.0" or "1.0".
+    pub smb_version: String,
+    /// "3", "4" or "4.1".
+    pub nfs_version: String,
+    /// Mounted on every server of the pool, not just the coordinator.
+    pub shared: bool,
+}
+
+/// The name an uploaded disc gets in an ISO library. The server's ISO driver only accepts letters,
+/// digits, dots and hyphens, ending in .iso or .img, so anything else becomes a hyphen:
+/// "Win11_24H2 English.iso" → "Win11-24H2-English.iso".
+pub fn iso_file_name(name: &str) -> String {
+    let mut out = String::new();
+    for c in name.trim().chars() {
+        let c = if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '-' };
+        if !(c == '-' && out.ends_with('-')) {
+            out.push(c);
+        }
+    }
+    let lower = out.to_ascii_lowercase();
+    let (stem, ext) = if lower.ends_with(".iso") || lower.ends_with(".img") { out.split_at(out.len() - 4) } else { (out.as_str(), ".iso") };
+    let stem = stem.trim_matches(|c| c == '-' || c == '.');
+    format!("{}{}", if stem.is_empty() { "disc" } else { stem }, ext)
+}
+
+impl IsoLibrary {
+    /// "\\nas\isos" or "nas/isos" as "//nas/isos"; NFS locations as typed.
+    pub fn normalise_location(nfs: bool, typed: &str) -> String {
+        let t = typed.trim();
+        if nfs {
+            return t.to_string();
+        }
+        let t = t.replace('\\', "/");
+        format!("//{}", t.trim_start_matches('/'))
+    }
+
+    /// Why the location can't be right, if it can't.
+    pub fn location_problem(&self) -> Option<&'static str> {
+        if self.nfs {
+            match self.location.split_once(':') {
+                Some((host, path)) if !host.is_empty() && path.starts_with('/') => None,
+                _ => Some("Type the NFS share as server:/path, for example nas:/mnt/tank/isos."),
+            }
+        } else {
+            let parts: Vec<&str> = self.location.trim_start_matches('/').split('/').filter(|p| !p.is_empty()).collect();
+            if parts.len() >= 2 {
+                None
+            } else {
+                Some("Type the share as \\\\server\\share, for example \\\\nas\\isos.")
+            }
+        }
+    }
+
+    /// The SR's device configuration, as the server's ISO driver expects it.
+    pub fn device_config(&self) -> Vec<(String, String)> {
+        let mut c = vec![("location".to_string(), self.location.clone())];
+        if self.nfs {
+            c.push(("type".into(), "nfs_iso".into()));
+            c.push(("nfsversion".into(), self.nfs_version.clone()));
+        } else {
+            c.push(("type".into(), "cifs".into()));
+            c.push(("vers".into(), self.smb_version.clone()));
+            if !self.username.is_empty() {
+                c.push(("username".into(), self.username.clone()));
+                c.push(("cifspassword".into(), self.password.clone()));
+            }
+        }
+        c
+    }
+
+    /// The same request as an `xe` command for the server's console, password hidden.
+    pub fn xe_command(&self) -> String {
+        let quote = |v: &str| if v.is_empty() || v.contains(|c: char| c.is_whitespace() || c == '"') { format!("\"{}\"", v.replace('"', "\\\"")) } else { v.to_string() };
+        let mut parts = vec![
+            "xe sr-create".to_string(),
+            "type=iso".into(),
+            "content-type=iso".into(),
+            format!("shared={}", self.shared),
+            format!("name-label={}", quote(&self.name)),
+        ];
+        for (k, v) in self.device_config() {
+            let v = if k.ends_with("password") { "********".to_string() } else { quote(&v) };
+            parts.push(format!("device-config:{}={}", k, v));
+        }
+        parts.join(" ")
+    }
+}
+
+#[cfg(test)]
+mod iso_tests {
+    use super::*;
+
+    #[test]
+    fn uploaded_file_names() {
+        assert_eq!(iso_file_name("ubuntu-24.04.1-live-server-amd64.iso"), "ubuntu-24.04.1-live-server-amd64.iso");
+        assert_eq!(iso_file_name("Win11_24H2_English_x64.iso"), "Win11-24H2-English-x64.iso");
+        assert_eq!(iso_file_name("  Instalação do Windows (2025).ISO "), "Instala-o-do-Windows-2025.ISO");
+        assert_eq!(iso_file_name("_.iso"), "disc.iso");
+        assert_eq!(iso_file_name("firmware.img"), "firmware.img");
+        assert_eq!(iso_file_name("notes"), "notes.iso");
+    }
+
+    fn smb(loc: &str) -> IsoLibrary {
+        IsoLibrary { name: "ISO Library".into(), location: IsoLibrary::normalise_location(false, loc), username: "joao".into(), password: "s3cret".into(), smb_version: "3.0".into(), nfs_version: "3".into(), shared: true, ..Default::default() }
+    }
+
+    #[test]
+    fn smb_locations() {
+        assert_eq!(smb("\\\\nas\\isos").location, "//nas/isos");
+        assert_eq!(smb("nas/isos/win").location, "//nas/isos/win");
+        assert_eq!(smb("//nas/isos").location_problem(), None);
+        assert!(smb("\\\\nas").location_problem().is_some());
+    }
+
+    #[test]
+    fn nfs_locations() {
+        let mut l = IsoLibrary { nfs: true, nfs_version: "3".into(), ..Default::default() };
+        l.location = "nas:/mnt/tank/isos".into();
+        assert_eq!(l.location_problem(), None);
+        l.location = "nas/mnt".into();
+        assert!(l.location_problem().is_some());
+    }
+
+    #[test]
+    fn xe_command_hides_the_password() {
+        let cmd = smb("\\\\nas\\isos").xe_command();
+        assert_eq!(cmd, "xe sr-create type=iso content-type=iso shared=true name-label=\"ISO Library\" device-config:location=//nas/isos device-config:type=cifs device-config:vers=3.0 device-config:username=joao device-config:cifspassword=********");
+        assert!(!cmd.contains("s3cret"));
+    }
+
+    #[test]
+    fn guest_access_sends_no_credentials() {
+        let mut l = smb("//nas/isos");
+        l.username.clear();
+        assert!(!l.device_config().iter().any(|(k, _)| k == "username" || k == "cifspassword"));
     }
 }

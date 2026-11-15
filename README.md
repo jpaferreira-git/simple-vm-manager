@@ -12,6 +12,7 @@ affiliated with or endorsed by the makers of XenServer or XCP-ng.
 | ![Light theme](docs/screenshot-light-vm.png) | ![Dark theme](docs/screenshot-dark-vm.png) |
 | ![Home page, dark](docs/screenshot-dark-home.png) | ![Folded sidebar](docs/screenshot-folded.png) |
 | ![A VM's console](docs/screenshot-dark-console.png) | ![Connecting to a server](docs/screenshot-dark-connect.png) |
+| ![An ISO library's files](docs/screenshot-dark-isos.png) | ![Uploading an ISO from a link](docs/screenshot-dark-upload.png) |
 
 ## Features
 
@@ -32,6 +33,20 @@ affiliated with or endorsed by the makers of XenServer or XCP-ng.
   to the VM while the mouse is over its screen), with *Send Ctrl+Alt+Del*, a *Send keys* menu for the
   combinations your desktop keeps for itself (the Windows key, Alt+Tab…) and *Scale to fit*. It
   reconnects by itself after the VM reboots.
+- **ISO libraries** — *ISO Library* on the toolbar adds a Windows (SMB) or NFS share of installation
+  discs to a pool: just the address (and a login for SMB) up front, protocol versions under
+  *Advanced* (SMB 3.0 and NFSv3 by default). The server mounts the share right away; if that fails
+  you get the reason in plain words, the equivalent `xe` command and the server's answer, ready to copy.
+  An ISO library shows a disc in the tree and an *ISO Files* tab listing its discs, each with a
+  description you can edit in place (kept by the pool, as XenCenter's) and a bin to delete it from
+  the share (asks first; a disc in a running VM's DVD drive can't go, and shut-down VMs that have it
+  get their drive emptied rather than removed), with *Upload*, *Rescan* (to pick up files copied to
+  the share) and *Disconnect* (asks first; the pool stops using it, nothing is deleted). *Upload* takes an .iso from your computer, or straight from a link on the web: the
+  link is checked as you paste it (file name and size), and its bytes go through the app into the
+  library as they arrive, never saved on your computer. Either way you get progress, speed, time
+  left and Cancel; the share must be writable by the account the library uses, and names keep only
+  letters, digits, dots and hyphens (the ISO driver's rule). Dropping an .iso on the window uploads
+  it too, except on Wayland, where the window toolkit doesn't receive dropped files yet.
 - **VM power actions** — Start, Shut Down, Reboot, Suspend, Resume, Force Shut Down, Force Reboot,
   enabled only when the server allows them, with confirmations for the disruptive ones.
 - **Keyboard shortcuts** — Ctrl+B start · Ctrl+E shut down · Ctrl+R reboot · Ctrl+Y suspend/resume ·

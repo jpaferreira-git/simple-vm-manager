@@ -6,8 +6,10 @@ use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub const DEFAULT_PORT: u16 = 443; // XenAPI.HTTP.DEFAULT_HTTPS_PORT
 pub const MAX_LOGIN_ATTEMPTS: u32 = 3; // XenConnection.DEFAULT_MAX_SESSION_LOGIN_ATTEMPTS
@@ -53,7 +55,153 @@ pub trait Connection: Send + Sync {
     fn run_action(&self, vm_ref: &str, action: &VmAction) -> Result<(), ApiError>;
     /// A stream to the VM's screen, ready for the VNC (RFB) handshake (see console.rs).
     fn open_console(&self, vm_ref: &str) -> Result<ConsoleStream, ApiError>;
+    /// Creates an ISO library; the server mounts the share right away, so a wrong address or
+    /// password fails here, with the mount's own message in the error's details.
+    fn create_iso_library(&self, lib: &IsoLibrary) -> Result<(), ApiError>;
+    /// Looks at the storage again for files added or removed (SR.scan).
+    fn scan_sr(&self, sr_ref: &str) -> Result<(), ApiError>;
+    /// Unplugs the storage from every server and forgets it; nothing on it is deleted.
+    fn forget_sr(&self, sr_ref: &str) -> Result<(), ApiError>;
+    /// Deletes an ISO file: its disc, and the file on the share. Shut-down VMs that have it in a
+    /// DVD drive get the drive emptied first, as destroying a disc also destroys the drives it's in.
+    fn delete_iso(&self, vdi_ref: &str) -> Result<(), ApiError>;
+    /// Changes a disc's description (an ISO file's, in an ISO library).
+    fn set_vdi_description(&self, vdi_ref: &str, text: &str) -> Result<(), ApiError>;
+    /// Copies a file into an ISO library as `name` (see `iso_file_name`): a new disc in the library,
+    /// then the file's bytes sent to it, from this computer or as they arrive from the web.
+    /// `address` is the server to send them to for a library that only one server sees; a shared
+    /// one takes them on the pool coordinator. A failed or cancelled upload leaves nothing behind.
+    fn upload_iso(&self, sr_ref: &str, address: Option<&str>, src: &Source, name: &str, t: &Arc<Transfer>) -> Result<(), ApiError>;
     fn close(&self);
+}
+
+/// Where an upload's bytes come from.
+#[derive(Clone, Debug)]
+pub enum Source {
+    File(PathBuf),
+    /// A link on the web, and the size it said it had when checked.
+    Web { url: String, size: u64 },
+}
+
+/// What a link on the web leads to.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WebFile {
+    pub name: String,
+    pub size: u64,
+}
+
+/// An agent for the web, checking certificates as a browser does (unlike the one for the
+/// servers, whose certificates are usually their own).
+fn web_agent() -> Result<ureq::Agent, String> {
+    let tls = native_tls::TlsConnector::new().map_err(|e| e.to_string())?;
+    Ok(ureq::AgentBuilder::new()
+        .tls_connector(Arc::new(tls))
+        .timeout_connect(Duration::from_secs(20))
+        .timeout_read(Duration::from_secs(60))
+        .redirects(8)
+        .user_agent(concat!("SimpleVMManager/", env!("CARGO_PKG_VERSION")))
+        .build())
+}
+
+/// Starts downloading a link: the answer, its body not read yet.
+fn web_get(url: &str) -> Result<ureq::Response, String> {
+    match web_agent()?.get(url.trim()).call() {
+        Ok(r) => Ok(r),
+        Err(ureq::Error::Status(404, _)) => Err("There's no file at that link (the site says 404, not found).".into()),
+        Err(ureq::Error::Status(code @ (401 | 403), _)) => Err(format!("The site won't send that file (HTTP {}).", code)),
+        Err(ureq::Error::Status(code, _)) => Err(format!("The site answered with HTTP {}.", code)),
+        Err(e) => Err(match e.kind() {
+            ureq::ErrorKind::Dns => "Couldn't find that site: check the address.".into(),
+            ureq::ErrorKind::ConnectionFailed => "Couldn't connect to that site.".into(),
+            ureq::ErrorKind::InvalidUrl | ureq::ErrorKind::UnknownScheme => "That isn't a valid link.".into(),
+            _ => e.to_string(),
+        }),
+    }
+}
+
+/// Checks a link before downloading it: its file's name and size. A site that doesn't tell the
+/// size can't be used, as the library needs it before the first byte.
+pub fn probe_url(url: &str) -> Result<WebFile, String> {
+    let r = web_get(url)?;
+    if r.content_type().contains("html") {
+        return Err("That link opens a web page, not a file. Use the link of the .iso itself (where the page's Download button points).".into());
+    }
+    let size = r.header("Content-Length").and_then(|v| v.trim().parse::<u64>().ok()).filter(|n| *n > 0);
+    let size = size.ok_or("The site doesn't say how big the file is, so it can't go straight into the library. Download it to this computer, then use Upload local file.")?;
+    let name = disposition_name(r.header("Content-Disposition").unwrap_or("")).or_else(|| url_file_name(r.get_url())).unwrap_or_else(|| "download.iso".into());
+    Ok(WebFile { name, size })
+}
+
+/// The file name in a Content-Disposition header (filename*=UTF-8''… or filename="…").
+fn disposition_name(h: &str) -> Option<String> {
+    let mut plain = None;
+    for part in h.split(';').map(str::trim) {
+        if let Some(v) = part.strip_prefix("filename*=") {
+            let v = v.rsplit('\'').next().unwrap_or(v);
+            return Some(percent_decode(v.trim_matches('"'))).filter(|n| !n.is_empty());
+        }
+        if let Some(v) = part.strip_prefix("filename=") {
+            plain = Some(v.trim_matches('"').to_string()).filter(|n| !n.is_empty());
+        }
+    }
+    plain
+}
+
+/// The last part of a link's path ("…/ubuntu-24.04.iso?x=1" → "ubuntu-24.04.iso").
+fn url_file_name(url: &str) -> Option<String> {
+    let path = url.split(['?', '#']).next().unwrap_or("");
+    let after_host = path.splitn(4, '/').nth(3).unwrap_or("");
+    after_host.rsplit('/').next().map(percent_decode).filter(|n| !n.is_empty())
+}
+
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let hex = |c: u8| (c as char).to_digit(16);
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// An upload under way, shared by its worker and the window.
+#[derive(Default)]
+pub struct Transfer {
+    pub sent: AtomicU64,
+    pub total: AtomicU64,
+    /// Every byte is sent; the server is finishing the file.
+    pub finishing: AtomicBool,
+    /// Set by the window to stop it.
+    pub cancel: AtomicBool,
+}
+
+/// The code of the error an upload ends with when it's cancelled.
+pub const CANCELLED: &str = "UPLOAD_CANCELLED";
+
+/// Reads what's being uploaded, counting what's been read, and stops when it's cancelled.
+struct Counting {
+    inner: Box<dyn Read + Send>,
+    t: Arc<Transfer>,
+}
+
+impl Read for Counting {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.t.cancel.load(Ordering::Relaxed) {
+            return Err(std::io::Error::new(std::io::ErrorKind::Other, "cancelled"));
+        }
+        let n = self.inner.read(buf)?;
+        self.t.sent.fetch_add(n as u64, Ordering::Relaxed);
+        Ok(n)
+    }
 }
 
 /// The connection to a VM's screen: TLS to a real server, plain TCP for a local test VNC server.
@@ -237,6 +385,29 @@ impl RealConnection {
         Err(last)
     }
 
+    /// Waits for a task to end: Ok(true) when it succeeded, Ok(false) when it's still going at the
+    /// deadline, and the task's own error when it failed.
+    fn task_result(&self, task: &str, limit: Duration) -> Result<bool, ApiError> {
+        let end = Instant::now() + limit;
+        loop {
+            match self.call("task.get_status", vec![json!(task)], 30_000)?.as_str().unwrap_or("") {
+                "success" => return Ok(true),
+                "failure" => {
+                    let info = self.call("task.get_error_info", vec![json!(task)], 30_000)?;
+                    let info: Vec<String> = info.as_array().map(|a| a.iter().map(|x| x.as_str().unwrap_or_default().to_string()).collect()).unwrap_or_default();
+                    let code = info.first().cloned().unwrap_or_else(|| "UNKNOWN".into());
+                    return Err(ApiError { code, details: info.into_iter().skip(1).collect() });
+                }
+                "cancelled" => return Err(ApiError { code: CANCELLED.into(), details: vec![] }),
+                _ => {}
+            }
+            if Instant::now() >= end {
+                return Ok(false);
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+
     fn call(&self, method: &str, extra: Vec<Value>, timeout_ms: u64) -> Result<Value, ApiError> {
         let (host, session, id) = {
             let mut st = self.state.lock().unwrap();
@@ -289,6 +460,10 @@ fn to_error(err: &Value) -> ApiError {
         code = val_str(err);
     }
     ApiError { code, details }
+}
+
+fn or_default(v: &str, default: &str) -> String {
+    if v.is_empty() { default.into() } else { v.into() }
 }
 
 fn val_str(v: &Value) -> String {
@@ -437,14 +612,24 @@ impl Connection for RealConnection {
         // Each storage is plugged into the servers that can use it (a PBD per server): local storage
         // into one, shared storage into all of them.
         let mut plugged: HashMap<String, Vec<String>> = HashMap::new();
+        let mut configs: HashMap<String, Value> = HashMap::new();
         for (_, r) in self.all("PBD", t)? {
             plugged.entry(s(&r, "SR")).or_default().push(s(&r, "host"));
+            configs.entry(s(&r, "SR")).or_insert_with(|| r.get("device_config").cloned().unwrap_or(Value::Null));
         }
         for (k, r) in self.all("SR", t)? {
             let shared = b(&r, "shared");
             let hosts = plugged.get(&k).cloned().unwrap_or_default();
             let host = if !shared && hosts.len() == 1 { Some(hosts[0].clone()) } else { None };
+            let config = configs.get(&k).cloned().unwrap_or(Value::Null);
+            let share = match s(&config, "type").as_str() {
+                "cifs" => format!("Windows share (SMB {})", or_default(&s(&config, "vers"), "3.0")),
+                "nfs_iso" => format!("NFS (v{})", or_default(&s(&config, "nfsversion"), "3")),
+                _ => String::new(),
+            };
             pd.srs.push(SrInfo {
+                location: s(&config, "location"),
+                share,
                 rref: k,
                 uuid: s(&r, "uuid"),
                 name: s(&r, "name_label"),
@@ -454,6 +639,7 @@ impl Connection for RealConnection {
                 used: n(&r, "physical_utilisation"),
                 shared,
                 host,
+                files: vec![], // filled in from the VDIs below
             });
         }
         for (k, r) in self.all("network", t)? {
@@ -468,13 +654,42 @@ impl Connection for RealConnection {
         }
         let vbds = self.all("VBD", t)?;
         let vdis = self.all("VDI", t)?;
+        let vm_records = self.all("VM", t)?;
+        // an ISO library's discs are its VDIs; the VMs with one in a DVD drive, through its VBDs
+        let in_drives = |v: &Value| -> Vec<(String, bool)> {
+            list(v, "VBDs")
+                .iter()
+                .filter_map(|r| vbds.get(r))
+                .filter(|vbd| !b(vbd, "empty"))
+                .filter_map(|vbd| {
+                    let vm = vm_records.get(&s(vbd, "VM"))?;
+                    let held = b(vbd, "currently_attached") || b(vbd, "reserved") || s(vm, "power_state") != "Halted";
+                    Some((s(vm, "name_label"), held))
+                })
+                .collect()
+        };
+        for x in pd.srs.iter_mut().filter(|x| x.is_iso()) {
+            x.files = vdis
+                .iter()
+                .filter(|(_, v)| s(v, "SR") == x.rref)
+                .map(|(k, v)| IsoFile {
+                    vdi: k.clone(),
+                    name: s(v, "name_label"),
+                    size: n(v, "virtual_size"),
+                    description: s(v, "name_description"),
+                    in_drives: in_drives(v),
+                    can_delete: list(v, "allowed_operations").iter().any(|o| o == "destroy"),
+                })
+                .collect();
+            x.files.sort_by_key(|f| f.name.to_lowercase());
+        }
         let vifs = self.all("VIF", t)?;
         let guests = self.all("VM_guest_metrics", t)?;
         let vm_metrics = self.all("VM_metrics", t)?;
         let sr_names: HashMap<String, String> = pd.srs.iter().map(|x| (x.rref.clone(), x.name.clone())).collect();
         let net_names: HashMap<String, String> = pd.networks.iter().map(|x| (x.rref.clone(), x.name.clone())).collect();
         let sr_hosts: HashMap<String, String> = pd.srs.iter().filter_map(|x| x.host.clone().map(|h| (x.rref.clone(), h))).collect();
-        for (k, r) in self.all("VM", t)? {
+        for (k, r) in vm_records {
             if b(&r, "is_a_template") || b(&r, "is_control_domain") || b(&r, "is_a_snapshot") {
                 continue;
             }
@@ -549,6 +764,130 @@ impl Connection for RealConnection {
             args.push(json!(false));
         }
         self.call(a.method, args, ACTION_TIMEOUT_MS).map(|_| ())
+    }
+
+    /// SR.create on the pool coordinator; a shared library gets plugged into every server.
+    fn create_iso_library(&self, lib: &IsoLibrary) -> Result<(), ApiError> {
+        let t = 30_000;
+        let coordinator = self.all("pool", t)?.values().map(|p| s(p, "master")).next().unwrap_or_default();
+        let config: Map<String, Value> = lib.device_config().into_iter().map(|(k, v)| (k, json!(v))).collect();
+        // mounting an unreachable share can take a minute or two to give up
+        let args = vec![json!(coordinator), Value::Object(config), json!(0), json!(lib.name), json!(lib.description), json!("iso"), json!("iso"), json!(lib.shared), json!({})];
+        self.call("SR.create", args, 180_000).map(|_| ())
+    }
+
+    fn scan_sr(&self, sr_ref: &str) -> Result<(), ApiError> {
+        self.call("SR.scan", vec![json!(sr_ref)], 120_000).map(|_| ())
+    }
+
+    fn forget_sr(&self, sr_ref: &str) -> Result<(), ApiError> {
+        let t = 60_000;
+        for pbd in self.call("SR.get_PBDs", vec![json!(sr_ref)], t)?.as_array().cloned().unwrap_or_default() {
+            if self.call("PBD.get_currently_attached", vec![pbd.clone()], t)?.as_bool().unwrap_or(false) {
+                self.call("PBD.unplug", vec![pbd], 120_000)?;
+            }
+        }
+        self.call("SR.forget", vec![json!(sr_ref)], t).map(|_| ())
+    }
+
+    fn set_vdi_description(&self, vdi_ref: &str, text: &str) -> Result<(), ApiError> {
+        self.call("VDI.set_name_description", vec![json!(vdi_ref), json!(text)], 30_000).map(|_| ())
+    }
+
+    fn delete_iso(&self, vdi_ref: &str) -> Result<(), ApiError> {
+        let t = 60_000;
+        let drives = self.call("VDI.get_VBDs", vec![json!(vdi_ref)], t)?.as_array().cloned().unwrap_or_default();
+        let mut records = vec![];
+        for vbd in drives {
+            let r = self.call("VBD.get_record", vec![vbd.clone()], t)?;
+            if b(&r, "currently_attached") || b(&r, "reserved") {
+                return Err(ApiError { code: "VDI_IN_USE".into(), details: vec![vdi_ref.into(), "destroy".into()] });
+            }
+            records.push((vbd, r));
+        }
+        for (vbd, _) in records.into_iter().filter(|(_, r)| !b(r, "empty")) {
+            self.call("VBD.eject", vec![vbd], 120_000)?;
+        }
+        self.call("VDI.destroy", vec![json!(vdi_ref)], 120_000).map(|_| ())
+    }
+
+    /// VDI.create in the library (sm_config "path" names the file on the share), then the bytes in
+    /// an HTTP PUT to /import_raw_vdi, then the task's verdict. XenServer answers the PUT before
+    /// reading it, so only the task says whether the file was written.
+    fn upload_iso(&self, sr_ref: &str, address: Option<&str>, src: &Source, name: &str, t: &Arc<Transfer>) -> Result<(), ApiError> {
+        let (size, reader): (u64, Box<dyn Read + Send>) = match src {
+            Source::File(file) => {
+                let size = std::fs::metadata(file).map_err(|e| ApiError::other(format!("Couldn't read {}: {}", file.display(), e)))?.len();
+                let f = std::fs::File::open(file).map_err(|e| ApiError::other(format!("Couldn't open {}: {}", file.display(), e)))?;
+                (size, Box::new(std::io::BufReader::with_capacity(1 << 20, f)))
+            }
+            Source::Web { url, .. } => {
+                let r = web_get(url).map_err(|e| ApiError::other(format!("Couldn't download it: {}", e)))?;
+                let size = r.header("Content-Length").and_then(|v| v.trim().parse::<u64>().ok()).filter(|n| *n > 0);
+                let size = size.ok_or_else(|| ApiError::other("The site no longer says how big the file is."))?;
+                (size, Box::new(r.into_reader()))
+            }
+        };
+        t.total.store(size, Ordering::Relaxed);
+        let record = json!({
+            "name_label": name, "name_description": "", "SR": sr_ref, "virtual_size": size, "type": "user",
+            "sharable": false, "read_only": false, "other_config": {}, "xenstore_data": {}, "sm_config": { "path": name }, "tags": [],
+        });
+        let vdi = self.call("VDI.create", vec![record], 120_000)?.as_str().unwrap_or_default().to_string();
+        let task = match self.call("task.create", vec![json!("Upload ISO"), json!(name)], 30_000) {
+            Ok(v) => v.as_str().unwrap_or_default().to_string(),
+            Err(e) => {
+                let _ = self.call("VDI.destroy", vec![json!(vdi)], 60_000);
+                return Err(e);
+            }
+        };
+        let (coordinator, session) = {
+            let st = self.state.lock().unwrap();
+            (st.host.clone(), st.session.clone().unwrap_or_default())
+        };
+        let host = address.filter(|a| !a.is_empty()).map(str::to_string).unwrap_or(coordinator);
+        let host = if host.contains(':') && !host.starts_with('[') { format!("[{}]", host) } else { host };
+        let port = if self.port == DEFAULT_PORT { String::new() } else { format!(":{}", self.port) };
+        let url = format!("https://{}{}/import_raw_vdi?session_id={}&vdi={}&task_id={}&format=raw", host, port, session, vdi, task);
+        let agent = ureq::AgentBuilder::new()
+            .tls_connector(self.tls.clone())
+            .timeout_connect(Duration::from_secs(30))
+            .timeout_write(Duration::from_secs(300))
+            .timeout_read(Duration::from_secs(600))
+            .redirects(0)
+            .user_agent(concat!("SimpleVMManager/", env!("CARGO_PKG_VERSION")))
+            .build();
+        let body = Counting { inner: reader, t: t.clone() };
+        let sent = agent.put(&url).set("Content-Length", &size.to_string()).send(body);
+        t.finishing.store(true, Ordering::Relaxed);
+        let cancelled = t.cancel.load(Ordering::Relaxed);
+        let put_error = match sent {
+            Ok(_) => None,
+            Err(ureq::Error::Status(code, _)) => Some(ApiError::other(format!("The server answered the upload with HTTP {}.", code))),
+            Err(e) => Some(ApiError::other(e.to_string())),
+        };
+        if cancelled || put_error.is_some() {
+            let _ = self.call("task.cancel", vec![json!(task)], 30_000);
+        }
+        // a broken upload's task ends soon (or never started); a whole one may still be writing
+        let wait = if cancelled || put_error.is_some() { 30 } else { 600 };
+        let verdict = self.task_result(&task, Duration::from_secs(wait));
+        let _ = self.call("task.destroy", vec![json!(task)], 30_000);
+        let result = if cancelled {
+            Err(ApiError { code: CANCELLED.into(), details: vec![] })
+        } else {
+            match verdict {
+                Ok(true) => Ok(()),
+                // the task failed for a reason of its own
+                Err(e) if e.code != CANCELLED => Err(e),
+                // still going, or cancelled above because the upload broke off
+                _ => Err(put_error.unwrap_or_else(|| ApiError::other("The server didn't finish the upload in time."))),
+            }
+        };
+        if result.is_err() {
+            let _ = self.call("VDI.destroy", vec![json!(vdi)], 120_000); // takes the unfinished file away
+        }
+        result
     }
 
     /// The VM's VNC console through an HTTP CONNECT tunnel on the server's HTTPS port, as the
@@ -664,6 +1003,7 @@ impl DemoConnection {
             used,
             shared: host.is_none(),
             host: host.map(String::from),
+            ..Default::default()
         };
         d.srs.push(sr("sr-local1", "Local storage", "lvm", 900 * GB, 0, Some("host-a")));
         d.srs.push(sr("sr-dvd1", "DVD drives", "udev", 4_700_000_000, 4_700_000_000, Some("host-a"))); // a disc in it
@@ -671,7 +1011,7 @@ impl DemoConnection {
         d.srs.push(sr("sr-dvd2", "DVD drives", "udev", 0, 0, Some("host-b"))); // empty: not listed
         d.srs.push(sr("sr-usb2", "Removable storage", "udev", 0, 0, Some("host-b"))); // empty: not listed
         d.srs.push(sr("sr-nfs", "Shared NFS storage", "nfs", 4096 * GB, 0, None));
-        d.srs.push(sr("sr-iso", "ISO library", "iso", 250 * GB, 87 * GB, None));
+        d.srs.push(SrInfo { location: "//nas/isos".into(), share: "Windows share (SMB 3.0)".into(), files: demo_isos("sr-iso"), ..sr("sr-iso", "ISO library", "iso", 250 * GB, 87 * GB, None) });
         d.networks.push(NetInfo { rref: "net-0".into(), uuid: demo_uuid(), name: "Pool-wide network 0".into(), description: String::new(), bridge: "xenbr0".into(), mtu: 1500 });
         d.networks.push(NetInfo { rref: "net-1".into(), uuid: demo_uuid(), name: "Storage network".into(), description: String::new(), bridge: "xenbr1".into(), mtu: 9000 });
 
@@ -717,6 +1057,30 @@ impl DemoConnection {
         recompute(&mut d);
         DemoConnection { data: Mutex::new(d) }
     }
+}
+
+/// The discs in the demo's ISO library `sr`, two of them described.
+fn demo_isos(sr: &str) -> Vec<IsoFile> {
+    [
+        ("debian-12.7.0-amd64-netinst.iso", 661, "Network install, for small servers"),
+        ("rocky-9.4-x86_64-minimal.iso", 1_800, ""),
+        ("ubuntu-24.04.1-live-server-amd64.iso", 2_700, "Ubuntu Server LTS, for the web servers"),
+        ("Win11_24H2_English_x64.iso", 5_800, ""),
+        ("windows-server-2025.iso", 5_200, ""),
+    ]
+    .iter()
+    .enumerate()
+    .map(|(i, (n, mb, d))| {
+        // in the first library, Rocky sits in a shut-down VM's drive and Ubuntu in a running one's
+        let in_drives = match (sr, i) {
+            ("sr-iso", 1) => vec![("Test Desktop".to_string(), false)],
+            ("sr-iso", 2) => vec![("Web Server".to_string(), true)],
+            _ => vec![],
+        };
+        let can_delete = in_drives.iter().all(|d| !d.1);
+        IsoFile { vdi: format!("{}-vdi-{}", sr, i), name: n.to_string(), size: mb * 1024 * 1024, description: d.to_string(), in_drives, can_delete }
+    })
+    .collect()
 }
 
 /// Made-up details for the demo VMs' General tab.
@@ -862,6 +1226,105 @@ impl Connection for DemoConnection {
         recompute(&mut d);
         Ok(())
     }
+    /// Pretends to mount the share: an address with "unreachable" in it doesn't answer, and the
+    /// password "wrong" is refused, so the error page can be tried out.
+    fn create_iso_library(&self, lib: &IsoLibrary) -> Result<(), ApiError> {
+        std::thread::sleep(Duration::from_millis(900));
+        let fail = |text: &str| Err(ApiError { code: "SR_BACKEND_FAILURE_222".into(), details: vec![String::new(), text.into(), String::new()] });
+        let host = if lib.nfs { lib.location.split(':').next().unwrap_or("") } else { lib.location.trim_start_matches('/').split('/').next().unwrap_or("") };
+        if lib.location.contains("unreachable") {
+            return if lib.nfs {
+                fail(&format!("ISO mount error [opterr=mount failed with return code 32] mount.nfs: Connection timed out (server {})", host))
+            } else {
+                fail("ISO mount error [opterr=mount failed with return code 32] mount error(113): No route to host. Refer to the mount.cifs(8) manual page (e.g. man mount.cifs) and kernel log messages (dmesg)")
+            };
+        }
+        if lib.password == "wrong" {
+            return fail("ISO mount error [opterr=mount failed with return code 32] mount error(13): Permission denied. Refer to the mount.cifs(8) manual page (e.g. man mount.cifs) and kernel log messages (dmesg)");
+        }
+        let mut d = self.data.lock().unwrap();
+        let rref = format!("sr-iso-{}", d.srs.len());
+        let files = demo_isos(&rref);
+        d.srs.push(SrInfo {
+            rref,
+            uuid: demo_uuid(),
+            name: lib.name.clone(),
+            description: lib.description.clone(),
+            kind: "iso".into(),
+            size: 2048 * GB,
+            used: 310 * GB,
+            shared: lib.shared,
+            host: None,
+            location: lib.location.clone(),
+            share: if lib.nfs { format!("NFS (v{})", lib.nfs_version) } else { format!("Windows share (SMB {})", lib.smb_version) },
+            files,
+        });
+        Ok(())
+    }
+    fn scan_sr(&self, _sr_ref: &str) -> Result<(), ApiError> {
+        std::thread::sleep(Duration::from_millis(600));
+        Ok(())
+    }
+    fn forget_sr(&self, sr_ref: &str) -> Result<(), ApiError> {
+        std::thread::sleep(Duration::from_millis(600));
+        let mut d = self.data.lock().unwrap();
+        if d.vms.iter().any(|v| v.power == PowerState::Running && v.disks.iter().any(|k| k.kind != "Disk" && d.sr(sr_ref).map_or(false, |x| x.name == k.sr_name))) {
+            return Err(ApiError { code: "VDI_IN_USE".into(), details: vec![] });
+        }
+        d.srs.retain(|x| x.rref != sr_ref);
+        Ok(())
+    }
+    /// Pretends to send the file in about four seconds; a name already in the library is refused
+    /// the way the server's ISO driver refuses it.
+    fn upload_iso(&self, sr_ref: &str, _address: Option<&str>, src: &Source, name: &str, t: &Arc<Transfer>) -> Result<(), ApiError> {
+        let size = match src {
+            Source::File(file) => std::fs::metadata(file).map(|m| m.len()).unwrap_or(700 * 1024 * 1024),
+            Source::Web { size, .. } => *size,
+        };
+        t.total.store(size, Ordering::Relaxed);
+        if self.data.lock().unwrap().sr(sr_ref).map_or(false, |x| x.files.iter().any(|f| f.name == name)) {
+            return Err(ApiError { code: "SR_BACKEND_FAILURE_79".into(), details: vec![String::new(), "VDI Invalid size [opterr=The VDI already exists]".into(), String::new()] });
+        }
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(4) {
+            if t.cancel.load(Ordering::Relaxed) {
+                return Err(ApiError { code: CANCELLED.into(), details: vec![] });
+            }
+            let part = start.elapsed().as_secs_f64() / 4.0;
+            t.sent.store((size as f64 * part) as u64, Ordering::Relaxed);
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        t.sent.store(size, Ordering::Relaxed);
+        t.finishing.store(true, Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(700));
+        let mut d = self.data.lock().unwrap();
+        let x = d.srs.iter_mut().find(|x| x.rref == sr_ref).ok_or_else(|| ApiError { code: "HANDLE_INVALID".into(), details: vec!["SR".into(), sr_ref.into()] })?;
+        let vdi = format!("{}-vdi-{}", sr_ref, x.files.len() + 100);
+        x.files.push(IsoFile { vdi, name: name.to_string(), size: size as i64, can_delete: true, ..Default::default() });
+        x.files.sort_by_key(|f| f.name.to_lowercase());
+        Ok(())
+    }
+    /// A disc in a running VM's drive can't go, as on a real server.
+    fn delete_iso(&self, vdi_ref: &str) -> Result<(), ApiError> {
+        std::thread::sleep(Duration::from_millis(500));
+        let mut d = self.data.lock().unwrap();
+        let x = d.srs.iter_mut().find(|x| x.files.iter().any(|f| f.vdi == vdi_ref));
+        let x = x.ok_or_else(|| ApiError { code: "HANDLE_INVALID".into(), details: vec!["VDI".into(), vdi_ref.into()] })?;
+        if x.files.iter().any(|f| f.vdi == vdi_ref && !f.held_by().is_empty()) {
+            return Err(ApiError { code: "VDI_IN_USE".into(), details: vec![vdi_ref.into(), "destroy".into()] });
+        }
+        x.files.retain(|f| f.vdi != vdi_ref);
+        Ok(())
+    }
+    fn set_vdi_description(&self, vdi_ref: &str, text: &str) -> Result<(), ApiError> {
+        std::thread::sleep(Duration::from_millis(400));
+        let mut d = self.data.lock().unwrap();
+        let f = d.srs.iter_mut().flat_map(|x| x.files.iter_mut()).find(|f| f.vdi == vdi_ref);
+        let f = f.ok_or_else(|| ApiError { code: "HANDLE_INVALID".into(), details: vec!["VDI".into(), vdi_ref.into()] })?;
+        f.description = text.to_string();
+        Ok(())
+    }
+
     fn open_console(&self, _vm_ref: &str) -> Result<ConsoleStream, ApiError> {
         let addr = debug_console_address().ok_or_else(|| ApiError::other("The demo server has no real consoles."))?;
         let (host, port) = split_host_port(addr.trim());
@@ -898,6 +1361,89 @@ mod tests {
         let mut vm = VmInfo { os: "Microsoft Windows Server 2025 Standard".into(), ..Default::default() };
         vm_details(&mut vm, &json!({ "other_config": { "base_template_name": "Windows Server 2025 (64-bit)" } }), &json!({}), &Value::Null);
         assert_eq!(vm.os, "Microsoft Windows Server 2025 Standard");
+    }
+
+    #[test]
+    fn demo_iso_descriptions() {
+        let c = DemoConnection::new();
+        c.set_vdi_description("sr-iso-vdi-1", "Rocky Linux 9").unwrap();
+        let d = c.data.lock().unwrap().clone();
+        let f = d.srs.iter().flat_map(|x| x.files.iter()).find(|f| f.vdi == "sr-iso-vdi-1").unwrap();
+        assert_eq!((f.name.as_str(), f.description.as_str()), ("rocky-9.4-x86_64-minimal.iso", "Rocky Linux 9"));
+        assert_eq!(c.set_vdi_description("no-such-disc", "x").unwrap_err().code, "HANDLE_INVALID");
+    }
+
+    #[test]
+    fn demo_upload() {
+        let dir = std::env::temp_dir().join(format!("svm-upload-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("alpine 3.20.iso");
+        std::fs::write(&file, vec![0u8; 4096]).unwrap();
+        let c = DemoConnection::new();
+        // a whole upload: the disc shows up in the library with the file's size
+        let t = Arc::new(Transfer::default());
+        let file = Source::File(file);
+        c.upload_iso("sr-iso", None, &file, "alpine-3.20.iso", &t).unwrap();
+        assert_eq!((t.sent.load(Ordering::Relaxed), t.total.load(Ordering::Relaxed)), (4096, 4096));
+        let has = |name: &str| c.data.lock().unwrap().sr("sr-iso").unwrap().files.iter().any(|f| f.name == name && f.size == 4096);
+        assert!(has("alpine-3.20.iso"));
+        // the same name again is refused, as by the server's ISO driver
+        let again = c.upload_iso("sr-iso", None, &file, "alpine-3.20.iso", &Arc::new(Transfer::default())).unwrap_err();
+        assert!(upload_text(&again).contains("already exists"));
+        // a cancelled one leaves nothing
+        let t = Arc::new(Transfer::default());
+        t.cancel.store(true, Ordering::Relaxed);
+        assert_eq!(c.upload_iso("sr-iso", None, &file, "other.iso", &t).unwrap_err().code, CANCELLED);
+        assert!(!has("other.iso"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn demo_delete_iso() {
+        let c = DemoConnection::new();
+        let names = || c.data.lock().unwrap().sr("sr-iso").unwrap().files.iter().map(|f| f.name.clone()).collect::<Vec<_>>();
+        // in a running VM's drive: refused, as by the server
+        assert_eq!(c.delete_iso("sr-iso-vdi-2").unwrap_err().code, "VDI_IN_USE");
+        // in a shut-down VM's drive, or in none: gone
+        c.delete_iso("sr-iso-vdi-1").unwrap();
+        c.delete_iso("sr-iso-vdi-0").unwrap();
+        assert_eq!(names(), vec!["ubuntu-24.04.1-live-server-amd64.iso", "Win11_24H2_English_x64.iso", "windows-server-2025.iso"]);
+        assert_eq!(c.delete_iso("sr-iso-vdi-0").unwrap_err().code, "HANDLE_INVALID");
+    }
+
+    #[test]
+    fn names_from_links() {
+        assert_eq!(url_file_name("https://releases.ubuntu.com/24.04/ubuntu-24.04.1-live-server-amd64.iso"), Some("ubuntu-24.04.1-live-server-amd64.iso".into()));
+        assert_eq!(url_file_name("https://cdn.example.com/get/Win%2011%20x64.iso?token=abc#top"), Some("Win 11 x64.iso".into()));
+        assert_eq!(url_file_name("https://example.com/"), None);
+        assert_eq!(url_file_name("https://example.com"), None);
+        assert_eq!(disposition_name("attachment; filename=\"debian 12.iso\""), Some("debian 12.iso".into()));
+        assert_eq!(disposition_name("attachment; filename=a.iso; filename*=UTF-8''Instala%C3%A7%C3%A3o.iso"), Some("Instalação.iso".into()));
+        assert_eq!(disposition_name("inline"), None);
+        assert_eq!(percent_decode("100%"), "100%");
+    }
+
+    /// Needs the internet: cargo test --release -- --ignored real_links
+    #[test]
+    #[ignore]
+    fn real_links() {
+        let iso = probe_url("https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/alpine-virt-3.20.3-x86_64.iso").unwrap();
+        assert_eq!(iso.name, "alpine-virt-3.20.3-x86_64.iso");
+        assert!(iso.size > 10_000_000, "{:?}", iso);
+        assert!(probe_url("https://alpinelinux.org/downloads/").unwrap_err().contains("web page"));
+        assert!(probe_url("https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/no-such-file.iso").unwrap_err().contains("404"));
+        // a download read through the counting reader arrives whole
+        let url = "https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/alpine-virt-3.20.3-x86_64.iso.sha256";
+        let size = probe_url(url).unwrap().size;
+        let t = Arc::new(Transfer::default());
+        let mut body = Counting { inner: Box::new(web_get(url).unwrap().into_reader()), t: t.clone() };
+        let mut got = Vec::new();
+        body.read_to_end(&mut got).unwrap();
+        assert_eq!((got.len() as u64, t.sent.load(Ordering::Relaxed)), (size, size));
+    }
+
+    fn upload_text(e: &ApiError) -> String {
+        format!("{} {}", e.code, e.details.join(" ")).to_lowercase()
     }
 
     #[test]

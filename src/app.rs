@@ -3,12 +3,16 @@
 
 use crate::conn::*;
 use crate::console::{self, ConsoleView};
+use crate::isolib::{IsoAction, IsoDialog};
+use crate::upload::{UploadAction, UploadDialog};
 use crate::secrets;
 use crate::icons::*;
 use crate::model::*;
 use crate::theme::{self, Pal, ThemeMode};
 use eframe::egui::{self, pos2, vec2, Align2, Color32, FontFamily, FontId, Key, Modifiers, Rect, Rounding, Sense, Stroke, Ui};
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -63,7 +67,56 @@ enum Msg {
     /// the servers to reconnect to.
     Keychain { available: bool, saved: Vec<(String, String, String)>, session: Vec<(String, String)> },
     KeychainError(String),
+    IsoDone { sid: u32, lib: IsoLibrary, result: Result<(), ApiError> },
+    /// A rescan (forget false) or disconnect (forget true) of a storage ended.
+    SrDone { sid: u32, sr: String, name: String, forget: bool, result: Result<(), ApiError> },
+    /// Deleting an ISO file ended.
+    IsoDeleted { sid: u32, sr: String, vdi: String, name: String, result: Result<(), ApiError> },
+    /// A link in the Upload dialog was checked.
+    LinkChecked { url: String, result: Result<WebFile, String> },
+    /// The file chooser closed: the file picked to upload to library `sr`, if any.
+    Picked { sid: u32, sr: String, path: Option<PathBuf> },
+    /// An upload to library `sr` ended.
+    UploadDone { sr: String, result: Result<(), ApiError> },
+    /// Saving an ISO file's description ended.
+    DescriptionDone { sid: u32, sr: String, vdi: String, name: String, text: String, result: Result<(), ApiError> },
     ActionDone { sid: u32, vm: String, log: usize, err: Option<String>, label: &'static str, text: String },
+}
+
+/// A file being copied into an ISO library, from this computer or from the web.
+struct Upload {
+    sid: u32,
+    /// The library's name.
+    lib: String,
+    /// The name it gets in the library.
+    name: String,
+    web: bool,
+    /// The site it comes from (for a download).
+    from: String,
+    t: Arc<Transfer>,
+    started: Instant,
+    /// Its line in the log, finished when it ends.
+    log: usize,
+    /// How long it took, once it's done; its card then stays a moment, green.
+    done: Option<Duration>,
+    ended: Option<Instant>,
+}
+
+impl Upload {
+    fn active(&self) -> bool {
+        self.done.is_none()
+    }
+}
+
+/// How long a finished upload's card stays.
+const DONE_CARD: Duration = Duration::from_secs(8);
+
+/// An ISO file's description being edited in its row.
+struct IsoEdit {
+    vdi: String,
+    text: String,
+    /// Put the cursor in the box on the next frame.
+    focus: bool,
 }
 
 struct LogEntry {
@@ -124,6 +177,7 @@ enum Tab {
     Storage,
     Networking,
     Console,
+    IsoFiles,
     Logs,
 }
 
@@ -137,6 +191,7 @@ impl Tab {
             Tab::Storage => "Storage",
             Tab::Networking => "Networking",
             Tab::Console => "Console",
+            Tab::IsoFiles => "ISO Files",
             Tab::Logs => "Logs",
         }
     }
@@ -147,6 +202,12 @@ enum Dialog {
     AddServer { server: String, user: String, password: String, error: String, remember: bool },
     Confirm { action: usize, sid: u32, vm: String, title: String, text: String },
     Message { title: String, text: String },
+    Iso(Box<IsoDialog>),
+    Upload(Box<UploadDialog>),
+    /// Disconnect (forget) an ISO library?
+    ConfirmSr { sid: u32, sr: String, text: String },
+    /// Deleting an ISO file: server, library, disc, its name, the question.
+    ConfirmDeleteIso { sid: u32, sr: String, vdi: String, name: String, text: String },
 }
 
 enum Intent {
@@ -157,6 +218,21 @@ enum Intent {
     Demo,
     Remove(u32),
     ForgetPassword(u32),
+    IsoLibrary,
+    RescanSr(u32, String),
+    AskForgetSr(u32, String),
+    /// Open the Upload dialog of an ISO library.
+    Upload(u32, String),
+    /// Ask before deleting an ISO file: server, library, disc.
+    AskDeleteIso(u32, String, String),
+    /// Hide a finished upload's card.
+    DismissUpload(String),
+    /// Files dropped on the window.
+    Dropped(Vec<PathBuf>),
+    /// Stop the upload to this library.
+    CancelUpload(String),
+    /// Save an ISO file's description: server, library, disc, file name, text.
+    SaveDescription(u32, String, String, String, String),
     Reconnect(u32),
     Refresh(Option<u32>),
     View(bool),
@@ -199,6 +275,16 @@ pub struct App {
     known_hosts: Vec<(String, String)>,
     /// None while still asking the system whether it has a keychain.
     keychain: Option<bool>,
+    /// Storage being rescanned or disconnected right now.
+    sr_busy: HashSet<String>,
+    /// The ISO file whose description is being typed in, if any.
+    iso_edit: Option<IsoEdit>,
+    /// Descriptions being saved, by disc, shown until the server answers.
+    iso_saving: HashMap<String, String>,
+    /// ISO files being deleted, by disc.
+    iso_deleting: HashSet<String>,
+    /// Files being uploaded, by ISO library (one at a time each).
+    uploads: HashMap<String, Upload>,
     /// Passwords saved in the keychain, by (server, user).
     saved: HashMap<(String, String), String>,
     shot_path: Option<String>,
@@ -241,6 +327,11 @@ impl App {
             known_hosts: load_history(),
             keychain: None,
             saved: HashMap::new(),
+            sr_busy: HashSet::new(),
+            iso_edit: None,
+            iso_saving: HashMap::new(),
+            iso_deleting: HashSet::new(),
+            uploads: HashMap::new(),
             shot_path: start.shot_path,
             shot_show: start.shot_show,
             frames: 0,
@@ -327,6 +418,111 @@ impl App {
         });
         self.add_log(id, &host, None, &host, &format!("Connecting to {}", host), "In progress");
         self.select(format!("srv:{}", id));
+    }
+
+    /// Rescans a storage, or disconnects (forgets) it, in the background.
+    fn sr_job(&mut self, sid: u32, sr: String, forget: bool, ctx: &egui::Context) {
+        let Some(s) = self.server(sid) else { return };
+        let name = s.data.as_ref().and_then(|d| d.sr(&sr)).map(|x| x.name.clone()).unwrap_or_default();
+        let (conn, tx, ctx) = (s.conn.clone(), self.tx.clone(), ctx.clone());
+        self.sr_busy.insert(sr.clone());
+        std::thread::spawn(move || {
+            let result = if forget { conn.forget_sr(&sr) } else { conn.scan_sr(&sr) };
+            let _ = tx.send(Msg::SrDone { sid, sr, name, forget, result });
+            ctx.request_repaint();
+        });
+    }
+
+    /// Opens the system's file chooser (on a worker thread, so the window keeps drawing).
+    fn pick_iso(&mut self, sid: u32, sr: String, ctx: &egui::Context) {
+        let lib = self.server(sid).and_then(|s| s.data.as_ref()).and_then(|d| d.sr(&sr)).map(|x| x.name.clone()).unwrap_or_default();
+        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let mut dialog = rfd::AsyncFileDialog::new().set_title(format!("Upload to {}", lib)).add_filter("ISO images", &["iso", "ISO"]);
+            let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from);
+            if let Some(dir) = home.map(|h| h.join("Downloads")).filter(|d| d.is_dir()) {
+                dialog = dialog.set_directory(dir);
+            }
+            let path = pollster::block_on(dialog.pick_file()).map(|f| f.path().to_path_buf());
+            let _ = tx.send(Msg::Picked { sid, sr, path });
+            ctx.request_repaint();
+        });
+    }
+
+    /// Starts copying a file (or a link's file) into ISO library `sr` in the background. A
+    /// local file keeps its own name, made into one the library takes.
+    fn start_upload(&mut self, sid: u32, sr: String, src: Source, name: Option<String>, ctx: &egui::Context) {
+        let Some(s) = self.server(sid) else { return };
+        let Some(d) = s.data.as_ref() else { return };
+        let Some(x) = d.sr(&sr) else { return };
+        let name = match (&src, name) {
+            (_, Some(n)) => n,
+            (Source::File(p), None) => iso_file_name(&p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()),
+            (Source::Web { .. }, None) => return,
+        };
+        let (web, from) = match &src {
+            Source::Web { url, .. } => (true, url.split("://").nth(1).and_then(|r| r.split('/').next()).unwrap_or("").to_string()),
+            Source::File(_) => (false, String::new()),
+        };
+        let lib = x.name.clone();
+        if self.uploads.get(&sr).map_or(false, Upload::active) {
+            self.dialog = Dialog::Message { title: "Upload".into(), text: format!("'{}' is already uploading a file. Wait for it to finish, then try again.", lib) };
+            return;
+        }
+        if x.files.iter().any(|f| f.name.eq_ignore_ascii_case(&name)) {
+            self.dialog = Dialog::Message { title: "Upload".into(), text: format!("There's already a file named '{}' in '{}'.", name, lib) };
+            return;
+        }
+        // a library only one server sees takes the file on that server
+        let address = x.host.as_deref().and_then(|h| d.host(h)).map(|h| h.address.clone());
+        let (conn, server, tx, ctx) = (s.conn.clone(), s.name(), self.tx.clone(), ctx.clone());
+        let what = if web { format!("Downloading '{}' from {} into '{}'", name, from, lib) } else { format!("Uploading '{}' to '{}'", name, lib) };
+        let log = self.add_log(sid, &server, Some(&sr), &lib, &what, "In progress");
+        let t = Arc::new(Transfer::default());
+        self.uploads.insert(sr.clone(), Upload { sid, lib, name: name.clone(), web, from, t: t.clone(), started: Instant::now(), log, done: None, ended: None });
+        std::thread::spawn(move || {
+            let result = conn.upload_iso(&sr, address.as_deref(), &src, &name, &t);
+            let _ = tx.send(Msg::UploadDone { sr, result });
+            ctx.request_repaint();
+        });
+    }
+
+    /// Deletes an ISO file in the background.
+    fn delete_iso(&mut self, sid: u32, sr: String, vdi: String, name: String, ctx: &egui::Context) {
+        let Some(s) = self.server(sid) else { return };
+        let (conn, tx, ctx) = (s.conn.clone(), self.tx.clone(), ctx.clone());
+        self.iso_deleting.insert(vdi.clone());
+        if self.iso_edit.as_ref().map_or(false, |e| e.vdi == vdi) {
+            self.iso_edit = None;
+        }
+        std::thread::spawn(move || {
+            let result = conn.delete_iso(&vdi);
+            let _ = tx.send(Msg::IsoDeleted { sid, sr, vdi, name, result });
+            ctx.request_repaint();
+        });
+    }
+
+    /// Saves an ISO file's description in the background.
+    fn save_description(&mut self, sid: u32, sr: String, vdi: String, name: String, text: String, ctx: &egui::Context) {
+        let Some(s) = self.server(sid) else { return };
+        let (conn, tx, ctx) = (s.conn.clone(), self.tx.clone(), ctx.clone());
+        self.iso_saving.insert(vdi.clone(), text.clone());
+        std::thread::spawn(move || {
+            let result = conn.set_vdi_description(&vdi, &text);
+            let _ = tx.send(Msg::DescriptionDone { sid, sr, vdi, name, text, result });
+            ctx.request_repaint();
+        });
+    }
+
+    /// Asks the server to create the ISO library (which mounts the share) in the background.
+    fn start_iso_library(&mut self, sid: u32, lib: IsoLibrary, ctx: &egui::Context) {
+        let Some(s) = self.server(sid) else { return };
+        let (conn, tx, ctx) = (s.conn.clone(), self.tx.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let result = conn.create_iso_library(&lib);
+            let _ = tx.send(Msg::IsoDone { sid, lib, result });
+            ctx.request_repaint();
+        });
     }
 
     /// Keeps a server's password in the keychain and reconnects there at startup (Some), or forgets
@@ -425,6 +621,132 @@ impl App {
                     }
                     self.selected = selected;
                 }
+                Msg::IsoDone { sid, lib, result } => {
+                    let server = self.server(sid).map(|s| s.name()).unwrap_or_default();
+                    match result {
+                        Ok(()) => {
+                            self.add_log(sid, &server, None, &lib.name, &format!("Created ISO library '{}' from {}", lib.name, lib.location), "Done");
+                            if matches!(self.dialog, Dialog::Iso(_)) {
+                                self.dialog = Dialog::None;
+                            }
+                            if let Some(s) = self.server_mut(sid) {
+                                s.next_refresh = Instant::now(); // show it right away
+                            }
+                            self.expanded.insert(format!("folder:{}:srs", sid));
+                        }
+                        Err(e) => {
+                            self.add_log(sid, &server, None, &lib.name, &format!("Couldn't create ISO library '{}': {}", lib.name, e.message()), "Failed");
+                            if let Dialog::Iso(d) = &mut self.dialog {
+                                d.failed(&lib, &e);
+                            }
+                        }
+                    }
+                }
+                Msg::SrDone { sid, sr, name, forget, result } => {
+                    self.sr_busy.remove(&sr);
+                    let server = self.server(sid).map(|s| s.name()).unwrap_or_default();
+                    let what = if forget { "Disconnected ISO library" } else { "Rescanned" };
+                    match result {
+                        Ok(()) => {
+                            self.add_log(sid, &server, Some(&sr), &name, &format!("{} '{}'", what, name), "Done");
+                            if forget && self.selected == format!("sr:{}:{}", sid, sr) {
+                                self.select(format!("srv:{}", sid));
+                            }
+                        }
+                        Err(e) => {
+                            let why = if e.code == "VDI_IN_USE" || e.details.join(" ").to_lowercase().contains("in use") {
+                                "A VM still has a disc from this library in its DVD drive. Eject it first, then try again.".to_string()
+                            } else {
+                                e.message()
+                            };
+                            let title = if forget { "Disconnect ISO Library" } else { "Rescan" };
+                            self.add_log(sid, &server, Some(&sr), &name, &format!("Couldn't {} '{}': {}", if forget { "disconnect" } else { "rescan" }, name, why), "Failed");
+                            self.dialog = Dialog::Message { title: title.into(), text: format!("Couldn't {} '{}'.\n\n{}", if forget { "disconnect" } else { "rescan" }, name, why) };
+                        }
+                    }
+                    if let Some(s) = self.server_mut(sid) {
+                        s.next_refresh = Instant::now();
+                    }
+                }
+                Msg::Picked { sid, sr, path } => {
+                    if let Some(p) = path {
+                        let ctx = ctx.clone();
+                        self.start_upload(sid, sr, Source::File(p), None, &ctx);
+                    }
+                }
+                Msg::IsoDeleted { sid, sr, vdi, name, result } => {
+                    self.iso_deleting.remove(&vdi);
+                    let server = self.server(sid).map(|s| s.name()).unwrap_or_default();
+                    let lib = self.server(sid).and_then(|s| s.data.as_ref()).and_then(|d| d.sr(&sr)).map(|x| x.name.clone()).unwrap_or_default();
+                    match result {
+                        Ok(()) => {
+                            // gone from the list right away; the next refresh agrees
+                            if let Some(x) = self.server_mut(sid).and_then(|s| s.data.as_mut()).and_then(|d| d.srs.iter_mut().find(|x| x.rref == sr)) {
+                                x.files.retain(|f| f.vdi != vdi);
+                            }
+                            self.add_log(sid, &server, Some(&sr), &lib, &format!("Deleted '{}' from '{}'", name, lib), "Done");
+                        }
+                        Err(e) => {
+                            let why = delete_problem(&e);
+                            self.add_log(sid, &server, Some(&sr), &lib, &format!("Couldn't delete '{}' from '{}': {}", name, lib, why), "Failed");
+                            self.dialog = Dialog::Message { title: "Delete ISO File".into(), text: format!("Couldn't delete '{}'.\n\n{}", name, why) };
+                        }
+                    }
+                    if let Some(s) = self.server_mut(sid) {
+                        s.next_refresh = Instant::now();
+                    }
+                }
+                Msg::LinkChecked { url, result } => {
+                    if let Dialog::Upload(d) = &mut self.dialog {
+                        d.answer(&url, result);
+                    }
+                }
+                Msg::UploadDone { sr, result } => {
+                    let Some(mut u) = self.uploads.remove(&sr) else { continue };
+                    let verb = if u.web { "download" } else { "upload" };
+                    let (status, text) = match &result {
+                        Ok(()) if u.web => ("Done", format!("Downloaded '{}' from {} into '{}'", u.name, u.from, u.lib)),
+                        Ok(()) => ("Done", format!("Uploaded '{}' to '{}'", u.name, u.lib)),
+                        Err(e) if e.code == CANCELLED => ("Cancelled", format!("Cancelled the {} of '{}' to '{}'", verb, u.name, u.lib)),
+                        Err(e) => ("Failed", format!("Couldn't {} '{}' to '{}': {}", verb, u.name, u.lib, upload_problem(e))),
+                    };
+                    if let Some(entry) = self.log.get_mut(u.log) {
+                        entry.status = status.into();
+                        entry.text = text;
+                    }
+                    if let (Err(e), "Failed") = (&result, status) {
+                        self.dialog = Dialog::Message { title: "Upload".into(), text: format!("Couldn't {} '{}' to '{}'.\n\n{}", verb, u.name, u.lib, upload_problem(e)) };
+                    }
+                    if let Some(s) = self.server_mut(u.sid) {
+                        s.next_refresh = Instant::now(); // the new disc shows up
+                    }
+                    if result.is_ok() {
+                        // its card stays a moment, green
+                        u.done = Some(u.started.elapsed());
+                        u.ended = Some(Instant::now());
+                        self.uploads.insert(sr, u);
+                    }
+                }
+                Msg::DescriptionDone { sid, sr, vdi, name, text, result } => {
+                    self.iso_saving.remove(&vdi);
+                    let server = self.server(sid).map(|s| s.name()).unwrap_or_default();
+                    match result {
+                        Ok(()) => {
+                            // show it right away; the next refresh reads it back from the server
+                            if let Some(f) = self.server_mut(sid).and_then(|s| s.data.as_mut()).and_then(|d| d.srs.iter_mut().find(|x| x.rref == sr)).and_then(|x| x.files.iter_mut().find(|f| f.vdi == vdi)) {
+                                f.description = text;
+                            }
+                            self.add_log(sid, &server, Some(&sr), &name, &format!("Changed the description of '{}'", name), "Done");
+                        }
+                        Err(e) => {
+                            self.add_log(sid, &server, Some(&sr), &name, &format!("Couldn't change the description of '{}': {}", name, e.message()), "Failed");
+                            self.dialog = Dialog::Message { title: "Description".into(), text: format!("Couldn't change the description of '{}'.\n\n{}", name, e.message()) };
+                        }
+                    }
+                    if let Some(s) = self.server_mut(sid) {
+                        s.next_refresh = Instant::now();
+                    }
+                }
                 Msg::KeychainError(e) => {
                     self.dialog = Dialog::Message { title: "Remember password".into(), text: format!("Couldn't save the password in the system's keychain.\n\n{}", e) };
                 }
@@ -486,6 +808,10 @@ impl App {
                         match self.shot_show.as_str() {
                             "home" => self.select("root".into()),
                             "storage" => self.select(format!("srv:{}", id)),
+                            "isos" | "iso-disconnect" | "iso-delete" | "iso-describe" | "iso-upload" | "iso-upload-choose" | "iso-upload-web" | "iso-upload-done" => {
+                                self.expanded.insert(format!("folder:{}:srs", id));
+                                self.select(format!("sr:{}:sr-iso", id));
+                            }
                             "search" | "logs" => self.select("root".into()),
                             "networks" => {
                                 self.expanded.insert(format!("folder:{}:nets", id));
@@ -548,7 +874,17 @@ impl App {
         if key == self.selected {
             return;
         }
+        self.iso_edit = None;
         self.selected = key;
+    }
+
+    /// The storage a tree node stands for, with its server.
+    fn sr_of<'a>(&'a self, node: &Node) -> Option<(&'a ServerEntry, &'a SrInfo)> {
+        if node.kind != Kind::Sr {
+            return None;
+        }
+        let s = self.server(node.sid?)?;
+        Some((s, s.data.as_ref()?.sr(node.rref.as_deref()?)?))
     }
 
     fn vm_of<'a>(&'a self, node: &Node) -> Option<(&'a ServerEntry, &'a PoolData, &'a VmInfo)> {
@@ -614,7 +950,7 @@ impl App {
                     cats[2].children.push(Node::new(format!("vm:{}:{}", id, v.rref), Self::vm_text(s, v), Self::vm_icon(s, v), Kind::Vm, Some(id), Some(v.rref.clone())));
                 }
                 for x in d.srs.iter().filter(|x| !x.is_empty_drive()) {
-                    cats[3].children.push(Node::new(format!("sr:{}:{}", id, x.rref), x.name.clone(), IconKind::Sr, Kind::Sr, Some(id), Some(x.rref.clone())));
+                    cats[3].children.push(Node::new(format!("sr:{}:{}", id, x.rref), x.name.clone(), sr_icon(x), Kind::Sr, Some(id), Some(x.rref.clone())));
                 }
                 for n in &d.networks {
                     cats[4].children.push(Node::new(format!("net:{}:{}", id, n.rref), n.name.clone(), IconKind::Net, Kind::Net, Some(id), Some(n.rref.clone())));
@@ -643,7 +979,7 @@ impl App {
                 let mut nets: Vec<&NetInfo> = d.networks.iter().collect();
                 nets.sort_by_key(|n| n.name.to_lowercase());
                 let vm_node = |v: &VmInfo| Node::new(format!("vm:{}:{}", id, v.rref), Self::vm_text(s, v), Self::vm_icon(s, v), Kind::Vm, Some(id), Some(v.rref.clone()));
-                let sr_node = |x: &SrInfo| Node::new(format!("sr:{}:{}", id, x.rref), x.name.clone(), IconKind::Sr, Kind::Sr, Some(id), Some(x.rref.clone()));
+                let sr_node = |x: &SrInfo| Node::new(format!("sr:{}:{}", id, x.rref), x.name.clone(), sr_icon(x), Kind::Sr, Some(id), Some(x.rref.clone()));
                 let folder = |what: &str, label: &str, kids: Vec<Node>| {
                     let mut f = Node::new(format!("folder:{}:{}", id, what), format!("{} ({})", label, kids.len()), IconKind::Folder, Kind::Folder, Some(id), Some(what.to_string()));
                     f.children = kids;
@@ -745,6 +1081,59 @@ impl App {
                 }
                 Intent::Action(i) => self.request_action(i, sel),
                 Intent::AddServer => self.dialog = Dialog::AddServer { server: String::new(), user: "root".into(), password: String::new(), error: String::new(), remember: self.keychain != Some(false) },
+                Intent::RescanSr(sid, sr) => self.sr_job(sid, sr, false, ctx),
+                Intent::SaveDescription(sid, sr, vdi, name, text) => self.save_description(sid, sr, vdi, name, text, ctx),
+                Intent::Upload(sid, sr) => {
+                    if let Some(x) = self.server(sid).and_then(|s| s.data.as_ref()).and_then(|d| d.sr(&sr)) {
+                        let existing = x.files.iter().map(|f| f.name.clone()).collect();
+                        self.dialog = Dialog::Upload(Box::new(UploadDialog::new(sid, sr, x.name.clone(), existing)));
+                    }
+                }
+                Intent::AskDeleteIso(sid, sr, vdi) => {
+                    let found = self.server(sid).and_then(|s| s.data.as_ref()).and_then(|d| d.sr(&sr)).and_then(|x| x.files.iter().find(|f| f.vdi == vdi).map(|f| (x, f)));
+                    if let Some((x, f)) = found {
+                        let place = if x.location.is_empty() { String::new() } else { format!(" {}", x.location) };
+                        let mut text = format!("Are you sure you want to delete '{}'?\n\nThe file ({}) is deleted from the share{}. This can't be undone.", f.name, fmt_bytes(f.size), place);
+                        let parked: Vec<&str> = f.in_drives.iter().filter(|d| !d.1).map(|d| d.0.as_str()).collect();
+                        if !parked.is_empty() {
+                            let which = if parked.len() == 1 { "which is shut down" } else { "which are shut down" };
+                            text.push_str(&format!("\n\nIt's in the DVD drive of {}, {}: the drive is left empty.", parked.join(", "), which));
+                        }
+                        self.dialog = Dialog::ConfirmDeleteIso { sid, sr, vdi, name: f.name.clone(), text };
+                    }
+                }
+                Intent::DismissUpload(sr) => {
+                    self.uploads.remove(&sr);
+                }
+                Intent::CancelUpload(sr) => {
+                    if let Some(u) = self.uploads.get(&sr) {
+                        u.t.cancel.store(true, Ordering::Relaxed);
+                    }
+                }
+                Intent::Dropped(paths) => match self.sr_of(sel).filter(|(_, x)| x.is_iso()).map(|(s, x)| (s.id, x.rref.clone())) {
+                    Some((sid, sr)) => {
+                        let mut isos = paths.into_iter().filter(|p| p.extension().map_or(false, |e| e.eq_ignore_ascii_case("iso")));
+                        match isos.next() {
+                            Some(p) => self.start_upload(sid, sr, Source::File(p), None, ctx),
+                            None => self.dialog = Dialog::Message { title: "Upload".into(), text: "Only .iso files can go in an ISO library.".into() },
+                        }
+                    }
+                    None => self.dialog = Dialog::Message { title: "Upload".into(), text: "To upload a file, select an ISO library in the tree, then drop the file on the window.".into() },
+                },
+                Intent::AskForgetSr(sid, sr) => {
+                    if let Some(x) = self.server(sid).and_then(|s| s.data.as_ref()).and_then(|d| d.sr(&sr)) {
+                        let place = if x.location.is_empty() { String::new() } else { format!(" {}", x.location) };
+                        let text = format!("Are you sure you want to disconnect the ISO library '{}'?\n\nThe pool stops using the share{}. The ISO files on it aren't deleted, and you can add it again with ISO Library.", x.name, place);
+                        self.dialog = Dialog::ConfirmSr { sid, sr, text };
+                    }
+                }
+                Intent::IsoLibrary => {
+                    let pools: Vec<(u32, String)> = self.servers.iter().filter(|s| s.data.is_some()).map(|s| (s.id, s.name())).collect();
+                    let sid = sel.sid.filter(|id| pools.iter().any(|p| p.0 == *id)).or(pools.first().map(|p| p.0));
+                    if let Some(sid) = sid {
+                        self.dialog = Dialog::Iso(Box::new(IsoDialog::new(sid, pools)));
+                    }
+                }
                 Intent::ForgetPassword(sid) => {
                     if let Some(s) = self.server(sid) {
                         let (h, u) = (s.conn.hostname(), s.conn.username());
@@ -834,8 +1223,8 @@ impl App {
         // becomes a tooltip): first the theme switch, then all of them.
         let fits = |level: u8| {
             let w = |l: &str, minor: bool| if level == 2 || (level == 1 && minor) { 32.0 } else { tool_width(ui, l) } + 2.0;
-            let buttons: f32 = w("Connect", false) + shown.iter().map(|a| w(a.label, false)).sum::<f32>() + w(theme_label, true) + arrows;
-            36.0 + 10.0 + 16.0 + buttons <= ui.available_width()
+            let buttons: f32 = w("Connect", false) + shown.iter().map(|a| w(a.label, false)).sum::<f32>() + w("ISO Library", false) + w(theme_label, true) + arrows;
+            36.0 + 2.0 * 10.0 + 16.0 + buttons <= ui.available_width()
         };
         let level = (0..2).find(|&l| fits(l)).unwrap_or(2);
         let compact = |minor: bool| level == 2 || (level == 1 && minor);
@@ -875,6 +1264,11 @@ impl App {
                         m.response.on_hover_text(force.label);
                     });
                 }
+            }
+            ui.separator();
+            let has_pool = self.servers.iter().any(|s| s.data.is_some());
+            if tool_button(ui, "iso", "ISO Library", has_pool, compact(false), &pal).on_hover_text("Add a library of installation discs (.iso files) from a Windows or NFS share").clicked() {
+                out.push(Intent::IsoLibrary);
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 // A click switches light / dark; a right-click also offers following the system.
@@ -1159,6 +1553,7 @@ impl App {
         let has_data = sel.sid.and_then(|id| self.server(id)).map_or(false, |s| s.data.is_some());
         match sel.kind {
             Kind::Root | Kind::Category => vec![Tab::Home, Tab::Search, Tab::Logs],
+            Kind::Sr if self.sr_of(sel).map_or(false, |(_, x)| x.is_iso()) => vec![Tab::General, Tab::IsoFiles, Tab::Logs],
             Kind::Folder if sel.rref.as_deref() == Some("nets") => vec![Tab::Networking],
             Kind::Folder => vec![Tab::Storage],
             _ if !has_data => vec![Tab::General, Tab::Logs],
@@ -1365,7 +1760,7 @@ impl App {
         ui.add_space(8.0);
         ui.label(egui::RichText::new("Connect to a XenServer or XCP-ng server to see its pools, servers, virtual machines, storage and networks, and to use your VMs' consoles.").color(pal.ink_soft));
         ui.add_space(20.0);
-        if dialog_button(ui, &pal, "Connect to a server", true, true) {
+        if dialog_button(ui, &pal, "connect", "Connect to a server", Look::Primary, true) {
             out.push(Intent::AddServer);
         }
         ui.add_space(10.0);
@@ -1545,10 +1940,23 @@ impl App {
             }
             Kind::Sr => {
                 if let Some(x) = d.sr(r) {
-                    secs.push((
-                        "General".into(),
-                        vec![row("Name", x.name.clone()), row("Description", x.description.clone()), row("Type", x.kind.clone()), row("Shared", if x.shared { "Yes".into() } else { "No".into() }), row("UUID", x.uuid.clone())],
-                    ));
+                    let mut g = vec![row("Name", x.name.clone())];
+                    if !x.description.is_empty() {
+                        g.push(row("Description", x.description.clone()));
+                    }
+                    g.push(row("Type", if x.is_iso() { "ISO library".into() } else { x.kind.clone() }));
+                    if !x.location.is_empty() {
+                        g.push(row("Location", x.location.clone()));
+                    }
+                    if !x.share.is_empty() {
+                        g.push(row("Connection", x.share.clone()));
+                    }
+                    if x.is_iso() {
+                        g.push(row("ISO files", x.files.len().to_string()));
+                    }
+                    g.push(row("Shared", if x.shared { "Yes".into() } else { "No".into() }));
+                    g.push(row("UUID", x.uuid.clone()));
+                    secs.push(("General".into(), g));
                     let pct = if x.size > 0 { format!(" ({}%)", 100 * x.used / x.size) } else { String::new() };
                     secs.push(("Size".into(), vec![row("Size", fmt_bytes(x.size)), row("Used", format!("{}{}", fmt_bytes(x.used), pct)), row("Free", fmt_bytes((x.size - x.used).max(0)))]));
                 }
@@ -1716,6 +2124,11 @@ impl App {
     /// A table: muted headings over a hairline, rows that light up under the mouse, cells cut short
     /// with "…"; the last column takes any room left. Returns the row clicked, when `clickable`.
     fn table(&self, ui: &mut Ui, id: &str, headers: &[&str], rows: &[Vec<Cell>], clickable: bool) -> Option<usize> {
+        self.table_with(ui, id, headers, rows, clickable, &mut |_, _, _, _, _| {})
+    }
+
+    /// A table whose `Cell::Custom` cells are drawn by `custom(ui, row, column, rect, row hovered)`.
+    fn table_with(&self, ui: &mut Ui, id: &str, headers: &[&str], rows: &[Vec<Cell>], clickable: bool, custom: &mut dyn FnMut(&mut Ui, usize, usize, Rect, bool)) -> Option<usize> {
         let pal = self.pal;
         let (head_font, font) = (FontId::new(12.0, FontFamily::Name("bold".into())), FontId::proportional(13.0));
         let measure = |t: &str, f: &FontId| ui.painter().layout_no_wrap(t.to_string(), f.clone(), pal.ink).size().x;
@@ -1727,6 +2140,7 @@ impl App {
                     Cell::Usage(_, t) => 120.0 + measure(t, &font),
                     Cell::Status(t) => 16.0 + measure(t, &font),
                     Cell::Icon(_, t) => 24.0 + measure(t, &font),
+                    Cell::Custom(w) => *w,
                 };
                 widths[i] = widths[i].max(w.min(380.0));
             }
@@ -1740,6 +2154,20 @@ impl App {
             if sum < avail {
                 if let Some(last) = widths.last_mut() {
                     *last += avail - sum;
+                }
+            } else {
+                // Too wide (a narrow window): cut the widest columns short, their text ending in "…",
+                // but not below 120 points, and never a usage bar's; only past that does the table
+                // scroll sideways.
+                let least = 120.0 + 2.0 * pad;
+                let fixed: Vec<bool> = (0..widths.len()).map(|i| rows.iter().any(|r| matches!(r.get(i), Some(Cell::Usage(..))))).collect();
+                let mut over = sum - avail;
+                while over > 0.5 {
+                    let Some(wi) = (0..widths.len()).filter(|&i| !fixed[i] && widths[i] > least).max_by(|&a, &b| widths[a].total_cmp(&widths[b])) else { break };
+                    let next = (0..widths.len()).filter(|&i| widths[i] < widths[wi]).map(|i| widths[i]).fold(least, f32::max);
+                    let cut = over.min(widths[wi] - least).min((widths[wi] - next).max(1.0));
+                    widths[wi] -= cut;
+                    over -= cut;
                 }
             }
             let total_w = widths.iter().sum::<f32>();
@@ -1762,7 +2190,9 @@ impl App {
             for (ri, r) in rows.iter().enumerate() {
                 let rr = Rect::from_min_size(pos2(area.min.x, area.min.y + head_h + ri as f32 * row_h), vec2(total_w, row_h));
                 let resp = ui.interact(rr, ui.id().with((id, ri)), if clickable { Sense::click() } else { Sense::hover() });
-                if resp.hovered() {
+                // (the pointer may be on a button in the row, which then counts as hovered instead)
+                let hot = resp.hovered() || ui.rect_contains_pointer(rr);
+                if hot {
                     p.rect_filled(rr.shrink2(vec2(2.0, 2.0)), Rounding::same(6.0), pal.hover);
                 } else if ri > 0 {
                     p.line_segment([pos2(rr.min.x + pad, rr.min.y), pos2(rr.max.x - pad, rr.min.y)], Stroke::new(1.0, pal.border.gamma_multiply(0.6)));
@@ -1787,9 +2217,13 @@ impl App {
                             t
                         }
                         Cell::Icon(k, t) => {
-                            paint_icon(&p, Rect::from_center_size(pos2(x + 8.0, cy), vec2(16.0, 16.0)), *k, &pal, if resp.hovered() { pal.hover } else { pal.window });
+                            paint_icon(&p, Rect::from_center_size(pos2(x + 8.0, cy), vec2(16.0, 16.0)), *k, &pal, if hot { pal.hover } else { pal.window });
                             x += 24.0;
                             t
+                        }
+                        Cell::Custom(_) => {
+                            custom(ui, ri, i, Rect::from_min_size(pos2(x, rr.min.y), vec2(room, row_h)), hot);
+                            continue;
                         }
                     };
                     let mut job = egui::text::LayoutJob::simple_singleline(text.clone(), font.clone(), pal.ink);
@@ -1859,6 +2293,193 @@ impl App {
         }
     }
 
+    /// An ISO library's discs, each with its description and a pencil to edit it there and then.
+    fn iso_files(&mut self, ui: &mut Ui, sel: &Node, out: &mut Vec<Intent>) {
+        let pal = self.pal;
+        let Some((s, x)) = self.sr_of(sel) else { return };
+        let (sid, sr, files) = (s.id, x.rref.clone(), x.files.clone());
+        let total: i64 = files.iter().map(|f| f.size).sum();
+        ui.add_space(10.0);
+        let count = format!("{} ISO file{}  ·  {}", files.len(), if files.len() == 1 { "" } else { "s" }, fmt_bytes(total));
+        ui.label(egui::RichText::new(count).color(pal.ink_soft));
+        ui.label(egui::RichText::new("If your file isn't in the list below, try rescanning the folder.").size(12.0).color(pal.ink_faint));
+        if let Some(u) = self.uploads.get(&sr) {
+            ui.add_space(8.0);
+            self.upload_card(ui, &sr, u, out);
+        }
+        let font = FontId::proportional(13.0);
+        let measure = |t: &str| ui.painter().layout_no_wrap(t.to_string(), font.clone(), pal.ink).size().x;
+        let rows: Vec<Vec<Cell>> = files
+            .iter()
+            .map(|f| {
+                let editing = self.iso_edit.as_ref().map_or(false, |e| e.vdi == f.vdi);
+                let desc_w = if editing { 240.0 } else { (measure(&f.description) + 34.0).min(380.0) };
+                vec![Cell::Icon(IconKind::IsoSr, f.name.clone()), Cell::Text(fmt_bytes(f.size)), Cell::Custom(desc_w), Cell::Custom(26.0)]
+            })
+            .collect();
+        let mut edit = self.iso_edit.take();
+        let (mut close, mut save, mut delete) = (false, None, None);
+        let (saving, deleting) = (&self.iso_saving, &self.iso_deleting);
+        self.table_with(ui, "isos", &["Name", "Size", "Description", ""], &rows, false, &mut |ui, row, col, r, hot| {
+            let f = &files[row];
+            let gone = deleting.contains(&f.vdi);
+            if col == 3 {
+                // the bin, at the row's end: faint, red under the mouse; off while a running VM holds the disc
+                if gone {
+                    return;
+                }
+                let held = f.held_by();
+                let can = f.can_delete && held.is_empty();
+                let b = Rect::from_center_size(pos2(r.max.x - 13.0, r.center().y), vec2(26.0, 26.0));
+                let resp = ui.interact(b, ui.id().with(("delete", &f.vdi)), if can { Sense::click() } else { Sense::hover() });
+                let tip = if !held.is_empty() {
+                    format!("In the DVD drive of {}, which is running: eject it there before deleting it", held.join(", "))
+                } else if !f.can_delete {
+                    "The server doesn't allow deleting this file right now".to_string()
+                } else {
+                    "Delete this file from the share".to_string()
+                };
+                let resp = resp.on_hover_text(tip);
+                if can && resp.hovered() {
+                    ui.painter().rect_filled(b, Rounding::same(5.0), pal.red.gamma_multiply(if pal.dark { 0.25 } else { 0.12 }));
+                }
+                let colour = if !can {
+                    pal.ink_faint.gamma_multiply(0.45)
+                } else if resp.hovered() {
+                    pal.red
+                } else if hot {
+                    pal.ink_soft
+                } else {
+                    pal.ink_faint
+                };
+                paint_glyph(ui.painter(), Rect::from_center_size(b.center(), vec2(16.0, 16.0)), "trash", colour);
+                if resp.clicked() {
+                    delete = Some(f.vdi.clone());
+                }
+                return;
+            }
+            if gone {
+                ui.painter().text(pos2(r.min.x, r.center().y), Align2::LEFT_CENTER, "Deleting…", font.clone(), pal.ink_faint);
+                return;
+            }
+            if let Some(e) = edit.as_mut().filter(|e| e.vdi == f.vdi) {
+                // a text box, then Save and Cancel; Enter saves, Esc cancels
+                let mut child = ui.new_child(egui::UiBuilder::new().max_rect(r).layout(egui::Layout::left_to_right(egui::Align::Center)));
+                child.spacing_mut().item_spacing.x = 4.0;
+                let field = text_field(&mut child, &pal, &mut e.text, (r.width() - 64.0).clamp(80.0, 520.0), false);
+                if e.focus {
+                    field.request_focus();
+                    e.focus = false;
+                }
+                let enter = field.lost_focus() && child.input(|i| i.key_pressed(Key::Enter));
+                let ok = flat_button(&mut child, "check", "Save", Some(pal.green), true, true, &pal).clicked();
+                let cancel = flat_button(&mut child, "close", "Cancel", None, true, true, &pal).clicked() || child.input(|i| i.key_pressed(Key::Escape));
+                if ok || enter {
+                    let text = e.text.trim().to_string();
+                    if text != f.description {
+                        save = Some((f.vdi.clone(), f.name.clone(), text));
+                    }
+                }
+                close |= ok || enter || cancel;
+                return;
+            }
+            // the description (or the one being saved, faded), then the pencil
+            let pending = saving.get(&f.vdi);
+            let (text, col) = match pending {
+                Some(t) => (t.as_str(), pal.ink_faint),
+                None if f.description.is_empty() => ("—", pal.ink_faint),
+                None => (f.description.as_str(), pal.ink),
+            };
+            let mut job = egui::text::LayoutJob::simple_singleline(text.to_string(), font.clone(), col);
+            job.wrap = egui::text::TextWrapping { max_width: (r.width() - 34.0).max(10.0), max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
+            let g = ui.painter().layout_job(job);
+            let end = r.min.x + g.size().x;
+            ui.painter().galley(pos2(r.min.x, r.center().y - g.size().y / 2.0), g, col);
+            if pending.is_some() {
+                return;
+            }
+            let b = Rect::from_center_size(pos2(end + 19.0, r.center().y), vec2(26.0, 26.0));
+            let resp = ui.interact(b, ui.id().with(("describe", &f.vdi)), Sense::click()).on_hover_text("Edit the description");
+            if resp.hovered() {
+                ui.painter().rect_filled(b, Rounding::same(5.0), pal.border);
+            }
+            paint_glyph(ui.painter(), Rect::from_center_size(b.center(), vec2(16.0, 16.0)), "edit", if hot { pal.ink_soft } else { pal.ink_faint });
+            if resp.clicked() {
+                edit = Some(IsoEdit { vdi: f.vdi.clone(), text: f.description.clone(), focus: true });
+            }
+        });
+        self.iso_edit = if close { None } else { edit };
+        if let Some((vdi, name, text)) = save {
+            out.push(Intent::SaveDescription(sid, sr.clone(), vdi, name, text));
+        }
+        if let Some(vdi) = delete {
+            out.push(Intent::AskDeleteIso(sid, sr, vdi));
+        }
+    }
+
+    /// An upload's progress: the file, a bar (blue, then green when it's done), how much and how
+    /// fast, and Cancel; once done, it stays a few seconds with how long it took.
+    fn upload_card(&self, ui: &mut Ui, sr: &str, u: &Upload, out: &mut Vec<Intent>) {
+        let pal = self.pal;
+        let (sent, total) = (u.t.sent.load(Ordering::Relaxed), u.t.total.load(Ordering::Relaxed));
+        let (finishing, cancelling) = (u.t.finishing.load(Ordering::Relaxed), u.t.cancel.load(Ordering::Relaxed));
+        let done = u.done.is_some();
+        let frac = if done { 1.0 } else if total > 0 { (sent as f64 / total as f64) as f32 } else { 0.0 };
+        let secs = u.started.elapsed().as_secs_f64().max(0.001);
+        let speed = sent as f64 / secs;
+        let detail = if let Some(took) = u.done {
+            format!("{} in {}  ·  now in {}", fmt_bytes(total as i64), fmt_took(took), u.lib)
+        } else if cancelling {
+            "Cancelling, and removing the unfinished file…".to_string()
+        } else if finishing {
+            "Finishing on the server…".to_string()
+        } else if total == 0 || sent == 0 {
+            if u.web { "Starting the download…".to_string() } else { "Starting…".to_string() }
+        } else {
+            let left = (total - sent.min(total)) as f64 / speed.max(1.0);
+            let left = if left < 60.0 { format!("about {} s left", left.ceil() as u64) } else { format!("about {} min left", (left / 60.0).ceil() as u64) };
+            format!("{} of {}  ·  {}/s  ·  {}", fmt_bytes(sent as i64), fmt_bytes(total as i64), fmt_bytes(speed as i64), left)
+        };
+        let title = match (done, u.web) {
+            (false, false) => format!("Uploading {}", u.name),
+            (false, true) => format!("Downloading {} from {}", u.name, u.from),
+            (true, false) => format!("Uploaded {}", u.name),
+            (true, true) => format!("Downloaded {}", u.name),
+        };
+        egui::Frame::none().fill(pal.surface).stroke(Stroke::new(1.0, pal.border)).rounding(Rounding::same(8.0)).inner_margin(egui::Margin::symmetric(12.0, 10.0)).show(ui, |ui| {
+            ui.set_max_width(ui.available_width().min(640.0)); // (a bare 640 would widen a narrow window's page)
+            ui.horizontal(|ui| {
+                let (r, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
+                let (glyph, col) = match (done, u.web) {
+                    (true, _) => ("check", pal.green),
+                    (false, true) => ("download", pal.accent),
+                    (false, false) => ("upload", pal.accent),
+                };
+                paint_glyph(ui.painter(), r, glyph, col);
+                // the title gives way to the button when the window is narrow
+                let button = if done { 28.0 } else { flat_button_width(ui, "Cancel") };
+                let room = (ui.available_width() - button - 8.0).max(40.0);
+                ui.allocate_ui_with_layout(vec2(room, 20.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.add(egui::Label::new(egui::RichText::new(title).color(pal.ink)).truncate());
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if done {
+                        if flat_button(ui, "close", "Dismiss", None, true, true, &pal).clicked() {
+                            out.push(Intent::DismissUpload(sr.to_string()));
+                        }
+                    } else if flat_button(ui, "close", "Cancel", None, !finishing && !cancelling, false, &pal).on_hover_text("Stop; the unfinished file is removed from the share").clicked() {
+                        out.push(Intent::CancelUpload(sr.to_string()));
+                    }
+                });
+            });
+            ui.add_space(4.0);
+            let (bar, _) = ui.allocate_exact_size(vec2(ui.available_width(), 6.0), Sense::hover());
+            progress_bar(ui.painter(), bar, frac, if done { pal.green } else { pal.accent }, &pal);
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new(detail).size(12.0).color(pal.ink_soft));
+        });
+    }
+
     /// The VM's screen. A shut down or suspended VM has none: offer to start or resume it.
     fn console_tab(&mut self, ui: &mut Ui, sel: &Node, out: &mut Vec<Intent>) {
         let pal = self.pal;
@@ -1876,7 +2497,7 @@ impl App {
                 ui.label(egui::RichText::new(text).size(15.0).color(pal.ink_soft));
                 ui.add_space(12.0);
                 if let Some(i) = action {
-                    if dialog_button(ui, &pal, ACTIONS[i].label, true, self.can_run(&ACTIONS[i], sel)) {
+                    if dialog_button(ui, &pal, op, ACTIONS[i].label, Look::Primary, self.can_run(&ACTIONS[i], sel)) {
                         out.push(Intent::Action(i));
                     }
                 }
@@ -1909,6 +2530,11 @@ impl App {
     fn dialogs(&mut self, ctx: &egui::Context) {
         let mut close = false;
         let mut add: Option<(String, String, String, bool)> = None;
+        let mut iso: Option<(u32, IsoLibrary)> = None;
+        let mut forget_sr: Option<(u32, String)> = None;
+        let mut delete_iso: Option<(u32, String, String, String)> = None;
+        // from the Upload dialog: the file chooser (None), or a link's file and its name
+        let mut upload: Option<(u32, String, Option<(Source, String)>)> = None;
         let (keychain, saved) = (self.keychain, self.saved.clone());
         let mut confirm: Option<(usize, u32, String)> = None;
         let hosts = self.known_hosts.clone();
@@ -1993,12 +2619,12 @@ impl App {
                     }
                     ui.add_space(4.0);
                     dialog_buttons(ui, |ui| {
-                        if dialog_button(ui, &pal, "Cancel", false, true) {
+                        if dialog_button(ui, &pal, "close", "Cancel", Look::Plain, true) {
                             close = true;
                         }
                         let ok = !server.trim().is_empty() && !user.trim().is_empty();
                         let enter = ui.input(|i| i.key_pressed(Key::Enter));
-                        if dialog_button(ui, &pal, "Connect", true, ok) || (ok && enter) {
+                        if dialog_button(ui, &pal, "connect", "Connect", Look::Primary, ok) || (ok && enter) {
                             if server.trim().contains(' ') {
                                 *error = "A server name can't contain spaces.".into();
                             } else {
@@ -2014,11 +2640,65 @@ impl App {
                     ui.label(text.as_str());
                     ui.add_space(12.0);
                     dialog_buttons(ui, |ui| {
-                        if dialog_button(ui, &pal, "No", false, true) {
+                        if dialog_button(ui, &pal, "close", "No", Look::Plain, true) {
                             close = true;
                         }
-                        if dialog_button(ui, &pal, "Yes", true, true) {
+                        if dialog_button(ui, &pal, "check", "Yes", Look::Primary, true) {
                             confirm = Some((*action, *sid, vm.clone()));
+                        }
+                    });
+                });
+            }
+            Dialog::Iso(d) => match d.ui(ctx, &pal) {
+                IsoAction::Close => close = true,
+                IsoAction::Create(sid, lib) => iso = Some((sid, lib)),
+                IsoAction::None => {}
+            },
+            Dialog::Upload(d) => {
+                let (sid, sr) = (d.sid, d.sr.clone());
+                match d.ui(ctx, &pal) {
+                    UploadAction::None => {}
+                    UploadAction::Close => close = true,
+                    UploadAction::PickLocal => upload = Some((sid, sr, None)),
+                    UploadAction::Check(url) => {
+                        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+                        std::thread::spawn(move || {
+                            let result = probe_url(&url);
+                            let _ = tx.send(Msg::LinkChecked { url, result });
+                            ctx.request_repaint();
+                        });
+                    }
+                    UploadAction::Download { url, name, size } => upload = Some((sid, sr, Some((Source::Web { url, size }, name)))),
+                }
+            }
+            Dialog::ConfirmDeleteIso { sid, sr, vdi, name, text } => {
+                dialog_window(ctx, "Delete ISO File").show(ctx, |ui| {
+                    ui.set_max_width(420.0);
+                    ui.label(text.as_str());
+                    ui.add_space(12.0);
+                    dialog_buttons(ui, |ui| {
+                        // Esc or Cancel keep it; only a click on the red button deletes
+                        if dialog_button(ui, &pal, "close", "Cancel", Look::Plain, true) || ui.input(|i| i.key_pressed(Key::Escape)) {
+                            close = true;
+                        }
+                        if dialog_button(ui, &pal, "trash", "Delete", Look::Danger, true) {
+                            delete_iso = Some((*sid, sr.clone(), vdi.clone(), name.clone()));
+                        }
+                    });
+                });
+            }
+            Dialog::ConfirmSr { sid, sr, text } => {
+                dialog_window(ctx, "Disconnect ISO Library").show(ctx, |ui| {
+                    ui.set_max_width(420.0);
+                    ui.label(text.as_str());
+                    ui.add_space(12.0);
+                    dialog_buttons(ui, |ui| {
+                        // Esc or Cancel keep it; only a click on the red button disconnects
+                        if dialog_button(ui, &pal, "close", "Cancel", Look::Plain, true) || ui.input(|i| i.key_pressed(Key::Escape)) {
+                            close = true;
+                        }
+                        if dialog_button(ui, &pal, "disconnect", "Disconnect", Look::Danger, true) {
+                            forget_sr = Some((*sid, sr.clone()));
                         }
                     });
                 });
@@ -2029,7 +2709,7 @@ impl App {
                     ui.label(text.as_str());
                     ui.add_space(12.0);
                     dialog_buttons(ui, |ui| {
-                        if dialog_button(ui, &pal, "OK", true, true) {
+                        if dialog_button(ui, &pal, "check", "OK", Look::Primary, true) {
                             close = true;
                         }
                     });
@@ -2049,6 +2729,24 @@ impl App {
                 // (the keychain may still be being looked for; only a missing one rules saving out)
                 s.pending_save = (self.keychain != Some(false)).then_some((remember, p));
             }
+        }
+        if let Some((sid, lib)) = iso {
+            self.start_iso_library(sid, lib, ctx);
+        }
+        if let Some((sid, sr, web)) = upload {
+            self.dialog = Dialog::None;
+            match web {
+                None => self.pick_iso(sid, sr, ctx),
+                Some((src, name)) => self.start_upload(sid, sr, src, Some(name), ctx),
+            }
+        }
+        if let Some((sid, sr, vdi, name)) = delete_iso {
+            self.dialog = Dialog::None;
+            self.delete_iso(sid, sr, vdi, name, ctx);
+        }
+        if let Some((sid, sr)) = forget_sr {
+            self.dialog = Dialog::None;
+            self.sr_job(sid, sr, true, ctx);
         }
         if let Some((a, sid, vm)) = confirm {
             self.dialog = Dialog::None;
@@ -2132,6 +2830,25 @@ impl eframe::App for App {
             self.console = None;
         }
         let mut out = self.shortcuts(ctx, &sel);
+        // files dropped on the window go to the selected ISO library (winit 0.30 delivers drops on
+        // Windows, macOS and X11, not on Wayland: there, Upload's file chooser is the way)
+        let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
+        if !dropped.is_empty() {
+            out.push(Intent::Dropped(dropped));
+        }
+        self.uploads.retain(|_, u| u.ended.map_or(true, |t| t.elapsed() < DONE_CARD));
+        if !self.uploads.is_empty() {
+            ctx.request_repaint_after(Duration::from_millis(250)); // the progress moves, a finished card goes
+        }
+        if self.uploads.values().any(Upload::active) {
+            // closing now would leave an unfinished file in the library
+            if ctx.input(|i| i.viewport().close_requested()) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                let names: Vec<String> = self.uploads.values().filter(|u| u.active()).map(|u| format!("'{}' to '{}'", u.name, u.lib)).collect();
+                let text = format!("Still uploading {}.\n\nWait for it to finish, or cancel it, before closing the app; closing now would leave an unfinished file in the library.", names.join(", "));
+                self.dialog = Dialog::Message { title: "Upload in progress".into(), text };
+            }
+        }
         // --show add-server | confirm | about: a check's screenshot with that dialog open.
         if self.shot_ready && !self.shot_dialog {
             self.shot_dialog = true;
@@ -2140,9 +2857,70 @@ impl eframe::App for App {
                 "confirm" => out.extend(ACTIONS.iter().position(|a| a.confirm && self.can_run(a, &sel)).map(Intent::Action)),
                 "about" => out.push(Intent::About),
                 "console" => out.push(Intent::Tab(Tab::Console)),
+                "iso" => out.push(Intent::IsoLibrary),
+                "iso-advanced" | "iso-error" => {
+                    let pools: Vec<(u32, String)> = self.servers.iter().filter(|s| s.data.is_some()).map(|s| (s.id, s.name())).collect();
+                    if let Some(&(sid, _)) = pools.first() {
+                        let error = self.shot_show == "iso-error";
+                        let mut d = IsoDialog::new(sid, pools).filled("\\\\nas\\isos", "joao", if error { "wrong" } else { "" }, !error);
+                        if error {
+                            if let IsoAction::Create(sid, lib) = d.submit() {
+                                self.start_iso_library(sid, lib, ctx);
+                            }
+                        }
+                        self.dialog = Dialog::Iso(Box::new(d));
+                    }
+                }
                 "storage" => out.push(Intent::Tab(Tab::Storage)),
                 "search" => out.push(Intent::Tab(Tab::Search)),
                 "logs" => out.push(Intent::Tab(Tab::Logs)),
+                "isos" => out.push(Intent::Tab(Tab::IsoFiles)),
+                "iso-disconnect" => {
+                    out.push(Intent::Tab(Tab::IsoFiles));
+                    if let Some(sid) = sel.sid {
+                        out.push(Intent::AskForgetSr(sid, "sr-iso".into()));
+                    }
+                }
+                "iso-upload" => {
+                    out.push(Intent::Tab(Tab::IsoFiles));
+                    if let Some(sid) = sel.sid {
+                        self.start_upload(sid, "sr-iso".into(), Source::File(PathBuf::from("/nonexistent/Win11_24H2_English_x64 (1).iso")), None, ctx);
+                    }
+                }
+                "iso-upload-choose" | "iso-upload-web" => {
+                    out.push(Intent::Tab(Tab::IsoFiles));
+                    if let Some(sid) = sel.sid {
+                        let d = UploadDialog::new(sid, "sr-iso".into(), "ISO library".into(), vec![]);
+                        let d = if self.shot_show == "iso-upload-web" {
+                            let url = "https://releases.ubuntu.com/24.04/ubuntu-24.04.3-live-server-amd64.iso";
+                            d.with_link(url, WebFile { name: "ubuntu-24.04.3-live-server-amd64.iso".into(), size: 3_213_064_192 })
+                        } else {
+                            d
+                        };
+                        self.dialog = Dialog::Upload(Box::new(d));
+                    }
+                }
+                "iso-upload-done" => {
+                    out.push(Intent::Tab(Tab::IsoFiles));
+                    if let Some(sid) = sel.sid {
+                        let t = Arc::new(Transfer::default());
+                        t.total.store(3_213_064_192, Ordering::Relaxed);
+                        let now = Instant::now();
+                        let (name, from) = ("ubuntu-24.04.3-live-server-amd64.iso".to_string(), "releases.ubuntu.com".to_string());
+                        let u = Upload { sid, lib: "ISO library".into(), name, web: true, from, t, started: now, log: 0, done: Some(Duration::from_secs(74)), ended: Some(now + Duration::from_secs(30)) };
+                        self.uploads.insert("sr-iso".into(), u);
+                    }
+                }
+                "iso-delete" => {
+                    out.push(Intent::Tab(Tab::IsoFiles));
+                    if let Some(sid) = sel.sid {
+                        out.push(Intent::AskDeleteIso(sid, "sr-iso".into(), "sr-iso-vdi-1".into()));
+                    }
+                }
+                "iso-describe" => {
+                    out.push(Intent::Tab(Tab::IsoFiles));
+                    self.iso_edit = Some(IsoEdit { vdi: "sr-iso-vdi-1".into(), text: "Rocky Linux 9, minimal install".into(), focus: true });
+                }
                 _ => {}
             }
         }
@@ -2171,6 +2949,24 @@ impl eframe::App for App {
                 if let Some(c) = self.console.as_mut() {
                     c.tab_controls(ui, free, &pal);
                 }
+            } else if let Some((s, x)) = self.sr_of(&sel).filter(|(_, x)| x.is_iso()) {
+                // an ISO library's actions, next to its tabs
+                let (sid, sr) = (s.id, x.rref.clone());
+                let busy = self.sr_busy.contains(&sr);
+                let uploading = self.uploads.get(&sr).map_or(false, Upload::active);
+                let mut child = ui.new_child(egui::UiBuilder::new().max_rect(free).layout(egui::Layout::right_to_left(egui::Align::Center)));
+                child.spacing_mut().item_spacing.x = 4.0;
+                // with their names when there's room, otherwise as icons
+                let compact = free.width() < flat_button_width(&child, "Disconnect") + flat_button_width(&child, "Working…") + flat_button_width(&child, "Upload") + 16.0;
+                if flat_button(&mut child, "disconnect", "Disconnect", Some(pal.red), !busy && !uploading, compact, &pal).on_hover_text("Stop using this library; nothing on the share is deleted").clicked() {
+                    out.push(Intent::AskForgetSr(sid, sr.clone()));
+                }
+                if flat_button(&mut child, "rescan", if busy { "Working…" } else { "Rescan" }, None, !busy, compact, &pal).on_hover_text("Look for ISO files added to or removed from the share").clicked() {
+                    out.push(Intent::RescanSr(sid, sr.clone()));
+                }
+                if flat_button(&mut child, "upload", "Upload", None, !busy && !uploading, compact, &pal).on_hover_text("Add an .iso file from this computer or from a link on the web").clicked() {
+                    out.push(Intent::Upload(sid, sr));
+                }
             }
             ui.spacing_mut().item_spacing.y = 4.0;
             let margin = if current == Tab::General || current == Tab::Home { 0.0 } else { 10.0 };
@@ -2182,23 +2978,36 @@ impl eframe::App for App {
                 Tab::Storage => self.storage(ui, &sel),
                 Tab::Networking => self.networking(ui, &sel),
                 Tab::Console => self.console_tab(ui, &sel, &mut out),
+                Tab::IsoFiles => self.iso_files(ui, &sel, &mut out),
                 Tab::Logs => self.logs(ui, &sel),
             });
         });
 
         self.dialogs(ctx);
         self.apply(out, &sel, ctx);
+        // files dragged over the window: say where they'd go
+        if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
+            let text = match self.sr_of(&sel).filter(|(_, x)| x.is_iso()) {
+                Some((_, x)) => format!("Drop to upload to {}", x.name),
+                None => "Select an ISO library first, then drop the file on it".to_string(),
+            };
+            let p = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("drop-files")));
+            let r = ctx.screen_rect();
+            p.rect_filled(r, 0.0, Color32::from_black_alpha(150));
+            p.rect_stroke(r.shrink(14.0), Rounding::same(12.0), Stroke::new(2.0, pal.accent));
+            p.text(r.center(), Align2::CENTER_CENTER, text, FontId::proportional(18.0), Color32::WHITE);
+        }
         self.screenshot(ctx);
         ctx.request_repaint_after(Duration::from_millis(250));
     }
 }
 
-const FIELD_HEIGHT: f32 = 26.0;
-const LABEL_WIDTH: f32 = 80.0;
-const GROUP_INSET: f32 = 11.0; // a group box's margin plus its 1px border
+pub(crate) const FIELD_HEIGHT: f32 = 26.0;
+pub(crate) const LABEL_WIDTH: f32 = 80.0;
+pub(crate) const GROUP_INSET: f32 = 11.0; // a group box's margin plus its 1px border
 
 /// A dialog window: centred, fixed size, with room around its contents.
-fn dialog_window(ctx: &egui::Context, title: &str) -> egui::Window<'static> {
+pub(crate) fn dialog_window(ctx: &egui::Context, title: &str) -> egui::Window<'static> {
     egui::Window::new(title.to_string())
         .collapsible(false)
         .resizable(false)
@@ -2207,7 +3016,7 @@ fn dialog_window(ctx: &egui::Context, title: &str) -> egui::Window<'static> {
 }
 
 /// A left-aligned field label of fixed width, so the boxes after it line up.
-fn field_label(ui: &mut Ui, text: &str, width: f32) {
+pub(crate) fn field_label(ui: &mut Ui, text: &str, width: f32) {
     ui.allocate_ui_with_layout(vec2(width, FIELD_HEIGHT), egui::Layout::left_to_right(egui::Align::Center), |ui| {
         ui.set_min_size(vec2(width, FIELD_HEIGHT));
         ui.label(text);
@@ -2216,7 +3025,7 @@ fn field_label(ui: &mut Ui, text: &str, width: f32) {
 
 /// A one-line text box with a visible border (blue while typing), drawn like the sidebar's search
 /// box. egui's own box has no border until hovered, and its focus outline is white.
-fn text_field(ui: &mut Ui, pal: &Pal, text: &mut String, width: f32, password: bool) -> egui::Response {
+pub(crate) fn text_field(ui: &mut Ui, pal: &Pal, text: &mut String, width: f32, password: bool) -> egui::Response {
     let bg = ui.painter().add(egui::Shape::Noop);
     let row = ui.text_style_height(&egui::TextStyle::Body);
     let pad = egui::Margin::symmetric(7.0, ((FIELD_HEIGHT - row) / 2.0).max(0.0));
@@ -2229,26 +3038,112 @@ fn text_field(ui: &mut Ui, pal: &Pal, text: &mut String, width: f32, password: b
 
 /// The row of buttons at the bottom of a dialog, right-aligned and one row tall. (A bare
 /// right-to-left layout would stretch an auto-sized window to the whole screen height.)
-fn dialog_buttons(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
+pub(crate) fn dialog_buttons(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
     ui.allocate_ui_with_layout(vec2(ui.available_width(), FIELD_HEIGHT), egui::Layout::right_to_left(egui::Align::Center), |ui| {
         ui.spacing_mut().item_spacing.x = 8.0;
         add(ui);
     });
 }
 
-/// A dialog button; the main one (Add, Yes, OK) is filled with the accent colour.
-fn dialog_button(ui: &mut Ui, pal: &Pal, label: &str, primary: bool, enabled: bool) -> bool {
-    let b = if primary && enabled {
-        egui::Button::new(egui::RichText::new(label).color(pal.on_accent)).fill(pal.accent)
-    } else {
-        egui::Button::new(label).stroke(Stroke::new(1.0, pal.border_strong))
+/// How a dialog button looks: outlined; filled with the accent colour (the main choice: Connect,
+/// Yes, OK); or red (a choice that takes something away, like Disconnect).
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum Look {
+    Plain,
+    Primary,
+    Danger,
+}
+
+/// A dialog button: an icon (a `paint_glyph` name), then its label.
+pub(crate) fn dialog_button(ui: &mut Ui, pal: &Pal, glyph: &str, label: &str, look: Look, enabled: bool) -> bool {
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let content = 22.0 + ui.painter().layout_no_wrap(label.to_string(), font.clone(), pal.ink).size().x;
+    let filled = enabled && look != Look::Plain;
+    let b = match look {
+        _ if !filled => egui::Button::new("").stroke(Stroke::new(1.0, pal.border_strong)),
+        Look::Danger => egui::Button::new("").fill(pal.red),
+        _ => egui::Button::new("").fill(pal.accent),
     };
-    ui.add_enabled(enabled, b.min_size(vec2(80.0, FIELD_HEIGHT)).rounding(Rounding::same(5.0))).clicked()
+    let resp = ui.add_enabled(enabled, b.min_size(vec2((content + 28.0).max(80.0), FIELD_HEIGHT)).rounding(Rounding::same(5.0)));
+    let (text, icon) = if filled {
+        (pal.on_accent, pal.on_accent)
+    } else if enabled {
+        (pal.ink, pal.ink_soft)
+    } else {
+        (pal.ink_faint, pal.ink_faint)
+    };
+    let (x, cy) = (resp.rect.center().x - content / 2.0, resp.rect.center().y);
+    let bg = match look {
+        _ if !filled => ui.style().interact(&resp).weak_bg_fill,
+        Look::Danger => pal.red,
+        _ => pal.accent,
+    };
+    paint_glyph_on(ui.painter(), Rect::from_center_size(pos2(x + 8.0, cy), vec2(16.0, 16.0)), glyph, icon, bg);
+    ui.painter().text(pos2(x + 22.0, cy), Align2::LEFT_CENTER, label, font, text);
+    resp.clicked()
 }
 
 /// How wide a labelled toolbar button is.
 fn tool_width(ui: &Ui, label: &str) -> f32 {
     32.0 + ui.painter().layout_no_wrap(label.to_string(), FontId::proportional(13.0), Color32::WHITE).size().x + 10.0
+}
+
+/// A thin rounded progress bar filled to `frac` in `col` (blue under way, green when done).
+fn progress_bar(p: &egui::Painter, r: Rect, frac: f32, col: Color32, pal: &Pal) {
+    let round = Rounding::same(r.height() / 2.0);
+    p.rect_filled(r, round, pal.border);
+    if frac > 0.0 {
+        p.rect_filled(Rect::from_min_size(r.min, vec2((r.width() * frac.clamp(0.0, 1.0)).max(r.height()), r.height())), round, col);
+    }
+}
+
+/// "45 s", "3 min 20 s", "1 h 05 min".
+fn fmt_took(d: Duration) -> String {
+    let s = d.as_secs();
+    match s {
+        0..=59 => format!("{} s", s.max(1)),
+        60..=3599 => format!("{} min {} s", s / 60, s % 60),
+        _ => format!("{} h {:02} min", s / 3600, s % 3600 / 60),
+    }
+}
+
+/// Why deleting an ISO file failed, in plain words where the server's answer is a known one.
+fn delete_problem(e: &ApiError) -> String {
+    let all = format!("{} {}", e.code, e.details.join(" ")).to_lowercase();
+    if e.code == "VDI_IN_USE" {
+        "A running VM has this disc in its DVD drive. Eject it there first, then try again.".into()
+    } else if all.contains("vdidelete") || all.contains("permission denied") || all.contains("read-only") || all.contains("vdi deletion failed") {
+        "The server couldn't delete the file on the share: the account this library uses to reach the share can't change files there. Give it write access on the NAS, or delete the file on the share yourself and Rescan.".into()
+    } else if e.code == "VM_BAD_POWER_STATE" {
+        "A VM that has this disc in its drive is suspended, so the disc can't be taken out. Resume or shut down that VM first.".into()
+    } else {
+        e.message()
+    }
+}
+
+/// Why an upload failed, in plain words where the server's answer is a known one.
+fn upload_problem(e: &ApiError) -> String {
+    let all = format!("{} {}", e.code, e.details.join(" ")).to_lowercase();
+    if all.contains("already exists") {
+        "There's already a file with that name in the library.".into()
+    } else if all.contains("could not create file") || all.contains("permission denied") || all.contains("read-only") {
+        "The server couldn't create the file on the share: the account this library uses to reach the share can't write there. Give it write access on the NAS, or copy the file to the share yourself and Rescan.".into()
+    } else if all.contains("no space") {
+        "The share is out of space.".into()
+    } else if all.contains("operation_not_supported") || all.contains("not supported") {
+        "This library doesn't take new files from the server. Copy the file to the share yourself, then Rescan.".into()
+    } else {
+        e.message()
+    }
+}
+
+/// Storage's tree icon: a disc for ISO libraries, a drum for the rest.
+fn sr_icon(x: &SrInfo) -> IconKind {
+    if x.is_iso() {
+        IconKind::IsoSr
+    } else {
+        IconKind::Sr
+    }
 }
 
 /// A cell of a table.
@@ -2260,10 +3155,39 @@ enum Cell {
     Status(String),
     /// An icon, then the text.
     Icon(IconKind, String),
+    /// Drawn by the caller (see `table_with`), at least this wide.
+    Custom(f32),
 }
 
 fn text_rows(rows: Vec<Vec<String>>) -> Vec<Vec<Cell>> {
     rows.into_iter().map(|r| r.into_iter().map(Cell::Text).collect()).collect()
+}
+
+/// A frameless button, an icon then its label, with a soft background under the mouse. `tint`
+/// colours the icon (red for one that takes something away); `compact` shows only the icon, with
+/// the label as its tooltip.
+pub(crate) fn flat_button(ui: &mut Ui, glyph: &str, label: &str, tint: Option<Color32>, enabled: bool, compact: bool, pal: &Pal) -> egui::Response {
+    let font = FontId::proportional(13.0);
+    let w = if compact { 28.0 } else { flat_button_width(ui, label) };
+    let (r, mut resp) = ui.allocate_exact_size(vec2(w, 26.0), if enabled { Sense::click() } else { Sense::hover() });
+    let bg = if enabled && resp.hovered() { pal.hover } else { pal.window };
+    if enabled && resp.hovered() {
+        ui.painter().rect_filled(r, Rounding::same(5.0), pal.hover);
+    }
+    let icon = if enabled { tint.unwrap_or(pal.ink_soft) } else { pal.ink_faint };
+    let at = if compact { r.center() } else { pos2(r.min.x + 18.0, r.center().y) };
+    paint_glyph_on(ui.painter(), Rect::from_center_size(at, vec2(16.0, 16.0)), glyph, icon, bg);
+    if compact {
+        resp = resp.on_hover_text(label);
+    } else {
+        ui.painter().text(pos2(r.min.x + 32.0, r.center().y), Align2::LEFT_CENTER, label, font, if enabled { pal.ink } else { pal.ink_faint });
+    }
+    resp
+}
+
+/// How wide a `flat_button` with its label is: 10 + icon 16 + 6 + label + 10.
+fn flat_button_width(ui: &Ui, label: &str) -> f32 {
+    42.0 + ui.painter().layout_no_wrap(label.to_string(), FontId::proportional(13.0), Color32::WHITE).size().x
 }
 
 /// A thin rounded bar filled to `frac`: accent blue, orange past 80%, red past 90%.

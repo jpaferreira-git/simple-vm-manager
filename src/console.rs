@@ -7,7 +7,9 @@
 //! them (QEMU's extended key events), so the VM's own keyboard layout applies, as with a real
 //! keyboard; otherwise as X11 keysyms. The demo server's VMs show a pretend text console instead.
 
+use crate::app::{dialog_button, Look};
 use crate::conn::{Connection, ConsoleStream};
+use crate::icons::paint_glyph;
 use crate::theme::Pal;
 use eframe::egui::{self, pos2, vec2, Align2, Color32, Event, FontId, Key, Modifiers, Rect, Rounding, Sense, Stroke, Ui};
 use std::io::{ErrorKind, Read, Write};
@@ -782,36 +784,6 @@ fn follow_pointer(ui: &Ui, resp: &egui::Response, focused: bool, allow: bool) {
 
 const ICON_BUTTON: egui::Vec2 = vec2(30.0, 22.0);
 
-/// A keyboard: an outline, two rows of keys and a space bar.
-fn paint_keyboard(p: &egui::Painter, r: Rect, col: Color32) {
-    let k = Rect::from_center_size(r.center(), vec2(17.0, 11.0));
-    p.rect_stroke(k, Rounding::same(2.0), Stroke::new(1.3, col));
-    for row in 0..2 {
-        for i in 0..5 {
-            let c = pos2(k.min.x + 3.0 + i as f32 * 2.75, k.min.y + 3.0 + row as f32 * 2.5);
-            p.rect_filled(Rect::from_center_size(c, vec2(1.4, 1.2)), 0.0, col);
-        }
-    }
-    p.line_segment([pos2(k.min.x + 5.0, k.max.y - 2.5), pos2(k.max.x - 5.0, k.max.y - 2.5)], Stroke::new(1.2, col));
-}
-
-/// A monitor on its stand; with `fit`, arrows pointing to its corners.
-fn paint_monitor(p: &egui::Painter, r: Rect, col: Color32, fit: bool) {
-    let m = Rect::from_center_size(r.center() - vec2(0.0, 1.5), vec2(17.0, 11.0));
-    let s = Stroke::new(1.3, col);
-    p.rect_stroke(m, Rounding::same(1.5), s);
-    p.line_segment([pos2(m.center().x, m.max.y), pos2(m.center().x, m.max.y + 2.5)], s);
-    p.line_segment([pos2(m.center().x - 3.5, m.max.y + 2.5), pos2(m.center().x + 3.5, m.max.y + 2.5)], s);
-    if fit {
-        let s = Stroke::new(1.1, col);
-        let (a, b) = (m.shrink2(vec2(3.0, 2.5)).min, m.shrink2(vec2(3.0, 2.5)).max);
-        for (corner, dx, dy) in [(a, 2.5, 2.0), (pos2(b.x, a.y), -2.5, 2.0), (pos2(a.x, b.y), 2.5, -2.0), (b, -2.5, -2.0)] {
-            p.line_segment([corner, corner + vec2(dx, 0.0)], s);
-            p.line_segment([corner, corner + vec2(0.0, dy)], s);
-        }
-    }
-}
-
 // ---------------------------------------------------------------- the demo server's pretend console
 
 #[derive(PartialEq)]
@@ -1010,7 +982,7 @@ impl ConsoleView {
                         ui.add_space(6.0);
                         ui.label(egui::RichText::new(msg).color(Color32::from_gray(170)));
                         ui.add_space(12.0);
-                        if ui.button("Try again").clicked() {
+                        if dialog_button(ui, pal, "retry", "Try again", Look::Plain, true) {
                             self.retries = 0;
                             self.connect();
                         }
@@ -1072,7 +1044,8 @@ impl ConsoleView {
     /// or, without room even for those, over the screen's corner.
     pub fn tab_controls(&mut self, ui: &mut Ui, free: Rect, pal: &Pal) {
         let text_w = |t: &str| ui.painter().layout_no_wrap(t.to_string(), egui::TextStyle::Button.resolve(ui.style()), pal.ink).size().x;
-        let full = text_w("Send Ctrl+Alt+Del") + text_w("Send keys      ") + text_w("Scale to fit") + 3.0 * 22.0 + 2.0 * 8.0;
+        // each: 10 + icon 16 + 6 + label + 10, Send keys its arrow too, and 4 between them
+        let full = text_w("Send Ctrl+Alt+Del") + text_w("Send keys") + text_w("Scale to fit") + 3.0 * 42.0 + 16.0 + 2.0 * 4.0;
         let icons = 2.0 * ICON_BUTTON.x + 8.0;
         self.overlay_controls = free.width() < icons;
         if !self.overlay_controls {
@@ -1126,7 +1099,7 @@ impl ConsoleView {
             let slot = ui.painter().add(egui::Shape::Noop);
             let b = ui.add(egui::Button::new("").frame(false).min_size(ICON_BUTTON)).on_hover_text(if self.fit { "Scale to fit: on" } else { "Scale to fit: off" });
             flat_bg(ui, slot, &b, self.fit);
-            paint_monitor(ui.painter(), b.rect, pal.ink_soft, self.fit);
+            paint_glyph(ui.painter(), b.rect, if self.fit { "fit" } else { "screen" }, pal.ink_soft);
             if b.clicked() {
                 self.fit = !self.fit;
             }
@@ -1134,34 +1107,41 @@ impl ConsoleView {
                 let slot = ui.painter().add(egui::Shape::Noop);
                 let m = egui::menu::menu_custom_button(ui, egui::Button::new("").frame(false).min_size(ICON_BUTTON), |ui| menu(ui, &mut combo, true));
                 flat_bg(ui, slot, &m.response, m.inner.is_some());
-                paint_keyboard(ui.painter(), m.response.rect, if connected { pal.ink_soft } else { pal.ink_faint });
+                paint_glyph(ui.painter(), m.response.rect, "keyboard", if connected { pal.ink_soft } else { pal.ink_faint });
                 m.response.on_hover_text("Send keys to the VM");
             });
         } else {
-            // egui gives frameless buttons no padding, so these draw their own label inside a sized,
-            // empty button: 10 points each side, and room for the menu's arrow.
+            // egui gives frameless buttons no padding, so these draw their own icon and label inside a
+            // sized, empty button: 10 points each side, and room for the menu's arrow.
             let font = egui::TextStyle::Button.resolve(ui.style());
-            let label = |ui: &Ui, r: Rect, text: &str, arrow: bool| {
-                let col = if connected { pal.ink } else { pal.ink_faint };
-                ui.painter().text(pos2(r.min.x + 10.0, r.center().y), Align2::LEFT_CENTER, text, font.clone(), col);
+            let label = |ui: &Ui, r: Rect, glyph: &str, text: &str, arrow: bool, enabled: bool| {
+                let (col, soft) = if enabled { (pal.ink, pal.ink_soft) } else { (pal.ink_faint, pal.ink_faint) };
+                paint_glyph(ui.painter(), Rect::from_center_size(pos2(r.min.x + 18.0, r.center().y), vec2(16.0, 16.0)), glyph, soft);
+                ui.painter().text(pos2(r.min.x + 32.0, r.center().y), Align2::LEFT_CENTER, text, font.clone(), col);
                 if arrow {
                     let c = pos2(r.max.x - 13.0, r.center().y);
-                    ui.painter().add(egui::Shape::line(vec![pos2(c.x - 3.5, c.y - 1.5), pos2(c.x, c.y + 2.0), pos2(c.x + 3.5, c.y - 1.5)], Stroke::new(1.4, if connected { pal.ink_soft } else { pal.ink_faint })));
+                    ui.painter().add(egui::Shape::line(vec![pos2(c.x - 3.5, c.y - 1.5), pos2(c.x, c.y + 2.0), pos2(c.x + 3.5, c.y - 1.5)], Stroke::new(1.4, soft)));
                 }
             };
-            let width = |ui: &Ui, text: &str| ui.painter().layout_no_wrap(text.to_string(), font.clone(), pal.ink).size().x + 20.0;
-            ui.checkbox(&mut self.fit, "Scale to fit");
-            ui.add_space(6.0);
+            let width = |ui: &Ui, text: &str| ui.painter().layout_no_wrap(text.to_string(), font.clone(), pal.ink).size().x + 42.0;
+            // Scale to fit: on while its background is lit
+            let slot = ui.painter().add(egui::Shape::Noop);
+            let b = ui.add(egui::Button::new("").frame(false).min_size(vec2(width(ui, "Scale to fit"), row.y))).on_hover_text(if self.fit { "Scale to fit: on" } else { "Scale to fit: off" });
+            flat_bg(ui, slot, &b, self.fit);
+            label(ui, b.rect, if self.fit { "fit" } else { "screen" }, "Scale to fit", false, true);
+            if b.clicked() {
+                self.fit = !self.fit;
+            }
             ui.add_enabled_ui(connected, |ui| {
                 let slot = ui.painter().add(egui::Shape::Noop);
                 let size = vec2(width(ui, "Send keys") + 16.0, row.y);
                 let m = egui::menu::menu_custom_button(ui, egui::Button::new("").frame(false).min_size(size), |ui| menu(ui, &mut combo, false));
                 flat_bg(ui, slot, &m.response, m.inner.is_some());
-                label(ui, m.response.rect, "Send keys", true);
+                label(ui, m.response.rect, "keyboard", "Send keys", true, connected);
                 let slot = ui.painter().add(egui::Shape::Noop);
                 let b = ui.add(egui::Button::new("").frame(false).min_size(vec2(width(ui, "Send Ctrl+Alt+Del"), row.y)));
                 flat_bg(ui, slot, &b, false);
-                label(ui, b.rect, "Send Ctrl+Alt+Del", false);
+                label(ui, b.rect, "lock", "Send Ctrl+Alt+Del", false, connected);
                 if b.clicked() {
                     combo = Some(vec![CTRL, ALT, DELETE]);
                 }
