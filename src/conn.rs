@@ -95,6 +95,11 @@ pub trait Connection: Send + Sync {
     /// Deletes an ISO file: its disc, and the file on the share. Shut-down VMs that have it in a
     /// DVD drive get the drive emptied first, as destroying a disc also destroys the drives it's in.
     fn delete_iso(&self, vdi_ref: &str) -> Result<(), ApiError>;
+    /// Shuts a server down the way the pool expects: no new VMs sent to it, the VMs that can't
+    /// leave it (disks on its own storage, no other server) shut down (the hard way if a clean
+    /// shut down fails, as for a VM without guest tools), the rest moved to the pool's other
+    /// servers, then the server itself. If any step fails it's enabled again.
+    fn shutdown_host(&self, host_ref: &str) -> Result<(), ApiError>;
     /// Deletes a VM: turned off first if it isn't (forced), its snapshots, then the VM; with
     /// `disks`, then the disks only it and its snapshots use (a disk another VM has stays). DVD
     /// drives just go, the ISO files in them untouched. The disks that couldn't be deleted (the
@@ -213,7 +218,7 @@ pub struct WebFile {
 
 /// An agent for the web, checking certificates as a browser does (unlike the one for the
 /// servers, whose certificates are usually their own).
-fn web_agent() -> Result<ureq::Agent, String> {
+pub(crate) fn web_agent() -> Result<ureq::Agent, String> {
     let tls = native_tls::TlsConnector::new().map_err(|e| e.to_string())?;
     Ok(ureq::AgentBuilder::new()
         .tls_connector(Arc::new(tls))
@@ -225,7 +230,7 @@ fn web_agent() -> Result<ureq::Agent, String> {
 }
 
 /// Starts downloading a link: the answer, its body not read yet.
-fn web_get(url: &str) -> Result<ureq::Response, String> {
+pub(crate) fn web_get(url: &str) -> Result<ureq::Response, String> {
     match web_agent()?.get(url.trim()).call() {
         Ok(r) => Ok(r),
         Err(ureq::Error::Status(404, _)) => Err("There's no file at that link (the site says 404, not found).".into()),
@@ -309,9 +314,9 @@ pub struct Transfer {
 pub const CANCELLED: &str = "UPLOAD_CANCELLED";
 
 /// Reads what's being uploaded, counting what's been read, and stops when it's cancelled.
-struct Counting {
-    inner: Box<dyn Read + Send>,
-    t: Arc<Transfer>,
+pub(crate) struct Counting {
+    pub(crate) inner: Box<dyn Read + Send>,
+    pub(crate) t: Arc<Transfer>,
 }
 
 impl Read for Counting {
@@ -802,6 +807,7 @@ impl Connection for RealConnection {
                 mem_free: n(&m, "memory_free"),
                 enabled: b(&r, "enabled"),
                 control_domain: String::new(), // filled in from the VMs below
+                live: m.get("live").map_or(true, |x| x.as_bool().unwrap_or(true)),
             });
         }
         // Each storage is plugged into the servers that can use it (a PBD per server): local storage
@@ -1292,6 +1298,33 @@ impl Connection for RealConnection {
         }
         Ok(left)
     }
+    fn shutdown_host(&self, host: &str) -> Result<(), ApiError> {
+        let t = 60_000;
+        self.call("host.disable", vec![json!(host)], t)?;
+        let done = (|| -> Result<(), ApiError> {
+            // the VMs that can't move elsewhere stop
+            let stuck = self.call("host.get_vms_which_prevent_evacuation", vec![json!(host)], t)?;
+            for vm in stuck.as_object().map(|o| o.keys().cloned().collect::<Vec<_>>()).unwrap_or_default() {
+                let power = self.call("VM.get_power_state", vec![json!(vm)], t)?;
+                let clean = match power.as_str() {
+                    Some("Halted") | Some("Suspended") => continue,
+                    Some("Running") => self.call("VM.clean_shutdown", vec![json!(vm)], ACTION_TIMEOUT_MS).map(|_| ()),
+                    _ => Err(ApiError::other("not running")),
+                };
+                if clean.is_err() {
+                    self.call("VM.hard_shutdown", vec![json!(vm)], ACTION_TIMEOUT_MS)?;
+                }
+            }
+            // the rest move to the other servers, then it goes off
+            self.call("host.evacuate", vec![json!(host)], ACTION_TIMEOUT_MS)?;
+            self.call("host.shutdown", vec![json!(host)], ACTION_TIMEOUT_MS)?;
+            Ok(())
+        })();
+        if done.is_err() {
+            let _ = self.call("host.enable", vec![json!(host)], t);
+        }
+        done
+    }
 
     /// VDI.create in the library (sm_config "path" names the file on the share), then the bytes in
     /// an HTTP PUT to /import_raw_vdi, then the task's verdict. XenServer answers the PUT before
@@ -1473,6 +1506,7 @@ impl DemoConnection {
             enabled: true,
             is_master: master,
             control_domain: format!("dom0-{}", r),
+            live: true,
         };
         d.hosts.push(host("host-a", "demo-host-01", "10.20.0.11", true));
         d.hosts.push(host("host-b", "demo-host-02", "10.20.0.12", false));
@@ -1918,6 +1952,23 @@ impl Connection for DemoConnection {
         self.data.lock().unwrap().vms.retain(|v| v.rref != vm_ref);
         Ok(vec![])
     }
+    /// Its VMs on its own storage stop, the others move to another server, and it's off.
+    fn shutdown_host(&self, host: &str) -> Result<(), ApiError> {
+        std::thread::sleep(Duration::from_millis(1800));
+        let mut d = self.data.lock().unwrap();
+        let other = d.hosts.iter().find(|h| h.rref != host && h.enabled && h.live).map(|h| h.rref.clone());
+        for v in d.vms.iter_mut().filter(|v| v.host.as_deref() == Some(host) && matches!(v.power, PowerState::Running | PowerState::Paused)) {
+            if v.storage_host.as_deref() == Some(host) || other.is_none() {
+                v.power = PowerState::Halted;
+                v.host = None;
+            } else {
+                v.host = other.clone();
+            }
+        }
+        let h = d.hosts.iter_mut().find(|h| h.rref == host).ok_or_else(|| ApiError { code: "HANDLE_INVALID".into(), details: vec!["host".into(), host.into()] })?;
+        (h.enabled, h.live, h.mem_free) = (false, false, 0);
+        Ok(())
+    }
     fn set_vdi_description(&self, vdi_ref: &str, text: &str) -> Result<(), ApiError> {
         std::thread::sleep(Duration::from_millis(400));
         let mut d = self.data.lock().unwrap();
@@ -2055,6 +2106,19 @@ mod tests {
         let e = job.join().unwrap().unwrap_err();
         assert!(started.elapsed() < Duration::from_millis(CONNECT_TIMEOUT_MS + 4_000), "took {:?}", started.elapsed());
         assert!(e.message().contains("isn't answering"), "{}", e.message());
+    }
+
+    #[test]
+    fn demo_shutdown_host() {
+        let c = DemoConnection::new();
+        // demo-host-02: Mail Relay's disk is on its own storage, so it stops
+        c.shutdown_host("host-b").unwrap();
+        let d = c.data.lock().unwrap().clone();
+        let h = d.host("host-b").unwrap();
+        assert!(!h.enabled && !h.live);
+        let mail = d.vm("vm-mail").unwrap();
+        assert_eq!((mail.power, mail.host.as_deref()), (PowerState::Halted, None));
+        assert!(d.vms.iter().all(|v| v.host.as_deref() != Some("host-b") || v.power != PowerState::Running));
     }
 
     #[test]

@@ -130,6 +130,8 @@ pub struct HostInfo {
     pub is_master: bool,
     /// Its control domain (dom0): the VM whose console is the server's own text console.
     pub control_domain: String,
+    /// Up and answering (its metrics say it's live); false once it's shut down.
+    pub live: bool,
 }
 
 #[derive(Clone, Debug, Default)]

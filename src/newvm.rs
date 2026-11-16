@@ -996,7 +996,7 @@ fn transcript(ui: &mut Ui, pal: &Pal, tr: &Trace, copied: &mut Option<Instant>, 
 /// A box under the form: yellow for a caution (a warning sign), red for what stops it being made
 /// (a cross); `title` in bold, then `text`, and `button` (its icon and label) at the foot.
 /// Whether the button was clicked.
-fn alert(ui: &mut Ui, pal: &Pal, stop: bool, title: &str, text: &str, button: Option<(&str, &str)>) -> bool {
+pub(crate) fn alert(ui: &mut Ui, pal: &Pal, stop: bool, title: &str, text: &str, button: Option<(&str, &str)>) -> bool {
     let (bg, ink, sign) = if stop { (pal.danger, pal.danger_ink, "error") } else { (pal.caution, pal.caution_ink, "warning") };
     let size = 12.5;
     let mut job = egui::text::LayoutJob::default();

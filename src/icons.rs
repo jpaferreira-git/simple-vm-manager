@@ -411,6 +411,11 @@ pub fn paint_glyph_on(p: &Painter, rect: Rect, name: &str, col: Color32, bg: Col
             line(p, c, &[(0.0, -2.2), (0.0, 1.6)], Stroke::new(1.6, col));
             p.circle_filled(c + vec2(0.0, 3.7), 0.95, col);
         }
+        "power" => {
+            // a power sign: a ring open at the top, a bar through the gap
+            arc(p, c + vec2(0.0, 0.8), 5.4, -55.0, 235.0, s);
+            p.line_segment([c + vec2(0.0, -6.2), c + vec2(0.0, -0.6)], s);
+        }
         "more" => {
             // three dots in a row
             for x in [-5.0, 0.0, 5.0] {

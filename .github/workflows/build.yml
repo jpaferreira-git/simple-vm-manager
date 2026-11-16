@@ -35,8 +35,13 @@ jobs:
         with:
           name: simple-vm-manager-linux-x86_64
           path: simple-vm-manager-linux-x86_64.tar.gz
+      - name: Release notes
+        if: startsWith(github.ref, 'refs/tags/v')
+        # the tagged commit's message, without its trailers (the app's "What's new" links here)
+        run: git log -1 --format=%b | grep -v -E '^(Co-Authored-By|Signed-off-by):' > release-notes.md
       - name: Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           files: simple-vm-manager-linux-x86_64.tar.gz
+          body_path: release-notes.md

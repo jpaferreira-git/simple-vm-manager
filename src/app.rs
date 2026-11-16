@@ -7,6 +7,7 @@ use crate::isolib::{IsoAction, IsoDialog};
 use crate::newvm::{NewVmAction, NewVmDialog};
 use crate::upload::{UploadAction, UploadDialog};
 use crate::secrets;
+use crate::update;
 use crate::icons::*;
 use crate::model::*;
 use crate::theme::{self, Pal, ThemeMode};
@@ -81,10 +82,16 @@ enum Msg {
     SrChecked { sid: u32, sr: String, host: Option<String>, result: Result<(), ApiError> },
     /// Deleting an ISO file ended.
     IsoDeleted { sid: u32, sr: String, vdi: String, name: String, result: Result<(), ApiError> },
+    /// Shutting a server down ended.
+    HostShutdown { sid: u32, host: String, name: String, log: usize, result: Result<(), ApiError> },
     /// Deleting a VM ended: the disks left behind, or why it wasn't deleted.
     VmDeleted { sid: u32, vm: String, name: String, result: Result<Vec<String>, ApiError> },
     /// A link in the Upload dialog was checked.
     LinkChecked { url: String, result: Result<WebFile, String> },
+    /// GitHub's latest release, or why it couldn't be had; `asked`: from Settings' Check now.
+    UpdateChecked { asked: bool, result: Result<update::Release, String> },
+    /// A new version is in place of this one (its file), or why not.
+    UpdateInstalled { result: Result<PathBuf, String> },
     /// The file chooser closed: the file picked to upload to library `sr`, if any.
     Picked { sid: u32, sr: String, path: Option<PathBuf> },
     /// An upload to library `sr` ended.
@@ -220,12 +227,26 @@ enum Dialog {
     ConfirmSr { sid: u32, sr: String, text: String },
     /// Deleting an ISO file: server, library, disc, its name, the question.
     ConfirmDeleteIso { sid: u32, sr: String, vdi: String, name: String, text: String },
+    /// Shutting a server down: which, its name, the VMs that move elsewhere and those that stop, and
+    /// whether it's the pool's coordinator (with other servers) or the only server.
+    ConfirmHostShutdown { sid: u32, host: String, name: String, moving: Vec<String>, stopping: Vec<String>, coordinator: bool, alone: bool },
+    /// A newer version: offered, downloading, or why it couldn't.
+    Update(Box<UpdateDialog>),
     /// The app's settings (the gear on the toolbar); `startup`: the servers it connects to as it
     /// starts (read when it opens).
     Settings { startup: Vec<(String, String)> },
     /// Deleting a VM: whether it's on (turned off first), its disks, how many snapshots it has,
     /// and whether its disks go too (ticked to begin with).
     ConfirmDeleteVm { sid: u32, vm: String, name: String, running: bool, disks: Vec<VmDisk>, snapshots: usize, delete_disks: bool },
+}
+
+/// The Update dialog: the release, this copy's file when it can replace itself, the download under
+/// way, and what went wrong.
+struct UpdateDialog {
+    release: update::Release,
+    exe: Option<PathBuf>,
+    transfer: Option<Arc<Transfer>>,
+    error: Option<String>,
 }
 
 enum Intent {
@@ -247,6 +268,8 @@ enum Intent {
     AskDeleteIso(u32, String, String),
     /// Ask before deleting a VM: server, VM.
     AskDeleteVm(u32, String),
+    /// Ask before shutting a server down: pool, server.
+    AskShutdownHost(u32, String),
     /// Hide a finished upload's card.
     DismissUpload(String),
     /// Files dropped on the window.
@@ -289,6 +312,13 @@ pub struct App {
     theme_mode: ThemeMode,
     /// The interface's size (egui's zoom factor), kept in the settings.
     zoom: f32,
+    /// Look for a newer version as the app starts (Settings).
+    check_updates: bool,
+    /// Looking for one now; the answer to a look asked for in Settings ("You have the latest").
+    update_checking: bool,
+    update_note: Option<String>,
+    /// A newer version found while another dialog was open: offered once it closes.
+    pending_update: Option<update::Release>,
     pal: Pal,
     applied_dark: Option<bool>,
     tab: Tab,
@@ -311,6 +341,8 @@ pub struct App {
     iso_deleting: HashSet<String>,
     /// VMs being deleted right now.
     vm_deleting: HashSet<String>,
+    /// Servers being shut down right now.
+    host_busy: HashSet<String>,
     /// A new VM to select (and the tab to show) once it's in the tree.
     pending_select: Option<(String, Tab)>,
     /// VMs being made right now (a check's screenshot waits for them).
@@ -351,6 +383,10 @@ impl App {
             sidebar_open: start.sidebar_open.unwrap_or(saved.sidebar_open),
             theme_mode,
             zoom: saved.zoom,
+            check_updates: saved.updates,
+            update_checking: false,
+            update_note: None,
+            pending_update: None,
             pal: theme::LIGHT,
             applied_dark: None,
             tab: Tab::Home,
@@ -366,6 +402,7 @@ impl App {
             iso_saving: HashMap::new(),
             iso_deleting: HashSet::new(),
             vm_deleting: HashSet::new(),
+            host_busy: HashSet::new(),
             pending_select: None,
             creating: 0,
             uploads: HashMap::new(),
@@ -379,6 +416,9 @@ impl App {
         };
         app.apply_theme(&cc.egui_ctx);
         cc.egui_ctx.set_zoom_factor(app.zoom);
+        if !shot && app.check_updates {
+            app.look_for_update(false, &cc.egui_ctx);
+        }
         if !shot {
             // The keychain may take a moment (or ask to be unlocked): read it in the background.
             let (tx, ctx) = (app.tx.clone(), cc.egui_ctx.clone());
@@ -431,7 +471,7 @@ impl App {
 
     fn save_settings(&self) {
         if self.shot_path.is_none() {
-            save_settings(&Settings { theme: self.theme_mode, sidebar_open: self.sidebar_open, zoom: self.zoom });
+            save_settings(&Settings { theme: self.theme_mode, sidebar_open: self.sidebar_open, zoom: self.zoom, updates: self.check_updates });
         }
     }
 
@@ -561,6 +601,61 @@ impl App {
                 let _ = tx.send(Msg::VmStarted { sid, vm, name: spec.name.clone(), result });
                 ctx.request_repaint();
             }
+        });
+    }
+
+    /// Asks GitHub for the latest release in the background (`asked`: from Settings' Check now).
+    fn look_for_update(&mut self, asked: bool, ctx: &egui::Context) {
+        if self.update_checking {
+            return;
+        }
+        self.update_checking = true;
+        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let result = update::latest();
+            let _ = tx.send(Msg::UpdateChecked { asked, result });
+            ctx.request_repaint();
+        });
+    }
+
+    /// Downloads the new version into this copy's place, in the background.
+    fn install_update(&mut self, ctx: &egui::Context) {
+        let Dialog::Update(d) = &mut self.dialog else { return };
+        let (Some(exe), Some((url, size))) = (d.exe.clone(), d.release.download.clone()) else { return };
+        let t = Arc::new(Transfer::default());
+        d.transfer = Some(t.clone());
+        d.error = None;
+        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let result = update::install(&url, size, &exe, &t).map(|_| exe);
+            let _ = tx.send(Msg::UpdateInstalled { result });
+            ctx.request_repaint();
+        });
+    }
+
+    /// Why the app shouldn't restart right now (an upload or a VM being made or deleted).
+    fn update_blocked(&self) -> Option<&'static str> {
+        if self.uploads.values().any(Upload::active) {
+            Some("An ISO file is uploading: wait for it to finish first.")
+        } else if self.creating > 0 {
+            Some("A new VM is being made: wait for it to finish first.")
+        } else if !self.vm_deleting.is_empty() {
+            Some("A VM is being deleted: wait for it to finish first.")
+        } else {
+            None
+        }
+    }
+
+    /// Shuts a server down in the background (its VMs moved or stopped first).
+    fn shutdown_host(&mut self, sid: u32, host: String, name: String, ctx: &egui::Context) {
+        let Some((conn, server)) = self.server(sid).map(|s| (s.conn.clone(), s.name())) else { return };
+        let log = self.add_log(sid, &server, None, &name, &format!("Shutting down server '{}'", name), "In progress");
+        self.host_busy.insert(host.clone());
+        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let result = conn.shutdown_host(&host);
+            let _ = tx.send(Msg::HostShutdown { sid, host, name, log, result });
+            ctx.request_repaint();
         });
     }
 
@@ -856,6 +951,31 @@ impl App {
                         s.next_refresh = Instant::now();
                     }
                 }
+                Msg::HostShutdown { sid, host, name, log, result } => {
+                    self.host_busy.remove(&host);
+                    match result {
+                        Ok(()) => {
+                            if let Some(e) = self.log.get_mut(log) {
+                                e.status = "Done".into();
+                            }
+                            // off now, before the next look says so
+                            if let Some(h) = self.server_mut(sid).and_then(|s| s.data.as_mut()).and_then(|d| d.hosts.iter_mut().find(|h| h.rref == host)) {
+                                (h.enabled, h.live) = (false, false);
+                            }
+                        }
+                        Err(e) => {
+                            let why = host_problem(&e);
+                            if let Some(l) = self.log.get_mut(log) {
+                                l.status = "Failed".into();
+                                l.text = format!("{}: {}", l.text, why);
+                            }
+                            self.dialog = Dialog::Message { title: "Shut Down Server".into(), text: format!("Couldn't shut down '{}'; it's taking new VMs again.\n\n{}", name, why) };
+                        }
+                    }
+                    if let Some(s) = self.server_mut(sid) {
+                        s.next_refresh = Instant::now();
+                    }
+                }
                 Msg::VmDeleted { sid, vm, name, result } => {
                     self.vm_deleting.remove(&vm);
                     let server = self.server(sid).map(|s| s.name()).unwrap_or_default();
@@ -886,6 +1006,44 @@ impl App {
                         s.next_refresh = Instant::now();
                     }
                 }
+                Msg::UpdateChecked { asked, result } => {
+                    self.update_checking = false;
+                    let current = env!("CARGO_PKG_VERSION");
+                    match result {
+                        Ok(r) if update::newer(&r.version, current) => {
+                            self.update_note = asked.then(|| format!("Version {} is out.", r.version));
+                            self.pending_update = Some(r);
+                            if asked {
+                                // asked for in Settings: shown now, in its place
+                                self.dialog = Dialog::None;
+                            }
+                        }
+                        Ok(_) => self.update_note = asked.then(|| format!("You have the latest version ({}).", current)),
+                        // a look as the app starts that fails says nothing (offline, say)
+                        Err(e) => self.update_note = asked.then(|| format!("Couldn't look: {}", e)),
+                    }
+                }
+                Msg::UpdateInstalled { result } => match result {
+                    Ok(exe) => {
+                        // the new version starts, this one closes
+                        let args: Vec<String> = std::env::args().skip(1).collect();
+                        match std::process::Command::new(&exe).args(args).spawn() {
+                            Ok(_) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                            Err(e) => {
+                                if let Dialog::Update(d) = &mut self.dialog {
+                                    d.transfer = None;
+                                    d.error = Some(format!("It's updated, but the new version didn't start ({}). Close the app and open it again.", e));
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        if let Dialog::Update(d) = &mut self.dialog {
+                            d.transfer = None;
+                            d.error = Some(e);
+                        }
+                    }
+                },
                 Msg::LinkChecked { url, result } => {
                     if let Dialog::Upload(d) = &mut self.dialog {
                         d.answer(&url, result);
@@ -1133,6 +1291,17 @@ impl App {
     fn vm_text(_s: &ServerEntry, v: &VmInfo) -> String {
         v.name.clone()
     }
+    /// A server's icon: off when disabled or shut down; a red ring turning while it shuts down.
+    fn host_icon(&self, h: &HostInfo) -> IconKind {
+        if self.host_busy.contains(&h.rref) {
+            IconKind::Busy(Tone::Red)
+        } else if h.enabled && h.live {
+            IconKind::Host
+        } else {
+            IconKind::HostOff
+        }
+    }
+
     /// A VM's icon, or, while a power action is under way, a ring turning in that action's colour.
     fn vm_icon(s: &ServerEntry, v: &VmInfo) -> IconKind {
         match s.busy.get(&v.rref) {
@@ -1163,7 +1332,7 @@ impl App {
                     cats[0].children.push(pn);
                 }
                 for h in &d.hosts {
-                    let icon = if h.enabled { IconKind::Host } else { IconKind::HostOff };
+                    let icon = self.host_icon(h);
                     let mut hn = Node::new(format!("host:{}:{}", id, h.rref), h.name.clone(), icon, Kind::Host, Some(id), Some(h.rref.clone()));
                     if !d.is_pool() {
                         hn.note = s.login_note();
@@ -1217,7 +1386,7 @@ impl App {
                     let icon = if s.state == ConnState::Reconnecting { IconKind::ServerDown } else { IconKind::Pool };
                     top = Node::new(skey, format!("{}{}", s.name(), suffix), icon, Kind::Pool, Some(id), None);
                     for h in &d.hosts {
-                        let icon = if h.enabled { IconKind::Host } else { IconKind::HostOff };
+                        let icon = self.host_icon(h);
                         let mut hn = Node::new(format!("host:{}:{}", id, h.rref), h.name.clone(), icon, Kind::Host, Some(id), Some(h.rref.clone()));
                         hn.children.extend(vms.iter().filter(|v| v.home() == Some(h.rref.as_str())).map(|v| vm_node(v)));
                         hn.children.extend(srs.iter().filter(|x| x.host.as_deref() == Some(h.rref.as_str())).map(|x| sr_node(x)));
@@ -1331,6 +1500,24 @@ impl App {
                             text.push_str(&format!("\n\nIt's in the DVD drive of {}, {}: the drive is left empty.", parked.join(", "), which));
                         }
                         self.dialog = Dialog::ConfirmDeleteIso { sid, sr, vdi, name: f.name.clone(), text };
+                    }
+                }
+                Intent::AskShutdownHost(sid, host) => {
+                    if let Some(d) = self.server(sid).and_then(|s| s.data.as_ref()) {
+                        if let Some(h) = d.host(&host) {
+                            let others = d.hosts.iter().any(|o| o.rref != host && o.enabled && o.live);
+                            let mut moving = vec![];
+                            let mut stopping = vec![];
+                            for v in d.vms.iter().filter(|v| v.host.as_deref() == Some(host.as_str()) && matches!(v.power, PowerState::Running | PowerState::Paused)) {
+                                if others && v.storage_host.as_deref() != Some(host.as_str()) {
+                                    moving.push(v.name.clone());
+                                } else {
+                                    stopping.push(v.name.clone());
+                                }
+                            }
+                            let (coordinator, alone) = (h.is_master && d.hosts.len() > 1, d.hosts.len() == 1);
+                            self.dialog = Dialog::ConfirmHostShutdown { sid, host, name: h.name.clone(), moving, stopping, coordinator, alone };
+                        }
                     }
                 }
                 Intent::AskDeleteVm(sid, vm) => {
@@ -1708,11 +1895,15 @@ impl App {
             w += ACTIONS.iter().filter(|a| a.on_toolbar(Some(v))).map(|a| 34.0 + if force_of(a.op).is_some() { ARROW_W } else { 0.0 }).sum::<f32>();
             w += 11.0 + 32.0; // a separator, then Delete
         }
+        let host = self.host_of(sel).is_some();
         if self.root_of(sel).is_some() {
-            w += 32.0; // Disconnect (with its name when there's room)
+            w += 32.0 + if host { 11.0 } else { 0.0 }; // Disconnect (with its name when there's room)
+        }
+        if host {
+            w += 34.0; // Shut Down
         }
         if current == Tab::Console && self.console.is_some() {
-            w += 32.0 + if vm.is_some() || self.root_of(sel).is_some() { 11.0 } else { 0.0 };
+            w += 32.0 + if vm.is_some() || self.root_of(sel).is_some() || host { 11.0 } else { 0.0 };
         }
         if w > 0.0 {
             w + 8.0
@@ -1740,6 +1931,8 @@ impl App {
         };
         let deleting = vm.as_ref().map_or(false, |(_, r)| self.vm_deleting.contains(r));
         let root = self.root_of(sel).map(|(sid, connected)| (sid, if connected { "Disconnect" } else { "Remove" }, self.server(sid).map(|s| s.name()).unwrap_or_default()));
+        // a server: Shut Down, while it's on and not already shutting down
+        let host = self.host_of(sel).map(|(s, h)| (s.id, h.rref.clone(), h.live && !self.host_busy.contains(&h.rref)));
         let mut console = if current == Tab::Console { self.console.as_mut() } else { None };
         let tip = |i: usize| match ACTIONS[i].shortcut.text() {
             "" => ACTIONS[i].label.to_string(),
@@ -1748,15 +1941,29 @@ impl App {
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(free).layout(egui::Layout::right_to_left(egui::Align::Center)));
         let ui = &mut child;
         ui.spacing_mut().item_spacing.x = 2.0;
-        if let Some((sid, label, name)) = root {
-            // a connection's own page: Disconnect at the end (its name too when there's room)
-            let wide = free.width() >= need - 32.0 + flat_button_width(ui, label) + 4.0;
-            let tip = format!("{} {}", if label == "Remove" { "Remove" } else { "Disconnect from" }, name);
-            if flat_button(ui, "disconnect", label, Some(pal.red), true, !wide, &pal).on_hover_text(tip).clicked() {
-                out.push(Intent::Remove(sid));
+        if root.is_some() || host.is_some() {
+            // right to left: a connection's Disconnect (its name too when there's room), a
+            // server's Shut Down, the keyboard
+            if let Some((sid, label, name)) = &root {
+                let wide = free.width() >= need - 32.0 + flat_button_width(ui, label) + 4.0;
+                let tip = format!("{} {}", if *label == "Remove" { "Remove" } else { "Disconnect from" }, name);
+                if flat_button(ui, "disconnect", label, Some(pal.red), true, !wide, &pal).on_hover_text(tip).clicked() {
+                    out.push(Intent::Remove(*sid));
+                }
+                if host.is_some() || console.is_some() {
+                    vsep(ui, &pal);
+                }
+            }
+            if let Some((sid, href, on)) = &host {
+                let tip = if *on { "Shut down this server…" } else { "It's off" };
+                if tool_button(ui, "clean_shutdown", tip, *on, true, &pal).clicked() {
+                    out.push(Intent::AskShutdownHost(*sid, href.clone()));
+                }
+                if console.is_some() {
+                    vsep(ui, &pal);
+                }
             }
             if let Some(c) = console.as_deref_mut() {
-                vsep(ui, &pal);
                 keys_button(ui, &pal, c);
             }
             return;
@@ -2024,7 +2231,7 @@ impl App {
                 if resp.hovered() {
                     p.rect_filled(r.shrink(2.0), Rounding::same(8.0), pal.hover);
                 }
-                let icon = if h.enabled { IconKind::Host } else { IconKind::HostOff };
+                let icon = self.host_icon(h);
                 paint_icon(p, Rect::from_center_size(pos2(r.min.x + 24.0, r.center().y), vec2(16.0, 16.0)), icon, &pal, if resp.hovered() { pal.hover } else { pal.surface });
                 let g = p.layout_no_wrap(h.name.clone(), FontId::proportional(13.5), pal.ink);
                 let name_w = g.size().x;
@@ -2918,10 +3125,17 @@ impl App {
         let mut delete_iso: Option<(u32, String, String, String)> = None;
         // from the Delete VM question: server, VM, its name, whether its disks go too
         let mut delete_vm: Option<(u32, String, String, bool)> = None;
+        // from the Shut Down Server question: pool, server, its name
+        let mut shutdown_host: Option<(u32, String, String)> = None;
         // from Settings: the theme and size chosen, a saved password to forget
         let mut theme: Option<ThemeMode> = None;
         let mut zoom: Option<f32> = None;
         let mut forget: Option<(String, String)> = None;
+        // from Settings and the Update dialog
+        let mut updates_on = self.check_updates;
+        let mut check_now = false;
+        let mut start_update = false;
+        let (update_checking, update_note, blocked) = (self.update_checking, self.update_note.clone(), self.update_blocked());
         let (theme_mode, zoom_now) = (self.theme_mode, self.zoom);
         let saved_keys: Vec<(String, String)> = self.saved.keys().cloned().collect();
         let mut new_vm: Option<(u32, NewVm, Arc<Trace>)> = None;
@@ -3131,6 +3345,118 @@ impl App {
                     });
                 });
             }
+            Dialog::ConfirmHostShutdown { sid, host, name, moving, stopping, coordinator, alone } => {
+                dialog_window(ctx, "Shut Down Server").show(ctx, |ui| {
+                    ui.set_width(440.0);
+                    ui.label(format!("Are you sure you want to shut down {}?", name));
+                    ui.add_space(8.0);
+                    let soft = |ui: &mut Ui, text: String| {
+                        ui.add(egui::Label::new(egui::RichText::new(text).color(pal.ink_soft)).wrap());
+                    };
+                    if moving.is_empty() && stopping.is_empty() {
+                        soft(ui, "No VMs are running on it.".into());
+                    }
+                    if !moving.is_empty() {
+                        soft(ui, format!("These move to the pool's other servers first: {}.", moving.join(", ")));
+                    }
+                    if !stopping.is_empty() {
+                        if !moving.is_empty() {
+                            ui.add_space(4.0);
+                        }
+                        let why = if *alone { "there's no other server to take them" } else { "their disks are on this server's own storage" };
+                        soft(ui, format!("These are shut down, as {}: {}. One without guest tools is turned off the hard way.", why, stopping.join(", ")));
+                    }
+                    if *coordinator {
+                        ui.add_space(8.0);
+                        crate::newvm::alert(ui, &pal, false, "It's the pool's coordinator.", "While it's off, the pool's other servers can't be managed, from this app or XenCenter.", None);
+                    } else if *alone {
+                        ui.add_space(8.0);
+                        crate::newvm::alert(ui, &pal, false, "It's the only server.", "This app loses its connection to it until it's back on.", None);
+                    }
+                    ui.add_space(8.0);
+                    soft(ui, "To turn it on again, use its power button (or its management board, such as iDRAC or iLO).".into());
+                    ui.add_space(12.0);
+                    dialog_buttons(ui, |ui| {
+                        // Esc or Cancel keep it on; only a click on the red button shuts it down
+                        if dialog_button(ui, &pal, "close", "Cancel", Look::Plain, true) || ui.input(|i| i.key_pressed(Key::Escape)) {
+                            close = true;
+                        }
+                        if dialog_button(ui, &pal, "power", "Shut Down", Look::Danger, true) {
+                            shutdown_host = Some((*sid, host.clone(), name.clone()));
+                        }
+                    });
+                });
+            }
+            Dialog::Update(d) => {
+                let current = env!("CARGO_PKG_VERSION");
+                dialog_window(ctx, "Update").show(ctx, |ui| {
+                    ui.set_width(420.0);
+                    ui.label(egui::RichText::new(format!("Simple VM Manager {} is out", d.release.version)).font(FontId::new(15.0, FontFamily::Name("bold".into()))).color(pal.ink));
+                    ui.add_space(2.0);
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(format!("You have {}.", current)).color(pal.ink_soft));
+                        if !d.release.page.is_empty() {
+                            ui.hyperlink_to("What's new", &d.release.page);
+                        }
+                    });
+                    ui.add_space(10.0);
+                    let can = d.exe.is_some() && d.release.download.is_some();
+                    if let Some(t) = &d.transfer {
+                        // downloading: the bar, then "starting"
+                        let (sent, total) = (t.sent.load(Ordering::Relaxed), t.total.load(Ordering::Relaxed).max(1));
+                        let done = t.finishing.load(Ordering::Relaxed);
+                        let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 6.0), Sense::hover());
+                        progress_bar(ui.painter(), r, (sent as f32 / total as f32).min(1.0), if done { pal.green } else { pal.blue }, &pal);
+                        ui.add_space(4.0);
+                        let what = if done { "Starting the new version…".to_string() } else { format!("Downloading…  {} of {}", fmt_bytes(sent as i64), fmt_bytes(total as i64)) };
+                        ui.label(egui::RichText::new(what).size(12.5).color(pal.ink_soft));
+                        ctx.request_repaint_after(Duration::from_millis(100));
+                    } else if !can {
+                        let why = if d.release.download.is_none() {
+                            "There's no ready-made copy for this kind of computer: get it from the release page."
+                        } else {
+                            "This copy can't update itself: it was installed by the system's package manager, or runs from a build of the source. Update it the way you installed it, e.g. in your copy of the source: git pull && makepkg -si (or ./install.sh)."
+                        };
+                        ui.add(egui::Label::new(egui::RichText::new(why).color(pal.ink_soft)).wrap());
+                    } else {
+                        ui.add(egui::Label::new(egui::RichText::new("Update downloads it from GitHub, puts it in this one's place and opens it again. Your servers and settings stay as they are.").color(pal.ink_soft)).wrap());
+                    }
+                    if let Some(e) = &d.error {
+                        ui.add_space(6.0);
+                        ui.add(egui::Label::new(egui::RichText::new(format!("Couldn't update. {}", e)).color(pal.red)).wrap());
+                    }
+                    if let (Some(why), true, None) = (blocked, can, &d.transfer) {
+                        ui.add_space(6.0);
+                        ui.add(egui::Label::new(egui::RichText::new(why).size(12.5).color(pal.caution_ink)).wrap());
+                    }
+                    ui.add_space(14.0);
+                    dialog_buttons(ui, |ui| {
+                        if let Some(t) = &d.transfer {
+                            if !t.finishing.load(Ordering::Relaxed) && dialog_button(ui, &pal, "close", "Cancel", Look::Plain, true) {
+                                t.cancel.store(true, Ordering::Relaxed);
+                            }
+                            return;
+                        }
+                        if can {
+                            if dialog_button(ui, &pal, "close", "Later", Look::Plain, true) || ui.input(|i| i.key_pressed(Key::Escape)) {
+                                close = true;
+                            }
+                            let label = if d.error.is_some() { "Try again" } else { "Update" };
+                            if dialog_button(ui, &pal, "download", label, Look::Primary, blocked.is_none()) {
+                                start_update = true;
+                            }
+                        } else {
+                            if dialog_button(ui, &pal, "close", "Close", Look::Plain, true) || ui.input(|i| i.key_pressed(Key::Escape)) {
+                                close = true;
+                            }
+                            if !d.release.page.is_empty() && dialog_button(ui, &pal, "globe", "Open the release page", Look::Primary, true) {
+                                ctx.open_url(egui::OpenUrl::new_tab(&d.release.page));
+                                close = true;
+                            }
+                        }
+                    });
+                });
+            }
             Dialog::Settings { startup } => {
                 dialog_window(ctx, "Settings").show(ctx, |ui| {
                     ui.set_width(440.0);
@@ -3216,6 +3542,22 @@ impl App {
                     }
                     ui.add_space(6.0);
                     ui.label(egui::RichText::new("Passwords are kept in your system's keychain, never in the app's own files.").size(12.0).color(pal.ink_soft));
+                    ui.add_space(18.0);
+
+                    heading(ui, "Updates");
+                    ui.checkbox(&mut updates_on, "Look for a new version when the app starts");
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        let label = if update_checking { "Looking…" } else { "Check now" };
+                        if flat_button(ui, "rescan", label, None, !update_checking, false, &pal).on_hover_text("Ask GitHub for the latest version").clicked() {
+                            check_now = true;
+                        }
+                        if let Some(n) = &update_note {
+                            ui.add(egui::Label::new(egui::RichText::new(n.as_str()).size(12.5).color(pal.ink_soft)).wrap());
+                        } else {
+                            ui.label(egui::RichText::new(format!("This is version {}.", env!("CARGO_PKG_VERSION"))).size(12.5).color(pal.ink_soft));
+                        }
+                    });
                     ui.add_space(14.0);
                     dialog_buttons(ui, |ui| {
                         if dialog_button(ui, &pal, "check", "Close", Look::Primary, true) || ui.input(|i| i.key_pressed(Key::Escape)) {
@@ -3290,6 +3632,17 @@ impl App {
             self.dialog = Dialog::None;
             self.delete_iso(sid, sr, vdi, name, ctx);
         }
+        if updates_on != self.check_updates {
+            self.check_updates = updates_on;
+            self.save_settings();
+        }
+        if check_now {
+            self.update_note = None;
+            self.look_for_update(true, ctx);
+        }
+        if start_update {
+            self.install_update(ctx);
+        }
         if let Some(m) = theme {
             self.theme_mode = m;
             self.apply_theme(ctx);
@@ -3302,6 +3655,10 @@ impl App {
         }
         if let Some((h, u)) = forget {
             self.keep_password(&h, &u, None);
+        }
+        if let Some((sid, host, name)) = shutdown_host {
+            self.dialog = Dialog::None;
+            self.shutdown_host(sid, host, name, ctx);
         }
         if let Some((sid, vm, name, disks)) = delete_vm {
             self.dialog = Dialog::None;
@@ -3382,6 +3739,12 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.apply_theme(ctx); // follows the system theme when set to "Same as the system"
+        // a newer version found: offered when nothing else is asked
+        if matches!(self.dialog, Dialog::None) {
+            if let Some(release) = self.pending_update.take() {
+                self.dialog = Dialog::Update(Box::new(UpdateDialog { release, exe: update::replaceable(), transfer: None, error: None }));
+            }
+        }
         // Ctrl + / Ctrl - change the size too: remembered like the choice in Settings
         let zoom = ctx.zoom_factor();
         if (zoom - self.zoom).abs() > 0.001 {
@@ -3435,6 +3798,16 @@ impl eframe::App for App {
                 "confirm" => out.extend(ACTIONS.iter().position(|a| a.confirm && self.can_run(a, &sel)).map(Intent::Action)),
                 "about" => out.push(Intent::About),
                 "console" => out.push(Intent::Tab(Tab::Console)),
+                "update" | "update-progress" => {
+                    let release = update::Release { version: "9.9.0".into(), page: "https://github.com/jpaferreira-git/simple-vm-manager/releases".into(), download: Some(("https://example.invalid/a.tar.gz".into(), 9_540_306)) };
+                    let transfer = (self.shot_show == "update-progress").then(|| {
+                        let t = Arc::new(Transfer::default());
+                        t.total.store(9_540_306, Ordering::Relaxed);
+                        t.sent.store(4_100_000, Ordering::Relaxed);
+                        t
+                    });
+                    self.dialog = Dialog::Update(Box::new(UpdateDialog { release, exe: Some(PathBuf::from("/tmp/simple-vm-manager")), transfer, error: None }));
+                }
                 "settings" => {
                     // two made-up saved passwords, one connecting at startup
                     self.keychain = Some(true);
@@ -3530,6 +3903,11 @@ impl eframe::App for App {
                             };
                             self.dialog = Dialog::NewVm(Box::new(dlg));
                         }
+                    }
+                }
+                "host-shutdown" => {
+                    if let Some(sid) = sel.sid {
+                        out.push(Intent::AskShutdownHost(sid, "host-a".into()));
                     }
                 }
                 "vm-delete" => {
@@ -3748,6 +4126,17 @@ fn create_problem(e: &ApiError) -> String {
             "UEFI Secure Boot couldn't be set up on this pool. Choose plain UEFI under Advanced, or install the pool's certificates (secureboot-certs install).".into()
         }
         _ if all.contains("no space") || all.contains("insufficient space") => "There isn't enough room on the storage for its disk.".into(),
+        _ => e.message(),
+    }
+}
+
+/// Why shutting a server down failed, in plain words where the server's answer is a known one.
+fn host_problem(e: &ApiError) -> String {
+    match e.code.as_str() {
+        "HOST_NOT_ENOUGH_FREE_MEMORY" | "NO_HOSTS_AVAILABLE" => "The pool's other servers haven't the memory free to take its VMs. Shut some VMs down, then try again.".into(),
+        "HOST_NOT_LIVE" => "It isn't answering: it may be off already.".into(),
+        "RBAC_PERMISSION_DENIED" | "PERMISSION_DENIED" => "Your account isn't allowed to do that.".into(),
+        "OTHER_OPERATION_IN_PROGRESS" => "The server is busy with something else. Wait a moment, then try again.".into(),
         _ => e.message(),
     }
 }
@@ -4064,11 +4453,13 @@ struct Settings {
     sidebar_open: bool,
     /// The interface's size, 1.0 being the system's own (Settings, or Ctrl + / Ctrl -).
     zoom: f32,
+    /// Look on GitHub for a newer version as the app starts.
+    updates: bool,
 }
 
 impl Default for Settings {
     fn default() -> Settings {
-        Settings { theme: ThemeMode::System, sidebar_open: true, zoom: 1.0 }
+        Settings { theme: ThemeMode::System, sidebar_open: true, zoom: 1.0, updates: true }
     }
 }
 
@@ -4080,6 +4471,7 @@ fn load_settings() -> Settings {
             match k.trim() {
                 "theme" => s.theme = ThemeMode::parse(v).unwrap_or(s.theme),
                 "sidebar" => s.sidebar_open = v.trim() != "folded",
+                "updates" => s.updates = v.trim() != "off",
                 "zoom" => s.zoom = v.trim().parse::<f32>().ok().filter(|z| (0.5..=3.0).contains(z)).unwrap_or(1.0),
                 _ => {}
             }
@@ -4091,7 +4483,7 @@ fn load_settings() -> Settings {
 fn save_settings(s: &Settings) {
     let Some(dir) = config_dir() else { return };
     let _ = std::fs::create_dir_all(&dir);
-    let text = format!("theme={}\nsidebar={}\nzoom={:.2}\n", s.theme.as_str(), if s.sidebar_open { "open" } else { "folded" }, s.zoom);
+    let text = format!("theme={}\nsidebar={}\nzoom={:.2}\nupdates={}\n", s.theme.as_str(), if s.sidebar_open { "open" } else { "folded" }, s.zoom, if s.updates { "on" } else { "off" });
     let _ = std::fs::write(dir.join("settings.txt"), text);
 }
 

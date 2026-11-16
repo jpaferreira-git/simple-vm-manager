@@ -70,6 +70,11 @@ affiliated with or endorsed by the makers of XenServer or XCP-ng.
 - **Delete VM** — the bin next to a VM's tabs, or on its right-click menu. It asks first, and its disks go too unless unticked (a disk another VM also uses stays);
   its snapshots go with it, and ISO files in its DVD drive aren't touched. A VM that's on is
   turned off first, the button saying so ("Shut down and delete").
+- **Shut down a server** — the red power icon at the end of a server's tabs. It asks first, saying
+  which VMs move to the pool's other servers and which are shut down (their disks on that server's
+  own storage), and warns when it's the pool's coordinator. Then it goes the way the pool expects:
+  no new VMs sent to it, those VMs shut down, the rest moved, then the server; if a step fails it
+  takes VMs again.
 - **VM power actions** — Start, Shut Down, Reboot, Suspend, Resume, Force Shut Down, Force Reboot,
   enabled only when the server allows them, with confirmations for the disruptive ones. They're
   coloured icons at the right end of a VM's tabs (the Force ones behind the small arrows; on the
@@ -80,6 +85,10 @@ affiliated with or endorsed by the makers of XenServer or XCP-ng.
   your desktop), the size of everything (90–125%; Ctrl + and Ctrl - too), and the saved passwords,
   each with *Forget* (deleted from the keychain; the app stops connecting there as it starts), even
   for a server no longer in the tree. Your choices are remembered.
+- **Updates** — as it starts, the app asks GitHub whether there's a newer release (Settings can turn
+  this off, or *Check now*). If there is, it offers it: *Update* downloads it, puts it in place of
+  the copy in `~/.local/bin` and opens it again; a copy the package manager installed (`/usr/bin`)
+  says how to update it instead.
 - **Demo server** — try everything without a real server (*Try the Demo Server* on the Home page).
 - Live refresh every 15 s, automatic reconnect. A server that's off is given up on after 6 s
   (the window never waits for it); if it's the one the app logs in through, the pool's other
@@ -87,15 +96,6 @@ affiliated with or endorsed by the makers of XenServer or XCP-ng.
   make another server the coordinator.
 
 ## Install on Arch Linux / Omarchy
-
-> **Private repository?** Sign in once with GitHub CLI and clone through it instead of `git clone`:
-> ```bash
-> sudo pacman -S --needed github-cli
-> gh auth login
-> gh repo clone jpaferreira-git/simple-vm-manager
-> ```
-> Then continue from `cd simple-vm-manager` below. (Make it public any time with
-> `gh repo edit jpaferreira-git/simple-vm-manager --visibility public --accept-visibility-change-consequences`.)
 
 ### Option 1 — as a system package (recommended)
 
