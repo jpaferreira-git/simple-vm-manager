@@ -255,7 +255,8 @@ impl IsoDialog {
 
             ui.add_space(4.0);
             dialog_buttons(ui, |ui| {
-                if dialog_button(ui, pal, "close", "Cancel", Look::Plain, true) {
+                // while the server's at it there's nothing to cancel: the window closes, it goes on
+                if dialog_button(ui, pal, "close", if busy { "Close" } else { "Cancel" }, Look::Plain, true) {
                     action = IsoAction::Close;
                 }
                 let ready = !busy && !self.name.trim().is_empty() && !self.location.trim().is_empty();

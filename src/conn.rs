@@ -9,7 +9,7 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const DEFAULT_PORT: u16 = 443; // XenAPI.HTTP.DEFAULT_HTTPS_PORT
 /// How many servers a login tries (the address given, the pool's other servers, and where they
@@ -24,6 +24,103 @@ pub const DEMO_ACTION_MS: u64 = 1500; // estimated
 /// plugged into the server it's for. The storage's name is the first detail.
 pub const NOT_ANSWERING: &str = "SR_NOT_ANSWERING";
 pub const NOT_PLUGGED: &str = "SR_NOT_PLUGGED";
+/// A revert that worked, but the VM couldn't be started (or resumed) again after it.
+pub const NOT_RESTARTED: &str = "REVERTED_NOT_STARTED";
+/// A long job's server stopped answering (a power cut, say): its name in the details.
+pub const LOST_CONTACT: &str = "LOST_CONTACT";
+/// How long a server may not answer while a job runs on it before the job counts as failed.
+pub const LOST_AFTER: Duration = Duration::from_secs(100);
+
+/// How far a long job's task on the server is, and whether the server still answers: shared
+/// between the thread doing the job (see `watch`) and the Activities list.
+pub struct Progress {
+    /// Every call the job made and the server's answers, for its details.
+    pub trace: Arc<Trace>,
+    /// Per mille; u32::MAX while the server hasn't said.
+    permille: AtomicU64,
+    /// Since when the server hasn't answered, while it doesn't.
+    silent_since: Mutex<Option<Instant>>,
+}
+
+impl Progress {
+    pub fn new() -> Arc<Progress> {
+        Arc::new(Progress { trace: Arc::new(Trace::default()), permille: AtomicU64::new(u64::MAX), silent_since: Mutex::new(None) })
+    }
+    /// How far it is (0 to 1), once the server says.
+    pub fn fraction(&self) -> Option<f32> {
+        let p = self.permille.load(Ordering::Relaxed);
+        (p != u64::MAX).then(|| p.min(1000) as f32 / 1000.0)
+    }
+    pub fn set_fraction(&self, f: f64) {
+        self.permille.store((f.clamp(0.0, 1.0) * 1000.0) as u64, Ordering::Relaxed);
+    }
+    /// How long the server hasn't answered, while it doesn't.
+    pub fn silent_for(&self) -> Option<Duration> {
+        self.silent_since.lock().unwrap().map(|t| t.elapsed())
+    }
+    fn heard(&self, yes: bool) {
+        let mut s = self.silent_since.lock().unwrap();
+        match (yes, *s) {
+            (true, _) => *s = None,
+            (false, None) => *s = Some(Instant::now()),
+            _ => {}
+        }
+    }
+}
+
+thread_local! {
+    /// The progress of the job this thread is doing, if it's watched.
+    static WATCHED: std::cell::RefCell<Option<Arc<Progress>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// From now on this thread's long calls report to `p` (call first thing in a job's thread).
+pub fn watch(p: &Arc<Progress>) {
+    WATCHED.with(|w| *w.borrow_mut() = Some(p.clone()));
+}
+
+fn watched() -> Option<Arc<Progress>> {
+    WATCHED.with(|w| w.borrow().clone())
+}
+
+/// Notes in the watched job's details a call it's making: the method and its arguments, any
+/// password hidden.
+fn said(method: &str, args: &[Value]) {
+    if let Some(w) = watched() {
+        w.trace.push(Said::Asked, format!("{}  {}", method, args_text(args)).trim_end().to_string());
+    }
+}
+
+/// Notes in the watched job's details how its last call went.
+fn answered(r: &Result<Value, ApiError>, took: Duration) {
+    if let Some(w) = watched() {
+        w.trace.outcome(r, took);
+    }
+}
+
+/// A call's arguments as text: references as they are, strings quoted, records compact, any
+/// password hidden, the whole cut short when very long.
+fn args_text(args: &[Value]) -> String {
+    fn hide(v: &Value) -> Value {
+        match v {
+            Value::Object(m) => Value::Object(m.iter().map(|(k, v)| (k.clone(), if k.contains("password") { json!("********") } else { hide(v) })).collect()),
+            Value::Array(a) => Value::Array(a.iter().map(hide).collect()),
+            other => other.clone(),
+        }
+    }
+    let text = args
+        .iter()
+        .map(|a| match a {
+            Value::String(s) if s.starts_with("OpaqueRef:") => s.clone(),
+            other => hide(other).to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("  ");
+    if text.chars().count() > 400 {
+        format!("{}…", text.chars().take(400).collect::<String>())
+    } else {
+        text
+    }
+}
 /// A login's error code when the pool's servers point to a coordinator that doesn't answer; its
 /// address is the detail.
 pub const COORDINATOR_DOWN: &str = "COORDINATOR_DOWN";
@@ -50,6 +147,11 @@ impl ApiError {
             "VM_MISSING_PV_DRIVERS" => "The VM needs its guest tools installed for a clean shut down or suspend.".into(),
             "HOST_NOT_ENOUGH_FREE_MEMORY" => "No server has enough free memory to start the VM.".into(),
             "CONNECTION" => self.details.join(" "),
+            LOST_CONTACT => format!(
+                "{} stopped answering for {} seconds (it may have lost power), so this was given up on. When it's back, check what's there: the app offers to delete anything it left half made.",
+                self.details.first().map(String::as_str).unwrap_or("The server"),
+                LOST_AFTER.as_secs()
+            ),
             COORDINATOR_DOWN => format!(
                 "The pool's coordinator ({}) isn't answering, and its other servers can't be managed without it. Turn it back on. If it's gone for good, make another server the coordinator: on that server's console, run xe pool-emergency-transition-to-master.",
                 self.details.first().map(String::as_str).unwrap_or("its main server")
@@ -119,6 +221,26 @@ pub trait Connection: Send + Sync {
     fn delete_vm(&self, vm_ref: &str, disks: bool) -> Result<Vec<String>, ApiError>;
     /// Changes a disc's description (an ISO file's, in an ISO library).
     fn set_vdi_description(&self, vdi_ref: &str, text: &str) -> Result<(), ApiError>;
+    /// Changes a VM's (or a snapshot's) description.
+    fn set_vm_description(&self, vm_ref: &str, text: &str) -> Result<(), ApiError>;
+    /// Takes a snapshot of a VM, named `name`: its disks, or with `memory` (a running VM) its disks
+    /// and memory too (a checkpoint: the VM pauses while its memory is written out). Its reference.
+    fn snapshot_vm(&self, vm_ref: &str, name: &str, description: &str, memory: bool) -> Result<String, ApiError>;
+    /// Puts a VM back as it was at a snapshot: turned off first (the hard way) if it's on, then
+    /// put back, then as it was then: resumed for a snapshot with memory, started if it was
+    /// running, otherwise left off. Put back but not started again is NOT_RESTARTED, the reason in
+    /// its details.
+    fn revert_vm(&self, snapshot_ref: &str) -> Result<(), ApiError>;
+    /// Makes a template from a VM that's off (a copy of it: the VM stays as it is) or from one of
+    /// its snapshots, named `name`: its disks copied in an instant on their own storage. Its
+    /// reference.
+    fn make_template(&self, source_ref: &str, name: &str, description: &str) -> Result<String, ApiError>;
+    /// Copies a VM that's off, named `name`: in an instant on its own storage (`sr` None), or in
+    /// full onto `sr`. Its reference.
+    fn copy_vm(&self, vm_ref: &str, name: &str, sr: Option<&str>) -> Result<String, ApiError>;
+    /// Deletes a snapshot and its own copies of the disks (and its saved memory). The ones that
+    /// couldn't be deleted (the snapshot is gone by then): each one's name and why.
+    fn delete_snapshot(&self, snapshot_ref: &str) -> Result<Vec<String>, ApiError>;
     /// Copies a file into an ISO library as `name` (see `iso_file_name`): a new disc in the library,
     /// then the file's bytes sent to it, from this computer or as they arrive from the web.
     /// `address` is the server to send them to for a library that only one server sees; a shared
@@ -481,6 +603,81 @@ impl RealConnection {
         }
     }
 
+    /// New VM from one of the user's templates: its disks copied (in an instant on their own
+    /// storage, in full onto `copy_to`), made a VM, then its CPUs, memory, home server and
+    /// network card as chosen; the ISO in its DVD drive, if any, taken out. Anything made before a
+    /// failure is taken away again.
+    fn from_template(&self, v: &NewVm, tr: &Trace) -> Result<String, ApiError> {
+        let t = 120_000;
+        let call = |shown: String, method: &str, args: Vec<Value>, timeout: u64| {
+            tr.push(Said::Asked, shown);
+            let started = Instant::now();
+            let r = self.call(method, args, timeout);
+            tr.outcome(&r, started.elapsed());
+            r
+        };
+        let mut names = v.names.clone();
+        let tpl = named(&names, &v.template);
+        let vm = match &v.copy_to {
+            None => call(format!("VM.clone  vm={}  new_name=\"{}\"", tpl, v.name), "VM.clone", vec![json!(v.template), json!(v.name)], 1_800_000)?,
+            Some(sr) => {
+                let shown = format!("VM.copy  vm={}  new_name=\"{}\"  sr={}", tpl, v.name, named(&names, sr));
+                call(shown, "VM.copy", vec![json!(v.template), json!(v.name), json!(sr)], 6 * 3_600_000)?
+            }
+        };
+        let vm = vm.as_str().unwrap_or_default().to_string();
+        names.insert(vm.clone(), v.name.clone());
+        let me = named(&names, &vm);
+        let made = (|| -> Result<(), ApiError> {
+            call(format!("VM.set_is_a_template  vm={}  value=false", me), "VM.set_is_a_template", vec![json!(vm), json!(false)], t)?;
+            call(format!("VM.set_name_description  vm={}  value=\"{}\"", me, v.description), "VM.set_name_description", vec![json!(vm), json!(v.description)], t)?;
+            let max = n(&call(format!("VM.get_record  vm={}", me), "VM.get_record", vec![json!(vm)], t)?, "VCPUs_max");
+            let order = if v.vcpus > max { ["VM.set_VCPUs_max", "VM.set_VCPUs_at_startup"] } else { ["VM.set_VCPUs_at_startup", "VM.set_VCPUs_max"] };
+            for m in order {
+                call(format!("{}  vm={}  value={}", m, me, v.vcpus), m, vec![json!(vm), json!(v.vcpus)], t)?;
+            }
+            let _ = call(format!("VM.remove_from_platform  vm={}  key=\"cores-per-socket\"", me), "VM.remove_from_platform", vec![json!(vm), json!("cores-per-socket")], t);
+            let shown = format!("VM.add_to_platform  vm={}  key=\"cores-per-socket\"  value=\"{}\"", me, v.cores_per_socket);
+            call(shown, "VM.add_to_platform", vec![json!(vm), json!("cores-per-socket"), json!(v.cores_per_socket.to_string())], t)?;
+            let floor = n(&call(format!("VM.get_record  vm={}", me), "VM.get_record", vec![json!(vm)], t)?, "memory_static_min").min(v.memory);
+            let shown = format!("VM.set_memory_limits  vm={}  static_min={}  dynamic_min={}  dynamic_max={}  static_max={}", me, floor, v.memory, v.memory, v.memory);
+            call(shown, "VM.set_memory_limits", vec![json!(vm), json!(floor), json!(v.memory), json!(v.memory), json!(v.memory)], t)?;
+            if let Some(h) = &v.host {
+                call(format!("VM.set_affinity  vm={}  host={}", me, named(&names, h)), "VM.set_affinity", vec![json!(vm), json!(h)], t)?;
+            }
+            // an ISO left in its DVD drive comes out (it'd start the installer again)
+            for vbd in call(format!("VM.get_VBDs  vm={}", me), "VM.get_VBDs", vec![json!(vm)], t)?.as_array().cloned().unwrap_or_default() {
+                let id = vbd.as_str().unwrap_or_default().to_string();
+                let r = call(format!("VBD.get_record  vbd={}", id), "VBD.get_record", vec![vbd.clone()], t)?;
+                if s(&r, "type") == "CD" && !b(&r, "empty") {
+                    call(format!("VBD.eject  vbd={}", id), "VBD.eject", vec![vbd], t)?;
+                }
+            }
+            if !v.keep_nics {
+                for vif in call(format!("VM.get_VIFs  vm={}", me), "VM.get_VIFs", vec![json!(vm)], t)?.as_array().cloned().unwrap_or_default() {
+                    call(format!("VIF.destroy  vif={}", vif.as_str().unwrap_or_default()), "VIF.destroy", vec![vif], t)?;
+                }
+                if let Some(net) = &v.network {
+                    let mtu = call(format!("network.get_MTU  network={}", named(&names, net)), "network.get_MTU", vec![json!(net)], t).map(|m| n(&json!({ "m": m }), "m")).unwrap_or(1500);
+                    let card = json!({
+                        "device": "0", "network": net, "VM": vm, "MAC": "", "MTU": mtu.max(68), "other_config": {},
+                        "qos_algorithm_type": "", "qos_algorithm_params": {}, "locking_mode": "network_default",
+                        "ipv4_allowed": [], "ipv6_allowed": [], "currently_attached": false,
+                    });
+                    call(format!("VIF.create  VM={}  network={}  device=0  MTU={}", me, named(&names, net), mtu.max(68)), "VIF.create", vec![card], t)?;
+                }
+            }
+            Ok(())
+        })();
+        if let Err(e) = made {
+            tr.push(Said::Note, "Undoing what was made:");
+            tr.push(Said::Asked, format!("VM.destroy  vm={}  (with its copies of the disks)", me));
+            let _ = self.delete_vm(&vm, true);
+            return Err(e);
+        }
+        Ok(vm)
+    }
+
     /// Knocks on each server's management address (all at once, two seconds each at most), as the
     /// pool counts one that goes down without shutting down as live for ten minutes. A server
     /// that the pool calls live but that hasn't answered `SILENT_LOOKS` times in a row is marked
@@ -661,7 +858,90 @@ impl RealConnection {
         }
     }
 
+    /// A call to the server. One that may take long (allowed over a minute: copying disks,
+    /// mounting a share, starting a VM…) runs as a task on the server, looked at every two seconds,
+    /// so that a server that goes away part way (a power cut) is noticed within `LOST_AFTER`
+    /// instead of being waited on for the whole time; the task's progress goes to the thread's
+    /// watched `Progress`.
     fn call(&self, method: &str, extra: Vec<Value>, timeout_ms: u64) -> Result<Value, ApiError> {
+        let quick = method.starts_with("Async.") || method.starts_with("task.") || method.starts_with("session.") || method.contains(".get_");
+        if timeout_ms > 60_000 && !quick {
+            return self.as_task(method, extra, timeout_ms);
+        }
+        self.call_now(method, extra, timeout_ms)
+    }
+
+    /// `method` as a task on the server (its Async form), its status looked at every two seconds
+    /// till it ends or `timeout_ms` passes; its result (a reference) as the call's would be.
+    fn as_task(&self, method: &str, extra: Vec<Value>, timeout_ms: u64) -> Result<Value, ApiError> {
+        said(method, &extra);
+        let began = Instant::now();
+        let r = self.task_watched(method, extra, timeout_ms);
+        answered(&r, began.elapsed());
+        r
+    }
+
+    fn task_watched(&self, method: &str, extra: Vec<Value>, timeout_ms: u64) -> Result<Value, ApiError> {
+        let task = self.call_raw(&format!("Async.{}", method), extra, 60_000)?.as_str().unwrap_or_default().to_string();
+        let watch = watched();
+        let end = Instant::now() + Duration::from_millis(timeout_ms);
+        let mut heard = Instant::now();
+        loop {
+            std::thread::sleep(Duration::from_secs(2));
+            match self.call_raw("task.get_record", vec![json!(task)], 20_000) {
+                Ok(r) => {
+                    heard = Instant::now();
+                    if let Some(w) = &watch {
+                        w.heard(true);
+                        if let Some(f) = r.get("progress").and_then(|p| p.as_f64()) {
+                            w.set_fraction(f);
+                        }
+                    }
+                    let done = match s(&r, "status").as_str() {
+                        "success" => Some(Ok(task_value(&s(&r, "result")))),
+                        "failure" => {
+                            let info: Vec<String> = list(&r, "error_info");
+                            Some(Err(ApiError { code: info.first().cloned().unwrap_or_else(|| "UNKNOWN".into()), details: info.into_iter().skip(1).collect() }))
+                        }
+                        "cancelled" => Some(Err(ApiError { code: CANCELLED.into(), details: vec![] })),
+                        _ => None,
+                    };
+                    if let Some(result) = done {
+                        let _ = self.call_raw("task.destroy", vec![json!(task)], 20_000);
+                        return result;
+                    }
+                }
+                // the server forgot the task: it restarted, and the job with it
+                Err(e) if e.code == "HANDLE_INVALID" => return Err(ApiError { code: LOST_CONTACT.into(), details: vec![self.hostname()] }),
+                Err(e) => {
+                    if let Some(w) = &watch {
+                        if w.silent_for().is_none() {
+                            w.trace.push(Said::Note, format!("No answer from the server while asking how it's going: {}", e.message()));
+                        }
+                        w.heard(false);
+                    }
+                    if heard.elapsed() >= LOST_AFTER {
+                        return Err(ApiError { code: LOST_CONTACT.into(), details: vec![self.hostname()] });
+                    }
+                }
+            }
+            if Instant::now() >= end {
+                return Err(ApiError::other(format!("It's still going on the server after {} minutes (its task {} goes on).", timeout_ms / 60_000, task)));
+            }
+        }
+    }
+
+    /// A call straight away, noted in the watched job's details.
+    fn call_now(&self, method: &str, extra: Vec<Value>, timeout_ms: u64) -> Result<Value, ApiError> {
+        said(method, &extra);
+        let began = Instant::now();
+        let r = self.call_raw(method, extra, timeout_ms);
+        answered(&r, began.elapsed());
+        r
+    }
+
+    /// A call straight away, not noted anywhere.
+    fn call_raw(&self, method: &str, extra: Vec<Value>, timeout_ms: u64) -> Result<Value, ApiError> {
         let (host, session) = self.session(timeout_ms.min(60_000))?;
         let mut params = vec![json!(session)];
         params.extend(extra.iter().cloned());
@@ -686,6 +966,16 @@ impl RealConnection {
 
     fn all(&self, cls: &str, timeout_ms: u64) -> Result<Map<String, Value>, ApiError> {
         Ok(self.call(&format!("{}.get_all_records", cls), vec![], timeout_ms)?.as_object().cloned().unwrap_or_default())
+    }
+}
+
+/// A task's result: the reference (or value) inside its <value>…</value>, or nothing.
+fn task_value(result: &str) -> Value {
+    let inner = result.trim().trim_start_matches("<value>").trim_end_matches("</value>").trim();
+    if inner.is_empty() {
+        Value::Null
+    } else {
+        json!(inner)
     }
 }
 
@@ -789,7 +1079,6 @@ fn vm_details(vm: &mut VmInfo, r: &Value, guest: &Value, metrics: &Value) {
         _ => "",
     }
     .into();
-    vm.snapshots = list(r, "snapshots").len();
     vm.vcpus_max = n(r, "VCPUs_max");
     vm.mem_static_min = n(r, "memory_static_min");
     if matches!(vm.power, PowerState::Running | PowerState::Paused) {
@@ -968,11 +1257,30 @@ impl Connection for RealConnection {
         let sr_hosts: HashMap<String, String> = pd.srs.iter().filter_map(|x| x.host.clone().map(|h| (x.rref.clone(), h))).collect();
         // each server's control domain (dom0), for its console
         let mut dom0: HashMap<String, String> = HashMap::new();
+        // each VM's snapshots (they're VM records too), the newest first
+        let mut snapshots: HashMap<String, Vec<SnapshotInfo>> = HashMap::new();
+        for (k, r) in vm_records.iter().filter(|(_, r)| b(r, "is_a_snapshot")) {
+            let info = r.get("snapshot_info").cloned().unwrap_or(Value::Null);
+            snapshots.entry(s(r, "snapshot_of")).or_default().push(SnapshotInfo {
+                rref: k.clone(),
+                name: s(r, "name_label"),
+                description: s(r, "name_description"),
+                time: parse_xen_time(&s(r, "snapshot_time")),
+                // a checkpoint's record is suspended: its memory is saved with it
+                memory: s(r, "power_state") == "Suspended",
+                was_running: s(&info, "power-state-at-snapshot") == "Running",
+            });
+        }
+        for list in snapshots.values_mut() {
+            list.sort_by_key(|x| std::cmp::Reverse(x.time));
+        }
         for (k, r) in vm_records {
             if b(&r, "is_control_domain") && !b(&r, "is_a_snapshot") {
                 dom0.insert(s(&r, "resident_on"), k.clone());
             }
-            if b(&r, "is_a_template") || b(&r, "is_control_domain") || b(&r, "is_a_snapshot") {
+            // the templates people made (not the built-in ones) are read like VMs, and kept apart
+            let user_template = b(&r, "is_a_template") && !b(&r, "is_a_snapshot") && s(r.get("other_config").unwrap_or(&Value::Null), "default_template") != "true";
+            if (b(&r, "is_a_template") && !user_template) || b(&r, "is_control_domain") || b(&r, "is_a_snapshot") {
                 continue;
             }
             let host = s(&r, "resident_on");
@@ -1001,6 +1309,9 @@ impl Connection for RealConnection {
                 ..Default::default()
             };
             vm_details(&mut vm, &r, &g, vm_metrics.get(&s(&r, "metrics")).unwrap_or(&Value::Null));
+            vm.snapshots = snapshots.remove(&vm.rref).unwrap_or_default();
+            let parent = s(&r, "parent");
+            vm.parent = vm.snapshots.iter().any(|x| x.rref == parent).then_some(parent);
             for vbd_ref in list(&r, "VBDs") {
                 let Some(vbd) = vbds.get(&vbd_ref) else { continue };
                 let cd = s(vbd, "type") == "CD";
@@ -1011,7 +1322,8 @@ impl Connection for RealConnection {
                     }
                     d.name = s(vdi, "name_label");
                     d.size = n(vdi, "virtual_size");
-                    d.sr_name = sr_names.get(&s(vdi, "SR")).cloned().unwrap_or_default();
+                    d.sr = s(vdi, "SR");
+                    d.sr_name = sr_names.get(&d.sr).cloned().unwrap_or_default();
                 } else if cd {
                     d.name = "(empty)".into();
                 }
@@ -1031,7 +1343,11 @@ impl Connection for RealConnection {
                 vm.nics.push(VmNic { mac: s(vif, "MAC"), network: net_names.get(&s(vif, "network")).cloned().unwrap_or_default(), ip, device: dev });
             }
             vm.nics.sort_by(|a, b| a.device.cmp(&b.device));
-            pd.vms.push(vm);
+            if user_template {
+                pd.user_templates.push(vm);
+            } else {
+                pd.vms.push(vm);
+            }
         }
         for h in pd.hosts.iter_mut() {
             h.control_domain = dom0.remove(&h.rref).unwrap_or_default();
@@ -1212,6 +1528,102 @@ impl Connection for RealConnection {
         self.call("VDI.set_name_description", vec![json!(vdi_ref), json!(text)], 30_000).map(|_| ())
     }
 
+    fn set_vm_description(&self, vm_ref: &str, text: &str) -> Result<(), ApiError> {
+        self.call("VM.set_name_description", vec![json!(vm_ref), json!(text)], 30_000).map(|_| ())
+    }
+
+    fn snapshot_vm(&self, vm: &str, name: &str, description: &str, memory: bool) -> Result<String, ApiError> {
+        // a checkpoint writes the VM's memory out, which takes as long as a suspend
+        let (method, wait) = if memory { ("VM.checkpoint", 3_600_000) } else { ("VM.snapshot", 1_800_000) };
+        let snap = self.call(method, vec![json!(vm), json!(name)], wait)?.as_str().unwrap_or_default().to_string();
+        if !description.is_empty() {
+            self.call("VM.set_name_description", vec![json!(snap), json!(description)], 30_000)?;
+        }
+        Ok(snap)
+    }
+
+    fn make_template(&self, source: &str, name: &str, description: &str) -> Result<String, ApiError> {
+        let t = 60_000;
+        // a clone of a snapshot is a template already; a VM's is made one
+        let tpl = self.call("VM.clone", vec![json!(source), json!(name)], 1_800_000)?.as_str().unwrap_or_default().to_string();
+        let done = (|| -> Result<(), ApiError> {
+            if !self.call("VM.get_is_a_template", vec![json!(tpl)], t)?.as_bool().unwrap_or(false) {
+                self.call("VM.set_is_a_template", vec![json!(tpl), json!(true)], t)?;
+            }
+            self.call("VM.set_name_description", vec![json!(tpl), json!(description)], t)?;
+            Ok(())
+        })();
+        if let Err(e) = done {
+            let _ = self.delete_vm(&tpl, true);
+            return Err(e);
+        }
+        Ok(tpl)
+    }
+
+    fn copy_vm(&self, vm: &str, name: &str, sr: Option<&str>) -> Result<String, ApiError> {
+        let made = match sr {
+            None => self.call("VM.clone", vec![json!(vm), json!(name)], 1_800_000)?,
+            // a full copy takes as long as writing its disks out again
+            Some(sr) => self.call("VM.copy", vec![json!(vm), json!(name), json!(sr)], 6 * 3_600_000)?,
+        };
+        Ok(made.as_str().unwrap_or_default().to_string())
+    }
+
+    fn revert_vm(&self, snap: &str) -> Result<(), ApiError> {
+        let t = 60_000;
+        let vm = self.call("VM.get_snapshot_of", vec![json!(snap)], t)?.as_str().unwrap_or_default().to_string();
+        let r = self.call("VM.get_record", vec![json!(snap)], t)?;
+        let memory = s(&r, "power_state") == "Suspended";
+        let was_running = s(r.get("snapshot_info").unwrap_or(&Value::Null), "power-state-at-snapshot") == "Running";
+        if self.call("VM.get_power_state", vec![json!(vm)], t)?.as_str() != Some("Halted") {
+            self.call("VM.hard_shutdown", vec![json!(vm)], 300_000)?;
+        }
+        self.call("VM.revert", vec![json!(snap)], 1_800_000)?;
+        // then as it was at the time
+        let again = if memory {
+            self.call("VM.resume", vec![json!(vm), json!(false), json!(false)], 1_800_000)
+        } else if was_running {
+            self.call("VM.start", vec![json!(vm), json!(false), json!(false)], 600_000)
+        } else {
+            return Ok(());
+        };
+        again.map(|_| ()).map_err(|e| ApiError { code: NOT_RESTARTED.into(), details: vec![e.message()] })
+    }
+
+    fn delete_snapshot(&self, snap: &str) -> Result<Vec<String>, ApiError> {
+        let t = 60_000;
+        let strings = |v: Value| -> Vec<String> { v.as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default() };
+        let valid = |r: &str| !r.is_empty() && r != "OpaqueRef:NULL";
+        // its own copies of the disks (never a disk something else uses), and its saved memory,
+        // found before it goes
+        let mut vdis: Vec<(String, String)> = vec![];
+        for vbd in strings(self.call("VM.get_VBDs", vec![json!(snap)], t)?) {
+            let r = self.call("VBD.get_record", vec![json!(vbd)], t)?;
+            let vdi = s(&r, "VDI");
+            if s(&r, "type") != "Disk" || !valid(&vdi) || !self.call("VDI.get_is_a_snapshot", vec![json!(vdi)], t)?.as_bool().unwrap_or(false) {
+                continue;
+            }
+            let name = self.call("VDI.get_name_label", vec![json!(vdi)], t)?.as_str().unwrap_or_default().to_string();
+            vdis.push((vdi, name));
+        }
+        let memory = self.call("VM.get_suspend_VDI", vec![json!(snap)], t)?.as_str().unwrap_or_default().to_string();
+        if valid(&memory) {
+            vdis.push((memory, "its saved memory".into()));
+        }
+        self.call("VM.destroy", vec![json!(snap)], t)?;
+        let mut left = vec![];
+        for (vdi, name) in vdis {
+            // something else still has it (it shouldn't): left alone
+            if !strings(self.call("VDI.get_VBDs", vec![json!(vdi)], t)?).is_empty() {
+                continue;
+            }
+            if let Err(e) = self.call("VDI.destroy", vec![json!(vdi)], 300_000) {
+                left.push(format!("{}: {}", if name.is_empty() { vdi } else { name }, e.message()));
+            }
+        }
+        Ok(left)
+    }
+
     fn create_vm(&self, v: &NewVm, tr: &Trace) -> Result<String, ApiError> {
         let t = 120_000;
         // each call goes in the trace, with its answer
@@ -1231,6 +1643,9 @@ impl Connection for RealConnection {
         // first, that the ISO's library (and the disk's storage, if it's on the network) answers
         for sr in &v.check {
             self.check_sr(sr, v.host.as_deref(), &v.names, tr)?;
+        }
+        if v.from_template {
+            return self.from_template(v, tr);
         }
         let mut names = v.names.clone();
         let vm = call(format!("VM.clone  vm={}  new_name=\"{}\"", named(&names, &v.template), v.name), "VM.clone", vec![json!(v.template), json!(v.name)], 300_000)?;
@@ -1721,8 +2136,8 @@ impl DemoConnection {
                 vcpus: *cpus,
                 allowed: vec![],
                 disks: vec![
-                    VmDisk { name: format!("{} disk 0", name), device: "0".into(), sr_name, kind: "Disk".into(), size: disk * GB },
-                    VmDisk { name: "(empty)".into(), device: "3".into(), sr_name: String::new(), kind: "DVD drive".into(), size: 0 },
+                    VmDisk { name: format!("{} disk 0", name), device: "0".into(), sr: srr.to_string(), sr_name, kind: "Disk".into(), size: disk * GB },
+                    VmDisk { name: "(empty)".into(), device: "3".into(), kind: "DVD drive".into(), ..Default::default() },
                 ],
                 nics: vec![VmNic { device: "0".into(), mac: format!("aa:16:3e:{:02x}:10:{:02x}", i + 1, 0x20 + i), network: "Pool-wide network 0".into(), ip: ip.to_string() }],
                 ..Default::default()
@@ -1730,7 +2145,71 @@ impl DemoConnection {
             demo_details(d.vms.last_mut().unwrap());
         }
         recompute(&mut d);
+        // two templates made from VMs like these, ready to copy
+        let made: [(&str, &str, &str, &str, i64, i64, i64); 2] = [
+            ("tpl-web", "Ubuntu 24.04 web server", "nginx and PHP 8.3, generalized", "Ubuntu 24.04 LTS", 2, 4, 40),
+            ("tpl-win", "Windows Server 2022 base", "Sysprepped, with the October updates", "Windows Server 2022", 4, 8, 80),
+        ];
+        for (r, name, description, os, cpus, mem, disk) in made {
+            let mut t = VmInfo {
+                rref: r.into(),
+                uuid: demo_uuid(),
+                name: name.into(),
+                description: description.into(),
+                os: os.into(),
+                power: PowerState::Halted,
+                vcpus: cpus,
+                vcpus_max: cpus,
+                mem_static_min: mem * GB / 2,
+                mem_static_max: mem * GB,
+                mem_dyn_min: mem * GB,
+                mem_dyn_max: mem * GB,
+                virt_mode: "HVM".into(),
+                firmware: "UEFI".into(),
+                boot_order: "Disk, DVD drive, Network".into(),
+                ..Default::default()
+            };
+            t.disks.push(VmDisk { name: format!("{} disk 0", name), device: "0".into(), sr: "sr-nfs".into(), sr_name: "Shared NFS storage".into(), kind: "Disk".into(), size: disk * GB });
+            t.nics.push(VmNic { device: "0".into(), mac: format!("aa:16:3e:7e:00:{:02x}", disk), network: "Pool-wide network 0".into(), ip: String::new() });
+            d.user_templates.push(t);
+        }
         DemoConnection { data: Mutex::new(d) }
+    }
+
+    /// New VM from one of the user's templates: the calls a real server gets, with made-up answers.
+    fn demo_from_template(&self, v: &NewVm, tr: &Trace) -> Result<String, ApiError> {
+        let tpl = self.data.lock().unwrap().user_template(&v.template).cloned().ok_or_else(|| ApiError { code: "HANDLE_INVALID".into(), details: vec!["VM".into(), v.template.clone()] })?;
+        let rref = format!("vm-new-{}", self.data.lock().unwrap().vms.len());
+        let me = format!("\"{}\"", v.name);
+        let mut steps = vec![match &v.copy_to {
+            None => format!("VM.clone  vm={}  new_name={}", named(&v.names, &v.template), me),
+            Some(sr) => format!("VM.copy  vm={}  new_name={}  sr={}", named(&v.names, &v.template), me, named(&v.names, sr)),
+        }];
+        steps.push(format!("VM.set_is_a_template  vm={}  value=false", me));
+        steps.push(format!("VM.set_VCPUs_at_startup  vm={}  value={}", me, v.vcpus));
+        steps.push(format!("VM.set_memory_limits  vm={}  static_min={}  dynamic_min={}  dynamic_max={}  static_max={}", me, v.memory, v.memory, v.memory, v.memory));
+        if !v.keep_nics {
+            steps.push(format!("VIF.destroy  vif=OpaqueRef:{}-vif-0", tpl.rref));
+            if let Some(net) = &v.network {
+                steps.push(format!("VIF.create  VM={}  network={}  device=0  MTU=1500", me, named(&v.names, net)));
+            }
+        }
+        demo_work(if v.copy_to.is_some() { 1500 } else { 300 });
+        for asked in steps {
+            tr.push(Said::Asked, asked);
+            std::thread::sleep(Duration::from_millis(150));
+            tr.push(Said::Answer, "OK  (0.1 s)");
+        }
+        let mut d = self.data.lock().unwrap();
+        let mut vm = demo_copy(&tpl, &rref, &v.name, &v.description, v.copy_to.as_deref(), &d.srs);
+        (vm.vcpus, vm.mem_static_max, vm.mem_dyn_min, vm.mem_dyn_max, vm.affinity) = (v.vcpus, v.memory, v.memory, v.memory, v.host.clone());
+        if !v.keep_nics {
+            let net = v.network.as_deref().and_then(|r| d.networks.iter().find(|n| n.rref == r));
+            vm.nics = net.map(|n| VmNic { device: "0".into(), mac: "aa:bb:cc:00:11:23".into(), network: n.name.clone(), ip: String::new() }).into_iter().collect();
+        }
+        d.vms.push(vm);
+        recompute(&mut d);
+        Ok(rref)
     }
 }
 
@@ -1762,10 +2241,52 @@ fn demo_templates() -> Vec<TemplateInfo> {
 }
 
 /// The discs in the demo's ISO library `sr`, two of them described.
+/// The demo's stand-in for a server task: `ms` of work, its progress reported to the thread's
+/// watched `Progress`.
+fn demo_work(ms: u64) {
+    let watch = watched();
+    let steps = (ms / 100).max(1);
+    for i in 1..=steps {
+        std::thread::sleep(Duration::from_millis(100));
+        if let Some(w) = &watch {
+            w.set_fraction(i as f64 / steps as f64);
+        }
+    }
+}
+
+/// A demo VM or template made from `from` (a VM's or template's details), off, with its disks on
+/// `sr` when given (a full copy) and new network cards' addresses.
+fn demo_copy(from: &VmInfo, rref: &str, name: &str, description: &str, sr: Option<&str>, srs: &[SrInfo]) -> VmInfo {
+    let mut v = from.clone();
+    v.rref = rref.to_string();
+    v.uuid = demo_uuid();
+    v.name = name.to_string();
+    v.description = description.to_string();
+    (v.power, v.host, v.started, v.mem_actual, v.parent) = (PowerState::Halted, None, None, 0, None);
+    v.snapshots.clear();
+    v.allowed.clear();
+    (v.ip, v.ips) = (String::new(), vec![]);
+    for (i, n) in v.nics.iter_mut().enumerate() {
+        n.ip.clear();
+        n.mac = format!("aa:16:3e:{}:{:02x}", &rref[rref.len().saturating_sub(5)..].replace('-', "0"), i);
+    }
+    if let Some(x) = sr.and_then(|r| srs.iter().find(|x| x.rref == r)) {
+        for k in v.disks.iter_mut().filter(|k| k.kind == "Disk") {
+            (k.sr, k.sr_name) = (x.rref.clone(), x.name.clone());
+        }
+        v.storage_host = x.host.clone();
+    }
+    v
+}
+
 /// The demo's pretend mount: an address with "unreachable" in it doesn't answer, and the password
 /// "wrong" is refused, so the error page can be tried out.
 fn demo_mount(lib: &IsoLibrary) -> Result<(), ApiError> {
-    let fail = |text: &str| Err(ApiError { code: "SR_BACKEND_FAILURE_222".into(), details: vec![String::new(), text.into(), String::new()] });
+    let fail = |text: &str| {
+        let e = ApiError { code: "SR_BACKEND_FAILURE_222".into(), details: vec![String::new(), text.into(), String::new()] };
+        answered(&Err(e.clone()), Duration::from_millis(900));
+        Err(e)
+    };
     let host = if lib.nfs { lib.location.split(':').next().unwrap_or("") } else { lib.location.trim_start_matches('/').split('/').next().unwrap_or("") };
     if lib.location.contains("unreachable") {
         return if lib.nfs {
@@ -1817,17 +2338,42 @@ fn demo_details(v: &mut VmInfo) {
     }
     v.vcpus_max = v.vcpus;
     v.mem_static_min = v.mem_dyn_min;
-    let (tags, folder, days, snaps, auto, ha): (&[&str], &str, i64, usize, bool, &str) = match v.rref.as_str() {
-        "vm-web" => (&["web", "production"], "/Production", 12, 2, true, "Restart"),
-        "vm-db" => (&["database", "production"], "/Production", 31, 5, true, "Restart"),
-        "vm-mail" => (&["mail"], "/Production", 4, 0, true, "Best effort"),
-        "vm-build" => (&["ci"], "/Development", 0, 1, false, ""),
-        "vm-desk" => (&["testing"], "/Development", 0, 3, false, ""),
-        _ => (&["backup"], "", 0, 0, false, ""),
+    let (tags, folder, days, auto, ha): (&[&str], &str, i64, bool, &str) = match v.rref.as_str() {
+        "vm-web" => (&["web", "production"], "/Production", 12, true, "Restart"),
+        "vm-db" => (&["database", "production"], "/Production", 31, true, "Restart"),
+        "vm-mail" => (&["mail"], "/Production", 4, true, "Best effort"),
+        "vm-build" => (&["ci"], "/Development", 0, false, ""),
+        "vm-desk" => (&["testing"], "/Development", 0, false, ""),
+        _ => (&["backup"], "", 0, false, ""),
     };
+    // snapshots, oldest first: name, description, how long ago (hours), with memory, was running
+    let snaps: &[(&str, &str, i64, bool, bool)] = match v.rref.as_str() {
+        "vm-web" => &[
+            ("Fresh install", "Ubuntu 24.04 with nginx, nothing else", 40 * 24 + 5, false, false),
+            ("Before kernel update", "", 9 * 24 + 2, false, true),
+            ("Before PHP 8.3", "Site working on PHP 8.2", 27, true, true),
+        ],
+        "vm-db" => &[("Before upgrade to 16", "PostgreSQL 15.8", 20 * 24, false, true), ("Before schema change", "", 50, false, true)],
+        "vm-build" => &[("Clean agent", "", 15 * 24, false, false)],
+        "vm-desk" => &[("Windows 11 clean", "", 60 * 24, false, false), ("Before 24H2", "", 30 * 24, false, false), ("Before driver update", "", 3 * 24, false, true)],
+        _ => &[],
+    };
+    v.snapshots = snaps
+        .iter()
+        .rev()
+        .enumerate()
+        .map(|(i, (name, description, hours, memory, was_running))| SnapshotInfo {
+            rref: format!("{}-snap-{}", v.rref, snaps.len() - i),
+            name: name.to_string(),
+            description: description.to_string(),
+            time: Some(now - hours * 3600 - 17 * 60),
+            memory: *memory,
+            was_running: *was_running,
+        })
+        .collect();
+    v.parent = v.snapshots.first().map(|x| x.rref.clone());
     v.tags = tags.iter().map(|t| t.to_string()).collect();
     v.folder = folder.into();
-    v.snapshots = snaps;
     v.auto_power_on = auto;
     v.ha = ha.into();
     v.tools_installed = v.rref != "vm-backup";
@@ -1842,9 +2388,9 @@ fn demo_details(v: &mut VmInfo) {
 fn recompute(d: &mut PoolData) {
     for (i, v) in d.vms.iter_mut().enumerate() {
         v.allowed = match v.power {
-            PowerState::Halted => vec!["start"],
-            PowerState::Running => vec!["clean_shutdown", "clean_reboot", "suspend", "hard_shutdown", "hard_reboot"],
-            PowerState::Suspended => vec!["resume", "hard_shutdown"],
+            PowerState::Halted => vec!["start", "snapshot"],
+            PowerState::Running => vec!["clean_shutdown", "clean_reboot", "suspend", "hard_shutdown", "hard_reboot", "snapshot", "checkpoint"],
+            PowerState::Suspended => vec!["resume", "hard_shutdown", "snapshot"],
             PowerState::Paused => vec!["hard_shutdown"],
             PowerState::Unknown => vec![],
         }
@@ -1905,6 +2451,7 @@ impl Connection for DemoConnection {
         Ok(self.data.lock().unwrap().clone())
     }
     fn run_action(&self, vm_ref: &str, a: &VmAction) -> Result<(), ApiError> {
+        said(a.method, &[json!(vm_ref)]);
         std::thread::sleep(Duration::from_millis(DEMO_ACTION_MS));
         let mut d = self.data.lock().unwrap();
         let Some(idx) = d.vms.iter().position(|v| v.rref == vm_ref) else {
@@ -1974,6 +2521,7 @@ impl Connection for DemoConnection {
     /// Mounts it everywhere in about a second and a half; but a storage named in
     /// SVM_DEMO_REPAIR_FAILS doesn't answer on the coordinator.
     fn repair_sr(&self, sr_ref: &str) -> Result<Vec<(String, Result<(), ApiError>)>, ApiError> {
+        said("PBD.plug", &[json!(format!("{}-pbd-host-a", sr_ref))]);
         std::thread::sleep(Duration::from_millis(1500));
         let mut d = self.data.lock().unwrap();
         let names: HashMap<String, String> = d.hosts.iter().map(|h| (h.rref.clone(), h.name.clone())).collect();
@@ -1995,6 +2543,7 @@ impl Connection for DemoConnection {
         Ok(out)
     }
     fn reattach_sr(&self, sr_ref: &str, lib: &IsoLibrary) -> Result<(), ApiError> {
+        said("PBD.create", &[json!({ "SR": sr_ref, "device_config": { "location": lib.location, "cifspassword": lib.password } })]);
         std::thread::sleep(Duration::from_millis(1200));
         demo_mount(lib)?;
         let mut d = self.data.lock().unwrap();
@@ -2007,10 +2556,12 @@ impl Connection for DemoConnection {
         Ok(())
     }
     fn scan_sr(&self, _sr_ref: &str) -> Result<(), ApiError> {
+        said("SR.scan", &[json!(_sr_ref)]);
         std::thread::sleep(Duration::from_millis(600));
         Ok(())
     }
     fn forget_sr(&self, sr_ref: &str) -> Result<(), ApiError> {
+        said("SR.forget", &[json!(sr_ref)]);
         std::thread::sleep(Duration::from_millis(600));
         let mut d = self.data.lock().unwrap();
         if d.vms.iter().any(|v| v.power == PowerState::Running && v.disks.iter().any(|k| k.kind != "Disk" && d.sr(sr_ref).map_or(false, |x| x.name == k.sr_name))) {
@@ -2071,6 +2622,9 @@ impl Connection for DemoConnection {
         for sr in &v.check {
             self.check_sr(sr, v.host.as_deref(), &v.names, tr)?;
         }
+        if v.from_template {
+            return self.demo_from_template(v, tr);
+        }
         // the calls a real server gets, a few of them, with made-up answers
         let rref = format!("vm-new-{}", self.data.lock().unwrap().vms.len());
         let me = format!("\"{}\"", v.name);
@@ -2113,9 +2667,9 @@ impl Connection for DemoConnection {
             allowed: vec!["start".into(), "start_on".into()],
             ..Default::default()
         };
-        vm.disks.push(VmDisk { device: "0".into(), name: format!("{} disk", v.name), sr_name, kind: "Disk".into(), size: v.disk });
+        vm.disks.push(VmDisk { device: "0".into(), name: format!("{} disk", v.name), sr: v.sr.clone(), sr_name, kind: "Disk".into(), size: v.disk });
         if let Some((lib, file, size)) = iso {
-            vm.disks.push(VmDisk { device: "3".into(), name: file, sr_name: lib, kind: "DVD drive".into(), size });
+            vm.disks.push(VmDisk { device: "3".into(), name: file, sr_name: lib, kind: "DVD drive".into(), size, ..Default::default() });
         }
         if let Some(net) = network {
             vm.nics.push(VmNic { device: "0".into(), mac: "aa:bb:cc:00:11:22".into(), network: net, ip: String::new() });
@@ -2145,6 +2699,12 @@ impl Connection for DemoConnection {
     }
     /// Takes the VM out of the demo pool (a running one is "turned off" first, taking longer).
     fn delete_vm(&self, vm_ref: &str, _disks: bool) -> Result<Vec<String>, ApiError> {
+        said("VM.destroy", &[json!(vm_ref)]);
+        if self.data.lock().unwrap().user_template(vm_ref).is_some() {
+            std::thread::sleep(Duration::from_millis(700));
+            self.data.lock().unwrap().user_templates.retain(|t| t.rref != vm_ref);
+            return Ok(vec![]);
+        }
         let running = self.data.lock().unwrap().vm(vm_ref).map(|v| v.power != PowerState::Halted);
         let Some(running) = running else {
             return Err(ApiError { code: "HANDLE_INVALID".into(), details: vec!["VM".into(), vm_ref.into()] });
@@ -2177,6 +2737,102 @@ impl Connection for DemoConnection {
         let f = f.ok_or_else(|| ApiError { code: "HANDLE_INVALID".into(), details: vec!["VDI".into(), vdi_ref.into()] })?;
         f.description = text.to_string();
         Ok(())
+    }
+    fn set_vm_description(&self, vm_ref: &str, text: &str) -> Result<(), ApiError> {
+        std::thread::sleep(Duration::from_millis(400));
+        let mut d = self.data.lock().unwrap();
+        for v in d.vms.iter_mut() {
+            if v.rref == vm_ref {
+                v.description = text.to_string();
+                return Ok(());
+            }
+            if let Some(x) = v.snapshots.iter_mut().find(|x| x.rref == vm_ref) {
+                x.description = text.to_string();
+                return Ok(());
+            }
+        }
+        Err(ApiError { code: "HANDLE_INVALID".into(), details: vec!["VM".into(), vm_ref.into()] })
+    }
+    /// About a second (two and a half with memory).
+    fn snapshot_vm(&self, vm_ref: &str, name: &str, description: &str, memory: bool) -> Result<String, ApiError> {
+        said(if memory { "VM.checkpoint" } else { "VM.snapshot" }, &[json!(vm_ref), json!(name)]);
+        demo_work(if memory { 2500 } else { 1200 });
+        let mut d = self.data.lock().unwrap();
+        let v = d.vms.iter_mut().find(|v| v.rref == vm_ref).ok_or_else(|| ApiError { code: "HANDLE_INVALID".into(), details: vec!["VM".into(), vm_ref.into()] })?;
+        if !v.can(if memory { "checkpoint" } else { "snapshot" }) {
+            return Err(ApiError { code: "VM_BAD_POWER_STATE".into(), details: vec![] });
+        }
+        let rref = format!("snap-{}", demo_uuid());
+        let time = SystemTime::now().duration_since(UNIX_EPOCH).map(|t| t.as_secs() as i64).ok();
+        let was_running = v.power == PowerState::Running;
+        v.snapshots.insert(0, SnapshotInfo { rref: rref.clone(), name: name.into(), description: description.into(), time, memory, was_running });
+        v.parent = Some(rref.clone());
+        Ok(rref)
+    }
+    /// About a second; a VM has to be off.
+    fn make_template(&self, source: &str, name: &str, description: &str) -> Result<String, ApiError> {
+        said("VM.clone", &[json!(source), json!(name)]);
+        demo_work(1100);
+        let mut d = self.data.lock().unwrap();
+        let from = match d.vm(source) {
+            Some(v) if v.power != PowerState::Halted => return Err(ApiError { code: "VM_BAD_POWER_STATE".into(), details: vec![] }),
+            Some(v) => v.clone(),
+            None => d.vms.iter().find(|v| v.snapshot(source).is_some()).cloned().ok_or_else(|| ApiError { code: "HANDLE_INVALID".into(), details: vec!["VM".into(), source.into()] })?,
+        };
+        let rref = format!("tpl-{}", demo_uuid());
+        let t = demo_copy(&from, &rref, name, description, None, &d.srs);
+        d.user_templates.push(t);
+        Ok(rref)
+    }
+    /// About a second on the same storage, four onto other storage; a VM has to be off.
+    fn copy_vm(&self, vm: &str, name: &str, sr: Option<&str>) -> Result<String, ApiError> {
+        match sr { Some(sr) => said("VM.copy", &[json!(vm), json!(name), json!(sr)]), None => said("VM.clone", &[json!(vm), json!(name)]) }
+        demo_work(if sr.is_some() { 4000 } else { 1000 });
+        let mut d = self.data.lock().unwrap();
+        let from = match d.vm(vm) {
+            Some(v) if v.power != PowerState::Halted => return Err(ApiError { code: "VM_BAD_POWER_STATE".into(), details: vec![] }),
+            Some(v) => v.clone(),
+            None => return Err(ApiError { code: "HANDLE_INVALID".into(), details: vec!["VM".into(), vm.into()] }),
+        };
+        let rref = format!("vm-copy-{}", d.vms.len());
+        let mut copy = demo_copy(&from, &rref, name, &from.description, sr, &d.srs);
+        copy.allowed = vec!["start".into()];
+        d.vms.push(copy);
+        recompute(&mut d);
+        Ok(rref)
+    }
+    fn revert_vm(&self, snap: &str) -> Result<(), ApiError> {
+        said("VM.revert", &[json!(snap)]);
+        std::thread::sleep(Duration::from_millis(1800));
+        let mut d = self.data.lock().unwrap();
+        let Some(idx) = d.vms.iter().position(|v| v.snapshot(snap).is_some()) else {
+            return Err(ApiError { code: "HANDLE_INVALID".into(), details: vec!["VM".into(), snap.into()] });
+        };
+        let x = d.vms[idx].snapshot(snap).cloned().unwrap_or_default();
+        let (need, host) = (d.vms[idx].mem_dyn_max, d.vms[idx].host.clone());
+        d.vms[idx].parent = Some(snap.to_string());
+        if x.memory || x.was_running {
+            let h = host.or_else(|| pick_host(&mut d, need));
+            d.vms[idx].power = PowerState::Running;
+            d.vms[idx].host = h;
+            d.vms[idx].started = SystemTime::now().duration_since(UNIX_EPOCH).map(|t| t.as_secs() as i64).ok();
+        } else {
+            d.vms[idx].power = PowerState::Halted;
+            d.vms[idx].host = None;
+        }
+        recompute(&mut d);
+        Ok(())
+    }
+    fn delete_snapshot(&self, snap: &str) -> Result<Vec<String>, ApiError> {
+        said("VM.destroy", &[json!(snap)]);
+        std::thread::sleep(Duration::from_millis(900));
+        let mut d = self.data.lock().unwrap();
+        let v = d.vms.iter_mut().find(|v| v.snapshot(snap).is_some()).ok_or_else(|| ApiError { code: "HANDLE_INVALID".into(), details: vec!["VM".into(), snap.into()] })?;
+        v.snapshots.retain(|x| x.rref != snap);
+        if v.parent.as_deref() == Some(snap) {
+            v.parent = None;
+        }
+        Ok(vec![])
     }
 
     fn open_console(&self, _vm_ref: &str) -> Result<ConsoleStream, ApiError> {
@@ -2211,6 +2867,113 @@ mod tests {
             c.knock_hosts(&mut hosts);
         }
         assert!(hosts.iter().all(|h| !h.unreachable));
+    }
+
+    /// Against a fake server that stops answering part way (SVM_FAKE_XAPI=host:port, see the
+    /// session's notes): the copy gives up LOST_AFTER after the last answer.
+    #[test]
+    #[ignore]
+    fn lost_contact_live() {
+        let addr = std::env::var("SVM_FAKE_XAPI").expect("SVM_FAKE_XAPI");
+        let c = RealConnection::new(&addr, "root", "x");
+        let p = Progress::new();
+        watch(&p);
+        let t = Instant::now();
+        let e = c.copy_vm("OpaqueRef:vm", "copy", Some("OpaqueRef:sr")).unwrap_err();
+        eprintln!("{} after {:.0} s; progress {:?}; {}", e.code, t.elapsed().as_secs_f32(), p.fraction(), e.message());
+        assert_eq!(e.code, LOST_CONTACT);
+        assert!(p.fraction().unwrap_or(0.0) > 0.0);
+    }
+
+    #[test]
+    fn calls_noted_without_passwords() {
+        let args = vec![json!("OpaqueRef:abc"), json!("Web 2"), json!({ "device_config": { "location": "//nas/isos", "cifspassword": "s3cret" } })];
+        let text = args_text(&args);
+        assert!(text.starts_with("OpaqueRef:abc  \"Web 2\"  "), "{}", text);
+        assert!(text.contains("//nas/isos") && text.contains("********") && !text.contains("s3cret"), "{}", text);
+        // a job's thread notes its calls, and how they went, in its details
+        let p = Progress::new();
+        watch(&p);
+        said("VM.clone", &[json!("OpaqueRef:abc"), json!("x")]);
+        answered(&Err(ApiError { code: "VM_BAD_POWER_STATE".into(), details: vec!["".into(), "running".into()] }), Duration::from_millis(5));
+        let lines = p.trace.lines();
+        assert_eq!(lines[0], (Said::Asked, "VM.clone  OpaqueRef:abc  \"x\"".to_string()));
+        assert_eq!(lines[1], (Said::Error, "Error code: VM_BAD_POWER_STATE".to_string()));
+        assert_eq!(lines[2], (Said::Error, "running".to_string()));
+    }
+
+    #[test]
+    fn task_results() {
+        assert_eq!(task_value("<value>OpaqueRef:1234</value>"), json!("OpaqueRef:1234"));
+        assert_eq!(task_value(""), Value::Null);
+        let p = Progress::new();
+        assert_eq!((p.fraction(), p.silent_for()), (None, None));
+        p.set_fraction(0.25);
+        p.heard(false);
+        assert_eq!(p.fraction(), Some(0.25));
+        assert!(p.silent_for().is_some());
+        p.heard(true);
+        assert!(p.silent_for().is_none());
+    }
+
+    #[test]
+    fn templates_and_copies() {
+        let c = DemoConnection::new();
+        // a VM that's on can't be copied or made a template
+        assert_eq!(c.make_template("vm-web", "x", "").unwrap_err().code, "VM_BAD_POWER_STATE");
+        assert_eq!(c.copy_vm("vm-web", "x", None).unwrap_err().code, "VM_BAD_POWER_STATE");
+        // from a VM that's off, and from a snapshot of a running one; the VM stays
+        let a = c.make_template("vm-desk", "Desktop template", "clean").unwrap();
+        let b = c.make_template("vm-web-snap-1", "Web, fresh", "").unwrap();
+        let d = c.fetch(0).unwrap();
+        assert!(d.vm("vm-desk").is_some() && d.vm(&a).is_none());
+        assert_eq!(d.user_template(&a).map(|t| (t.name.as_str(), t.description.as_str())), Some(("Desktop template", "clean")));
+        assert_eq!(d.user_template(&b).unwrap().power, PowerState::Halted);
+        // copies: in an instant, or in full onto other storage
+        let same = c.copy_vm("vm-desk", "Desktop 2", None).unwrap();
+        let other = c.copy_vm("vm-desk", "Desktop 3", Some("sr-nfs")).unwrap();
+        let d = c.fetch(0).unwrap();
+        assert_eq!(d.vm(&same).unwrap().disks[0].sr, "sr-local1");
+        assert_eq!(d.vm(&other).unwrap().disks[0].sr, "sr-nfs");
+        // a VM from a template: its network cards kept, or one on the chosen network
+        let spec = NewVm { name: "Web 2".into(), template: "tpl-web".into(), vcpus: 2, cores_per_socket: 2, memory: 4 * GB, sr: "sr-nfs".into(), from_template: true, keep_nics: true, ..Default::default() };
+        let kept = c.create_vm(&spec, &Trace::default()).unwrap();
+        let moved = c.create_vm(&NewVm { name: "Web 3".into(), keep_nics: false, network: Some("net-1".into()), ..spec }, &Trace::default()).unwrap();
+        let d = c.fetch(0).unwrap();
+        assert_eq!(d.vm(&kept).unwrap().nics[0].network, "Pool-wide network 0");
+        assert_eq!(d.vm(&moved).unwrap().nics[0].network, "Storage network");
+        assert_eq!(d.vm(&kept).unwrap().disks[0].size, 40 * GB);
+        // deleted
+        c.delete_vm("tpl-win", true).unwrap();
+        assert!(c.fetch(0).unwrap().user_template("tpl-win").is_none());
+    }
+
+    #[test]
+    fn snapshots_taken_reverted_and_deleted() {
+        let c = DemoConnection::new();
+        let vm = |c: &DemoConnection| c.fetch(0).unwrap().vm("vm-web").cloned().unwrap();
+        assert_eq!(vm(&c).power, PowerState::Running);
+        assert_eq!(vm(&c).snapshots.len(), 3);
+        // with its memory, the newest first, and now the current state comes from it
+        let snap = c.snapshot_vm("vm-web", "Before upgrade", "nginx 1.24", true).unwrap();
+        let v = vm(&c);
+        assert_eq!((v.snapshots.len(), v.snapshots[0].rref.as_str(), v.parent.as_deref()), (4, snap.as_str(), Some(snap.as_str())));
+        assert!(v.snapshots[0].memory && v.snapshots[0].was_running && v.snapshots[0].description == "nginx 1.24");
+        // a halted VM can't have its memory kept
+        assert_eq!(c.snapshot_vm("vm-desk", "x", "", true).unwrap_err().code, "VM_BAD_POWER_STATE");
+        // back to one taken while it was off: it stays off
+        c.revert_vm("vm-web-snap-1").unwrap();
+        let v = vm(&c);
+        assert_eq!((v.power, v.parent.as_deref()), (PowerState::Halted, Some("vm-web-snap-1")));
+        // back to the one with memory: running again
+        c.revert_vm(&snap).unwrap();
+        assert_eq!(vm(&c).power, PowerState::Running);
+        // deleted
+        assert!(c.delete_snapshot(&snap).unwrap().is_empty());
+        let v = vm(&c);
+        assert!(v.snapshot(&snap).is_none() && v.parent.is_none());
+        c.set_vm_description("vm-web-snap-2", "Kernel 6.8").unwrap();
+        assert_eq!(vm(&c).snapshot("vm-web-snap-2").unwrap().description, "Kernel 6.8");
     }
 
     #[test]

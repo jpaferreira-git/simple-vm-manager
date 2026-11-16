@@ -14,6 +14,8 @@ affiliated with or endorsed by the makers of XenServer or XCP-ng.
 | ![A VM's console](docs/screenshot-dark-console.png) | ![Connecting to a server](docs/screenshot-dark-connect.png) |
 | ![An ISO library's files](docs/screenshot-dark-isos.png) | ![Uploading an ISO from a link](docs/screenshot-dark-upload.png) |
 | ![Creating a VM](docs/screenshot-dark-new-vm.png) | ![A new VM's advanced options](docs/screenshot-dark-new-vm-advanced.png) |
+| ![A VM's snapshots](docs/screenshot-dark-snapshots.png) | ![Taking a snapshot](docs/screenshot-dark-snapshot-take.png) |
+| ![Your templates](docs/screenshot-dark-templates.png) | ![A new VM from a template](docs/screenshot-dark-new-vm-template.png) |
 
 ## Features
 
@@ -26,14 +28,15 @@ affiliated with or endorsed by the makers of XenServer or XCP-ng.
   the app doesn't reconnect to it at the next start.
 - **Resource tree** — *Infrastructure* view (pool → servers → their VMs and storage; shared storage and
   virtual networks in folders) or *Objects* view (grouped by type), with a search box. The sidebar **folds** into a slim icon strip.
-  A dot on each icon says how it's doing: VMs by power state; servers green when on, red when off
-  or not answering; shared storage and ISO libraries green when mounted, red when their server is
+  A dot on each icon says how it's doing: VMs by power state (grey, unknown, while the server
+  they run on is off or not answering: nothing can be done to them then); servers green when on,
+  red when off or not answering; shared storage and ISO libraries green when mounted, red when their server is
   down (a server's own local storage and removable drives have none). A server that goes
   down without shutting down (power cut, crash) turns red within about half a minute, though the
   pool itself only gives up on it after ten: the app knocks on each server's address as it looks.
 - **Home overview** — servers, running VMs, memory and storage in use at a glance, each server's load
   and the latest activity.
-- **Details** — General, Memory, Storage, Networking and Logs tabs for pools, hosts and VMs, and Console for hosts and VMs.
+- **Details** — General, Memory, Storage, Networking and Logs tabs for pools, hosts and VMs, Console for hosts and VMs, and Snapshots for VMs.
   A VM's General tab shows its tags, operating system, uptime, IP addresses, guest tools, CPUs and
   memory, firmware and Secure Boot, boot order, high availability, disks and snapshots; click a value
   to copy it.
@@ -80,9 +83,30 @@ affiliated with or endorsed by the makers of XenServer or XCP-ng.
   down, what was made is undone and its answer stays there. Once made, the dialog can be closed
   while the VM starts (which can take a while). An ISO the app doesn't recognise still gives a
   readable name ("fedora-coreos-44.20260928.3.1-live-iso.x86_64.iso" → "Fedora CoreOS 44").
+- **Templates** — the copy button next to a VM's camera (or its right-click menu) has *Make
+  Template…*: a template from the VM, which stays as it is, its disks copied in an instant on their
+  own storage. A snapshot's row has it too (from a snapshot of the disks only), so a VM that's on
+  needn't stop; otherwise the VM has to be off, as a copy of a running one is like one after a power
+  cut (said when a snapshot was taken while it ran). The dialog reminds you to generalize it first:
+  Windows' sysprep; on Linux an empty machine ID and new SSH host keys. Your templates (not the
+  built-in ones) are in a *Templates* folder in the pool, each with its page, New VM and Delete.
+  *New VM* then offers *Create from: An ISO | A template*: from a template, its size as it is or
+  other CPUs and memory, its disks copied in an instant where it is or in full onto other storage,
+  and its network cards as they are or one on another network.
+- **Copy VM** — in the same menu: a VM just like one that's off, with its own disks (an instant copy
+  where they are, or in full onto other storage) and new network addresses.
 - **Delete VM** — the bin next to a VM's tabs, or on its right-click menu. It asks first, and its disks go too unless unticked (a disk another VM also uses stays);
   its snapshots go with it, and ISO files in its DVD drive aren't touched. A VM that's on is
   turned off first, the button saying so ("Shut down and delete").
+- **Snapshots** — the camera next to a VM's power buttons (or on its right-click menu) takes one:
+  its disks as they are now, named with the date and time unless you name it, and, for a running VM,
+  its memory too if you tick it, so that reverting resumes it right where it was. The VM's
+  *Snapshots* tab lists them, the newest first: when each was taken, what it holds, a description
+  you can edit in place, and "Now" on the one the VM's current state comes from. *Revert* (the
+  arrow at a row's end) asks first, offers to take a snapshot of now before it, turns the VM off if
+  it's on, puts it back, and then leaves it as it was at the time: resumed, started again, or off.
+  The bin deletes one, with its copies of the disks. In a narrow window the tab keeps Revert and
+  Delete in view, dropping the other columns first.
 - **Shut down a server** — the red power icon at the end of a server's tabs. It asks first, saying
   which VMs move to the pool's other servers and which are shut down (their disks on that server's
   own storage), and warns when it's the pool's coordinator. Then it goes the way the pool expects:
@@ -90,10 +114,28 @@ affiliated with or endorsed by the makers of XenServer or XCP-ng.
   takes VMs again.
 - **VM power actions** — Start, Shut Down, Reboot, Suspend, Resume, Force Shut Down, Force Reboot,
   enabled only when the server allows them, with confirmations for the disruptive ones. They're
-  coloured icons at the right end of a VM's tabs (the Force ones behind the small arrows; on the
-  name's line when the window is narrow), and on its right-click menu.
+  all behind one button at the right end of a VM's tabs: the power symbol in the colour of the
+  VM's state (a ring turning while an action runs) and an arrow, opening a menu of the actions with
+  their coloured icons and shortcuts (on the name's line when the window is narrow). They're on
+  its right-click menu too.
 - **Keyboard shortcuts** — Ctrl+B start · Ctrl+E shut down · Ctrl+R reboot · Ctrl+Y suspend/resume ·
   F5 refresh.
+- **Activities** — next to the gear: what's under way (a ring turning, with how many), each with its
+  server, how long it's been and how far it is, and the last few that ended. Above them, what's
+  wrong right now (a red dot on the button): a connection lost, a server off or not answering (and
+  the VMs whose state that makes unknown), storage that isn't mounted; a click opens it. A server
+  that stops answering or comes back is noted there too, and Refresh (F5) says how it went,
+  servers that don't answer included. Long lines take two. A click on one (or on a row of the Logs
+  tab) shows it in full: the server, when, how it went, and every call made to the server with its
+  answer or its error, as the server gave it (passwords hidden), ready to copy.
+- **Tables** — a column's edge in the header can be dragged to make it wider or narrower; a double
+  click gives it back its own width. Long jobs (copying
+  disks, mounting a share, starting a VM…) run as tasks on the server that the app looks at every
+  two seconds: if the server stops answering (a power cut), the job is given up as failed after
+  100 seconds, instead of waited on for hours. What was being made then (a VM, a copy, a template)
+  is noted, even across closing the app; once the server's back, anything left half made under its
+  name is offered for deleting. A dialog whose job can't be cancelled says *Close*, not *Cancel*:
+  closing it leaves the job going, under Activities.
 - **Settings** — the gear at the far left of the toolbar: the theme (light, dark, or the same as
   your desktop), the size of everything (90–125%; Ctrl + and Ctrl - too), and the saved passwords,
   each with *Forget* (deleted from the keychain; the app stops connecting there as it starts), even

@@ -36,6 +36,8 @@ impl PowerState {
 pub struct VmDisk {
     pub name: String,
     pub device: String,
+    /// Its storage (reference), and what it's called.
+    pub sr: String,
     pub sr_name: String,
     pub kind: String,
     pub size: i64,
@@ -88,7 +90,11 @@ pub struct VmInfo {
     pub auto_power_on: bool,
     /// High availability: "Restart", "Best effort", or empty when off.
     pub ha: String,
-    pub snapshots: usize,
+    /// Its snapshots, the newest first.
+    pub snapshots: Vec<SnapshotInfo>,
+    /// The snapshot its current state comes from: the last one taken, or the one it was last
+    /// put back to.
+    pub parent: Option<String>,
     pub vcpus_max: i64,
     pub mem_static_min: i64,
     /// The memory the VM has right now (while running).
@@ -102,6 +108,20 @@ pub struct VmInfo {
     pub ips: Vec<String>,
 }
 
+/// A VM's snapshot: its disks as they were, and maybe its memory.
+#[derive(Clone, Debug, Default)]
+pub struct SnapshotInfo {
+    pub rref: String,
+    pub name: String,
+    pub description: String,
+    /// When it was taken, in seconds since 1970.
+    pub time: Option<i64>,
+    /// It holds the VM's memory too (a checkpoint): reverting to it resumes the VM where it was.
+    pub memory: bool,
+    /// The VM was running when it was taken.
+    pub was_running: bool,
+}
+
 impl VmInfo {
     /// The server the VM belongs with: where it runs, or for a VM that's off, the server with its
     /// disks, or else its home server (as the original's VM.Home). None: any server in the pool.
@@ -111,6 +131,15 @@ impl VmInfo {
 
     pub fn can(&self, op: &str) -> bool {
         self.allowed.iter().any(|a| a == op)
+    }
+
+    /// A snapshot can be taken now: of its disks, or (running) of its disks and memory.
+    pub fn can_snapshot(&self) -> bool {
+        self.can("snapshot") || self.can("checkpoint")
+    }
+
+    pub fn snapshot(&self, r: &str) -> Option<&SnapshotInfo> {
+        self.snapshots.iter().find(|x| x.rref == r)
     }
 }
 
@@ -224,6 +253,9 @@ pub struct PoolData {
     pub templates: Vec<TemplateInfo>,
     /// The pool's default storage, if set.
     pub default_sr: Option<String>,
+    /// The templates people made (from their VMs or snapshots), not the built-in ones; they have
+    /// disks of their own, copied into each VM made from them.
+    pub user_templates: Vec<VmInfo>,
 }
 
 /// A built-in VM template: what it sets up and recommends.
@@ -283,6 +315,12 @@ pub struct NewVm {
     /// The boot mode, when it differs from the template's.
     pub boot: Option<Boot>,
     pub start: bool,
+    /// `template` is one of the user's own templates, with its disks: they're copied (in an
+    /// instant on their own storage, or in full onto `copy_to`), and there's no ISO or new disk.
+    pub from_template: bool,
+    pub copy_to: Option<String>,
+    /// Keep the template's network cards (`network` is ignored).
+    pub keep_nics: bool,
     /// What the references above are called (the template, storage, ISO, network, server), for
     /// the steps shown while it's made.
     pub names: std::collections::HashMap<String, String>,
@@ -329,6 +367,17 @@ impl PoolData {
     }
     pub fn net(&self, r: &str) -> Option<&NetInfo> {
         self.networks.iter().find(|n| n.rref == r)
+    }
+    /// For a VM the pool says is running (or paused) on a server that's off or not answering, that
+    /// server: what the VM is really doing can't be known, and nothing can be done to it there.
+    pub fn host_down_for(&self, v: &VmInfo) -> Option<&HostInfo> {
+        if !matches!(v.power, PowerState::Running | PowerState::Paused) {
+            return None;
+        }
+        self.host(v.host.as_deref()?).filter(|h| !h.is_up())
+    }
+    pub fn user_template(&self, r: &str) -> Option<&VmInfo> {
+        self.user_templates.iter().find(|t| t.rref == r)
     }
 
     /// Where a storage should be mounted but isn't, if anywhere: a server that's on and has its
@@ -417,6 +466,10 @@ impl VmAction {
     /// The original's CanRun rule for each command. `busy` means this app is already running a task on the
     /// VM: then only Force Shut Down / Force Reboot of a running VM are allowed (HasRunningTasks branch).
     pub fn can_run(&self, vm: &VmInfo, d: &PoolData, busy: bool) -> bool {
+        // its server's gone: the pool can't reach the VM
+        if d.host_down_for(vm).is_some() {
+            return false;
+        }
         if busy {
             return self.is_force() && vm.power == PowerState::Running;
         }
@@ -462,6 +515,9 @@ impl VmAction {
         if self.can_run(vm, d, busy) {
             return None;
         }
+        if let Some(h) = d.host_down_for(vm) {
+            return Some(format!("Its server, {}, {}: what the VM is doing can't be known, and nothing can be done to it there.", h.name, if h.live { "isn't answering" } else { "is off" }));
+        }
         let s = if busy {
             "This VM is busy with another task."
         } else if self.op == "resume" {
@@ -495,6 +551,48 @@ pub fn fmt_duration(secs: i64) -> String {
 }
 
 /// XenAPI's times, like "20261114T13:22:01Z", in seconds since 1970.
+/// The civil date (year, month 1–12, day) of a day counted from 1970 (Howard Hinnant's algorithm,
+/// the inverse of the one in `parse_xen_time`).
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (yoe + era * 400 + if m <= 2 { 1 } else { 0 }, m, d)
+}
+
+/// When something happened, for people: "Today, 08:42", "Yesterday, 19:10", "3 Nov, 14:00", or
+/// "3 Nov 2025, 14:00" in another year. `t` and `now` are seconds since 1970; `offset` is the
+/// local time zone's, in seconds east of UTC.
+pub fn fmt_when(t: i64, now: i64, offset: i64) -> String {
+    const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    let (lt, ln) = (t + offset, now + offset);
+    let (day, today) = (lt.div_euclid(86_400), ln.div_euclid(86_400));
+    let clock = format!("{:02}:{:02}", lt.rem_euclid(86_400) / 3600, lt.rem_euclid(3600) / 60);
+    let (y, m, d) = civil_from_days(day);
+    if day == today {
+        format!("Today, {}", clock)
+    } else if day == today - 1 {
+        format!("Yesterday, {}", clock)
+    } else if y == civil_from_days(today).0 {
+        format!("{} {}, {}", d, MONTHS[(m - 1) as usize], clock)
+    } else {
+        fmt_date_time(t, offset)
+    }
+}
+
+/// A date and time in full, local: "16 Nov 2026, 08:42" (as a new snapshot's name).
+pub fn fmt_date_time(t: i64, offset: i64) -> String {
+    const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    let lt = t + offset;
+    let (y, m, d) = civil_from_days(lt.div_euclid(86_400));
+    format!("{} {} {}, {:02}:{:02}", d, MONTHS[(m - 1) as usize], y, lt.rem_euclid(86_400) / 3600, lt.rem_euclid(3600) / 60)
+}
+
 pub fn parse_xen_time(t: &str) -> Option<i64> {
     let t = t.trim().trim_end_matches('Z').replace('-', "");
     let (date, time) = t.split_once('T')?;
@@ -886,6 +984,36 @@ mod iso_tests {
         let again = smb("//nas/isos").xe_command(Some("1234"));
         assert!(again.starts_with("xe pbd-create sr-uuid=1234 host-uuid=<coordinator> device-config:location=//nas/isos"), "{}", again);
         assert!(!again.contains("s3cret"));
+    }
+
+    #[test]
+    fn vms_on_a_server_thats_gone() {
+        let host = |r: &str, live: bool, unreachable: bool| HostInfo { rref: r.into(), name: r.into(), live, unreachable, enabled: true, ..Default::default() };
+        let d = PoolData { hosts: vec![host("a", true, false), host("b", true, true), host("c", false, false)], ..Default::default() };
+        let vm = |h: &str, power: PowerState| VmInfo { host: Some(h.into()), power, allowed: vec!["clean_shutdown".into(), "suspend".into()], ..Default::default() };
+        let shut_down = &ACTIONS[1];
+        assert!(d.host_down_for(&vm("a", PowerState::Running)).is_none());
+        assert!(shut_down.can_run(&vm("a", PowerState::Running), &d, false));
+        // on a server that doesn't answer, or that's off: unknown, and nothing can be done
+        for h in ["b", "c"] {
+            let v = vm(h, PowerState::Running);
+            assert_eq!(d.host_down_for(&v).map(|x| x.rref.as_str()), Some(h));
+            assert!(!shut_down.can_run(&v, &d, false));
+            assert!(shut_down.cant_run_reason(&v, &d, false).unwrap().contains(h));
+        }
+        // a suspended VM isn't on any server
+        assert!(d.host_down_for(&vm("b", PowerState::Suspended)).is_none());
+    }
+
+    #[test]
+    fn when_for_people() {
+        let now = parse_xen_time("20261116T11:42:00Z").unwrap(); // 08:42 in Brazil (UTC-3)
+        let br = -3 * 3600;
+        assert_eq!(fmt_when(now - 60, now, br), "Today, 08:41");
+        assert_eq!(fmt_when(now - 9 * 3600, now, br), "Yesterday, 23:42");
+        assert_eq!(fmt_when(parse_xen_time("20261103T17:00:00Z").unwrap(), now, br), "3 Nov, 14:00");
+        assert_eq!(fmt_when(parse_xen_time("20250101T02:30:00Z").unwrap(), now, br), "31 Dec 2024, 23:30");
+        assert_eq!(fmt_when(parse_xen_time("20240229T12:00:00Z").unwrap(), now, 0), "29 Feb 2024, 12:00");
     }
 
     #[test]

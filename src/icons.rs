@@ -23,6 +23,10 @@ pub enum IconKind {
     Net,
     Folder,
     Vm(PowerState),
+    /// A VM's snapshot: a camera.
+    Snapshot,
+    /// A template made by the user: a screen with copies of it behind.
+    Template,
 }
 
 /// How a storage is doing, as the dot on its icon.
@@ -56,6 +60,7 @@ impl Tone {
             "clean_shutdown" | "hard_shutdown" => Tone::Red,
             "hard_reboot" => Tone::Orange,
             "suspend" => Tone::Blue,
+            "revert" => Tone::Orange,
             _ => Tone::Accent,
         }
     }
@@ -95,6 +100,13 @@ pub fn arc(p: &Painter, c: Pos2, r: f32, start_deg: f32, end_deg: f32, stroke: S
 fn poly(p: &Painter, o: Pos2, pts: &[(f32, f32)], fill: Color32) {
     let v: Vec<Pos2> = pts.iter().map(|(x, y)| pos2(o.x + x, o.y + y)).collect();
     p.add(Shape::convex_polygon(v, fill, Stroke::NONE));
+}
+
+/// A camera around `c`: its body, the bump on top and the lens.
+fn camera(p: &Painter, c: Pos2, s: Stroke) {
+    p.rect_stroke(Rect::from_min_max(c + vec2(-6.5, -3.5), c + vec2(6.5, 5.5)), Rounding::same(1.6), s);
+    line(p, c, &[(-3.0, -3.5), (-1.8, -5.6), (1.8, -5.6), (3.0, -3.5)], s);
+    p.circle_stroke(c + vec2(0.0, 1.0), 2.4, s);
 }
 
 fn line(p: &Painter, o: Pos2, pts: &[(f32, f32)], s: Stroke) {
@@ -193,6 +205,15 @@ pub fn paint_icon(p: &Painter, rect: Rect, kind: IconKind, pal: &Pal, bg: Color3
                 }
             }
         }
+        IconKind::Snapshot => camera(p, o + vec2(8.0, 8.0), s),
+        IconKind::Template => {
+            let faint = Stroke::new(1.1, pal.icon.gamma_multiply(0.55));
+            line(p, o, &[(4.5, 1.0), (15.0, 1.0), (15.0, 8.0)], faint);
+            line(p, o, &[(3.0, 2.5), (13.5, 2.5), (13.5, 9.5)], faint);
+            rrect(p, o, 1.0, 4.0, 11.0, 8.0, 1.4, s);
+            line(p, o, &[(4.0, 14.5), (9.0, 14.5)], s);
+            line(p, o, &[(6.5, 12.0), (6.5, 14.5)], s);
+        }
         IconKind::Folder => {
             line(p, o, &[(1.5, 13.0), (1.5, 3.5), (6.0, 3.5), (7.5, 5.0), (14.5, 5.0), (14.5, 13.0), (1.5, 13.0)], s);
             line(p, o, &[(1.5, 7.0), (14.5, 7.0)], Stroke::new(1.0, pal.icon.gamma_multiply(0.6)));
@@ -215,6 +236,11 @@ pub fn paint_tool(p: &Painter, rect: Rect, op: &str, enabled: bool, pal: &Pal) {
         "hard_reboot" => pal.orange,
         "suspend" | "resume" => pal.blue,
         "start" | "connect" => pal.green,
+        // the power menu's face: the VM's state, as its dot in the tree
+        "power-running" => pal.green,
+        "power-halted" => pal.red,
+        "power-suspended" => pal.blue,
+        "power-paused" => pal.orange,
         "newvm" => pal.blue,
         "iso" => pal.orange,
         _ => pal.icon,
@@ -228,6 +254,10 @@ pub fn paint_tool(p: &Painter, rect: Rect, op: &str, enabled: bool, pal: &Pal) {
     let s = Stroke::new(2.0, col);
     let o = rect.min;
     match op {
+        "power-running" | "power-halted" | "power-suspended" | "power-paused" => {
+            arc(p, c + vec2(0.0, 0.8), 5.6, -55.0, 235.0, s);
+            p.line_segment([c + vec2(0.0, -6.5), c + vec2(0.0, -0.5)], s);
+        }
         "clean_shutdown" | "hard_shutdown" => {
             arc(p, c + vec2(0.0, 0.8), 5.6, -55.0, 235.0, s);
             p.line_segment([c + vec2(0.0, -6.5), c + vec2(0.0, -0.5)], s);
@@ -361,6 +391,33 @@ pub fn paint_glyph_on(p: &Painter, rect: Rect, name: &str, col: Color32, bg: Col
     let c = rect.center();
     let s = Stroke::new(1.5, col);
     match name {
+        "camera" => camera(p, c, s),
+        "activity" => line(p, c, &[(-7.0, 1.0), (-3.5, 1.0), (-1.5, -5.0), (1.5, 6.0), (3.5, -1.0), (7.0, -1.0)], s),
+        "template" => {
+            // a screen with copies of it behind (as the Template icon)
+            let o = c - vec2(8.0, 8.0);
+            let faint = Stroke::new(1.1, col.gamma_multiply(0.6));
+            line(p, o, &[(4.5, 1.0), (15.0, 1.0), (15.0, 8.0)], faint);
+            line(p, o, &[(3.0, 2.5), (13.5, 2.5), (13.5, 9.5)], faint);
+            p.rect_stroke(Rect::from_min_size(o + vec2(1.0, 4.0), vec2(11.0, 8.0)), Rounding::same(1.4), s);
+            line(p, o, &[(4.0, 14.5), (9.0, 14.5)], s);
+            line(p, o, &[(6.5, 12.0), (6.5, 14.5)], s);
+        }
+        "memory" => {
+            // a memory module: the board, three chips, the pins below
+            p.rect_stroke(Rect::from_min_max(c + vec2(-7.0, -4.0), c + vec2(7.0, 2.5)), Rounding::same(1.0), s);
+            for x in [-4.5f32, -1.0, 2.5] {
+                p.rect_filled(Rect::from_min_size(c + vec2(x, -2.2), vec2(2.4, 2.8)), Rounding::ZERO, col);
+            }
+            for x in [-5.0f32, -2.5, 0.0, 2.5, 5.0] {
+                line(p, c, &[(x, 2.5), (x, 4.8)], Stroke::new(1.1, col));
+            }
+        }
+        "revert" => {
+            // an arrow going back round (Rescan's, the other way)
+            arc(p, c, 5.0, -90.0, 210.0, s);
+            poly(p, c, &[(-3.6, -7.4), (-6.9, -2.6), (-1.5, -2.3)], col);
+        }
         "rescan" | "retry" => {
             // an arrow going round, its head where it starts
             arc(p, c, 5.0, -30.0, 270.0, s);

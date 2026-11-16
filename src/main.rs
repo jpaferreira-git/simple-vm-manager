@@ -21,6 +21,8 @@ struct Args {
     show: String,
     theme: Option<theme::ThemeMode>,
     sidebar_open: Option<bool>,
+    /// The screenshot window's width (as narrow as 760, the app's least, to check a tight layout).
+    width: f32,
 }
 
 fn main() -> eframe::Result {
@@ -28,17 +30,21 @@ fn main() -> eframe::Result {
     // --show home|welcome|objects|networks|storage|isos|search|logs|vm|console|add-server|confirm|about|iso|
     // iso-advanced|iso-error|iso-disconnect|iso-describe|iso-upload|
     // iso-upload-choose|iso-upload-web|iso-upload-done|iso-delete|new-vm|new-vm-advanced|new-vm-custom|new-vm-no-start|new-vm-created|new-vm-offline|vm-delete|host-console|vm-busy|settings|update|update-progress|host-shutdown|
-    // sr-unmounted|sr-detached|sr-auto-repair|sr-repair-failed|host-down picks what the screenshot shows (default: a VM's
+    // sr-unmounted|sr-detached|sr-auto-repair|sr-repair-failed|host-down|snapshots|snapshot-take|
+    // snapshot-revert|snapshot-delete|snapshot-taken|templates|template|new-vm-template|make-template|
+    // make-template-snapshot|copy-vm|template-made|vm-off|activities|log-detail picks what the screenshot shows (default: a VM's
     // General tab; welcome is Home with no server; storage, search, logs, console and isos show that
     // tab; iso-describe an ISO's description being typed; iso-upload a demo upload under way, -done its
     // finished card; iso-upload-choose and -web the Upload dialog's two steps; sr-unmounted the ISO
     // library mounted nowhere, sr-auto-repair the Logs after the app mounted it again by itself,
     // sr-detached Repair asking where it is,
     // sr-repair-failed Repair's answer when the share doesn't, host-down a server that went down
-    // without shutting down; the rest open a dialog).
-    // --theme system|light|dark and --sidebar open|folded override the saved choices.
+    // without shutting down, snapshots the Web Server's Snapshots tab (the others with a dialog over
+    // it); the rest open a dialog).
+    // --theme system|light|dark and --sidebar open|folded override the saved choices; --width 760…1180
+    // makes the screenshot narrower.
     let argv: Vec<String> = std::env::args().collect();
-    let mut args = Args { shot: None, show: "vm".into(), theme: None, sidebar_open: None };
+    let mut args = Args { shot: None, show: "vm".into(), theme: None, sidebar_open: None, width: 1180.0 };
     let mut i = 1;
     while i < argv.len() {
         let next = argv.get(i + 1).cloned();
@@ -59,6 +65,10 @@ fn main() -> eframe::Result {
                 args.sidebar_open = Some(v != "folded" && v != "closed");
                 i += 1;
             }
+            ("--width", Some(v)) => {
+                args.width = v.parse::<f32>().unwrap_or(1180.0).clamp(760.0, 1180.0);
+                i += 1;
+            }
             _ => {}
         }
         i += 1;
@@ -74,7 +84,8 @@ fn main() -> eframe::Result {
     if shot.is_some() {
         // never take focus during a check; on Windows also sit behind other windows (it still draws there).
         // A fixed size, so tiling window managers float it and every screenshot comes out the same.
-        viewport = viewport.with_active(false).with_min_inner_size([1180.0, 740.0]).with_max_inner_size([1180.0, 740.0]);
+        let size = [args.width, 740.0];
+        viewport = viewport.with_active(false).with_inner_size(size).with_min_inner_size(size).with_max_inner_size(size);
         if cfg!(windows) {
             viewport = viewport.with_window_level(egui::WindowLevel::AlwaysOnBottom);
         }

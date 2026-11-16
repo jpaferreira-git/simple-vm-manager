@@ -28,6 +28,21 @@ pub enum NewVmAction {
     Create(u32, NewVm),
 }
 
+/// One of the user's own templates (made from a VM): its disks come with it.
+struct Own {
+    rref: String,
+    name: String,
+    os: String,
+    vcpus: i64,
+    memory: i64,
+    mem_min: i64,
+    /// Its disks' size, and their storage.
+    disk: i64,
+    sr: String,
+    /// Its network cards' networks, by name.
+    nets: Vec<String>,
+}
+
 struct Iso {
     vdi: String,
     name: String,
@@ -110,6 +125,12 @@ pub struct NewVmDialog {
     checks: HashMap<(String, Option<String>), Check>,
     /// For the screenshot checks: Create, as if clicked.
     press: bool,
+    /// The user's own templates; making it from one of them (else from an ISO), and which.
+    own: Vec<Own>,
+    from_own: bool,
+    own_pick: usize,
+    /// From a template of the user's: keep its network cards (else `net`).
+    keep_nics: bool,
 }
 
 impl NewVmDialog {
@@ -136,6 +157,25 @@ impl NewVmDialog {
         let net = d.networks.iter().filter(|n| !n.bridge.starts_with("xapi")).position(|n| n.bridge == "xenbr0").or(if nets.is_empty() { None } else { Some(0) });
         let mut servers: Vec<Server> = d.hosts.iter().map(|h| Server { rref: h.rref.clone(), name: h.name.clone(), mem_free: h.mem_free, cpus: h.cpu_count }).collect();
         servers.sort_by_key(|s| s.name.to_lowercase());
+        let mut own: Vec<Own> = d
+            .user_templates
+            .iter()
+            .map(|t| {
+                let disks: Vec<&VmDisk> = t.disks.iter().filter(|k| k.kind == "Disk").collect();
+                Own {
+                    rref: t.rref.clone(),
+                    name: t.name.clone(),
+                    os: t.os.clone(),
+                    vcpus: t.vcpus.max(1),
+                    memory: t.mem_dyn_max.max(t.mem_static_max.min(t.mem_dyn_max.max(1))),
+                    mem_min: t.mem_static_min,
+                    disk: disks.iter().map(|k| k.size).sum(),
+                    sr: disks.first().map(|k| k.sr.clone()).unwrap_or_default(),
+                    nets: t.nics.iter().map(|n| n.network.clone()).filter(|n| !n.is_empty()).collect(),
+                }
+            })
+            .collect();
+        own.sort_by_key(|t| t.name.to_lowercase());
         let mut templates = d.templates.clone();
         if !templates.iter().any(|t| t.name == OTHER_MEDIA) {
             templates.insert(0, TemplateInfo { name: OTHER_MEDIA.into(), supports_uefi: true, mem_min: GB, vcpus: 1, ..Default::default() });
@@ -176,11 +216,49 @@ impl NewVmDialog {
             not_started: None,
             checks: HashMap::new(),
             press: false,
+            own,
+            from_own: false,
+            own_pick: 0,
+            keep_nics: true,
         };
         dlg.server = dlg.first_server();
         dlg.server_changed();
         dlg.iso_changed();
         dlg
+    }
+
+    /// Made from the user's template `tpl` (else as it was).
+    pub fn with_template(mut self, tpl: &str) -> NewVmDialog {
+        if let Some(i) = self.own.iter().position(|t| t.rref == tpl) {
+            self.from_own = true;
+            self.own_pick = i;
+            self.own_changed();
+        }
+        self
+    }
+
+    /// Another of the user's templates (or a switch to them): its name (unless one was typed), its
+    /// size, its disks staying where they are (on the server that sees them), its network cards.
+    fn own_changed(&mut self) {
+        let Some(t) = self.own.get(self.own_pick) else { return };
+        if !self.name_typed {
+            let base = t.name.trim_end_matches(" template").trim_end_matches(" Template").trim();
+            self.name = unique_name(if base.is_empty() { &t.name } else { base }, &self.taken);
+        }
+        self.size = 0;
+        self.keep_nics = true;
+        let sr = t.sr.clone();
+        if let Some(i) = self.stores.iter().position(|s| s.rref == sr) {
+            self.store = i;
+            if let Some(h) = self.stores[i].host.clone() {
+                self.server = self.server_index(&h);
+            }
+        }
+    }
+
+    /// The user's template chosen, when making it from one.
+    fn own(&self) -> Option<&Own> {
+        self.own.get(self.own_pick).filter(|_| self.from_own)
     }
 
     /// For the screenshot checks: Advanced open.
@@ -241,10 +319,15 @@ impl NewVmDialog {
     fn to_check(&self) -> Vec<(String, Option<String>)> {
         let host = self.server.map(|i| self.servers[i].rref.clone());
         let mut out = vec![];
-        if let Some(iso) = self.isos.get(self.iso) {
+        if let Some(t) = self.own() {
+            // the template's disks' storage, when it's on the network
+            if self.stores.iter().any(|s| s.rref == t.sr && s.remote) {
+                out.push((t.sr.clone(), host.clone()));
+            }
+        } else if let Some(iso) = self.isos.get(self.iso) {
             out.push((iso.sr.clone(), host.clone()));
         }
-        if let Some(st) = self.chosen_store().filter(|s| s.remote) {
+        if let Some(st) = self.chosen_store().filter(|s| s.remote && !out.iter().any(|o| o.0 == s.rref)) {
             out.push((st.rref.clone(), host));
         }
         out
@@ -402,6 +485,14 @@ impl NewVmDialog {
 
     /// The chosen CPUs, memory and disk (in bytes), or why Custom's numbers won't do.
     fn sizes(&self) -> Result<(i64, i64, i64), String> {
+        if let Some(t) = self.own() {
+            if self.size < 3 {
+                return Ok((t.vcpus, t.memory, t.disk));
+            }
+            let cpus = self.cpus.trim().parse::<i64>().ok().filter(|v| *v > 0).ok_or("CPUs must be a whole number, 1 or more.")?;
+            let mem = self.memory.trim().replace(',', ".").parse::<f64>().ok().filter(|v| *v > 0.0).ok_or("Memory must be a number of GB.")?;
+            return Ok((cpus, (mem * GB as f64) as i64, t.disk));
+        }
         if self.size < 3 {
             let (c, m, k) = self.presets()[self.size];
             return Ok((c, m * GB, k * GB));
@@ -434,6 +525,29 @@ impl NewVmDialog {
     /// What stops it being made.
     fn problems(&self) -> Vec<String> {
         let mut stop = vec![];
+        if let Some(t) = self.own() {
+            if self.name.trim().is_empty() {
+                stop.push("Give it a name.".into());
+            }
+            match self.sizes() {
+                Err(e) => stop.push(e),
+                Ok((cpus, mem, _)) => {
+                    let most_cpus = self.can_run().iter().map(|s| s.cpus).max().unwrap_or(0);
+                    if most_cpus > 0 && cpus > most_cpus {
+                        stop.push(format!("{} CPUs is more than the server has ({}).", cpus, most_cpus));
+                    }
+                    if mem < t.mem_min {
+                        stop.push(format!("The template needs at least {} of memory.", fmt_bytes(t.mem_min)));
+                    }
+                }
+            }
+            match self.chosen_store() {
+                None => stop.push("Pick where its disks go.".into()),
+                Some(s) if s.rref != t.sr && t.disk > s.free => stop.push(format!("{} has only {} free; the disks need {}.", s.name, fmt_bytes(s.free), fmt_bytes(t.disk))),
+                _ => {}
+            }
+            return stop;
+        }
         if self.isos.is_empty() {
             stop.push("There are no ISO files in this pool. Add an ISO library, or upload one to it, first.".into());
         }
@@ -487,6 +601,41 @@ impl NewVmDialog {
 
     /// What to make, or why the choices don't add up.
     fn try_request(&self) -> Result<NewVm, String> {
+        if let Some(t) = self.own() {
+            let (vcpus, memory, disk) = self.sizes()?;
+            let sockets = if vcpus % self.sockets == 0 { self.sockets } else { 1 };
+            let host = self.server.map(|i| &self.servers[i]);
+            let store = self.chosen_store().ok_or("Pick where its disks go.")?;
+            let net = if self.keep_nics { None } else { self.net.and_then(|i| self.nets.get(i)) };
+            let mut names = HashMap::new();
+            names.insert(t.rref.clone(), t.name.clone());
+            names.insert(store.rref.clone(), store.name.clone());
+            if let Some(n) = net {
+                names.insert(n.0.clone(), n.1.clone());
+            }
+            if let Some(h) = host {
+                names.insert(h.rref.clone(), h.name.clone());
+            }
+            return Ok(NewVm {
+                name: self.name.trim().to_string(),
+                description: self.description.trim().to_string(),
+                template: t.rref.clone(),
+                vcpus,
+                cores_per_socket: vcpus / sockets,
+                memory,
+                disk,
+                sr: store.rref.clone(),
+                network: net.map(|n| n.0.clone()),
+                host: host.map(|h| h.rref.clone()),
+                start: self.start,
+                names,
+                check: self.to_check().into_iter().map(|(sr, _)| sr).collect(),
+                from_template: true,
+                copy_to: (store.rref != t.sr).then(|| store.rref.clone()),
+                keep_nics: self.keep_nics,
+                ..Default::default()
+            });
+        }
         let (vcpus, memory, disk) = self.sizes()?;
         let sockets = if vcpus % self.sockets == 0 { self.sockets } else { 1 };
         let host = self.server.map(|i| &self.servers[i]);
@@ -524,6 +673,9 @@ impl NewVmDialog {
             start: self.start,
             names,
             check: self.to_check().into_iter().map(|(sr, _)| sr).collect(),
+            from_template: false,
+            copy_to: None,
+            keep_nics: false,
         })
     }
 
@@ -630,7 +782,9 @@ impl NewVmDialog {
                     }
                     return;
                 }
-                if dialog_button(ui, pal, "close", "Cancel", Look::Plain, !busy) {
+                // while it's being made there's nothing to cancel: the window closes, the making
+                // goes on (under Activities)
+                if dialog_button(ui, pal, "close", if busy { "Close" } else { "Cancel" }, Look::Plain, true) {
                     action = NewVmAction::Close;
                 }
                 let press = std::mem::take(&mut self.press);
@@ -643,7 +797,7 @@ impl NewVmDialog {
                 }
             });
         });
-        if (!busy || self.made_vm.is_some()) && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             action = NewVmAction::Close;
         }
         action
@@ -658,21 +812,67 @@ impl NewVmDialog {
             format!("{} disk on {}", fmt_bytes(spec.disk), self.chosen_store().map(|s| s.name.as_str()).unwrap_or_default()),
         ];
         parts.push(self.server.map(|i| self.servers[i].name.clone()).unwrap_or_else(|| "any server".into()));
-        parts.push(self.net.and_then(|i| self.nets.get(i)).map(|n| n.1.clone()).unwrap_or_else(|| "no network".into()));
+        let net = match self.own() {
+            Some(t) if self.keep_nics => if t.nets.is_empty() { "no network".to_string() } else { t.nets.join(", ") },
+            _ => self.net.and_then(|i| self.nets.get(i)).map(|n| n.1.clone()).unwrap_or_else(|| "no network".into()),
+        };
+        parts.push(net);
         egui::Frame::none().fill(pal.rail).stroke(Stroke::new(1.0, pal.border)).rounding(Rounding::same(8.0)).inner_margin(egui::Margin::symmetric(12.0, 10.0)).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.spacing_mut().item_spacing.y = 3.0;
             ui.label(egui::RichText::new(spec.name.as_str()).font(FontId::new(14.0, FontFamily::Name("bold".into()))).color(pal.ink));
-            let iso = self.isos.get(self.iso).map(|i| i.name.as_str()).unwrap_or_default();
+            let from = match self.own() {
+                Some(t) if spec.copy_to.is_some() => format!("Made from the template {}, its disks copied in full", t.name),
+                Some(t) => format!("Made from the template {}, in an instant", t.name),
+                None => format!("Installs from {}", self.isos.get(self.iso).map(|i| i.name.as_str()).unwrap_or_default()),
+            };
             ui.add(egui::Label::new(egui::RichText::new(parts.join("  ·  ")).size(12.5).color(pal.ink_soft)).wrap());
-            ui.add(egui::Label::new(egui::RichText::new(format!("Installs from {}", iso)).size(12.5).color(pal.ink_soft)).truncate());
+            ui.add(egui::Label::new(egui::RichText::new(from).size(12.5).color(pal.ink_soft)).truncate());
         });
     }
 
     fn form(&mut self, ui: &mut Ui, pal: &Pal) {
         combo_style(ui, pal);
-        // Install from
-        ui.horizontal(|ui| {
+        // from an ISO, or from one of the user's templates (when there are any)
+        if !self.own.is_empty() {
+            ui.horizontal(|ui| {
+                field_label(ui, "Create from:", LABEL_WIDTH);
+                let mut i = self.from_own as usize;
+                if crate::isolib::segmented(ui, pal, &["An ISO", "A template"], &mut i, ui.available_width()) {
+                    self.from_own = i == 1;
+                    self.name_typed = false;
+                    self.size = if self.from_own { 0 } else { 1 };
+                    if self.from_own {
+                        self.own_changed();
+                    } else {
+                        self.keep_nics = true;
+                        self.server = self.first_server();
+                        self.server_changed();
+                        self.iso_changed();
+                    }
+                }
+            });
+        }
+        if self.from_own {
+            ui.horizontal(|ui| {
+                field_label(ui, "Template:", LABEL_WIDTH);
+                let label = |t: &Own| if t.os.is_empty() { t.name.clone() } else { format!("{}   ·  {}", t.name, t.os) };
+                let shown = self.own.get(self.own_pick).map(label).unwrap_or_default();
+                let mut picked = self.own_pick;
+                combo("newvm-own", shown, ui.available_width()).height(320.0).show_ui(ui, |ui| {
+                    for (i, t) in self.own.iter().enumerate() {
+                        ui.selectable_value(&mut picked, i, label(t));
+                    }
+                });
+                if picked != self.own_pick {
+                    self.own_pick = picked;
+                    self.own_changed();
+                }
+            });
+        }
+        // Install from (an ISO)
+        if !self.from_own {
+            ui.horizontal(|ui| {
             field_label(ui, "Install from:", LABEL_WIDTH);
             let shown = self.isos.get(self.iso).map(|i| i.name.clone()).unwrap_or_else(|| "No ISO files".into());
             let libs = self.isos.iter().map(|i| &i.lib).collect::<std::collections::HashSet<_>>().len();
@@ -687,7 +887,8 @@ impl NewVmDialog {
                 self.iso = picked;
                 self.iso_changed();
             }
-        });
+            });
+        }
         // Name
         ui.horizontal(|ui| {
             field_label(ui, "Name:", LABEL_WIDTH);
@@ -703,8 +904,25 @@ impl NewVmDialog {
                 ui.add_space(title_y - FIELD_HEIGHT / 2.0);
                 field_label(ui, "Size:", LABEL_WIDTH);
             });
-            let presets = self.presets();
             let gap = 8.0;
+            if let Some(t) = self.own() {
+                // as the template, or other CPUs and memory (its disks come as they are)
+                let w = (ui.available_width() - gap) / 2.0;
+                ui.spacing_mut().item_spacing.x = gap;
+                let (c, m, k) = (t.vcpus, t.memory, t.disk);
+                let lines = vec![format!("{} CPU{}", c, if c == 1 { "" } else { "s" }), format!("{} memory", fmt_bytes(m)), format!("{} disk", fmt_bytes(k))];
+                let custom = vec!["Other CPUs".to_string(), "and memory".to_string()];
+                for (i, title, lines) in [(0usize, "As the template", lines), (3usize, "Custom", custom)] {
+                    if size_card(ui, pal, vec2(w, h), title, &lines, self.size == i).clicked() && self.size != i {
+                        if i == 3 {
+                            (self.cpus, self.memory) = (c.to_string(), format!("{}", (m as f64 / GB as f64 * 10.0).round() / 10.0));
+                        }
+                        self.size = i;
+                    }
+                }
+                return;
+            }
+            let presets = self.presets();
             let w = (ui.available_width() - 3.0 * gap) / 4.0;
             ui.spacing_mut().item_spacing.x = gap;
             for (i, title) in ["Small", "Medium", "Large", "Custom"].iter().enumerate() {
@@ -755,8 +973,13 @@ impl NewVmDialog {
             }
         });
         ui.horizontal(|ui| {
-            field_label(ui, "Disk on:", LABEL_WIDTH);
-            let label = |s: &Store| format!("{}  ·  {} free", s.name, fmt_bytes(s.free));
+            field_label(ui, if self.from_own { "Disks on:" } else { "Disk on:" }, LABEL_WIDTH);
+            let tpl_sr = self.own().map(|t| t.sr.clone());
+            let label = |s: &Store| match &tpl_sr {
+                Some(r) if *r == s.rref => format!("{}  ·  with the template, an instant copy", s.name),
+                Some(_) => format!("{}  ·  {} free, a full copy", s.name, fmt_bytes(s.free)),
+                None => format!("{}  ·  {} free", s.name, fmt_bytes(s.free)),
+            };
             let shown = self.chosen_store().map(label).unwrap_or_else(|| "No storage".into());
             let mut picked = self.store;
             combo("newvm-sr", shown, ui.available_width()).show_ui(ui, |ui| {
@@ -769,14 +992,28 @@ impl NewVmDialog {
         // Network
         ui.horizontal(|ui| {
             field_label(ui, "Network:", LABEL_WIDTH);
-            let shown = self.net.and_then(|i| self.nets.get(i)).map(|n| n.1.clone()).unwrap_or_else(|| "No network".into());
+            let as_template = self.own().map(|t| if t.nets.is_empty() { "As in the template (none)".to_string() } else { format!("As in the template ({})", t.nets.join(", ")) });
+            let shown = match (&as_template, self.keep_nics) {
+                (Some(a), true) => a.clone(),
+                _ => self.net.and_then(|i| self.nets.get(i)).map(|n| n.1.clone()).unwrap_or_else(|| "No network".into()),
+            };
+            // (None, keep) as the template; (Some(i), _) that network; (None, no keep) none
+            let mut choice = if as_template.is_some() && self.keep_nics { (None, true) } else { (self.net, false) };
             combo("newvm-net", shown, ui.available_width()).show_ui(ui, |ui| {
+                if let Some(a) = &as_template {
+                    ui.selectable_value(&mut choice, (None, true), a.as_str());
+                    ui.separator();
+                }
                 for (i, n) in self.nets.iter().enumerate() {
-                    ui.selectable_value(&mut self.net, Some(i), n.1.as_str());
+                    ui.selectable_value(&mut choice, (Some(i), false), n.1.as_str());
                 }
                 ui.separator();
-                ui.selectable_value(&mut self.net, None, "No network");
+                ui.selectable_value(&mut choice, (None, false), "No network");
             });
+            self.keep_nics = choice.1 && as_template.is_some();
+            if !self.keep_nics {
+                self.net = choice.0;
+            }
         });
         self.advanced_part(ui, pal);
     }
@@ -797,7 +1034,9 @@ impl NewVmDialog {
                     ui.add_space(((w - before) / 2.0).max(0.0));
                     let start = ui.cursor().min.x;
                     let mut end = start;
-                    for (i, (label, value, unit)) in [("CPUs", &mut self.cpus, ""), ("Memory", &mut self.memory, "GB"), ("Disk", &mut self.disk, "GB")].into_iter().enumerate() {
+                    let fields = [("CPUs", &mut self.cpus, ""), ("Memory", &mut self.memory, "GB"), ("Disk", &mut self.disk, "GB")];
+                    let shown = if self.from_own { 2 } else { 3 };
+                    for (i, (label, value, unit)) in fields.into_iter().take(shown).enumerate() {
                         if i > 0 {
                             ui.add_space(18.0);
                         }
@@ -818,6 +1057,40 @@ impl NewVmDialog {
     }
 
     fn advanced_part(&mut self, ui: &mut Ui, pal: &Pal) {
+        if self.from_own {
+            // from a template of the user's: its system and boot mode come with it
+            let cpus = self.sizes().map(|s| s.0).unwrap_or(1);
+            if cpus % self.sockets != 0 {
+                self.sockets = 1;
+            }
+            let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::click());
+            if resp.hovered() {
+                ui.painter().rect_filled(r, Rounding::same(5.0), pal.hover);
+            }
+            let c = pos2(r.min.x + 10.0, r.center().y);
+            let chev = if self.advanced { vec![c + vec2(-3.5, -1.5), c + vec2(0.0, 2.0), c + vec2(3.5, -1.5)] } else { vec![c + vec2(-1.5, -3.5), c + vec2(2.0, 0.0), c + vec2(-1.5, 3.5)] };
+            ui.painter().add(egui::Shape::line(chev, Stroke::new(1.4, pal.ink_soft)));
+            ui.painter().text(pos2(r.min.x + 22.0, r.center().y), Align2::LEFT_CENTER, "Advanced", FontId::proportional(13.0), pal.ink);
+            ui.painter().text(pos2(r.max.x - 8.0, r.center().y), Align2::RIGHT_CENTER, sockets_text(self.sockets, cpus), FontId::proportional(12.0), pal.ink_soft);
+            if resp.clicked() {
+                self.advanced = !self.advanced;
+            }
+            if self.advanced {
+                ui.horizontal(|ui| {
+                    field_label(ui, "CPU layout:", LABEL_WIDTH);
+                    combo("newvm-sockets", sockets_text(self.sockets, cpus), ui.available_width()).show_ui(ui, |ui| {
+                        for s in (1..=cpus).filter(|s| cpus % s == 0) {
+                            ui.selectable_value(&mut self.sockets, s, sockets_text(s, cpus));
+                        }
+                    });
+                });
+                ui.horizontal(|ui| {
+                    field_label(ui, "Description:", LABEL_WIDTH);
+                    text_field(ui, pal, &mut self.description, ui.available_width(), false);
+                });
+            }
+            return;
+        }
         let t = self.templates[self.template].clone();
         let boot = self.boot.unwrap_or(self.template_boot());
         let cpus = self.sizes().map(|s| s.0).unwrap_or(1);
@@ -905,12 +1178,12 @@ impl NewVmDialog {
 
 /// A drop-down list as wide as `width`, a text too long for it cut short with "…" (a long ISO
 /// name would otherwise widen the dialog).
-fn combo(id: &str, shown: String, width: f32) -> egui::ComboBox {
+pub(crate) fn combo(id: &str, shown: String, width: f32) -> egui::ComboBox {
     egui::ComboBox::from_id_salt(id).selected_text(shown).width(width).truncate()
 }
 
 /// Drop-down lists drawn like the text boxes: as tall, with the same border and fill.
-fn combo_style(ui: &mut Ui, pal: &Pal) {
+pub(crate) fn combo_style(ui: &mut Ui, pal: &Pal) {
     ui.spacing_mut().interact_size.y = FIELD_HEIGHT;
     ui.spacing_mut().button_padding = vec2(7.0, 3.0);
     let v = ui.visuals_mut();
@@ -947,7 +1220,7 @@ fn note(ui: &mut Ui, pal: &Pal, text: &str) {
 
 /// Each call made to the server and its answer, as in a terminal (the latest at the bottom),
 /// with Copy.
-fn transcript(ui: &mut Ui, pal: &Pal, tr: &Trace, copied: &mut Option<Instant>, running: bool) {
+pub(crate) fn transcript(ui: &mut Ui, pal: &Pal, tr: &Trace, copied: &mut Option<Instant>, running: bool) {
     let lines = tr.lines();
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("What the server said").size(12.0).color(pal.ink_soft));
@@ -1101,6 +1374,28 @@ mod tests {
         d.srs.iter_mut().find(|x| x.rref == "sr-iso").unwrap().host = Some("host-a".into());
         let dlg = NewVmDialog::new(1, &d, None);
         assert_eq!(place(&dlg), (Some("host-a".into()), "sr-nfs".into()));
+    }
+
+    #[test]
+    fn from_a_template() {
+        let d = DemoConnection::new().fetch(0).unwrap();
+        let mut dlg = NewVmDialog::new(1, &d, None).with_template("tpl-web");
+        let spec = dlg.request().unwrap();
+        assert!(spec.from_template && spec.keep_nics && spec.iso.is_empty());
+        assert_eq!((spec.template.as_str(), spec.name.as_str()), ("tpl-web", "Ubuntu 24.04 web server"));
+        assert_eq!((spec.vcpus, spec.memory, spec.disk), (2, 4 * GB, 40 * GB));
+        // its disks stay on its own storage: an instant copy, checked first (it's NFS)
+        assert_eq!((spec.sr.as_str(), spec.copy_to.as_ref()), ("sr-nfs", None));
+        assert_eq!(spec.check, vec!["sr-nfs".to_string()]);
+        // onto a server's own storage: a full copy there
+        dlg.server = dlg.server_index("host-a");
+        dlg.store = dlg.stores.iter().position(|s| s.rref == "sr-local1").unwrap();
+        assert_eq!(dlg.request().unwrap().copy_to.as_deref(), Some("sr-local1"));
+        // other CPUs and memory, its disk as it is
+        dlg.size = 3;
+        (dlg.cpus, dlg.memory) = ("6".into(), "12".into());
+        let spec = dlg.request().unwrap();
+        assert_eq!((spec.vcpus, spec.memory, spec.disk), (6, 12 * GB, 40 * GB));
     }
 
     #[test]

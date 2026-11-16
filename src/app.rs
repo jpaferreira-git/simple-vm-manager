@@ -76,6 +76,15 @@ enum Msg {
     /// Mounting a storage again ended: each server tried and how it went; `auto`: the app did it
     /// by itself on finding it unmounted.
     SrRepaired { sid: u32, sr: String, name: String, auto: bool, result: Result<Vec<(String, Result<(), ApiError>)>, ApiError> },
+    /// A snapshot job on VM `vm` ended (taking one, reverting to one, deleting one): its log line,
+    /// and what to call it if it failed; what's worth saying though it worked (disks left behind).
+    SnapDone { sid: u32, vm: String, snap: Option<String>, log: usize, title: &'static str, text: String, result: Result<Vec<String>, ApiError> },
+    /// Making a template (`template`) or a copy of VM `vm` ended: the new one, or why not.
+    Made { sid: u32, vm: String, name: String, log: usize, title: &'static str, text: String, template: bool, result: Result<String, ApiError> },
+    /// Deleting a template of the user's ended: the disks left behind, or why not.
+    TemplateDeleted { sid: u32, tpl: String, name: String, log: usize, result: Result<Vec<String>, ApiError> },
+    /// Saving a snapshot's description ended.
+    SnapDescribed { sid: u32, vm: String, snap: String, name: String, text: String, result: Result<(), ApiError> },
     /// Giving a detached library its settings back ended.
     Reattached { sid: u32, sr: String, lib: IsoLibrary, result: Result<(), ApiError> },
     /// Making a new VM ended: its name, and whether it was to start.
@@ -142,6 +151,20 @@ struct IsoEdit {
     focus: bool,
 }
 
+/// A VM or template being made when its server went quiet (or the app closed): once that
+/// server's back, what's there under its name that wasn't before may be half made.
+#[derive(Clone, Debug, PartialEq)]
+struct Unfinished {
+    host: String,
+    user: String,
+    name: String,
+    /// What already had that name.
+    before: Vec<String>,
+    /// Its job ended without the server's word (or the app closed meanwhile): look once it's back.
+    lost: bool,
+}
+
+#[derive(Clone)]
 struct LogEntry {
     time: String,
     sid: u32,
@@ -150,6 +173,12 @@ struct LogEntry {
     obj: String,
     text: String,
     status: String,
+    /// When it began; and, for something that runs a while (it began "In progress"), how far its
+    /// task on the server is: listed under Activities.
+    started: Instant,
+    progress: Option<Arc<Progress>>,
+    /// Listed under Activities: something that ran a while, or a server going or coming back.
+    activity: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -162,8 +191,10 @@ enum Kind {
     Vm,
     Sr,
     Net,
-    /// "Shared Storage" or "Virtual Networks" in a pool (rref is "srs" or "nets").
+    /// "Shared Storage", "Virtual Networks" or "Templates" in a pool (rref is "srs", "nets" or "tpls").
     Folder,
+    /// A template the user made.
+    Template,
 }
 
 #[derive(Clone)]
@@ -201,6 +232,9 @@ enum Tab {
     Networking,
     Console,
     IsoFiles,
+    Snapshots,
+    /// The Templates folder's list.
+    Templates,
     Logs,
 }
 
@@ -215,6 +249,8 @@ impl Tab {
             Tab::Networking => "Networking",
             Tab::Console => "Console",
             Tab::IsoFiles => "ISO Files",
+            Tab::Snapshots => "Snapshots",
+            Tab::Templates => "Templates",
             Tab::Logs => "Logs",
         }
     }
@@ -243,6 +279,25 @@ enum Dialog {
     /// Deleting a VM: whether it's on (turned off first), its disks, how many snapshots it has,
     /// and whether its disks go too (ticked to begin with).
     ConfirmDeleteVm { sid: u32, vm: String, name: String, running: bool, disks: Vec<VmDisk>, snapshots: usize, delete_disks: bool },
+    /// Take Snapshot: of VM `vm`; `can_memory`: it's running, so its memory can go in too
+    /// (`memory_size` of it); `focus`: put the cursor in the name on the next frame.
+    TakeSnapshot { sid: u32, vm: String, vm_name: String, name: String, description: String, memory: bool, can_memory: bool, memory_size: i64, focus: bool },
+    /// Reverting to snapshot `snap`: what happens, in words, and whether a snapshot of now is taken first.
+    ConfirmRevert { sid: u32, snap: String, vm_name: String, snap_name: String, text: String, first: bool },
+    ConfirmDeleteSnapshot { sid: u32, snap: String, vm_name: String, snap_name: String, memory: bool },
+    /// Make Template: from `source` (VM `vm`, off, or one of its snapshots), `from` saying which in
+    /// words; `power_cut`: a snapshot of its disks taken while it was running.
+    MakeTemplate { sid: u32, vm: String, source: String, from: String, name: String, description: String, power_cut: bool, focus: bool },
+    /// Copy VM: where its disks can go (reference, label, whether it's where they are now: an
+    /// instant copy), and which.
+    CopyVm { sid: u32, vm: String, vm_name: String, name: String, stores: Vec<(String, String, bool)>, store: usize, focus: bool },
+    ConfirmDeleteTemplate { sid: u32, tpl: String, name: String, disk: i64 },
+    /// Something was being made when contact with the server was lost, and is there now (maybe
+    /// half made): delete it?
+    ConfirmLeftover { sid: u32, name: String, refs: Vec<String>, server: String },
+    /// A log entry in full (from Activities or Logs): what happened, and the calls made to the
+    /// server with its answers; when the Copy button was last used.
+    LogDetail { index: usize, copied: Option<Instant> },
 }
 
 /// The Update dialog: the release, this copy's file when it can replace itself, the download under
@@ -275,6 +330,23 @@ enum Intent {
     AskDeleteIso(u32, String, String),
     /// Ask before deleting a VM: server, VM.
     AskDeleteVm(u32, String),
+    /// Open the Take Snapshot dialog: server, VM.
+    TakeSnapshot(u32, String),
+    /// Show a log entry in full.
+    ShowLog(usize),
+    /// Open the Make Template dialog: server, a VM that's off or a snapshot.
+    MakeTemplate(u32, String),
+    /// Open the Copy VM dialog: server, VM.
+    CopyVm(u32, String),
+    /// Open the New VM dialog on this template of the user's: server, template.
+    NewVmFromTemplate(u32, String),
+    /// Ask before deleting a template of the user's: server, template.
+    AskDeleteTemplate(u32, String),
+    /// Ask before reverting a VM to a snapshot, or deleting one: server, snapshot.
+    AskRevert(u32, String),
+    AskDeleteSnapshot(u32, String),
+    /// Save a snapshot's description: server, snapshot, text.
+    SaveSnapshotDescription(u32, String, String),
     /// Ask before shutting a server down: pool, server.
     AskShutdownHost(u32, String),
     /// Hide a finished upload's card.
@@ -308,6 +380,10 @@ pub struct App {
     servers: Vec<ServerEntry>,
     next_id: u32,
     log: Vec<LogEntry>,
+    /// Jobs under way that log only when they end, by key: their "In progress" line.
+    jobs: HashMap<String, usize>,
+    /// What was being made when contact was lost, kept in a file till it's sorted out.
+    unfinished: Vec<Unfinished>,
     tx: mpsc::Sender<Msg>,
     rx: mpsc::Receiver<Msg>,
     selected: String,
@@ -349,6 +425,12 @@ pub struct App {
     iso_edit: Option<IsoEdit>,
     /// Descriptions being saved, by disc, shown until the server answers.
     iso_saving: HashMap<String, String>,
+    /// The snapshot whose description is being typed in, if any (keyed by the snapshot).
+    snap_edit: Option<IsoEdit>,
+    /// Snapshot descriptions being saved, by snapshot, shown until the server answers.
+    snap_saving: HashMap<String, String>,
+    /// Snapshots being deleted.
+    snap_deleting: HashSet<String>,
     /// ISO files being deleted, by disc.
     iso_deleting: HashSet<String>,
     /// VMs being deleted right now.
@@ -385,6 +467,8 @@ impl App {
             servers: vec![],
             next_id: 1,
             log: vec![],
+            jobs: HashMap::new(),
+            unfinished: load_unfinished(),
             tx,
             rx,
             selected: "root".into(),
@@ -415,6 +499,9 @@ impl App {
             sr_checking: HashSet::new(),
             iso_edit: None,
             iso_saving: HashMap::new(),
+            snap_edit: None,
+            snap_saving: HashMap::new(),
+            snap_deleting: HashSet::new(),
             iso_deleting: HashSet::new(),
             vm_deleting: HashSet::new(),
             host_busy: HashSet::new(),
@@ -527,9 +614,12 @@ impl App {
     fn sr_job(&mut self, sid: u32, sr: String, forget: bool, ctx: &egui::Context) {
         let Some(s) = self.server(sid) else { return };
         let name = s.data.as_ref().and_then(|d| d.sr(&sr)).map(|x| x.name.clone()).unwrap_or_default();
-        let (conn, tx, ctx) = (s.conn.clone(), self.tx.clone(), ctx.clone());
+        let (conn, tx, ctx, server) = (s.conn.clone(), self.tx.clone(), ctx.clone(), s.name());
         self.sr_busy.insert(sr.clone());
+        let text = if forget { format!("Disconnecting ISO library '{}'", name) } else { format!("Rescanning '{}'", name) };
+        let prog = self.job(format!("sr:{}", sr), sid, &server, Some(&sr), &name, &text);
         std::thread::spawn(move || {
+            crate::conn::watch(&prog);
             let result = if forget { conn.forget_sr(&sr) } else { conn.scan_sr(&sr) };
             let _ = tx.send(Msg::SrDone { sid, sr, name, forget, result });
             ctx.request_repaint();
@@ -556,9 +646,12 @@ impl App {
     fn repair_job(&mut self, sid: u32, sr: String, auto: bool, ctx: &egui::Context) {
         let Some(s) = self.server(sid) else { return };
         let name = s.data.as_ref().and_then(|d| d.sr(&sr)).map(|x| x.name.clone()).unwrap_or_default();
-        let (conn, tx, ctx) = (s.conn.clone(), self.tx.clone(), ctx.clone());
+        let (conn, tx, ctx, server) = (s.conn.clone(), self.tx.clone(), ctx.clone(), s.name());
         self.sr_busy.insert(sr.clone());
+        let text = if auto { format!("Found '{}' unmounted; mounting it again", name) } else { format!("Mounting '{}' again", name) };
+        let prog = self.job(format!("sr:{}", sr), sid, &server, Some(&sr), &name, &text);
         std::thread::spawn(move || {
+            crate::conn::watch(&prog);
             let result = conn.repair_sr(&sr);
             let _ = tx.send(Msg::SrRepaired { sid, sr, name, auto, result });
             ctx.request_repaint();
@@ -568,9 +661,11 @@ impl App {
     /// Gives a detached library the settings typed in the Repair dialog, in the background.
     fn reattach_job(&mut self, sid: u32, sr: String, lib: IsoLibrary, ctx: &egui::Context) {
         let Some(s) = self.server(sid) else { return };
-        let (conn, tx, ctx) = (s.conn.clone(), self.tx.clone(), ctx.clone());
+        let (conn, tx, ctx, server) = (s.conn.clone(), self.tx.clone(), ctx.clone(), s.name());
         self.sr_busy.insert(sr.clone());
+        let prog = self.job(format!("sr:{}", sr), sid, &server, Some(&sr), &lib.name, &format!("Mounting '{}' again from {}", lib.name, lib.location));
         std::thread::spawn(move || {
+            crate::conn::watch(&prog);
             let result = conn.reattach_sr(&sr, &lib);
             let _ = tx.send(Msg::Reattached { sid, sr, lib, result });
             ctx.request_repaint();
@@ -654,9 +749,13 @@ impl App {
             }
             return;
         };
-        let (conn, tx, ctx) = (s.conn.clone(), self.tx.clone(), ctx.clone());
+        let (conn, tx, ctx, server) = (s.conn.clone(), self.tx.clone(), ctx.clone(), s.name());
         self.creating += 1;
+        let what = if spec.from_template { format!("Creating VM '{}' from a template", spec.name) } else { format!("Creating VM '{}'", spec.name) };
+        let prog = self.job(format!("newvm:{}:{}", sid, spec.name), sid, &server, None, &spec.name, &what);
+        self.remember_unfinished(sid, &spec.name);
         std::thread::spawn(move || {
+            crate::conn::watch(&prog);
             let result = conn.create_vm(&spec, &trace);
             let made = result.as_ref().ok().cloned();
             let _ = tx.send(Msg::VmCreated { sid, name: spec.name.clone(), start: spec.start, result });
@@ -716,9 +815,11 @@ impl App {
     fn shutdown_host(&mut self, sid: u32, host: String, name: String, ctx: &egui::Context) {
         let Some((conn, server)) = self.server(sid).map(|s| (s.conn.clone(), s.name())) else { return };
         let log = self.add_log(sid, &server, None, &name, &format!("Shutting down server '{}'", name), "In progress");
+        let prog = self.progress(log);
         self.host_busy.insert(host.clone());
         let (tx, ctx) = (self.tx.clone(), ctx.clone());
         std::thread::spawn(move || {
+            crate::conn::watch(&prog);
             let result = conn.shutdown_host(&host);
             let _ = tx.send(Msg::HostShutdown { sid, host, name, log, result });
             ctx.request_repaint();
@@ -727,12 +828,157 @@ impl App {
 
     /// Deletes a VM (and, with `disks`, its disks) in the background.
     fn delete_vm(&mut self, sid: u32, vm: String, name: String, disks: bool, ctx: &egui::Context) {
-        let Some(conn) = self.server(sid).map(|s| s.conn.clone()) else { return };
+        let Some((conn, server)) = self.server(sid).map(|s| (s.conn.clone(), s.name())) else { return };
         let (tx, ctx) = (self.tx.clone(), ctx.clone());
         self.vm_deleting.insert(vm.clone());
+        let prog = self.job(format!("vmdel:{}", vm), sid, &server, Some(&vm), &name, &format!("Deleting VM '{}'", name));
         std::thread::spawn(move || {
+            crate::conn::watch(&prog);
             let result = conn.delete_vm(&vm, disks);
             let _ = tx.send(Msg::VmDeleted { sid, vm, name, result });
+            ctx.request_repaint();
+        });
+    }
+
+    /// Takes a snapshot of a VM in the background, its icon turning meanwhile.
+    fn take_snapshot(&mut self, sid: u32, vm: String, name: String, description: String, memory: bool, ctx: &egui::Context) {
+        let Some(s) = self.server(sid) else { return };
+        let Some(v) = s.data.as_ref().and_then(|d| d.vm(&vm)) else { return };
+        let what = if memory { "with its memory" } else { "of its disks" };
+        let text = format!("Taking snapshot '{}' of VM '{}' ({})", name, v.name, what);
+        let (conn, tx, ctx, server, vm_name) = (s.conn.clone(), self.tx.clone(), ctx.clone(), s.name(), v.name.clone());
+        let log = self.add_log(sid, &server, Some(&vm), &vm_name, &text, "In progress");
+        let prog = self.progress(log);
+        if let Some(s) = self.server_mut(sid) {
+            s.busy.insert(vm.clone(), ("Taking a snapshot…".into(), "snapshot"));
+        }
+        std::thread::spawn(move || {
+            crate::conn::watch(&prog);
+            let result = conn.snapshot_vm(&vm, &name, &description, memory).map(|_| vec![]);
+            let _ = tx.send(Msg::SnapDone { sid, vm, snap: None, log, title: "Take Snapshot", text, result });
+            ctx.request_repaint();
+        });
+    }
+
+    /// Reverts a VM to a snapshot in the background (with `first`, after taking a snapshot of
+    /// now), its icon turning meanwhile.
+    fn revert(&mut self, sid: u32, snap: String, first: bool, ctx: &egui::Context) {
+        let Some(s) = self.server(sid) else { return };
+        let Some((v, x)) = s.data.as_ref().and_then(|d| d.vms.iter().find_map(|v| v.snapshot(&snap).map(|x| (v, x)))) else { return };
+        let (vm, vm_name, snap_name) = (v.rref.clone(), v.name.clone(), x.name.clone());
+        let text = format!("Reverting VM '{}' to snapshot '{}'", vm_name, snap_name);
+        let (conn, tx, ctx, server) = (s.conn.clone(), self.tx.clone(), ctx.clone(), s.name());
+        let log = self.add_log(sid, &server, Some(&vm), &vm_name, &text, "In progress");
+        let prog = self.progress(log);
+        if let Some(s) = self.server_mut(sid) {
+            s.busy.insert(vm.clone(), ("Reverting…".into(), "revert"));
+        }
+        let now_name = format!("Before reverting to {}", snap_name);
+        std::thread::spawn(move || {
+            crate::conn::watch(&prog);
+            let result = (|| {
+                if first {
+                    conn.snapshot_vm(&vm, &now_name, "", false)?;
+                }
+                conn.revert_vm(&snap)
+            })()
+            .map(|_| vec![]);
+            let _ = tx.send(Msg::SnapDone { sid, vm, snap: Some(snap), log, title: "Revert", text, result });
+            ctx.request_repaint();
+        });
+    }
+
+    /// Deletes a snapshot in the background, its row saying so meanwhile.
+    fn delete_snapshot(&mut self, sid: u32, snap: String, ctx: &egui::Context) {
+        let Some(s) = self.server(sid) else { return };
+        let Some((v, x)) = s.data.as_ref().and_then(|d| d.vms.iter().find_map(|v| v.snapshot(&snap).map(|x| (v, x)))) else { return };
+        let (vm, vm_name) = (v.rref.clone(), v.name.clone());
+        let text = format!("Deleting snapshot '{}' of VM '{}'", x.name, vm_name);
+        let (conn, tx, ctx, server) = (s.conn.clone(), self.tx.clone(), ctx.clone(), s.name());
+        let log = self.add_log(sid, &server, Some(&vm), &vm_name, &text, "In progress");
+        let prog = self.progress(log);
+        self.snap_deleting.insert(snap.clone());
+        if self.snap_edit.as_ref().map_or(false, |e| e.vdi == snap) {
+            self.snap_edit = None;
+        }
+        std::thread::spawn(move || {
+            crate::conn::watch(&prog);
+            let result = conn.delete_snapshot(&snap);
+            let _ = tx.send(Msg::SnapDone { sid, vm, snap: Some(snap), log, title: "Delete Snapshot", text, result });
+            ctx.request_repaint();
+        });
+    }
+
+    /// Makes a template from a VM that's off, or one of its snapshots, in the background, the VM's
+    /// icon turning meanwhile.
+    fn make_template(&mut self, sid: u32, vm: String, source: String, name: String, description: String, ctx: &egui::Context) {
+        let Some(s) = self.server(sid) else { return };
+        let Some(v) = s.data.as_ref().and_then(|d| d.vm(&vm)) else { return };
+        let text = format!("Making template '{}' from VM '{}'", name, v.name);
+        let (conn, tx, ctx, server, vm_name) = (s.conn.clone(), self.tx.clone(), ctx.clone(), s.name(), v.name.clone());
+        let log = self.add_log(sid, &server, Some(&vm), &vm_name, &text, "In progress");
+        let prog = self.progress(log);
+        self.remember_unfinished(sid, &name);
+        if let Some(s) = self.server_mut(sid) {
+            s.busy.insert(vm.clone(), ("Making a template…".into(), "copy"));
+        }
+        std::thread::spawn(move || {
+            crate::conn::watch(&prog);
+            let result = conn.make_template(&source, &name, &description);
+            let _ = tx.send(Msg::Made { sid, vm, name, log, title: "Make Template", text, template: true, result });
+            ctx.request_repaint();
+        });
+    }
+
+    /// Copies a VM that's off in the background, its icon turning meanwhile.
+    fn copy_vm(&mut self, sid: u32, vm: String, name: String, sr: Option<String>, ctx: &egui::Context) {
+        let Some(s) = self.server(sid) else { return };
+        let Some(v) = s.data.as_ref().and_then(|d| d.vm(&vm)) else { return };
+        let onto = sr.as_deref().and_then(|r| s.data.as_ref().and_then(|d| d.sr(r))).map(|x| format!(" onto {}", x.name)).unwrap_or_default();
+        let text = format!("Copying VM '{}' as '{}'{}", v.name, name, onto);
+        let (conn, tx, ctx, server, vm_name) = (s.conn.clone(), self.tx.clone(), ctx.clone(), s.name(), v.name.clone());
+        let log = self.add_log(sid, &server, Some(&vm), &vm_name, &text, "In progress");
+        let prog = self.progress(log);
+        self.remember_unfinished(sid, &name);
+        if let Some(s) = self.server_mut(sid) {
+            s.busy.insert(vm.clone(), ("Copying…".into(), "copy"));
+        }
+        std::thread::spawn(move || {
+            crate::conn::watch(&prog);
+            let result = conn.copy_vm(&vm, &name, sr.as_deref());
+            let _ = tx.send(Msg::Made { sid, vm, name, log, title: "Copy VM", text, template: false, result });
+            ctx.request_repaint();
+        });
+    }
+
+    /// Deletes a template of the user's and its disks in the background.
+    fn delete_template(&mut self, sid: u32, tpl: String, ctx: &egui::Context) {
+        let Some(s) = self.server(sid) else { return };
+        let Some(t) = s.data.as_ref().and_then(|d| d.user_template(&tpl)) else { return };
+        let name = t.name.clone();
+        let (conn, tx, ctx, server) = (s.conn.clone(), self.tx.clone(), ctx.clone(), s.name());
+        let log = self.add_log(sid, &server, Some(&tpl), &name, &format!("Deleting template '{}'", name), "In progress");
+        let prog = self.progress(log);
+        if let Some(s) = self.server_mut(sid) {
+            s.busy.insert(tpl.clone(), ("Deleting…".into(), "delete"));
+        }
+        std::thread::spawn(move || {
+            crate::conn::watch(&prog);
+            let result = conn.delete_vm(&tpl, true);
+            let _ = tx.send(Msg::TemplateDeleted { sid, tpl, name, log, result });
+            ctx.request_repaint();
+        });
+    }
+
+    fn save_snapshot_description(&mut self, sid: u32, snap: String, text: String, ctx: &egui::Context) {
+        let Some(s) = self.server(sid) else { return };
+        let Some((v, x)) = s.data.as_ref().and_then(|d| d.vms.iter().find_map(|v| v.snapshot(&snap).map(|x| (v, x)))) else { return };
+        let (vm, name) = (v.rref.clone(), x.name.clone());
+        let (conn, tx, ctx) = (s.conn.clone(), self.tx.clone(), ctx.clone());
+        self.snap_saving.insert(snap.clone(), text.clone());
+        std::thread::spawn(move || {
+            let result = conn.set_vm_description(&snap, &text);
+            let _ = tx.send(Msg::SnapDescribed { sid, vm, snap, name, text, result });
             ctx.request_repaint();
         });
     }
@@ -740,12 +986,15 @@ impl App {
     /// Deletes an ISO file in the background.
     fn delete_iso(&mut self, sid: u32, sr: String, vdi: String, name: String, ctx: &egui::Context) {
         let Some(s) = self.server(sid) else { return };
-        let (conn, tx, ctx) = (s.conn.clone(), self.tx.clone(), ctx.clone());
+        let (conn, tx, ctx, server) = (s.conn.clone(), self.tx.clone(), ctx.clone(), s.name());
+        let lib = s.data.as_ref().and_then(|d| d.sr(&sr)).map(|x| x.name.clone()).unwrap_or_default();
         self.iso_deleting.insert(vdi.clone());
         if self.iso_edit.as_ref().map_or(false, |e| e.vdi == vdi) {
             self.iso_edit = None;
         }
+        let prog = self.job(format!("isodel:{}", vdi), sid, &server, Some(&sr), &lib, &format!("Deleting '{}' from '{}'", name, lib));
         std::thread::spawn(move || {
+            crate::conn::watch(&prog);
             let result = conn.delete_iso(&vdi);
             let _ = tx.send(Msg::IsoDeleted { sid, sr, vdi, name, result });
             ctx.request_repaint();
@@ -767,8 +1016,10 @@ impl App {
     /// Asks the server to create the ISO library (which mounts the share) in the background.
     fn start_iso_library(&mut self, sid: u32, lib: IsoLibrary, ctx: &egui::Context) {
         let Some(s) = self.server(sid) else { return };
-        let (conn, tx, ctx) = (s.conn.clone(), self.tx.clone(), ctx.clone());
+        let (conn, tx, ctx, server) = (s.conn.clone(), self.tx.clone(), ctx.clone(), s.name());
+        let prog = self.job(format!("isolib:{}:{}", sid, lib.name), sid, &server, None, &lib.name, &format!("Creating ISO library '{}' from {}", lib.name, lib.location));
         std::thread::spawn(move || {
+            crate::conn::watch(&prog);
             let result = conn.create_iso_library(&lib);
             let _ = tx.send(Msg::IsoDone { sid, lib, result });
             ctx.request_repaint();
@@ -838,8 +1089,105 @@ impl App {
             obj: obj.into(),
             text: text.into(),
             status: status.into(),
+            started: Instant::now(),
+            progress: (status == "In progress").then(Progress::new),
+            activity: status == "In progress",
         });
         self.log.len() - 1
+    }
+
+    /// Something worth seeing under Activities that wasn't a job (a server gone, or back).
+    fn notice(&mut self, sid: u32, server: &str, obj_ref: Option<&str>, obj: &str, text: &str, status: &str) {
+        let i = self.add_log(sid, server, obj_ref, obj, text, status);
+        self.log[i].activity = true;
+    }
+
+    /// Notes that a VM or template named `name` is being made on server `sid` (what already has
+    /// that name, too), in case contact is lost meanwhile.
+    fn remember_unfinished(&mut self, sid: u32, name: &str) {
+        let Some(s) = self.server(sid).filter(|s| !s.conn.is_demo()) else { return };
+        let (host, user) = (s.conn.hostname(), s.conn.username());
+        let before = s.data.as_ref().map(|d| d.vms.iter().chain(&d.user_templates).filter(|v| v.name == name).map(|v| v.rref.clone()).collect()).unwrap_or_default();
+        self.unfinished.retain(|u| !(u.host == host && u.name == name));
+        self.unfinished.push(Unfinished { host, user, name: name.into(), before, lost: false });
+        save_unfinished(&self.unfinished);
+    }
+
+    /// It was made, or what was made was taken away again: nothing to look for.
+    fn forget_unfinished(&mut self, sid: u32, name: &str) {
+        let Some(host) = self.server(sid).map(|s| s.conn.hostname()) else { return };
+        let before = self.unfinished.len();
+        self.unfinished.retain(|u| !(u.host == host && u.name == name));
+        if self.unfinished.len() != before {
+            save_unfinished(&self.unfinished);
+        }
+    }
+
+    /// Its job lost contact: looked for once the server's back.
+    fn lost_unfinished(&mut self, sid: u32, name: &str) {
+        let Some(host) = self.server(sid).map(|s| s.conn.hostname()) else { return };
+        for u in self.unfinished.iter_mut().filter(|u| u.host == host && u.name == name) {
+            u.lost = true;
+        }
+    }
+
+    /// Server `sid` answers again: anything left half made there under a lost job's name is
+    /// offered for deleting (one at a time); a name with nothing new under it is let go.
+    fn check_unfinished(&mut self, sid: u32) {
+        let Some(s) = self.server(sid) else { return };
+        let Some(d) = s.data.as_ref() else { return };
+        let (host, user, server) = (s.conn.hostname(), s.conn.username(), s.name());
+        let mut found = None;
+        let mut gone = vec![];
+        for (i, u) in self.unfinished.iter().enumerate().filter(|(_, u)| u.lost && u.host == host && u.user == user) {
+            let left: Vec<String> = d.vms.iter().chain(&d.user_templates).filter(|v| v.name == u.name && !u.before.contains(&v.rref)).map(|v| v.rref.clone()).collect();
+            if left.is_empty() {
+                gone.push(i);
+            } else if found.is_none() {
+                found = Some((i, left));
+            }
+        }
+        for &i in gone.iter().rev() {
+            let u = self.unfinished.remove(i);
+            self.add_log(sid, &server, None, &u.name, &format!("Nothing was left of '{}', which was being made when contact was lost", u.name), "Done");
+        }
+        if let Some((i, refs)) = found.filter(|_| matches!(self.dialog, Dialog::None)) {
+            let i = i - gone.iter().filter(|&&g| g < i).count();
+            let u = self.unfinished.remove(i);
+            self.dialog = Dialog::ConfirmLeftover { sid, name: u.name, refs, server };
+        }
+        if !gone.is_empty() || matches!(self.dialog, Dialog::ConfirmLeftover { .. }) {
+            save_unfinished(&self.unfinished);
+        }
+    }
+
+    /// What the job logged as `log` reports its progress to (its thread calls `watch` with it).
+    fn progress(&self, log: usize) -> Arc<Progress> {
+        self.log.get(log).and_then(|e| e.progress.clone()).unwrap_or_else(Progress::new)
+    }
+
+    /// Starts a job known by `key` (one at a time per key): its log line, "In progress" and under
+    /// Activities till `job_done`; what its thread reports progress to.
+    fn job(&mut self, key: String, sid: u32, server: &str, obj_ref: Option<&str>, obj: &str, text: &str) -> Arc<Progress> {
+        let log = self.add_log(sid, server, obj_ref, obj, text, "In progress");
+        self.jobs.insert(key, log);
+        self.progress(log)
+    }
+
+    /// Ends the job known by `key`: its line says how it went (a new line when there was none).
+    fn job_done(&mut self, key: &str, sid: u32, server: &str, obj_ref: Option<&str>, obj: &str, text: &str, status: &str) {
+        match self.jobs.remove(key).and_then(|i| self.log.get_mut(i)) {
+            Some(e) => {
+                e.text = text.into();
+                e.status = status.into();
+                if obj_ref.is_some() {
+                    e.obj_ref = obj_ref.map(String::from);
+                }
+            }
+            None => {
+                self.add_log(sid, server, obj_ref, obj, text, status);
+            }
+        }
     }
 
     fn tick(&mut self, ctx: &egui::Context) {
@@ -875,7 +1223,7 @@ impl App {
                     let server = self.server(sid).map(|s| s.name()).unwrap_or_default();
                     match result {
                         Ok(()) => {
-                            self.add_log(sid, &server, None, &lib.name, &format!("Created ISO library '{}' from {}", lib.name, lib.location), "Done");
+                            self.job_done(&format!("isolib:{}:{}", sid, lib.name), sid, &server, None, &lib.name, &format!("Created ISO library '{}' from {}", lib.name, lib.location), "Done");
                             if matches!(self.dialog, Dialog::Iso(_)) {
                                 self.dialog = Dialog::None;
                             }
@@ -885,7 +1233,7 @@ impl App {
                             self.expanded.insert(format!("folder:{}:srs", sid));
                         }
                         Err(e) => {
-                            self.add_log(sid, &server, None, &lib.name, &format!("Couldn't create ISO library '{}': {}", lib.name, e.message()), "Failed");
+                            self.job_done(&format!("isolib:{}:{}", sid, lib.name), sid, &server, None, &lib.name, &format!("Couldn't create ISO library '{}': {}", lib.name, e.message()), "Failed");
                             if let Dialog::Iso(d) = &mut self.dialog {
                                 d.failed(&lib, &e);
                             }
@@ -898,7 +1246,7 @@ impl App {
                     let what = if forget { "Disconnected ISO library" } else { "Rescanned" };
                     match result {
                         Ok(()) => {
-                            self.add_log(sid, &server, Some(&sr), &name, &format!("{} '{}'", what, name), "Done");
+                            self.job_done(&format!("sr:{}", sr), sid, &server, Some(&sr), &name, &format!("{} '{}'", what, name), "Done");
                             if forget && self.selected == format!("sr:{}:{}", sid, sr) {
                                 self.select(format!("srv:{}", sid));
                             }
@@ -912,7 +1260,7 @@ impl App {
                                 e.message()
                             };
                             let title = if forget { "Disconnect ISO Library" } else { "Rescan" };
-                            self.add_log(sid, &server, Some(&sr), &name, &format!("Couldn't {} '{}': {}", if forget { "disconnect" } else { "rescan" }, name, why), "Failed");
+                            self.job_done(&format!("sr:{}", sr), sid, &server, Some(&sr), &name, &format!("Couldn't {} '{}': {}", if forget { "disconnect" } else { "rescan" }, name, why), "Failed");
                             self.dialog = Dialog::Message { title: title.into(), text: format!("Couldn't {} '{}'.\n\n{}", if forget { "disconnect" } else { "rescan" }, name, why) };
                         }
                     }
@@ -932,12 +1280,12 @@ impl App {
                         None => {
                             let on = if mounted.is_empty() { String::new() } else { format!(" on {}", mounted.join(", ")) };
                             let text = if auto { format!("{}mounted it again{}", found, on) } else { format!("Mounted '{}' again{}", name, on) };
-                            self.add_log(sid, &server, Some(&sr), &name, &text, "Done");
+                            self.job_done(&format!("sr:{}", sr), sid, &server, Some(&sr), &name, &text, "Done");
                         }
                         Some((host, e)) => {
                             let place = if host.is_empty() { String::new() } else { format!(" on {}", host) };
                             let text = if auto { format!("{}couldn't mount it again{}: {}", found, place, e.message()) } else { format!("Couldn't mount '{}' again{}: {}", name, place, e.message()) };
-                            self.add_log(sid, &server, Some(&sr), &name, &text, "Failed");
+                            self.job_done(&format!("sr:{}", sr), sid, &server, Some(&sr), &name, &text, "Failed");
                             if !auto {
                                 let also = if mounted.is_empty() { String::new() } else { format!("\n\nIt's mounted on {} now.", mounted.join(", ")) };
                                 self.dialog = Dialog::Message { title: "Repair".into(), text: format!("Couldn't mount '{}'{}.\n\n{}{}", name, place, mount_problem(&e, nfs), also) };
@@ -953,13 +1301,13 @@ impl App {
                     let server = self.server(sid).map(|s| s.name()).unwrap_or_default();
                     match result {
                         Ok(()) => {
-                            self.add_log(sid, &server, Some(&sr), &lib.name, &format!("Mounted '{}' again from {}", lib.name, lib.location), "Done");
+                            self.job_done(&format!("sr:{}", sr), sid, &server, Some(&sr), &lib.name, &format!("Mounted '{}' again from {}", lib.name, lib.location), "Done");
                             if matches!(self.dialog, Dialog::Iso(_)) {
                                 self.dialog = Dialog::None;
                             }
                         }
                         Err(e) => {
-                            self.add_log(sid, &server, Some(&sr), &lib.name, &format!("Couldn't mount '{}' from {}: {}", lib.name, lib.location, e.message()), "Failed");
+                            self.job_done(&format!("sr:{}", sr), sid, &server, Some(&sr), &lib.name, &format!("Couldn't mount '{}' from {}: {}", lib.name, lib.location, e.message()), "Failed");
                             if let Dialog::Iso(d) = &mut self.dialog {
                                 d.failed(&lib, &e);
                             }
@@ -982,23 +1330,35 @@ impl App {
                     }
                     match result {
                         Ok(vm) => {
-                            self.add_log(sid, &server, Some(&vm), &name, &format!("Created VM '{}'", name), "Done");
+                            self.forget_unfinished(sid, &name);
+                            self.job_done(&format!("newvm:{}:{}", sid, name), sid, &server, Some(&vm), &name, &format!("Created VM '{}'", name), "Done");
                             if start {
+                                self.job(format!("start:{}", vm), sid, &server, Some(&vm), &name, &format!("Starting VM '{}'", name));
                                 // the dialog waits for the start, but can be closed
                                 if let Dialog::NewVm(d) = &mut self.dialog {
                                     d.starting(vm.clone());
                                 }
-                            } else {
+                            } else if matches!(self.dialog, Dialog::NewVm(_)) {
                                 self.dialog = Dialog::None;
                             }
                             // shown once the next refresh brings it
                             self.pending_select = Some((format!("vm:{}:{}", sid, vm), Tab::General));
                         }
                         Err(e) => {
+                            // lost contact: something may be left half made, to offer deleting
+                            // once the server is back; otherwise what was made was taken away
+                            if matches!(e.code.as_str(), LOST_CONTACT | "CONNECTION") {
+                                self.lost_unfinished(sid, &name);
+                            } else {
+                                self.forget_unfinished(sid, &name);
+                            }
                             let why = create_problem(&e);
-                            self.add_log(sid, &server, None, &name, &format!("Couldn't create VM '{}': {}", name, why), "Failed");
-                            if let Dialog::NewVm(d) = &mut self.dialog {
-                                d.failed(why);
+                            self.job_done(&format!("newvm:{}:{}", sid, name), sid, &server, None, &name, &format!("Couldn't create VM '{}': {}", name, why), "Failed");
+                            match &mut self.dialog {
+                                Dialog::NewVm(d) => d.failed(why),
+                                // its dialog was closed: said here, unless another dialog is open
+                                Dialog::None => self.dialog = Dialog::Message { title: "New VM".into(), text: format!("Couldn't create '{}'.\n\n{}", name, why) },
+                                _ => {}
                             }
                         }
                     }
@@ -1021,7 +1381,7 @@ impl App {
                     let watching = matches!(&self.dialog, Dialog::NewVm(d) if d.made_vm() == Some(vm.as_str()));
                     match result {
                         Ok(()) => {
-                            self.add_log(sid, &server, Some(&vm), &name, &format!("Started VM '{}'", name), "Done");
+                            self.job_done(&format!("start:{}", vm), sid, &server, Some(&vm), &name, &format!("Started VM '{}'", name), "Done");
                             // running now, before the refresh says so (its console opens straight away)
                             if let Some(v) = self.server_mut(sid).and_then(|s| s.data.as_mut()).and_then(|d| d.vms.iter_mut().find(|v| v.rref == vm)) {
                                 v.power = PowerState::Running;
@@ -1033,7 +1393,7 @@ impl App {
                         }
                         Err(e) => {
                             let why = create_problem(&e);
-                            self.add_log(sid, &server, Some(&vm), &name, &format!("Couldn't start VM '{}': {}", name, why), "Failed");
+                            self.job_done(&format!("start:{}", vm), sid, &server, Some(&vm), &name, &format!("Couldn't start VM '{}': {}", name, why), "Failed");
                             match &mut self.dialog {
                                 Dialog::NewVm(d) if watching => d.not_started(why),
                                 // its dialog was closed: said here, unless another dialog is open
@@ -1056,11 +1416,11 @@ impl App {
                             if let Some(x) = self.server_mut(sid).and_then(|s| s.data.as_mut()).and_then(|d| d.srs.iter_mut().find(|x| x.rref == sr)) {
                                 x.files.retain(|f| f.vdi != vdi);
                             }
-                            self.add_log(sid, &server, Some(&sr), &lib, &format!("Deleted '{}' from '{}'", name, lib), "Done");
+                            self.job_done(&format!("isodel:{}", vdi), sid, &server, Some(&sr), &lib, &format!("Deleted '{}' from '{}'", name, lib), "Done");
                         }
                         Err(e) => {
                             let why = delete_problem(&e);
-                            self.add_log(sid, &server, Some(&sr), &lib, &format!("Couldn't delete '{}' from '{}': {}", name, lib, why), "Failed");
+                            self.job_done(&format!("isodel:{}", vdi), sid, &server, Some(&sr), &lib, &format!("Couldn't delete '{}' from '{}': {}", name, lib, why), "Failed");
                             self.dialog = Dialog::Message { title: "Delete ISO File".into(), text: format!("Couldn't delete '{}'.\n\n{}", name, why) };
                         }
                     }
@@ -1106,16 +1466,16 @@ impl App {
                                 self.select(format!("srv:{}", sid));
                             }
                             if left.is_empty() {
-                                self.add_log(sid, &server, None, &name, &format!("Deleted VM '{}'", name), "Done");
+                                self.job_done(&format!("vmdel:{}", vm), sid, &server, None, &name, &format!("Deleted VM '{}'", name), "Done");
                             } else {
                                 let text = format!("Deleted VM '{}', but not all its disks: {}", name, left.join("; "));
-                                self.add_log(sid, &server, None, &name, &text, "Done");
+                                self.job_done(&format!("vmdel:{}", vm), sid, &server, None, &name, &text, "Done");
                                 self.dialog = Dialog::Message { title: "Delete VM".into(), text: format!("'{}' was deleted, but these disks couldn't be:\n\n{}", name, left.join("\n")) };
                             }
                         }
                         Err(e) => {
                             let why = delete_vm_problem(&e);
-                            self.add_log(sid, &server, Some(&vm), &name, &format!("Couldn't delete VM '{}': {}", name, why), "Failed");
+                            self.job_done(&format!("vmdel:{}", vm), sid, &server, Some(&vm), &name, &format!("Couldn't delete VM '{}': {}", name, why), "Failed");
                             self.dialog = Dialog::Message { title: "Delete VM".into(), text: format!("Couldn't delete '{}'.\n\n{}", name, why) };
                         }
                     }
@@ -1212,6 +1572,131 @@ impl App {
                         s.next_refresh = Instant::now();
                     }
                 }
+                Msg::SnapDone { sid, vm, snap, log, title, text, result } => {
+                    if let Some(s) = self.server_mut(sid) {
+                        s.busy.remove(&vm);
+                        s.next_refresh = Instant::now(); // re-read right away
+                    }
+                    if let Some(x) = &snap {
+                        self.snap_deleting.remove(x);
+                    }
+                    let shot = self.shot_path.is_some();
+                    match result {
+                        Ok(left) => {
+                            if let Some(e) = self.log.get_mut(log) {
+                                e.status = "Done".into();
+                            }
+                            if !left.is_empty() && !shot {
+                                let text = format!("The snapshot is gone, but some of its disks couldn't be deleted:\n\n{}", left.join("\n"));
+                                self.dialog = Dialog::Message { title: title.into(), text };
+                            }
+                        }
+                        Err(e) => {
+                            let (status, why) = if e.code == NOT_RESTARTED {
+                                // put back, but it didn't start again
+                                ("Done", format!("put back, but couldn't start it again: {}", e.details.join(" ")))
+                            } else {
+                                ("Failed", snapshot_problem(&e))
+                            };
+                            if let Some(l) = self.log.get_mut(log) {
+                                l.status = status.into();
+                                l.text = format!("{}: {}", l.text, why);
+                            }
+                            if !shot {
+                                let text = if e.code == NOT_RESTARTED {
+                                    format!("{}: done, but it couldn't be started again.\n\n{}", text, e.details.join(" "))
+                                } else {
+                                    format!("{} failed.\n\n{}", text, why)
+                                };
+                                self.dialog = Dialog::Message { title: title.into(), text };
+                            }
+                        }
+                    }
+                }
+                Msg::Made { sid, vm, name, log, title, text, template, result } => {
+                    if let Some(s) = self.server_mut(sid) {
+                        s.busy.remove(&vm);
+                        s.next_refresh = Instant::now(); // re-read right away
+                    }
+                    match &result {
+                        Err(e) if matches!(e.code.as_str(), LOST_CONTACT | "CONNECTION") => self.lost_unfinished(sid, &name),
+                        _ => self.forget_unfinished(sid, &name),
+                    }
+                    match result {
+                        Ok(made) => {
+                            if let Some(e) = self.log.get_mut(log) {
+                                e.status = "Done".into();
+                            }
+                            // the new one opened, once the server's been read again
+                            let key = if template { format!("tpl:{}:{}", sid, made) } else { format!("vm:{}:{}", sid, made) };
+                            if template {
+                                self.expanded.insert(format!("folder:{}:tpls", sid));
+                                self.expanded.insert("cat:tpls".into());
+                            }
+                            self.pending_select = Some((key, Tab::General));
+                        }
+                        Err(e) => {
+                            let why = snapshot_problem(&e);
+                            if let Some(l) = self.log.get_mut(log) {
+                                l.status = "Failed".into();
+                                l.text = format!("{}: {}", l.text, why);
+                            }
+                            if self.shot_path.is_none() {
+                                self.dialog = Dialog::Message { title: title.into(), text: format!("{} failed.\n\n{}", text, why) };
+                            }
+                        }
+                    }
+                }
+                Msg::TemplateDeleted { sid, tpl, name, log, result } => {
+                    if let Some(s) = self.server_mut(sid) {
+                        s.busy.remove(&tpl);
+                        s.next_refresh = Instant::now();
+                    }
+                    match result {
+                        Ok(left) => {
+                            if let Some(d) = self.server_mut(sid).and_then(|s| s.data.as_mut()) {
+                                d.user_templates.retain(|t| t.rref != tpl);
+                            }
+                            if self.selected == format!("tpl:{}:{}", sid, tpl) {
+                                self.select(format!("srv:{}", sid));
+                            }
+                            if let Some(e) = self.log.get_mut(log) {
+                                e.status = "Done".into();
+                                if !left.is_empty() {
+                                    e.text = format!("{}, but not all its disks: {}", e.text, left.join("; "));
+                                }
+                            }
+                            if !left.is_empty() {
+                                self.dialog = Dialog::Message { title: "Delete Template".into(), text: format!("'{}' was deleted, but these disks couldn't be:\n\n{}", name, left.join("\n")) };
+                            }
+                        }
+                        Err(e) => {
+                            let why = delete_vm_problem(&e);
+                            if let Some(l) = self.log.get_mut(log) {
+                                l.status = "Failed".into();
+                                l.text = format!("{}: {}", l.text, why);
+                            }
+                            self.dialog = Dialog::Message { title: "Delete Template".into(), text: format!("Couldn't delete '{}'.\n\n{}", name, why) };
+                        }
+                    }
+                }
+                Msg::SnapDescribed { sid, vm, snap, name, text, result } => {
+                    self.snap_saving.remove(&snap);
+                    let server = self.server(sid).map(|s| s.name()).unwrap_or_default();
+                    match result {
+                        Ok(()) => {
+                            // show it right away; the next refresh reads it back from the server
+                            if let Some(x) = self.server_mut(sid).and_then(|s| s.data.as_mut()).and_then(|d| d.vms.iter_mut().find(|v| v.rref == vm)).and_then(|v| v.snapshots.iter_mut().find(|x| x.rref == snap)) {
+                                x.description = text;
+                            }
+                            self.add_log(sid, &server, Some(&vm), &name, &format!("Changed the description of snapshot '{}'", name), "Done");
+                        }
+                        Err(e) => {
+                            self.add_log(sid, &server, Some(&vm), &name, &format!("Couldn't change the description of snapshot '{}': {}", name, e.message()), "Failed");
+                            self.dialog = Dialog::Message { title: "Description".into(), text: format!("Couldn't change the description of '{}'.\n\n{}", name, e.message()) };
+                        }
+                    }
+                }
                 Msg::KeychainError(e) => {
                     self.dialog = Dialog::Message { title: "Remember password".into(), text: format!("Couldn't save the password in the system's keychain.\n\n{}", e) };
                 }
@@ -1273,6 +1758,19 @@ impl App {
                         }
                     }
                 }
+                // servers that stopped answering (or came back) since the last look: said under
+                // Activities (a server shut down from here is expected, not a failure)
+                let before: HashMap<String, bool> = self.servers[idx].data.as_ref().map(|o| o.hosts.iter().map(|h| (h.rref.clone(), h.is_up())).collect()).unwrap_or_default();
+                let mut changes: Vec<(String, String, String, &str)> = vec![];
+                for h in &d.hosts {
+                    let was = before.get(&h.rref).copied().unwrap_or(true);
+                    if was && !h.is_up() {
+                        let expected = self.host_busy.contains(&h.rref) && !h.live;
+                        changes.push((h.rref.clone(), h.name.clone(), format!("{} {}", h.name, if h.live { "isn't answering" } else { "is off" }), if expected { "Done" } else { "Failed" }));
+                    } else if !was && h.is_up() {
+                        changes.push((h.rref.clone(), h.name.clone(), format!("{} answers again", h.name), "Done"));
+                    }
+                }
                 let s = &mut self.servers[idx];
                 s.fetching = false;
                 let first = !s.ever;
@@ -1319,6 +1817,15 @@ impl App {
                             }
                             "search" | "logs" => self.select("root".into()),
                             "host-down" => self.select(format!("host:{}:host-b", id)),
+                            "templates" => {
+                                self.expanded.insert(format!("folder:{}:tpls", id));
+                                self.select(format!("folder:{}:tpls", id));
+                            }
+                            "template" => {
+                                self.expanded.insert(format!("folder:{}:tpls", id));
+                                self.select(format!("tpl:{}:tpl-web", id));
+                            }
+                            "make-template" | "copy-vm" | "template-made" | "vm-off" => self.select(format!("vm:{}:vm-desk", id)),
                             "networks" => {
                                 self.expanded.insert(format!("folder:{}:nets", id));
                                 self.select(format!("folder:{}:nets", id));
@@ -1335,9 +1842,29 @@ impl App {
                 } else if was_reconnecting {
                     self.add_log(id, &name, None, &name, &format!("Connection to {} is back", name), "Done");
                 }
+                self.check_unfinished(id);
+                let name = self.servers[idx].name();
+                for (h, host, text, status) in changes {
+                    self.notice(id, &name, Some(&h), &host, &text, status);
+                }
+                // a refresh asked for: how it went, servers not answering said
+                let key = format!("refresh:{}", id);
+                if self.jobs.contains_key(&key) {
+                    let down: Vec<String> = self.servers[idx].data.as_ref().map(|d| d.hosts.iter().filter(|h| !h.is_up()).map(|h| format!("{} {}", h.name, if h.live { "isn't answering" } else { "is off" })).collect()).unwrap_or_default();
+                    if down.is_empty() {
+                        self.job_done(&key, id, &name, None, &name, &format!("Refreshed {}", name), "Done");
+                    } else {
+                        self.job_done(&key, id, &name, None, &name, &format!("Refreshed {}, but {}", name, down.join("; ")), "Failed");
+                    }
+                }
             }
             Err(e) => {
                 let msg = e.message();
+                let key = format!("refresh:{}", id);
+                if self.jobs.contains_key(&key) {
+                    let name = self.servers[idx].name();
+                    self.job_done(&key, id, &name, None, &name, &format!("Couldn't refresh {}: {}", name, msg), "Failed");
+                }
                 let s = &mut self.servers[idx];
                 s.fetching = false;
                 s.failures += 1;
@@ -1385,6 +1912,15 @@ impl App {
     }
 
     /// The storage a tree node stands for, with its server.
+    /// The user's template a tree node stands for, with its server.
+    fn template_of<'a>(&'a self, node: &Node) -> Option<(&'a ServerEntry, &'a VmInfo)> {
+        if node.kind != Kind::Template {
+            return None;
+        }
+        let s = self.server(node.sid?)?;
+        Some((s, s.data.as_ref()?.user_template(node.rref.as_deref()?)?))
+    }
+
     fn sr_of<'a>(&'a self, node: &Node) -> Option<(&'a ServerEntry, &'a SrInfo)> {
         if node.kind != Kind::Sr {
             return None;
@@ -1443,9 +1979,12 @@ impl App {
     }
 
     /// A VM's icon, or, while a power action is under way, a ring turning in that action's colour.
+    /// A VM's icon, or, while a power action is under way, a ring turning in that action's colour;
+    /// grey (unknown) while the server it runs on is off or not answering.
     fn vm_icon(s: &ServerEntry, v: &VmInfo) -> IconKind {
         match s.busy.get(&v.rref) {
             Some((_, op)) => IconKind::Busy(Tone::of_action(op)),
+            None if s.data.as_ref().map_or(false, |d| d.host_down_for(v).is_some()) => IconKind::Vm(PowerState::Unknown),
             None => IconKind::Vm(v.power),
         }
     }
@@ -1459,6 +1998,7 @@ impl App {
                 Node::new("cat:vms".into(), "Virtual machines".into(), IconKind::Vm(PowerState::Running), Kind::Category, None, None),
                 Node::new("cat:srs".into(), "Storage".into(), IconKind::Sr, Kind::Category, None, None),
                 Node::new("cat:nets".into(), "Networks".into(), IconKind::Net, Kind::Category, None, None),
+                Node::new("cat:tpls".into(), "Templates".into(), IconKind::Template, Kind::Category, None, None),
             ];
             for s in &self.servers {
                 let id = s.id;
@@ -1484,6 +2024,9 @@ impl App {
                 }
                 for x in d.srs.iter().filter(|x| !x.is_empty_drive()) {
                     cats[3].children.push(Node::new(format!("sr:{}:{}", id, x.rref), x.name.clone(), sr_icon(d, x, self.sr_busy.contains(&x.rref)), Kind::Sr, Some(id), Some(x.rref.clone())));
+                }
+                for t in &d.user_templates {
+                    cats[5].children.push(template_node(id, s, t));
                 }
                 for n in &d.networks {
                     cats[4].children.push(Node::new(format!("net:{}:{}", id, n.rref), n.name.clone(), IconKind::Net, Kind::Net, Some(id), Some(n.rref.clone())));
@@ -1512,6 +2055,8 @@ impl App {
                 let mut nets: Vec<&NetInfo> = d.networks.iter().collect();
                 nets.sort_by_key(|n| n.name.to_lowercase());
                 let vm_node = |v: &VmInfo| Node::new(format!("vm:{}:{}", id, v.rref), Self::vm_text(s, v), Self::vm_icon(s, v), Kind::Vm, Some(id), Some(v.rref.clone()));
+                let mut tpls: Vec<Node> = d.user_templates.iter().map(|t| template_node(id, s, t)).collect();
+                tpls.sort_by_key(|n| n.text.to_lowercase());
                 let sr_node = |x: &SrInfo| Node::new(format!("sr:{}:{}", id, x.rref), x.name.clone(), sr_icon(d, x, self.sr_busy.contains(&x.rref)), Kind::Sr, Some(id), Some(x.rref.clone()));
                 let folder = |what: &str, label: &str, kids: Vec<Node>| {
                     let mut f = Node::new(format!("folder:{}:{}", id, what), format!("{} ({})", label, kids.len()), IconKind::Folder, Kind::Folder, Some(id), Some(what.to_string()));
@@ -1533,6 +2078,9 @@ impl App {
                         top.children.push(hn);
                     }
                     top.children.extend(vms.iter().filter(|v| v.home().and_then(|h| d.host(h)).is_none()).map(|v| vm_node(v)));
+                    if !tpls.is_empty() {
+                        top.children.push(folder("tpls", "Templates", tpls.clone()));
+                    }
                     let shared: Vec<Node> = srs.iter().filter(|x| x.host.as_deref().and_then(|h| d.host(h)).is_none()).map(|x| sr_node(x)).collect();
                     if !shared.is_empty() {
                         top.children.push(folder("srs", "Shared Storage", shared));
@@ -1543,6 +2091,9 @@ impl App {
                     top = Node::new(skey, format!("{}{}", h.name, suffix), icon, Kind::Host, Some(id), Some(h.rref.clone()));
                     top.children.extend(vms.iter().map(|v| vm_node(v)));
                     top.children.extend(srs.iter().map(|x| sr_node(x)));
+                    if !tpls.is_empty() {
+                        top.children.push(folder("tpls", "Templates", tpls.clone()));
+                    }
                 }
                 top.note = s.login_note();
                 if !nets.is_empty() {
@@ -1593,11 +2144,13 @@ impl App {
         let text = format!("{} VM '{}'", a.verb, vm.name);
         let (vm_name, server_name, conn) = (vm.name.clone(), s.name(), s.conn.clone());
         let log = self.add_log(sid, &server_name, Some(&vref), &vm_name, &text, "In progress");
+        let prog = self.progress(log);
         if let Some(s) = self.server_mut(sid) {
             s.busy.insert(vref.clone(), (format!("{}…", a.verb), a.op));
         }
         let tx = self.tx.clone();
         std::thread::spawn(move || {
+            crate::conn::watch(&prog);
             let r = conn.run_action(&vref, &ACTIONS[i]);
             let _ = tx.send(Msg::ActionDone { sid, vm: vref, log, err: r.err().map(|e| e.message()), label: ACTIONS[i].label, op: ACTIONS[i].op, text });
         });
@@ -1665,7 +2218,86 @@ impl App {
                     if let Some(v) = self.server(sid).and_then(|s| s.data.as_ref()).and_then(|d| d.vm(&vm)) {
                         let disks: Vec<VmDisk> = v.disks.iter().filter(|k| k.kind == "Disk").cloned().collect();
                         let running = v.power != PowerState::Halted;
-                        self.dialog = Dialog::ConfirmDeleteVm { sid, vm, name: v.name.clone(), running, disks, snapshots: v.snapshots, delete_disks: true };
+                        self.dialog = Dialog::ConfirmDeleteVm { sid, vm, name: v.name.clone(), running, disks, snapshots: v.snapshots.len(), delete_disks: true };
+                    }
+                }
+                Intent::TakeSnapshot(sid, vm) => {
+                    if let Some(v) = self.server(sid).and_then(|s| s.data.as_ref()).and_then(|d| d.vm(&vm)) {
+                        let name = fmt_date_time(unix_now(), local_offset(unix_now()));
+                        let can_memory = v.can("checkpoint");
+                        let memory_size = if v.mem_actual > 0 { v.mem_actual } else { v.mem_dyn_max };
+                        self.dialog = Dialog::TakeSnapshot { sid, vm, vm_name: v.name.clone(), name, description: String::new(), memory: false, can_memory, memory_size, focus: true };
+                    }
+                }
+                Intent::AskRevert(sid, snap) => {
+                    if let Some((v, x)) = self.server(sid).and_then(|s| s.data.as_ref()).and_then(|d| d.vms.iter().find_map(|v| v.snapshot(&snap).map(|x| (v, x)))) {
+                        let mut parts = vec!["What changed since then is lost.".to_string()];
+                        if v.power != PowerState::Halted {
+                            parts.push("It's on: it's turned off first, the hard way.".into());
+                        }
+                        parts.push(if x.memory {
+                            "Then it resumes right where it was then, its programs still open.".into()
+                        } else if x.was_running {
+                            "Then it starts again, as it was running then.".into()
+                        } else {
+                            "It stays off, as it was then.".into()
+                        });
+                        self.dialog = Dialog::ConfirmRevert { sid, snap, vm_name: v.name.clone(), snap_name: x.name.clone(), text: parts.join(" "), first: true };
+                    }
+                }
+                Intent::AskDeleteSnapshot(sid, snap) => {
+                    if let Some((v, x)) = self.server(sid).and_then(|s| s.data.as_ref()).and_then(|d| d.vms.iter().find_map(|v| v.snapshot(&snap).map(|x| (v, x)))) {
+                        self.dialog = Dialog::ConfirmDeleteSnapshot { sid, snap, vm_name: v.name.clone(), snap_name: x.name.clone(), memory: x.memory };
+                    }
+                }
+                Intent::SaveSnapshotDescription(sid, snap, text) => self.save_snapshot_description(sid, snap, text, ctx),
+                Intent::MakeTemplate(sid, source) => {
+                    let Some(d) = self.server(sid).and_then(|s| s.data.as_ref()) else { continue };
+                    let date = fmt_date_time(unix_now(), local_offset(unix_now()));
+                    if let Some(v) = d.vm(&source) {
+                        let (name, description) = (format!("{} template", v.name), format!("From '{}', {}", v.name, date));
+                        self.dialog = Dialog::MakeTemplate { sid, vm: v.rref.clone(), source, from: format!("'{}' (it stays as it is)", v.name), name, description, power_cut: false, focus: true };
+                    } else if let Some((v, x)) = d.vms.iter().find_map(|v| v.snapshot(&source).map(|x| (v, x))) {
+                        let (name, description) = (format!("{} – {}", v.name, x.name), format!("From the snapshot '{}' of '{}'", x.name, v.name));
+                        let from = format!("the snapshot '{}' of '{}'", x.name, v.name);
+                        self.dialog = Dialog::MakeTemplate { sid, vm: v.rref.clone(), source, from, name, description, power_cut: x.was_running, focus: true };
+                    }
+                }
+                Intent::CopyVm(sid, vm) => {
+                    let Some(d) = self.server(sid).and_then(|s| s.data.as_ref()) else { continue };
+                    let Some(v) = d.vm(&vm) else { continue };
+                    // where its disks can go: where they are (an instant copy), or other storage for
+                    // disks that the server holding them also sees (a full copy)
+                    let now: Option<&SrInfo> = v.disks.iter().find(|k| k.kind == "Disk").and_then(|k| d.sr(&k.sr));
+                    let mut stores: Vec<(String, String, bool)> = vec![];
+                    if let Some(x) = now {
+                        stores.push((x.rref.clone(), format!("{}  ·  where it is, an instant copy", x.name), true));
+                    }
+                    let mut others: Vec<&SrInfo> = d
+                        .srs
+                        .iter()
+                        .filter(|x| !x.is_iso() && x.kind != "udev" && x.size > 0 && Some(x.rref.as_str()) != now.map(|n| n.rref.as_str()))
+                        .filter(|x| match (now.and_then(|n| n.host.as_deref()), x.host.as_deref()) {
+                            (Some(a), Some(b)) => a == b,
+                            _ => true,
+                        })
+                        .collect();
+                    others.sort_by_key(|x| (x.host.is_some(), -(x.size - x.used)));
+                    stores.extend(others.iter().map(|x| (x.rref.clone(), format!("{}  ·  {} free, a full copy", x.name, fmt_bytes((x.size - x.used).max(0))), false)));
+                    let taken: Vec<String> = d.vms.iter().map(|v| v.name.clone()).collect();
+                    let name = unique_name(&format!("{} (copy)", v.name), &taken);
+                    self.dialog = Dialog::CopyVm { sid, vm, vm_name: v.name.clone(), name, stores, store: 0, focus: true };
+                }
+                Intent::ShowLog(index) => self.dialog = Dialog::LogDetail { index, copied: None },
+                Intent::NewVmFromTemplate(sid, tpl) => {
+                    if let Some(d) = self.server(sid).and_then(|s| s.data.as_ref()) {
+                        self.dialog = Dialog::NewVm(Box::new(NewVmDialog::new(sid, d, None).with_template(&tpl)));
+                    }
+                }
+                Intent::AskDeleteTemplate(sid, tpl) => {
+                    if let Some(t) = self.server(sid).and_then(|s| s.data.as_ref()).and_then(|d| d.user_template(&tpl)) {
+                        let disk = t.disks.iter().filter(|k| k.kind == "Disk").map(|k| k.size).sum();
+                        self.dialog = Dialog::ConfirmDeleteTemplate { sid, tpl, name: t.name.clone(), disk };
                     }
                 }
                 Intent::DismissUpload(sr) => {
@@ -1722,10 +2354,17 @@ impl App {
                     }
                 }
                 Intent::Refresh(only) => {
-                    for s in self.servers.iter_mut().filter(|s| only.map_or(true, |o| o == s.id)) {
-                        s.next_refresh = Instant::now();
-                        if s.state == ConnState::Disconnected {
-                            s.state = ConnState::Connecting;
+                    let ids: Vec<(u32, String)> = self.servers.iter().filter(|s| only.map_or(true, |o| o == s.id)).map(|s| (s.id, s.name())).collect();
+                    for (id, name) in ids {
+                        // said under Activities: how it went, servers not answering included
+                        if !self.jobs.contains_key(&format!("refresh:{}", id)) {
+                            self.job(format!("refresh:{}", id), id, &name, None, &name, &format!("Refreshing {}", name));
+                        }
+                        if let Some(s) = self.server_mut(id) {
+                            s.next_refresh = Instant::now();
+                            if s.state == ConnState::Disconnected {
+                                s.state = ConnState::Connecting;
+                            }
                         }
                     }
                 }
@@ -1772,7 +2411,7 @@ impl App {
         let fits = |level: u8| {
             let w = |l: &str, rank: u8| if level >= rank { 32.0 } else { tool_width(ui, l) } + 2.0;
             let buttons: f32 = w("Connect", 3) + w("New VM", 2) + w("ISO Library", 2);
-            36.0 + 10.0 + 16.0 + buttons + 160.0 <= ui.available_width() // 160: the app's name
+            36.0 + 40.0 + 10.0 + 16.0 + buttons + 160.0 <= ui.available_width() // 160: the app's name
         };
         let level = (0..3).find(|&l| fits(l)).unwrap_or(3);
         let compact = |rank: u8| level >= rank;
@@ -1781,6 +2420,7 @@ impl App {
             if icon_button(ui, "settings", &pal, true, false).on_hover_text("Settings").clicked() {
                 out.push(Intent::Settings);
             }
+            self.activities_button(ui, out);
             ui.add_space(4.0);
             if tool_button(ui, "connect", "Connect", true, compact(3), &pal).clicked() {
                 out.push(Intent::AddServer);
@@ -1804,6 +2444,203 @@ impl App {
                 }
             });
         });
+    }
+
+    /// What's wrong right now, for Activities: connections lost, servers off or not answering
+    /// (with the VMs whose state that makes unknown), storage that isn't mounted where it should
+    /// be. Each with the tree item it's about, and a softer second line.
+    fn problems(&self) -> Vec<(String, String, String)> {
+        let mut out = vec![];
+        for s in &self.servers {
+            let Some(d) = &s.data else {
+                if s.state == ConnState::Disconnected {
+                    out.push((format!("srv:{}", s.id), format!("Not connected to {}", s.conn.hostname()), s.error.clone().unwrap_or_default()));
+                }
+                continue;
+            };
+            if s.state == ConnState::Reconnecting {
+                out.push((format!("srv:{}", s.id), format!("Lost the connection to {}", s.name()), "Reconnecting…".into()));
+            }
+            for h in d.hosts.iter().filter(|h| !h.is_up()) {
+                let what = if h.live { "isn't answering" } else { "is off" };
+                let vms: Vec<&str> = d.vms.iter().filter(|v| d.host_down_for(v).map_or(false, |x| x.rref == h.rref)).map(|v| v.name.as_str()).collect();
+                let detail = match vms.len() {
+                    0 => String::new(),
+                    1 => format!("{}'s state is unknown", vms[0]),
+                    _ => format!("{} VMs' state is unknown: {}", vms.len(), vms.join(", ")),
+                };
+                out.push((format!("host:{}:{}", s.id, h.rref), format!("{} {}", h.name, what), detail));
+            }
+            for x in &d.srs {
+                if let Some(t) = d.sr_trouble(x) {
+                    let detail = if t.detached { "The pool has no settings for it: Repair asks where it is".to_string() } else { "Repair, on its page, mounts it again".to_string() };
+                    out.push((format!("sr:{}:{}", s.id, x.rref), format!("{} isn't mounted{}", x.name, if t.nowhere { "" } else { " everywhere" }), detail));
+                }
+            }
+        }
+        out
+    }
+
+    /// Activities, by the gear: what's under way (a ring turning, with how many), each with its
+    /// server, how long it's been, how far it is when the server says, and a warning while the
+    /// server doesn't answer; then the last few that ended, and a way to the whole log.
+    fn activities_button(&self, ui: &mut Ui, out: &mut Vec<Intent>) {
+        let pal = self.pal;
+        let running: Vec<usize> = (0..self.log.len()).filter(|&i| self.log[i].status == "In progress" && self.log[i].activity).collect();
+        let ended: Vec<usize> = (0..self.log.len()).rev().filter(|&i| self.log[i].status != "In progress" && self.log[i].activity).take(5).collect();
+        let problems = self.problems();
+        let slot = ui.painter().add(egui::Shape::Noop);
+        let m = egui::menu::menu_custom_button(ui, egui::Button::new("").frame(false).min_size(vec2(32.0, 30.0)), |ui| {
+            ui.set_min_width(380.0);
+            ui.set_max_width(380.0);
+            ui.spacing_mut().item_spacing.y = 2.0;
+            ui.label(egui::RichText::new("Activities").font(FontId::new(13.5, FontFamily::Name("bold".into()))).color(pal.ink));
+            ui.add_space(2.0);
+            // what's wrong right now: a click opens it
+            if !problems.is_empty() {
+                ui.label(egui::RichText::new("Problems").size(12.0).color(pal.ink_faint));
+                for (key, text, detail) in &problems {
+                    // two lines at most for each
+                    let w = ui.available_width();
+                    let lay = |t: &str, size: f32, col: Color32| {
+                        let mut job = egui::text::LayoutJob::simple(t.to_string(), FontId::proportional(size), col, w - 30.0);
+                        job.wrap.max_rows = 2;
+                        job.wrap.overflow_character = Some('…');
+                        ui.painter().layout_job(job)
+                    };
+                    let (g, d) = (lay(text, 13.0, pal.ink), (!detail.is_empty()).then(|| lay(detail, 12.0, pal.ink_soft)));
+                    let h = 8.0 + g.size().y + d.as_ref().map_or(0.0, |d| d.size().y + 2.0);
+                    let (r, resp) = ui.allocate_exact_size(vec2(w, h), Sense::click());
+                    if resp.hovered() {
+                        ui.painter().rect_filled(r, Rounding::same(5.0), pal.hover);
+                    }
+                    paint_glyph(ui.painter(), Rect::from_min_size(r.min + vec2(4.0, 4.0), vec2(16.0, 16.0)), "warning", pal.red);
+                    let gh = g.size().y;
+                    ui.painter().galley(r.min + vec2(26.0, 4.0), g, pal.ink);
+                    if let Some(d) = d {
+                        ui.painter().galley(r.min + vec2(26.0, 6.0 + gh), d, pal.ink_soft);
+                    }
+                    if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                        out.push(Intent::Select(key.clone()));
+                        ui.close_menu();
+                    }
+                }
+                ui.add_space(4.0);
+                ui.separator();
+            }
+            if running.is_empty() && ended.is_empty() && problems.is_empty() {
+                ui.label(egui::RichText::new("Nothing under way, and nothing wrong.").color(pal.ink_soft));
+            }
+            // an entry, clickable for its details: its mark, its text (two lines at most), then
+            // its server, how long, how far, and a warning while the server doesn't answer
+            let entry = |ui: &mut Ui, i: usize, out: &mut Vec<Intent>| {
+                let e = &self.log[i];
+                let running = e.status == "In progress";
+                let p = e.progress.as_ref();
+                // an upload's own progress, else the server task's
+                let fraction = self.uploads.values().find(|u| u.log == i && u.active()).and_then(|u| {
+                    let (sent, total) = (u.t.sent.load(Ordering::Relaxed), u.t.total.load(Ordering::Relaxed));
+                    (total > 0).then(|| sent as f32 / total as f32)
+                });
+                let fraction = if running { fraction.or_else(|| p.and_then(|p| p.fraction())) } else { None };
+                let w = ui.available_width();
+                let text = if running { e.text.clone() } else { format!("{}  ·  {}", e.text, e.time) };
+                let ink = if running || e.status == "Failed" { pal.ink } else { pal.ink_soft };
+                let mut job = egui::text::LayoutJob::simple(text, FontId::proportional(13.0), ink, w - 30.0);
+                job.wrap.max_rows = 2;
+                job.wrap.overflow_character = Some('…');
+                let g = ui.painter().layout_job(job);
+                let mut detail = vec![];
+                if running {
+                    detail.push(e.server.clone());
+                    detail.push(fmt_took(e.started.elapsed()));
+                    if let Some(f) = fraction {
+                        detail.push(format!("{}%", (f * 100.0).round()));
+                    }
+                }
+                let quiet = p.and_then(|p| p.silent_for()).filter(|d| running && d.as_secs() >= 5);
+                let h = 6.0 + g.size().y + if running { 18.0 } else { 0.0 } + if fraction.is_some() { 8.0 } else { 0.0 } + 4.0;
+                let (r, resp) = ui.allocate_exact_size(vec2(w, h), Sense::click());
+                if resp.hovered() {
+                    ui.painter().rect_filled(r, Rounding::same(5.0), pal.hover);
+                }
+                let top = r.min + vec2(0.0, 4.0);
+                let mark = Rect::from_min_size(top + vec2(4.0, 1.0), vec2(16.0, 16.0));
+                if running {
+                    paint_icon(ui.painter(), mark, IconKind::Busy(Tone::Accent), &pal, pal.surface);
+                } else {
+                    ui.painter().circle_filled(mark.center(), 3.5, status_color(&e.status, &pal));
+                }
+                let gh = g.size().y;
+                ui.painter().galley(top + vec2(26.0, 0.0), g, ink);
+                let mut y = top.y + gh + 2.0;
+                if running {
+                    let d = ui.painter().text(pos2(top.x + 26.0, y), Align2::LEFT_TOP, detail.join("  ·  "), FontId::proportional(12.0), pal.ink_soft);
+                    if let Some(q) = quiet {
+                        let left = LOST_AFTER.saturating_sub(q).as_secs();
+                        ui.painter().text(pos2(d.max.x + 10.0, y), Align2::LEFT_TOP, format!("no answer for {} s, gives up in {} s", q.as_secs(), left), FontId::proportional(12.0), pal.orange);
+                    }
+                    y += 18.0;
+                }
+                if let Some(f) = fraction {
+                    let bar = Rect::from_min_size(pos2(top.x + 26.0, y), vec2(w - 34.0, 4.0));
+                    ui.painter().rect_filled(bar, Rounding::same(2.0), pal.border);
+                    ui.painter().rect_filled(Rect::from_min_size(bar.min, vec2(bar.width() * f.clamp(0.0, 1.0), 4.0)), Rounding::same(2.0), pal.accent);
+                }
+                if resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Show what happened, and what the server said").clicked() {
+                    out.push(Intent::ShowLog(i));
+                    ui.close_menu();
+                }
+            };
+            for &i in &running {
+                entry(ui, i, out);
+                ui.ctx().request_repaint_after(Duration::from_millis(500));
+            }
+            if !ended.is_empty() {
+                if !running.is_empty() {
+                    ui.add_space(4.0);
+                    ui.separator();
+                }
+                ui.label(egui::RichText::new("Ended").size(12.0).color(pal.ink_faint));
+                for &i in &ended {
+                    entry(ui, i, out);
+                }
+            }
+            ui.add_space(4.0);
+            ui.separator();
+            if ui.add(egui::Label::new(egui::RichText::new("All of it in Logs").size(12.5).color(pal.accent)).sense(Sense::click())).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                out.push(Intent::Select("root".into()));
+                out.push(Intent::Tab(Tab::Logs));
+                ui.close_menu();
+            }
+        });
+        let r = m.response.rect;
+        if m.response.hovered() || m.inner.is_some() {
+            ui.painter().set(slot, egui::epaint::RectShape::filled(r, Rounding::same(6.0), pal.hover));
+        }
+        let icon = Rect::from_center_size(r.center(), vec2(16.0, 16.0));
+        if running.is_empty() {
+            paint_glyph(ui.painter(), icon, "activity", pal.ink_soft);
+            if !problems.is_empty() {
+                // something's wrong: a red dot
+                ui.painter().circle(pos2(r.max.x - 8.0, r.min.y + 8.0), 4.0, pal.red, Stroke::new(1.5, pal.toolbar));
+            }
+        } else {
+            paint_icon(ui.painter(), icon, IconKind::Busy(Tone::Accent), &pal, pal.toolbar);
+            // how many, in a small badge
+            let b = pos2(r.max.x - 7.0, r.min.y + 7.0);
+            ui.painter().circle_filled(b, 6.5, pal.accent);
+            ui.painter().text(b, Align2::CENTER_CENTER, running.len().to_string(), FontId::proportional(9.5), Color32::WHITE);
+        }
+        let mut tip = match running.len() {
+            0 => "Activities".to_string(),
+            1 => "Activities: 1 under way".to_string(),
+            n => format!("Activities: {} under way", n),
+        };
+        if !problems.is_empty() {
+            tip = format!("{}{} problem{}", if running.is_empty() { "Activities: ".to_string() } else { format!("{}, ", tip) }, problems.len(), if problems.len() == 1 { "" } else { "s" });
+        }
+        m.response.on_hover_text(tip);
     }
 
     /// The unfolded sidebar: search box, the Infrastructure / Objects switch, and the resource tree.
@@ -1951,6 +2788,7 @@ impl App {
         // an ISO library (local disks, DVD drives, USB) unless it needs Repair.
         let has_menu = match node.kind {
             Kind::Net | Kind::Folder => false,
+            Kind::Template => true,
             Kind::Sr => self.sr_of(node).map_or(false, |(s, x)| x.is_iso() || s.data.as_ref().and_then(|d| d.sr_trouble(x)).is_some()),
             _ => true,
         };
@@ -1963,6 +2801,20 @@ impl App {
             return;
         }
         resp.context_menu(|ui| match node.kind {
+            Kind::Template => {
+                if let (Some(sid), Some(t)) = (node.sid, node.rref.clone()) {
+                    let busy = self.server(sid).map_or(false, |s| s.busy.contains_key(&t));
+                    if ui.add_enabled(!busy, egui::Button::new("New VM from Template…")).clicked() {
+                        out.push(Intent::NewVmFromTemplate(sid, t.clone()));
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.add_enabled(!busy, egui::Button::new(egui::RichText::new("Delete Template…").color(self.pal.red))).clicked() {
+                        out.push(Intent::AskDeleteTemplate(sid, t));
+                        ui.close_menu();
+                    }
+                }
+            }
             Kind::Sr => {
                 // what its page has beside the tabs: an ISO library's actions, Repair when it
                 // isn't mounted somewhere
@@ -2006,6 +2858,20 @@ impl App {
                     ui.separator();
                     let pal = self.pal;
                     let deleting = self.vm_deleting.contains(&vm);
+                    let snap_ok = self.vm_of(node).map_or(false, |(s, d, v)| v.can_snapshot() && !s.busy.contains_key(&v.rref) && d.host_down_for(v).is_none());
+                    if ui.add_enabled(snap_ok && !deleting, egui::Button::new("Take Snapshot…")).clicked() {
+                        out.push(Intent::Select(node.key.clone()));
+                        out.push(Intent::TakeSnapshot(sid, vm.clone()));
+                        ui.close_menu();
+                    }
+                    let off = self.vm_of(node).map_or(false, |(s, _, v)| v.power == PowerState::Halted && !s.busy.contains_key(&v.rref));
+                    for (label, intent) in [("Copy VM…", Intent::CopyVm(sid, vm.clone())), ("Make Template…", Intent::MakeTemplate(sid, vm.clone()))] {
+                        if ui.add_enabled(off && !deleting, egui::Button::new(label)).on_disabled_hover_text(SHUT_DOWN_FIRST).clicked() {
+                            out.push(Intent::Select(node.key.clone()));
+                            out.push(intent);
+                            ui.close_menu();
+                        }
+                    }
                     if ui.add_enabled(!deleting, egui::Button::new(egui::RichText::new("Delete VM…").color(pal.red))).clicked() {
                         out.push(Intent::Select(node.key.clone()));
                         out.push(Intent::AskDeleteVm(sid, vm));
@@ -2078,9 +2944,9 @@ impl App {
     fn tab_actions_width(&self, sel: &Node, current: Tab) -> f32 {
         let vm = self.vm_of(sel).map(|x| x.2);
         let mut w = 0.0;
-        if let Some(v) = vm {
-            w += ACTIONS.iter().filter(|a| a.on_toolbar(Some(v))).map(|a| 34.0 + if force_of(a.op).is_some() { ARROW_W } else { 0.0 }).sum::<f32>();
-            w += 11.0 + 32.0; // a separator, then Delete
+        if vm.is_some() {
+            w += 34.0 + ARROW_W; // the power menu
+            w += 11.0 + 32.0 + 34.0 + ARROW_W + 32.0; // a separator, then Take Snapshot, Copy and Delete
         }
         let host = self.host_of(sel).is_some();
         if self.root_of(sel).is_some() {
@@ -2116,15 +2982,29 @@ impl App {
                 .collect(),
             None => vec![],
         };
+        // the power menu: its face (the VM's state, or a ring turning while an action runs), then
+        // its entries (None: a line), the Force ones last
+        let face = self.vm_of(sel).map(|(s, _, v)| match s.busy.get(&v.rref) {
+            Some((_, op)) => Err(Tone::of_action(op)),
+            None => Ok(match v.power {
+                PowerState::Running => "power-running",
+                PowerState::Suspended => "power-suspended",
+                PowerState::Paused => "power-paused",
+                _ => "power-halted",
+            }),
+        });
+        let state = self.vm_of(sel).map(|x| x.2.power.label()).unwrap_or_default();
+        let mut entries: Vec<Option<(usize, bool)>> = actions.iter().map(|&(i, ok, _)| Some((i, ok))).collect();
+        entries.push(None);
+        entries.extend(actions.iter().filter_map(|&(_, _, force)| force).map(Some));
         let deleting = vm.as_ref().map_or(false, |(_, r)| self.vm_deleting.contains(r));
+        let snap_ok = self.vm_of(sel).map_or(false, |(s, d, v)| v.can_snapshot() && !s.busy.contains_key(&v.rref) && d.host_down_for(v).is_none());
+        // Copy VM and Make Template: only while it's off
+        let off = self.vm_of(sel).map_or(false, |(s, _, v)| v.power == PowerState::Halted && !s.busy.contains_key(&v.rref));
         let root = self.root_of(sel).map(|(sid, connected)| (sid, if connected { "Disconnect" } else { "Remove" }, self.server(sid).map(|s| s.name()).unwrap_or_default()));
         // a server: Shut Down, while it's on and not already shutting down
         let host = self.host_of(sel).map(|(s, h)| (s.id, h.rref.clone(), h.is_up() && !self.host_busy.contains(&h.rref)));
         let mut console = if current == Tab::Console { self.console.as_mut() } else { None };
-        let tip = |i: usize| match ACTIONS[i].shortcut.text() {
-            "" => ACTIONS[i].label.to_string(),
-            k => format!("{}  ({})", ACTIONS[i].label, k),
-        };
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(free).layout(egui::Layout::right_to_left(egui::Align::Center)));
         let ui = &mut child;
         ui.spacing_mut().item_spacing.x = 2.0;
@@ -2156,20 +3036,18 @@ impl App {
             return;
         }
         if free.width() >= need {
-            // right to left: Delete, the power actions, the keyboard
+            // right to left: Delete, Take Snapshot, the power actions, the keyboard
             if let Some((sid, vref)) = &vm {
                 if flat_button(ui, "trash", "Delete VM…", Some(pal.red), !deleting, true, &pal).clicked() {
                     out.push(Intent::AskDeleteVm(*sid, vref.clone()));
                 }
+                copy_menu(ui, &pal, *sid, vref, off && !deleting, out);
+                if flat_button(ui, "camera", "Take Snapshot…", Some(pal.accent), snap_ok && !deleting, true, &pal).clicked() {
+                    out.push(Intent::TakeSnapshot(*sid, vref.clone()));
+                }
                 vsep(ui, &pal);
-                for &(i, ok, force) in actions.iter().rev() {
-                    let clicked = match force {
-                        Some((fi, fok)) => split_tool(ui, &pal, ACTIONS[i].op, &tip(i), ok, fi, fok, out),
-                        None => tool_button(ui, ACTIONS[i].op, &tip(i), ok, true, &pal).clicked(),
-                    };
-                    if clicked {
-                        out.push(Intent::Action(i));
-                    }
+                if let Some(face) = face {
+                    power_menu(ui, &pal, face, state, &entries, out);
                 }
             }
             if let Some(c) = console.as_deref_mut() {
@@ -2201,6 +3079,16 @@ impl App {
             }
             if let Some((sid, vref)) = &vm {
                 ui.separator();
+                if ui.add_enabled(snap_ok && !deleting, egui::Button::new("Take Snapshot…")).clicked() {
+                    out.push(Intent::TakeSnapshot(*sid, vref.clone()));
+                    ui.close_menu();
+                }
+                for (label, intent) in [("Copy VM…", Intent::CopyVm(*sid, vref.clone())), ("Make Template…", Intent::MakeTemplate(*sid, vref.clone()))] {
+                    if ui.add_enabled(off && !deleting, egui::Button::new(label)).on_disabled_hover_text(SHUT_DOWN_FIRST).clicked() {
+                        out.push(intent);
+                        ui.close_menu();
+                    }
+                }
                 if ui.add_enabled(!deleting, egui::Button::new(egui::RichText::new("Delete VM…").color(pal.red))).clicked() {
                     out.push(Intent::AskDeleteVm(*sid, vref.clone()));
                     ui.close_menu();
@@ -2280,7 +3168,11 @@ impl App {
             (Kind::Root, _) => ("All servers".into(), String::new()),
             (Kind::Category, _) => (sel.text.clone(), String::new()),
             (Kind::Folder, Some((s, _))) => {
-                let what = if sel.rref.as_deref() == Some("nets") { "Virtual Networks" } else { "Shared Storage" };
+                let what = match sel.rref.as_deref() {
+                    Some("nets") => "Virtual Networks",
+                    Some("tpls") => "Templates",
+                    _ => "Shared Storage",
+                };
                 (what.into(), join(vec![Some(format!("in {}", s.name())), recon]))
             }
             (Kind::Vm, Some((_, d))) => {
@@ -2288,6 +3180,10 @@ impl App {
                 let on = v.and_then(|v| v.host.as_deref()).and_then(|h| d.host(h)).map(|h| format!("on {}", h.name));
                 // (a power action under way shows as the icon turning)
                 (v.map_or_else(|| sel.text.clone(), |v| v.name.clone()), join(vec![on, recon]))
+            }
+            (Kind::Template, Some((_, d))) => {
+                let t = sel.rref.as_deref().and_then(|r| d.user_template(r));
+                (t.map_or_else(|| sel.text.clone(), |t| t.name.clone()), join(vec![Some("template".into()), t.map(|t| t.os.clone()), recon]))
             }
             (Kind::Pool, Some((s, d))) => (s.name(), join(vec![Some(format!("{} servers", d.hosts.len())), recon])),
             (Kind::Host, Some((_, d))) => {
@@ -2309,9 +3205,11 @@ impl App {
             Kind::Root | Kind::Category => vec![Tab::Home, Tab::Search, Tab::Logs],
             Kind::Sr if self.sr_of(sel).map_or(false, |(_, x)| x.is_iso()) => vec![Tab::General, Tab::IsoFiles, Tab::Logs],
             Kind::Folder if sel.rref.as_deref() == Some("nets") => vec![Tab::Networking],
+            Kind::Folder if sel.rref.as_deref() == Some("tpls") => vec![Tab::Templates],
+            Kind::Template => vec![Tab::General, Tab::Logs],
             Kind::Folder => vec![Tab::Storage],
             _ if !has_data => vec![Tab::General, Tab::Logs],
-            Kind::Vm => vec![Tab::General, Tab::Memory, Tab::Storage, Tab::Networking, Tab::Console, Tab::Logs],
+            Kind::Vm => vec![Tab::General, Tab::Memory, Tab::Storage, Tab::Networking, Tab::Snapshots, Tab::Console, Tab::Logs],
             Kind::Host => vec![Tab::General, Tab::Memory, Tab::Storage, Tab::Networking, Tab::Console, Tab::Logs],
             Kind::Pool => vec![Tab::General, Tab::Memory, Tab::Storage, Tab::Networking, Tab::Logs],
             _ => vec![Tab::General, Tab::Logs],
@@ -2640,7 +3538,11 @@ impl App {
                     g.push(row("UUID", v.uuid.clone()));
                     secs.push(("General".into(), g));
 
-                    let state = s.busy.get(&v.rref).map(|b| b.0.clone()).unwrap_or_else(|| v.power.label().into());
+                    let state = match (s.busy.get(&v.rref), d.host_down_for(v)) {
+                        (Some(b), _) => b.0.clone(),
+                        (None, Some(h)) => format!("Unknown: {} {} (it was {} there)", h.name, if h.live { "isn't answering" } else { "is off" }, v.power.label().to_lowercase()),
+                        (None, None) => v.power.label().into(),
+                    };
                     let mut st = vec![row("Power state", state)];
                     let host_name = |h: Option<&str>| h.and_then(|h| d.host(h)).map(|h| h.name.clone());
                     if running {
@@ -2699,7 +3601,7 @@ impl App {
                         dev.push(row("DVD drive", dvd));
                     }
                     dev.push(row("Network interfaces", if nets.is_empty() { v.nics.len().to_string() } else { format!("{}  ·  {}", v.nics.len(), nets.join(", ")) }));
-                    dev.push(row("Snapshots", v.snapshots.to_string()));
+                    dev.push(row("Snapshots", v.snapshots.len().to_string()));
                     secs.push(("Devices".into(), dev));
                 }
             }
@@ -2727,6 +3629,37 @@ impl App {
                     secs.push(("General".into(), g));
                     let pct = if x.size > 0 { format!(" ({}%)", 100 * x.used / x.size) } else { String::new() };
                     secs.push(("Size".into(), vec![row("Size", fmt_bytes(x.size)), row("Used", format!("{}{}", fmt_bytes(x.used), pct)), row("Free", fmt_bytes((x.size - x.used).max(0)))]));
+                }
+            }
+            Kind::Template => {
+                if let Some(t) = d.user_template(r) {
+                    let mut g = vec![row("Name", t.name.clone())];
+                    if !t.description.is_empty() {
+                        g.push(row("Description", t.description.clone()));
+                    }
+                    g.push(row("Operating system", or(&t.os, "Unknown").into()));
+                    g.push(row("UUID", t.uuid.clone()));
+                    secs.push(("General".into(), g));
+                    let memory = if t.mem_dyn_min > 0 && t.mem_dyn_min < t.mem_dyn_max { format!("{} – {} (dynamic)", fmt_bytes(t.mem_dyn_min), fmt_bytes(t.mem_dyn_max)) } else { fmt_bytes(t.mem_dyn_max) };
+                    secs.push(("CPU and memory".into(), vec![row("Virtual CPUs", t.vcpus.to_string()), row("Memory", memory)]));
+                    let mut dev = vec![];
+                    for k in t.disks.iter().filter(|k| k.kind == "Disk") {
+                        dev.push(row(&format!("Disk {}", k.device), format!("{}  ·  on {}", fmt_bytes(k.size), or(&k.sr_name, "unknown storage"))));
+                    }
+                    let mut nets: Vec<String> = t.nics.iter().map(|n| n.network.clone()).filter(|n| !n.is_empty()).collect();
+                    nets.dedup();
+                    dev.push(row("Network interfaces", if nets.is_empty() { t.nics.len().to_string() } else { format!("{}  ·  {}", t.nics.len(), nets.join(", ")) }));
+                    let mut boot = vec![];
+                    if !t.firmware.is_empty() {
+                        boot.push(row("Firmware", t.firmware.clone()));
+                    }
+                    if !t.boot_order.is_empty() {
+                        boot.push(row("Boot order", t.boot_order.clone()));
+                    }
+                    secs.push(("Devices".into(), dev));
+                    if !boot.is_empty() {
+                        secs.push(("Boot".into(), boot));
+                    }
                 }
             }
             Kind::Net => {
@@ -2938,6 +3871,21 @@ impl App {
                     over -= cut;
                 }
             }
+            // widths the user set by dragging a header's edge (for this table, this session)
+            let set_id = egui::Id::new(("column-widths", id));
+            let mut set: Vec<Option<f32>> = ui.data(|d| d.get_temp(set_id)).unwrap_or_default();
+            set.resize(widths.len(), None);
+            for (w, s) in widths.iter_mut().zip(&set) {
+                if let Some(s) = s {
+                    *w = *s;
+                }
+            }
+            let sum: f32 = widths.iter().sum();
+            if sum < avail && set.iter().any(|s| s.is_some()) {
+                if let Some(last) = widths.last_mut() {
+                    *last += avail - sum;
+                }
+            }
             let total_w = widths.iter().sum::<f32>();
             let (head_h, row_h) = (32.0, 34.0);
             ui.add_space(4.0);
@@ -2950,6 +3898,35 @@ impl App {
             let p = ui.painter().clone();
             for (i, h) in headers.iter().enumerate() {
                 p.text(pos2(xs[i] + pad, area.min.y + head_h / 2.0), Align2::LEFT_CENTER, *h, head_font.clone(), pal.ink_soft);
+            }
+            // each column's right edge in the header can be dragged to resize it (a double click
+            // gives it back its own width)
+            for i in 0..widths.len().saturating_sub(1) {
+                let x = xs[i] + widths[i];
+                let grip = Rect::from_min_max(pos2(x - 4.0, area.min.y + 4.0), pos2(x + 4.0, area.min.y + head_h - 4.0));
+                let resp = ui.interact(grip, ui.id().with((id, "grip", i)), Sense::click_and_drag()).on_hover_cursor(egui::CursorIcon::ResizeColumn);
+                if resp.hovered() || resp.dragged() {
+                    p.line_segment([pos2(x, grip.min.y), pos2(x, grip.max.y)], Stroke::new(2.0, pal.accent));
+                } else {
+                    p.line_segment([pos2(x, grip.min.y + 4.0), pos2(x, grip.max.y - 4.0)], Stroke::new(1.0, pal.border));
+                }
+                // the width from where the drag began (the same however often a frame is laid out)
+                let from_id = ui.id().with((id, "grip-from", i));
+                if resp.drag_started() {
+                    if let Some(at) = resp.interact_pointer_pos() {
+                        ui.data_mut(|d| d.insert_temp(from_id, (widths[i], at.x)));
+                    }
+                }
+                if resp.dragged() {
+                    if let (Some((base, from)), Some(at)) = (ui.data(|d| d.get_temp::<(f32, f32)>(from_id)), resp.interact_pointer_pos()) {
+                        set[i] = Some((base + at.x - from).max(48.0));
+                        ui.data_mut(|d| d.insert_temp(set_id, set.clone()));
+                    }
+                }
+                if resp.double_clicked() {
+                    set[i] = None;
+                    ui.data_mut(|d| d.insert_temp(set_id, set.clone()));
+                }
             }
             p.line_segment([pos2(area.min.x, area.min.y + head_h - 0.5), pos2(area.max.x, area.min.y + head_h - 0.5)], Stroke::new(1.0, pal.border));
             if rows.is_empty() {
@@ -3198,6 +4175,317 @@ impl App {
         }
     }
 
+    /// The Snapshots tab: a VM's snapshots, the newest first, each with when it was taken, what it
+    /// holds, a description that's edited in place, and Revert and Delete at the row's end. The
+    /// one the VM's current state comes from says "Now". Taking one is the camera by the power
+    /// buttons (and here, while there are none).
+    fn snapshots_tab(&mut self, ui: &mut Ui, sel: &Node, out: &mut Vec<Intent>) {
+        let pal = self.pal;
+        let Some((s, _, v)) = self.vm_of(sel) else { return };
+        let (sid, vref, snaps, parent) = (s.id, v.rref.clone(), v.snapshots.clone(), v.parent.clone());
+        let doing = s.busy.get(&v.rref).map(|b| b.0.clone());
+        let gone = self.vm_of(sel).map_or(false, |(_, d, v)| d.host_down_for(v).is_some());
+        let can_take = v.can_snapshot() && doing.is_none() && !gone;
+        ui.add_space(10.0);
+        if let Some(what) = &doing {
+            ui.horizontal(|ui| {
+                ui.add(egui::Spinner::new().size(14.0));
+                ui.label(egui::RichText::new(what.as_str()).color(pal.ink_soft));
+            });
+            ui.add_space(4.0);
+        }
+        if snaps.is_empty() {
+            ui.add_space(24.0);
+            ui.vertical_centered(|ui| {
+                ui.set_max_width(420.0);
+                ui.label(egui::RichText::new("No snapshots yet").size(15.0).color(pal.ink));
+                ui.add_space(4.0);
+                ui.add(egui::Label::new(egui::RichText::new("A snapshot keeps this VM's disks (and, if you like, its memory) as they are now, so you can come back to this moment later.").color(pal.ink_soft)).wrap());
+                ui.add_space(10.0);
+                if flat_button(ui, "camera", "Take Snapshot…", Some(pal.accent), can_take, false, &pal).clicked() {
+                    out.push(Intent::TakeSnapshot(sid, vref.clone()));
+                }
+            });
+            return;
+        }
+        let count = format!("{} snapshot{}", snaps.len(), if snaps.len() == 1 { "" } else { "s" });
+        ui.label(egui::RichText::new(count).color(pal.ink_soft));
+        ui.label(egui::RichText::new("Revert puts the VM back as it was then; what changed since is lost.").size(12.0).color(pal.ink_faint));
+        let now = unix_now();
+        let offset = local_offset(now);
+        let font = FontId::proportional(13.0);
+        let measure = |t: &str| ui.painter().layout_no_wrap(t.to_string(), font.clone(), pal.ink).size().x;
+        const PILL: f32 = 42.0;
+        // Revert and Delete always show: in a narrower window "Holds" goes (a memory module after
+        // the time instead), then the description (shown over the name instead)
+        #[derive(Clone, Copy, PartialEq)]
+        enum Col {
+            Name,
+            Taken,
+            Holds,
+            Description,
+            Actions,
+        }
+        let avail = ui.available_width();
+        let cols: Vec<Col> = if avail >= 700.0 {
+            vec![Col::Name, Col::Taken, Col::Holds, Col::Description, Col::Actions]
+        } else if avail >= 540.0 {
+            vec![Col::Name, Col::Taken, Col::Description, Col::Actions]
+        } else {
+            vec![Col::Name, Col::Taken, Col::Actions]
+        };
+        let headers: Vec<&str> = cols
+            .iter()
+            .map(|c| match c {
+                Col::Name => "Name",
+                Col::Taken => "Taken",
+                Col::Holds => "Holds",
+                Col::Description => "Description",
+                Col::Actions => "",
+            })
+            .collect();
+        let rows: Vec<Vec<Cell>> = snaps
+            .iter()
+            .map(|x| {
+                cols.iter()
+                    .map(|c| match c {
+                        Col::Name => Cell::Custom(24.0 + measure(&x.name) + if parent.as_deref() == Some(x.rref.as_str()) { PILL + 8.0 } else { 0.0 }),
+                        Col::Taken => {
+                            let when = x.time.map(|t| fmt_when(t, now, offset)).unwrap_or_else(|| "—".into());
+                            Cell::Custom(measure(&when) + if x.memory && !cols.contains(&Col::Holds) { 26.0 } else { 0.0 })
+                        }
+                        Col::Holds => Cell::Text(if x.memory { "Disks and memory" } else { "Disks" }.into()),
+                        Col::Description => {
+                            let editing = self.snap_edit.as_ref().map_or(false, |e| e.vdi == x.rref);
+                            Cell::Custom(if editing { 240.0 } else { (measure(&x.description) + 34.0).min(380.0) })
+                        }
+                        Col::Actions => Cell::Custom(86.0),
+                    })
+                    .collect()
+            })
+            .collect();
+        let mut edit = self.snap_edit.take();
+        let (mut close, mut save, mut delete, mut revert, mut template) = (false, None, None, None, None);
+        let (saving, deleting) = (&self.snap_saving, &self.snap_deleting);
+        let (with_description, with_holds) = (cols.contains(&Col::Description), cols.contains(&Col::Holds));
+        self.table_with(ui, "snaps", &headers, &rows, false, &mut |ui, row, col, r, hot| {
+            let x = &snaps[row];
+            let gone = deleting.contains(&x.rref);
+            let p = ui.painter().clone();
+            let current = parent.as_deref() == Some(x.rref.as_str());
+            if cols[col] == Col::Name {
+                // the camera, the name (cut short if need be), and "Now" on the one the VM's
+                // current state comes from
+                paint_icon(&p, Rect::from_min_size(pos2(r.min.x, r.center().y - 8.0), vec2(16.0, 16.0)), IconKind::Snapshot, &pal, pal.window);
+                let colour = if gone { pal.ink_faint } else { pal.ink };
+                let mut job = egui::text::LayoutJob::simple_singleline(x.name.clone(), font.clone(), colour);
+                job.wrap = egui::text::TextWrapping { max_width: (r.width() - 24.0 - if current { PILL + 8.0 } else { 0.0 }).max(20.0), max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
+                let g = p.layout_job(job);
+                let end = r.min.x + 24.0 + g.size().x;
+                p.galley(pos2(r.min.x + 24.0, r.center().y - g.size().y / 2.0), g, colour);
+                if !with_description && !x.description.is_empty() {
+                    ui.interact(Rect::from_min_max(r.min, pos2(end, r.max.y)), ui.id().with(("name", &x.rref)), Sense::hover()).on_hover_text(x.description.as_str());
+                }
+                if current {
+                    let pill = Rect::from_min_size(pos2(end + 8.0, r.center().y - 9.0), vec2(PILL, 18.0));
+                    p.rect_filled(pill, Rounding::same(9.0), pal.accent.gamma_multiply(if pal.dark { 0.3 } else { 0.15 }));
+                    p.text(pill.center(), Align2::CENTER_CENTER, "Now", FontId::proportional(11.5), pal.accent);
+                    ui.interact(pill, ui.id().with(("now", &x.rref)), Sense::hover()).on_hover_text("The VM's current state comes from this snapshot");
+                }
+                return;
+            }
+            if cols[col] == Col::Taken {
+                // when, then (with no Holds column) a memory module on one that holds its memory
+                let when = x.time.map(|t| fmt_when(t, now, offset)).unwrap_or_else(|| "—".into());
+                let chip = x.memory && !with_holds;
+                let mut job = egui::text::LayoutJob::simple_singleline(when, font.clone(), pal.ink);
+                job.wrap = egui::text::TextWrapping { max_width: (r.width() - if chip { 26.0 } else { 0.0 }).max(20.0), max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
+                let g = p.layout_job(job);
+                let end = r.min.x + g.size().x;
+                p.galley(pos2(r.min.x, r.center().y - g.size().y / 2.0), g, pal.ink);
+                if chip {
+                    let m = Rect::from_center_size(pos2(end + 16.0, r.center().y), vec2(16.0, 16.0));
+                    paint_glyph(&p, m, "memory", pal.ink_soft);
+                    ui.interact(m.expand(3.0), ui.id().with(("mem", &x.rref)), Sense::hover()).on_hover_text("Holds its memory too: reverting resumes the VM where it was");
+                }
+                return;
+            }
+            if cols[col] == Col::Actions {
+                // Revert, then the bin
+                if gone {
+                    return;
+                }
+                let ok = doing.is_none() && !gone;
+                // Make Template, from a snapshot of its disks only
+                let tb = Rect::from_center_size(pos2(r.max.x - 43.0, r.center().y), vec2(26.0, 26.0));
+                let tok = ok && !x.memory;
+                let tip = if x.memory { "Templates come from snapshots of the disks only (this one holds its memory too)" } else { "Make a template from this snapshot…" };
+                let tresp = ui.interact(tb, ui.id().with(("template", &x.rref)), if tok { Sense::click() } else { Sense::hover() }).on_hover_text(tip);
+                if tok && tresp.hovered() {
+                    p.rect_filled(tb, Rounding::same(5.0), pal.border);
+                }
+                let tc = if !tok { pal.ink_faint.gamma_multiply(0.45) } else if tresp.hovered() { pal.accent } else if hot { pal.ink_soft } else { pal.ink_faint };
+                paint_glyph(&p, Rect::from_center_size(tb.center(), vec2(16.0, 16.0)), "template", tc);
+                if tok && tresp.clicked() {
+                    template = Some(x.rref.clone());
+                }
+                let rb = Rect::from_center_size(pos2(r.max.x - 73.0, r.center().y), vec2(26.0, 26.0));
+                let rresp = ui.interact(rb, ui.id().with(("revert", &x.rref)), if ok { Sense::click() } else { Sense::hover() }).on_hover_text("Revert the VM to this snapshot…");
+                if ok && rresp.hovered() {
+                    p.rect_filled(rb, Rounding::same(5.0), pal.border);
+                }
+                let rc = if !ok { pal.ink_faint.gamma_multiply(0.45) } else if rresp.hovered() { pal.orange } else if hot { pal.ink_soft } else { pal.ink_faint };
+                paint_glyph(&p, Rect::from_center_size(rb.center(), vec2(16.0, 16.0)), "revert", rc);
+                if ok && rresp.clicked() {
+                    revert = Some(x.rref.clone());
+                }
+                let b = Rect::from_center_size(pos2(r.max.x - 13.0, r.center().y), vec2(26.0, 26.0));
+                let resp = ui.interact(b, ui.id().with(("delete", &x.rref)), Sense::click()).on_hover_text("Delete this snapshot…");
+                if resp.hovered() {
+                    p.rect_filled(b, Rounding::same(5.0), pal.red.gamma_multiply(if pal.dark { 0.25 } else { 0.12 }));
+                }
+                let colour = if resp.hovered() { pal.red } else if hot { pal.ink_soft } else { pal.ink_faint };
+                paint_glyph(&p, Rect::from_center_size(b.center(), vec2(16.0, 16.0)), "trash", colour);
+                if resp.clicked() {
+                    delete = Some(x.rref.clone());
+                }
+                return;
+            }
+            // the description
+            if gone {
+                p.text(pos2(r.min.x, r.center().y), Align2::LEFT_CENTER, "Deleting…", font.clone(), pal.ink_faint);
+                return;
+            }
+            if let Some(e) = edit.as_mut().filter(|e| e.vdi == x.rref) {
+                // a text box, then Save and Cancel; Enter saves, Esc cancels
+                let mut child = ui.new_child(egui::UiBuilder::new().max_rect(r).layout(egui::Layout::left_to_right(egui::Align::Center)));
+                child.spacing_mut().item_spacing.x = 4.0;
+                let field = text_field(&mut child, &pal, &mut e.text, (r.width() - 64.0).clamp(80.0, 520.0), false);
+                if e.focus {
+                    field.request_focus();
+                    e.focus = false;
+                }
+                let enter = field.lost_focus() && child.input(|i| i.key_pressed(Key::Enter));
+                let ok = flat_button(&mut child, "check", "Save", Some(pal.green), true, true, &pal).clicked();
+                let cancel = flat_button(&mut child, "close", "Cancel", None, true, true, &pal).clicked() || child.input(|i| i.key_pressed(Key::Escape));
+                if ok || enter {
+                    let text = e.text.trim().to_string();
+                    if text != x.description {
+                        save = Some((x.rref.clone(), text));
+                    }
+                }
+                close |= ok || enter || cancel;
+                return;
+            }
+            let pending = saving.get(&x.rref);
+            let (text, col) = match pending {
+                Some(t) => (t.as_str(), pal.ink_faint),
+                None if x.description.is_empty() => ("—", pal.ink_faint),
+                None => (x.description.as_str(), pal.ink),
+            };
+            let mut job = egui::text::LayoutJob::simple_singleline(text.to_string(), font.clone(), col);
+            job.wrap = egui::text::TextWrapping { max_width: (r.width() - 34.0).max(10.0), max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
+            let g = p.layout_job(job);
+            let end = r.min.x + g.size().x;
+            p.galley(pos2(r.min.x, r.center().y - g.size().y / 2.0), g, col);
+            if pending.is_some() {
+                return;
+            }
+            let b = Rect::from_center_size(pos2(end + 19.0, r.center().y), vec2(26.0, 26.0));
+            let resp = ui.interact(b, ui.id().with(("describe", &x.rref)), Sense::click()).on_hover_text("Edit the description");
+            if resp.hovered() {
+                p.rect_filled(b, Rounding::same(5.0), pal.border);
+            }
+            paint_glyph(&p, Rect::from_center_size(b.center(), vec2(16.0, 16.0)), "edit", if hot { pal.ink_soft } else { pal.ink_faint });
+            if resp.clicked() {
+                edit = Some(IsoEdit { vdi: x.rref.clone(), text: x.description.clone(), focus: true });
+            }
+        });
+        self.snap_edit = if close { None } else { edit };
+        if let Some((snap, text)) = save {
+            out.push(Intent::SaveSnapshotDescription(sid, snap, text));
+        }
+        if let Some(snap) = revert {
+            out.push(Intent::AskRevert(sid, snap));
+        }
+        if let Some(snap) = delete {
+            out.push(Intent::AskDeleteSnapshot(sid, snap));
+        }
+        if let Some(snap) = template {
+            out.push(Intent::MakeTemplate(sid, snap));
+        }
+    }
+
+    /// The Templates folder: the user's templates, each with its system, size and description, and
+    /// New VM and Delete at the row's end; a click on a row opens it.
+    fn templates_tab(&mut self, ui: &mut Ui, sel: &Node, out: &mut Vec<Intent>) {
+        let pal = self.pal;
+        let Some(s) = sel.sid.and_then(|id| self.server(id)) else { return };
+        let Some(d) = s.data.as_ref() else { return };
+        let sid = s.id;
+        let mut tpls = d.user_templates.clone();
+        tpls.sort_by_key(|t| t.name.to_lowercase());
+        let busy: Vec<bool> = tpls.iter().map(|t| s.busy.contains_key(&t.rref)).collect();
+        ui.add_space(10.0);
+        ui.label(egui::RichText::new(format!("{} template{}", tpls.len(), if tpls.len() == 1 { "" } else { "s" })).color(pal.ink_soft));
+        ui.label(egui::RichText::new("Made from your VMs (Make Template, by the copy button next to a VM's camera), to make new VMs from.").size(12.0).color(pal.ink_faint));
+        let wide = ui.available_width() >= 640.0;
+        let mut headers = vec!["Name", "System", "Size"];
+        if wide {
+            headers.push("Description");
+        }
+        headers.push("");
+        let rows: Vec<Vec<Cell>> = tpls
+            .iter()
+            .map(|t| {
+                let disk: i64 = t.disks.iter().filter(|k| k.kind == "Disk").map(|k| k.size).sum();
+                let mut r = vec![
+                    Cell::Icon(IconKind::Template, t.name.clone()),
+                    Cell::Text(or(&t.os, "—").into()),
+                    Cell::Text(format!("{} CPU{}  ·  {}  ·  {} disk", t.vcpus, if t.vcpus == 1 { "" } else { "s" }, fmt_bytes(t.mem_dyn_max), fmt_bytes(disk))),
+                ];
+                if wide {
+                    r.push(Cell::Text(or(&t.description, "—").into()));
+                }
+                r.push(Cell::Custom(56.0));
+                r
+            })
+            .collect();
+        let (mut new_vm, mut delete) = (None, None);
+        let opened = self.table_with(ui, "tpls", &headers, &rows, true, &mut |ui, row, _col, r, hot| {
+            let t = &tpls[row];
+            if busy[row] {
+                return;
+            }
+            let p = ui.painter().clone();
+            let nb = Rect::from_center_size(pos2(r.max.x - 43.0, r.center().y), vec2(26.0, 26.0));
+            let nresp = ui.interact(nb, ui.id().with(("tnew", &t.rref)), Sense::click()).on_hover_text("Make a VM from this template…");
+            if nresp.hovered() {
+                p.rect_filled(nb, Rounding::same(5.0), pal.border);
+            }
+            paint_glyph(&p, Rect::from_center_size(nb.center(), vec2(16.0, 16.0)), "newvm", if nresp.hovered() { pal.accent } else if hot { pal.ink_soft } else { pal.ink_faint });
+            if nresp.clicked() {
+                new_vm = Some(t.rref.clone());
+            }
+            let b = Rect::from_center_size(pos2(r.max.x - 13.0, r.center().y), vec2(26.0, 26.0));
+            let resp = ui.interact(b, ui.id().with(("tdel", &t.rref)), Sense::click()).on_hover_text("Delete this template…");
+            if resp.hovered() {
+                p.rect_filled(b, Rounding::same(5.0), pal.red.gamma_multiply(if pal.dark { 0.25 } else { 0.12 }));
+            }
+            paint_glyph(&p, Rect::from_center_size(b.center(), vec2(16.0, 16.0)), "trash", if resp.hovered() { pal.red } else if hot { pal.ink_soft } else { pal.ink_faint });
+            if resp.clicked() {
+                delete = Some(t.rref.clone());
+            }
+        });
+        if let Some(t) = new_vm {
+            out.push(Intent::NewVmFromTemplate(sid, t));
+        } else if let Some(t) = delete {
+            out.push(Intent::AskDeleteTemplate(sid, t));
+        } else if let Some(i) = opened {
+            out.push(Intent::Select(format!("tpl:{}:{}", sid, tpls[i].rref)));
+        }
+    }
+
     /// An upload's progress: the file, a bar (blue, then green when it's done), how much and how
     /// fast, and Cancel; once done, it stays a few seconds with how long it took.
     fn upload_card(&self, ui: &mut Ui, sr: &str, u: &Upload, out: &mut Vec<Intent>) {
@@ -3303,18 +4591,29 @@ impl App {
         }
     }
 
-    fn logs(&self, ui: &mut Ui, sel: &Node) {
-        let rows = self
-            .log
-            .iter()
+    /// The Logs tab: the newest first (for a VM, its own); a click on one shows it in full, with
+    /// what the server said.
+    fn logs(&self, ui: &mut Ui, sel: &Node, out: &mut Vec<Intent>) {
+        let shown: Vec<usize> = (0..self.log.len())
             .rev()
-            .filter(|e| match sel.sid {
-                Some(sid) => e.sid == sid && (sel.kind != Kind::Vm || e.obj_ref.as_deref() == sel.rref.as_deref()),
-                None => true,
+            .filter(|&i| {
+                let e = &self.log[i];
+                match sel.sid {
+                    Some(sid) => e.sid == sid && (sel.kind != Kind::Vm || e.obj_ref.as_deref() == sel.rref.as_deref()),
+                    None => true,
+                }
             })
-            .map(|e| vec![Cell::Text(e.time.clone()), Cell::Text(e.server.clone()), Cell::Text(e.obj.clone()), Cell::Text(e.text.clone()), Cell::Status(e.status.clone())])
-            .collect::<Vec<_>>();
-        self.table(ui, "logs", &["Time", "Server", "Object", "What happened", "Result"], &rows, false);
+            .collect();
+        let rows: Vec<Vec<Cell>> = shown
+            .iter()
+            .map(|&i| {
+                let e = &self.log[i];
+                vec![Cell::Text(e.time.clone()), Cell::Text(e.server.clone()), Cell::Text(e.obj.clone()), Cell::Text(e.text.clone()), Cell::Status(e.status.clone())]
+            })
+            .collect();
+        if let Some(r) = self.table(ui, "logs", &["Time", "Server", "Object", "What happened", "Result"], &rows, true) {
+            out.push(Intent::ShowLog(shown[r]));
+        }
     }
 
     fn dialogs(&mut self, ctx: &egui::Context) {
@@ -3326,6 +4625,17 @@ impl App {
         let mut delete_iso: Option<(u32, String, String, String)> = None;
         // from the Delete VM question: server, VM, its name, whether its disks go too
         let mut delete_vm: Option<(u32, String, String, bool)> = None;
+        // from the snapshot dialogs: take one (server, VM, name, description, memory), revert to
+        // one (server, snapshot, a snapshot of now first), delete one (server, snapshot)
+        let mut take_snap: Option<(u32, String, String, String, bool)> = None;
+        let mut revert_to: Option<(u32, String, bool)> = None;
+        let mut delete_snap: Option<(u32, String)> = None;
+        // from the template and copy dialogs
+        let mut make_tpl: Option<(u32, String, String, String, String)> = None;
+        let mut copy_to: Option<(u32, String, String, Option<String>)> = None;
+        let mut delete_tpl: Option<(u32, String)> = None;
+        // something left half made, to delete: server, what, its name
+        let mut leftover: Option<(u32, Vec<String>, String)> = None;
         // from the Shut Down Server question: pool, server, its name
         let mut shutdown_host: Option<(u32, String, String)> = None;
         // from Settings: the theme and size chosen, a saved password to forget
@@ -3350,6 +4660,18 @@ impl App {
         let hosts = self.known_hosts.clone();
         let red = self.pal.red;
         let pal = self.pal;
+        let detail: Option<LogEntry> = match &self.dialog {
+            Dialog::LogDetail { index, .. } => self.log.get(*index).cloned(),
+            _ => None,
+        };
+        let upload_fraction = |i: usize| self.uploads.values().find(|u| u.log == i && u.active()).and_then(|u| {
+            let (sent, total) = (u.t.sent.load(Ordering::Relaxed), u.t.total.load(Ordering::Relaxed));
+            (total > 0).then(|| sent as f32 / total as f32)
+        });
+        let detail_fraction = match &self.dialog {
+            Dialog::LogDetail { index, .. } => upload_fraction(*index),
+            _ => None,
+        };
         match &mut self.dialog {
             Dialog::None => {}
             Dialog::AddServer { server, user, password, error, remember } => {
@@ -3544,6 +4866,205 @@ impl App {
                         }
                         if dialog_button(ui, &pal, "trash", if *running { "Shut down and delete" } else { "Delete" }, Look::Danger, true) {
                             delete_vm = Some((*sid, vm.clone(), name.clone(), *delete_disks && !disks.is_empty()));
+                        }
+                    });
+                });
+            }
+            Dialog::TakeSnapshot { sid, vm, vm_name, name, description, memory, can_memory, memory_size, focus } => {
+                dialog_window(ctx, "Take Snapshot").show(ctx, |ui| {
+                    ui.set_width(440.0);
+                    ui.spacing_mut().item_spacing.y = 8.0;
+                    let what = if *memory { "disks and memory" } else { "disks" };
+                    ui.add(egui::Label::new(egui::RichText::new(format!("Keeps the {} of '{}' as they are now, to come back to later.", what, vm_name)).color(pal.ink_soft)).wrap());
+                    ui.add_space(2.0);
+                    ui.horizontal(|ui| {
+                        field_label(ui, "Name:", LABEL_WIDTH);
+                        let r = text_field(ui, &pal, name, ui.available_width(), false);
+                        if *focus {
+                            r.request_focus();
+                            *focus = false;
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        field_label(ui, "Description:", LABEL_WIDTH);
+                        text_field(ui, &pal, description, ui.available_width(), false);
+                    });
+                    if *can_memory {
+                        ui.horizontal(|ui| {
+                            ui.add_space(LABEL_WIDTH + ui.spacing().item_spacing.x);
+                            ui.checkbox(memory, "Include its memory");
+                        });
+                        ui.horizontal(|ui| {
+                            ui.add_space(LABEL_WIDTH + ui.spacing().item_spacing.x + 2.0);
+                            let note = format!("Reverting to it then resumes the VM right where it was. It pauses while its {} of memory is written to disk.", fmt_bytes(*memory_size));
+                            ui.add(egui::Label::new(egui::RichText::new(note).size(12.0).color(pal.ink_soft)).wrap());
+                        });
+                    }
+                    ui.add_space(4.0);
+                    dialog_buttons(ui, |ui| {
+                        if dialog_button(ui, &pal, "close", "Cancel", Look::Plain, true) || ui.input(|i| i.key_pressed(Key::Escape)) {
+                            close = true;
+                        }
+                        let ready = !name.trim().is_empty();
+                        let enter = ui.input(|i| i.key_pressed(Key::Enter));
+                        if dialog_button(ui, &pal, "camera", "Take Snapshot", Look::Primary, ready) || (ready && enter) {
+                            take_snap = Some((*sid, vm.clone(), name.trim().to_string(), description.trim().to_string(), *memory && *can_memory));
+                        }
+                    });
+                });
+            }
+            Dialog::ConfirmRevert { sid, snap, vm_name, snap_name, text, first } => {
+                dialog_window(ctx, "Revert to Snapshot").show(ctx, |ui| {
+                    ui.set_width(440.0);
+                    ui.add(egui::Label::new(format!("Revert '{}' to its snapshot '{}'?", vm_name, snap_name)).wrap());
+                    ui.add_space(8.0);
+                    ui.add(egui::Label::new(egui::RichText::new(text.as_str()).color(pal.ink_soft)).wrap());
+                    ui.add_space(8.0);
+                    ui.checkbox(first, "Take a snapshot of now first, to be able to come back");
+                    ui.add_space(12.0);
+                    dialog_buttons(ui, |ui| {
+                        if dialog_button(ui, &pal, "close", "Cancel", Look::Plain, true) || ui.input(|i| i.key_pressed(Key::Escape)) {
+                            close = true;
+                        }
+                        if dialog_button(ui, &pal, "revert", "Revert", if *first { Look::Primary } else { Look::Danger }, true) {
+                            revert_to = Some((*sid, snap.clone(), *first));
+                        }
+                    });
+                });
+            }
+            Dialog::ConfirmDeleteSnapshot { sid, snap, vm_name, snap_name, memory } => {
+                dialog_window(ctx, "Delete Snapshot").show(ctx, |ui| {
+                    ui.set_width(420.0);
+                    ui.add(egui::Label::new(format!("Delete the snapshot '{}' of '{}'?", snap_name, vm_name)).wrap());
+                    ui.add_space(8.0);
+                    let mine = if *memory { "Its copies of the disks and its saved memory go" } else { "Its copies of the disks go" };
+                    let text = format!("{}; the VM itself isn't touched. The space comes back once the storage has merged the disks, in a few minutes. This can't be undone.", mine);
+                    ui.add(egui::Label::new(egui::RichText::new(text).color(pal.ink_soft)).wrap());
+                    ui.add_space(12.0);
+                    dialog_buttons(ui, |ui| {
+                        if dialog_button(ui, &pal, "close", "Cancel", Look::Plain, true) || ui.input(|i| i.key_pressed(Key::Escape)) {
+                            close = true;
+                        }
+                        if dialog_button(ui, &pal, "trash", "Delete", Look::Danger, true) {
+                            delete_snap = Some((*sid, snap.clone()));
+                        }
+                    });
+                });
+            }
+            Dialog::MakeTemplate { sid, vm, source, from, name, description, power_cut, focus } => {
+                dialog_window(ctx, "Make Template").show(ctx, |ui| {
+                    ui.set_width(460.0);
+                    ui.spacing_mut().item_spacing.y = 8.0;
+                    ui.add(egui::Label::new(egui::RichText::new(format!("A template from {}, to make new VMs from. Its disks are copied in an instant on their own storage.", from)).color(pal.ink_soft)).wrap());
+                    ui.add_space(2.0);
+                    ui.horizontal(|ui| {
+                        field_label(ui, "Name:", LABEL_WIDTH);
+                        let r = text_field(ui, &pal, name, ui.available_width(), false);
+                        if *focus {
+                            r.request_focus();
+                            *focus = false;
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        field_label(ui, "Description:", LABEL_WIDTH);
+                        text_field(ui, &pal, description, ui.available_width(), false);
+                    });
+                    ui.add_space(2.0);
+                    if *power_cut {
+                        crate::newvm::alert(ui, &pal, false, "Taken while the VM was running.", "VMs made from it start as after a power cut: they check their disks, and programs that were busy may need to recover.", None);
+                    }
+                    let tip = "Windows: run  sysprep /generalize /oobe /shutdown  first.\nLinux: empty the machine ID (truncate -s 0 /etc/machine-id) and delete the SSH host keys (/etc/ssh/ssh_host_*), then shut it down; on Debian and Ubuntu, run  ssh-keygen -A  on each new VM.";
+                    crate::newvm::alert(ui, &pal, false, "Generalize it first, so its copies don't clash.", tip, None);
+                    ui.add_space(4.0);
+                    dialog_buttons(ui, |ui| {
+                        if dialog_button(ui, &pal, "close", "Cancel", Look::Plain, true) || ui.input(|i| i.key_pressed(Key::Escape)) {
+                            close = true;
+                        }
+                        let ready = !name.trim().is_empty();
+                        if dialog_button(ui, &pal, "template", "Make Template", Look::Primary, ready) || (ready && ui.input(|i| i.key_pressed(Key::Enter))) {
+                            make_tpl = Some((*sid, vm.clone(), source.clone(), name.trim().to_string(), description.trim().to_string()));
+                        }
+                    });
+                });
+            }
+            Dialog::CopyVm { sid, vm, vm_name, name, stores, store, focus } => {
+                dialog_window(ctx, "Copy VM").show(ctx, |ui| {
+                    ui.set_width(460.0);
+                    ui.spacing_mut().item_spacing.y = 8.0;
+                    ui.add(egui::Label::new(egui::RichText::new(format!("A new VM just like '{}', with its own disks; it starts off. New network cards get new addresses.", vm_name)).color(pal.ink_soft)).wrap());
+                    ui.add_space(2.0);
+                    ui.horizontal(|ui| {
+                        field_label(ui, "Name:", LABEL_WIDTH);
+                        let r = text_field(ui, &pal, name, ui.available_width(), false);
+                        if *focus {
+                            r.request_focus();
+                            *focus = false;
+                        }
+                    });
+                    if !stores.is_empty() {
+                        ui.horizontal(|ui| {
+                            field_label(ui, "Disks on:", LABEL_WIDTH);
+                            crate::newvm::combo_style(ui, &pal);
+                            let shown = stores.get(*store).map(|s| s.1.clone()).unwrap_or_default();
+                            crate::newvm::combo("copy-sr", shown, ui.available_width()).show_ui(ui, |ui| {
+                                for (i, s) in stores.iter().enumerate() {
+                                    ui.selectable_value(store, i, s.1.as_str());
+                                }
+                            });
+                        });
+                    }
+                    let instant = stores.get(*store).map_or(true, |s| s.2);
+                    let note = if instant {
+                        "The copy shares the original's disks until either changes them, so it's ready at once and takes no room to begin with."
+                    } else {
+                        "Its disks are written out in full on the other storage: as long as copying them takes."
+                    };
+                    ui.add(egui::Label::new(egui::RichText::new(note).size(12.0).color(pal.ink_soft)).wrap());
+                    ui.add_space(4.0);
+                    dialog_buttons(ui, |ui| {
+                        if dialog_button(ui, &pal, "close", "Cancel", Look::Plain, true) || ui.input(|i| i.key_pressed(Key::Escape)) {
+                            close = true;
+                        }
+                        let ready = !name.trim().is_empty();
+                        if dialog_button(ui, &pal, "copy", "Copy", Look::Primary, ready) || (ready && ui.input(|i| i.key_pressed(Key::Enter))) {
+                            let sr = stores.get(*store).filter(|s| !s.2).map(|s| s.0.clone());
+                            copy_to = Some((*sid, vm.clone(), name.trim().to_string(), sr));
+                        }
+                    });
+                });
+            }
+            Dialog::ConfirmDeleteTemplate { sid, tpl, name, disk } => {
+                dialog_window(ctx, "Delete Template").show(ctx, |ui| {
+                    ui.set_width(420.0);
+                    ui.add(egui::Label::new(format!("Delete the template '{}'?", name)).wrap());
+                    ui.add_space(8.0);
+                    let text = format!("Its disks ({}) go too. VMs already made from it aren't touched. This can't be undone.", fmt_bytes(*disk));
+                    ui.add(egui::Label::new(egui::RichText::new(text).color(pal.ink_soft)).wrap());
+                    ui.add_space(12.0);
+                    dialog_buttons(ui, |ui| {
+                        if dialog_button(ui, &pal, "close", "Cancel", Look::Plain, true) || ui.input(|i| i.key_pressed(Key::Escape)) {
+                            close = true;
+                        }
+                        if dialog_button(ui, &pal, "trash", "Delete", Look::Danger, true) {
+                            delete_tpl = Some((*sid, tpl.clone()));
+                        }
+                    });
+                });
+            }
+            Dialog::ConfirmLeftover { sid, name, refs, server } => {
+                dialog_window(ctx, "Left Half Made?").show(ctx, |ui| {
+                    ui.set_width(440.0);
+                    ui.add(egui::Label::new(format!("'{}' was being made when contact with {} was lost.", name, server)).wrap());
+                    ui.add_space(8.0);
+                    let what = if refs.len() == 1 { "It's there now, but it may be incomplete (its disks only partly copied)" } else { "There are a few of them now, maybe incomplete" };
+                    ui.add(egui::Label::new(egui::RichText::new(format!("{}. Delete it, with its disks? To keep it, check that it works first.", what)).color(pal.ink_soft)).wrap());
+                    ui.add_space(12.0);
+                    dialog_buttons(ui, |ui| {
+                        if dialog_button(ui, &pal, "check", "Keep it", Look::Plain, true) || ui.input(|i| i.key_pressed(Key::Escape)) {
+                            close = true;
+                        }
+                        if dialog_button(ui, &pal, "trash", "Delete", Look::Danger, true) {
+                            leftover = Some((*sid, refs.clone(), name.clone()));
                         }
                     });
                 });
@@ -3794,6 +5315,68 @@ impl App {
                     });
                 });
             }
+            Dialog::LogDetail { copied, .. } => match &detail {
+                None => close = true,
+                Some(e) => {
+                    let running = e.status == "In progress";
+                    dialog_window(ctx, if e.progress.is_some() { "Activity" } else { "Log Entry" }).show(ctx, |ui| {
+                        ui.set_width(560.0);
+                        ui.spacing_mut().item_spacing.y = 6.0;
+                        // what happened, after its result's dot (a ring while it runs)
+                        ui.horizontal_top(|ui| {
+                            let (r, _) = ui.allocate_exact_size(vec2(18.0, 20.0), Sense::hover());
+                            let icon = Rect::from_center_size(r.center(), vec2(14.0, 14.0));
+                            if running {
+                                paint_icon(ui.painter(), icon, IconKind::Busy(Tone::Accent), &pal, pal.surface);
+                            } else {
+                                ui.painter().circle_filled(icon.center(), 4.5, status_color(&e.status, &pal));
+                            }
+                            ui.add(egui::Label::new(egui::RichText::new(e.text.as_str()).font(FontId::new(14.0, FontFamily::Name("bold".into()))).color(pal.ink)).wrap());
+                        });
+                        let mut facts = vec![("Server", e.server.clone()), ("About", e.obj.clone()), ("At", e.time.clone())];
+                        facts.push(("Result", if running { format!("Under way for {}", fmt_took(e.started.elapsed())) } else { e.status.clone() }));
+                        let fraction = detail_fraction.or_else(|| e.progress.as_ref().and_then(|p| p.fraction()));
+                        if let (true, Some(f)) = (running, fraction) {
+                            facts.push(("Progress", format!("{}%", (f * 100.0).round())));
+                        }
+                        if let Some(quiet) = e.progress.as_ref().and_then(|p| p.silent_for()).filter(|d| running && d.as_secs() >= 5) {
+                            facts.push(("Server", format!("no answer for {} s; given up at {} s", quiet.as_secs(), LOST_AFTER.as_secs())));
+                        }
+                        egui::Grid::new("log-facts").num_columns(2).spacing(vec2(16.0, 4.0)).show(ui, |ui| {
+                            for (k, v) in facts.iter().filter(|(_, v)| !v.is_empty()) {
+                                ui.label(egui::RichText::new(*k).color(pal.ink_soft));
+                                ui.add(egui::Label::new(v.as_str()).wrap());
+                                ui.end_row();
+                            }
+                        });
+                        ui.add_space(6.0);
+                        // the calls made to the server, and its answers; a call left without one
+                        // (the demo's) gets the result
+                        let lines = e.progress.as_ref().map(|p| p.trace.lines()).unwrap_or_default();
+                        if lines.is_empty() {
+                            ui.label(egui::RichText::new(if running { "Nothing asked of the server yet." } else { "Nothing was asked of the server for this." }).color(pal.ink_soft));
+                        } else {
+                            let shown = Trace::default();
+                            for (k, l) in &lines {
+                                shown.push(*k, l.clone());
+                            }
+                            if !running && lines.last().map_or(false, |l| l.0 == Said::Asked) {
+                                shown.push(if e.status == "Failed" { Said::Error } else { Said::Answer }, if e.status == "Failed" { e.text.clone() } else { "OK".into() });
+                            }
+                            crate::newvm::transcript(ui, &pal, &shown, copied, running);
+                        }
+                        if running {
+                            ui.ctx().request_repaint_after(Duration::from_millis(500));
+                        }
+                        ui.add_space(8.0);
+                        dialog_buttons(ui, |ui| {
+                            if dialog_button(ui, &pal, "check", "Close", Look::Primary, true) || ui.input(|i| i.key_pressed(Key::Escape)) {
+                                close = true;
+                            }
+                        });
+                    });
+                }
+            },
             Dialog::Message { title, text } => {
                 dialog_window(ctx, title.as_str()).show(ctx, |ui| {
                     ui.set_max_width(420.0);
@@ -3881,6 +5464,36 @@ impl App {
             self.dialog = Dialog::None;
             self.delete_vm(sid, vm, name, disks, ctx);
         }
+        if let Some((sid, vm, name, description, memory)) = take_snap {
+            self.dialog = Dialog::None;
+            self.take_snapshot(sid, vm, name, description, memory, ctx);
+        }
+        if let Some((sid, snap, first)) = revert_to {
+            self.dialog = Dialog::None;
+            self.revert(sid, snap, first, ctx);
+        }
+        if let Some((sid, snap)) = delete_snap {
+            self.dialog = Dialog::None;
+            self.delete_snapshot(sid, snap, ctx);
+        }
+        if let Some((sid, vm, source, name, description)) = make_tpl {
+            self.dialog = Dialog::None;
+            self.make_template(sid, vm, source, name, description, ctx);
+        }
+        if let Some((sid, vm, name, sr)) = copy_to {
+            self.dialog = Dialog::None;
+            self.copy_vm(sid, vm, name, sr, ctx);
+        }
+        if let Some((sid, tpl)) = delete_tpl {
+            self.dialog = Dialog::None;
+            self.delete_template(sid, tpl, ctx);
+        }
+        if let Some((sid, refs, name)) = leftover {
+            self.dialog = Dialog::None;
+            for r in refs {
+                self.delete_vm(sid, r, name.clone(), true, ctx);
+            }
+        }
         if let Some((sid, sr)) = forget_sr {
             self.dialog = Dialog::None;
             self.sr_job(sid, sr, true, ctx);
@@ -3918,7 +5531,13 @@ impl App {
         ctx.request_repaint();
         self.frames += 1;
         let timed_out = self.started.elapsed() > Duration::from_secs(20);
-        let settled = self.creating == 0 && self.pending_select.is_none() && self.sr_checking.is_empty() && self.sr_busy.is_empty() && self.auto_queue.is_empty();
+        let settled = self.creating == 0
+            && self.pending_select.is_none()
+            && self.sr_checking.is_empty()
+            && self.sr_busy.is_empty()
+            && self.auto_queue.is_empty()
+            // nothing under way, and no look at the server due (one is right after a job)
+            && self.servers.iter().all(|s| s.busy.is_empty() && !s.fetching && s.next_refresh > Instant::now());
         if !self.shot_requested && ((self.shot_ready && self.frames >= 120 && settled) || timed_out) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot);
             self.shot_requested = true;
@@ -4015,6 +5634,58 @@ impl eframe::App for App {
                 "confirm" => out.extend(ACTIONS.iter().position(|a| a.confirm && self.can_run(a, &sel)).map(Intent::Action)),
                 "about" => out.push(Intent::About),
                 "sr-detached" | "sr-repair-failed" => out.extend(sel.sid.map(|sid| Intent::RepairSr(sid, "sr-iso".into()))),
+                "snapshots" => out.push(Intent::Tab(Tab::Snapshots)),
+                "new-vm-template" => out.extend(sel.sid.map(|sid| Intent::NewVmFromTemplate(sid, "tpl-web".into()))),
+                "make-template" => out.extend(sel.sid.map(|sid| Intent::MakeTemplate(sid, "vm-desk".into()))),
+                "make-template-snapshot" => {
+                    out.push(Intent::Tab(Tab::Snapshots));
+                    out.extend(sel.sid.map(|sid| Intent::MakeTemplate(sid, "vm-web-snap-2".into())));
+                }
+                "copy-vm" => out.extend(sel.sid.map(|sid| Intent::CopyVm(sid, "vm-desk".into()))),
+                "log-detail" => {
+                    // a copy that lost its server part way, as it'd be logged
+                    if let Some(sid) = sel.sid {
+                        let text = "Copying VM 'Test Desktop' as 'Test Desktop (copy)' onto Shared NFS storage: demo-host-01 stopped answering for 100 seconds (it may have lost power), so this was given up on.";
+                        let i = self.add_log(sid, "Demo Pool", Some("vm-desk"), "Test Desktop", text, "In progress");
+                        let p = self.progress(i);
+                        p.trace.push(Said::Asked, "VM.copy  OpaqueRef:5f0c2a9e-vm-desk  \"Test Desktop (copy)\"  OpaqueRef:8b1d44c0-sr-nfs");
+                        p.trace.push(Said::Note, "No answer from the server while asking how it's going: Couldn't connect to 10.20.0.11: timed out");
+                        p.trace.push(Said::Error, "Error code: LOST_CONTACT");
+                        p.trace.push(Said::Error, "demo-host-01");
+                        self.log[i].status = "Failed".into();
+                        self.dialog = Dialog::LogDetail { index: i, copied: None };
+                    }
+                }
+                "activities" => {
+                    // two real jobs in the demo, for Activities to show
+                    if let Some(sid) = sel.sid {
+                        self.copy_vm(sid, "vm-desk".into(), "Test Desktop (copy)".into(), Some("sr-nfs".into()), ctx);
+                        self.take_snapshot(sid, "vm-web".into(), "Before nginx 1.26".into(), String::new(), true, ctx);
+                    }
+                }
+                "template-made" => {
+                    // a real one made in the demo, as the dialog's Make Template does
+                    if let Some(sid) = sel.sid {
+                        self.make_template(sid, "vm-desk".into(), "vm-desk".into(), "Test Desktop template".into(), "Windows 11, sysprepped".into(), ctx);
+                    }
+                }
+                "snapshot-taken" => {
+                    // a real one taken in the demo, as the dialog's Take Snapshot does
+                    out.push(Intent::Tab(Tab::Snapshots));
+                    if let Some(sid) = sel.sid {
+                        self.take_snapshot(sid, "vm-web".into(), "Before nginx 1.26".into(), "Config backed up in /root".into(), true, ctx);
+                    }
+                }
+                "snapshot-take" | "snapshot-revert" | "snapshot-delete" => {
+                    out.push(Intent::Tab(Tab::Snapshots));
+                    if let Some(sid) = sel.sid {
+                        out.push(match self.shot_show.as_str() {
+                            "snapshot-take" => Intent::TakeSnapshot(sid, "vm-web".into()),
+                            "snapshot-revert" => Intent::AskRevert(sid, "vm-web-snap-2".into()),
+                            _ => Intent::AskDeleteSnapshot(sid, "vm-web-snap-3".into()),
+                        });
+                    }
+                }
                 "sr-auto-repair" => out.push(Intent::Tab(Tab::Logs)),
                 "console" => out.push(Intent::Tab(Tab::Console)),
                 "update" | "update-progress" => {
@@ -4171,6 +5842,18 @@ impl eframe::App for App {
             let free = self.header_and_tabs(ui, &sel, &tabs, current, actions, &mut out);
             if actions > 0.0 {
                 self.tab_actions(ui, free, &sel, current, actions, &mut out);
+            } else if let Some((s, t)) = self.template_of(&sel) {
+                // a template's: New VM from it, and Delete
+                let (sid, tref, busy) = (s.id, t.rref.clone(), s.busy.contains_key(&t.rref));
+                let mut child = ui.new_child(egui::UiBuilder::new().max_rect(free).layout(egui::Layout::right_to_left(egui::Align::Center)));
+                child.spacing_mut().item_spacing.x = 4.0;
+                let compact = free.width() < flat_button_width(&child, "Delete") + flat_button_width(&child, "New VM") + 16.0;
+                if flat_button(&mut child, "trash", "Delete", Some(pal.red), !busy, compact, &pal).on_hover_text("Delete this template and its disks; VMs made from it aren't touched").clicked() {
+                    out.push(Intent::AskDeleteTemplate(sid, tref.clone()));
+                }
+                if flat_button(&mut child, "newvm", "New VM", Some(pal.accent), !busy, compact, &pal).on_hover_text("Make a VM from this template").clicked() {
+                    out.push(Intent::NewVmFromTemplate(sid, tref));
+                }
             } else if let Some((s, x, trouble)) = self.sr_of(&sel).map(|(s, x)| (s, x, s.data.as_ref().and_then(|d| d.sr_trouble(x)))).filter(|(_, x, t)| x.is_iso() || t.is_some()) {
                 // an ISO library's actions, and Repair for storage that isn't mounted somewhere,
                 // next to its tabs
@@ -4211,7 +5894,9 @@ impl eframe::App for App {
                 Tab::Networking => self.networking(ui, &sel),
                 Tab::Console => self.console_tab(ui, &sel, &mut out),
                 Tab::IsoFiles => self.iso_files(ui, &sel, &mut out),
-                Tab::Logs => self.logs(ui, &sel),
+                Tab::Snapshots => self.snapshots_tab(ui, &sel, &mut out),
+                Tab::Templates => self.templates_tab(ui, &sel, &mut out),
+                Tab::Logs => self.logs(ui, &sel, &mut out),
             });
         });
 
@@ -4411,6 +6096,12 @@ fn upload_problem(e: &ApiError) -> String {
 }
 
 /// Storage's tree icon: a disc for ISO libraries, a drum for the rest.
+/// A user's template in the tree (a ring turning while a VM is made from it or it's deleted).
+fn template_node(sid: u32, s: &ServerEntry, t: &VmInfo) -> Node {
+    let icon = if s.busy.contains_key(&t.rref) { IconKind::Busy(Tone::Accent) } else { IconKind::Template };
+    Node::new(format!("tpl:{}:{}", sid, t.rref), t.name.clone(), icon, Kind::Template, Some(sid), Some(t.rref.clone()))
+}
+
 /// A storage's icon: a ring turning while it's rescanned, repaired or disconnected; otherwise a
 /// green dot when it's mounted on a server that's up, a red one when its server is off or not
 /// answering, a "!" when it isn't mounted where it should be. A server's own storage (local
@@ -4566,41 +6257,81 @@ fn force_of(op: &str) -> Option<usize> {
     }
 }
 
-/// Shut Down or Reboot (`op`) and the small arrow whose menu holds its Force partner
-/// (ACTIONS[`fi`]), as one button in two parts: the mouse over either lights both, a hairline
-/// between them. Whether the main part was clicked.
-fn split_tool(ui: &mut Ui, pal: &Pal, op: &str, tip: &str, enabled: bool, fi: usize, force_ok: bool, out: &mut Vec<Intent>) -> bool {
-    let (r, _) = ui.allocate_exact_size(vec2(32.0 + ARROW_W, 30.0), Sense::hover());
-    let back = ui.painter().add(egui::Shape::Noop);
-    let main_r = Rect::from_min_size(r.min, vec2(32.0, r.height()));
-    let arrow_r = Rect::from_min_max(pos2(main_r.max.x, r.min.y), r.max);
-    let main = ui.interact(main_r, ui.id().with(("split", op)), if enabled { Sense::click() } else { Sense::hover() });
-    paint_tool(ui.painter(), Rect::from_center_size(main_r.center(), vec2(22.0, 22.0)), op, enabled, pal);
-    let main = main.on_hover_text(tip);
-    // the arrow and its menu
-    let force = &ACTIONS[fi];
-    let (mut arrow_lit, mut open) = (false, false);
-    let mut part = ui.new_child(egui::UiBuilder::new().max_rect(arrow_r).layout(egui::Layout::left_to_right(egui::Align::Center)));
-    part.add_enabled_ui(force_ok, |ui| {
-        let m = egui::menu::menu_custom_button(ui, egui::Button::new("").frame(false).min_size(arrow_r.size()), |ui| {
-            ui.set_min_width(170.0);
-            if ui.button(force.label).clicked() {
-                out.push(Intent::Action(fi));
+/// Why Copy VM and Make Template wait for a VM to be off.
+const SHUT_DOWN_FIRST: &str = "Shut it down first: a copy of a running VM is like one after a power cut";
+
+/// Copy VM and Make Template: one button (the copy icon and an arrow) opening both, each greyed
+/// out while the VM is on.
+fn copy_menu(ui: &mut Ui, pal: &Pal, sid: u32, vm: &str, off: bool, out: &mut Vec<Intent>) {
+    let slot = ui.painter().add(egui::Shape::Noop);
+    let m = egui::menu::menu_custom_button(ui, egui::Button::new("").frame(false).min_size(vec2(32.0 + ARROW_W, 30.0)), |ui| {
+        ui.set_min_width(200.0);
+        for (glyph, label, intent) in [("copy", "Copy VM…", Intent::CopyVm(sid, vm.to_string())), ("template", "Make Template…", Intent::MakeTemplate(sid, vm.to_string()))] {
+            let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), if off { Sense::click() } else { Sense::hover() });
+            if off && resp.hovered() {
+                ui.painter().rect_filled(r, Rounding::same(5.0), pal.hover);
+            }
+            let ink = if off { pal.ink } else { pal.ink_faint };
+            paint_glyph(ui.painter(), Rect::from_min_size(r.min + vec2(7.0, 7.0), vec2(16.0, 16.0)), glyph, if off { pal.accent } else { pal.ink_faint });
+            ui.painter().text(pos2(r.min.x + 32.0, r.center().y), Align2::LEFT_CENTER, label, FontId::proportional(13.0), ink);
+            let resp = if off { resp } else { resp.on_hover_text(SHUT_DOWN_FIRST) };
+            if off && resp.clicked() {
+                out.push(intent);
                 ui.close_menu();
             }
-        });
-        arrow_lit = m.response.hovered() && force_ok;
-        open = m.inner.is_some();
-        m.response.on_hover_text(force.label);
+        }
     });
-    let c = arrow_r.center();
-    let col = if force_ok { pal.ink_soft } else { pal.ink_faint };
-    ui.painter().add(egui::Shape::line(vec![pos2(c.x - 3.5, c.y - 1.5), pos2(c.x, c.y + 2.0), pos2(c.x + 3.5, c.y - 1.5)], Stroke::new(1.4, col)));
-    if (main.hovered() && enabled) || arrow_lit || open {
-        ui.painter().set(back, egui::epaint::RectShape::filled(r, Rounding::same(6.0), pal.hover));
-        ui.painter().line_segment([pos2(main_r.max.x, r.min.y + 7.0), pos2(main_r.max.x, r.max.y - 7.0)], Stroke::new(1.0, pal.border_strong));
+    let r = m.response.rect;
+    if m.response.hovered() || m.inner.is_some() {
+        ui.painter().set(slot, egui::epaint::RectShape::filled(r, Rounding::same(6.0), pal.hover));
     }
-    main.clicked()
+    paint_glyph(ui.painter(), Rect::from_center_size(pos2(r.min.x + 16.0, r.center().y), vec2(16.0, 16.0)), "copy", pal.accent);
+    let c = pos2(r.max.x - ARROW_W / 2.0, r.center().y);
+    ui.painter().add(egui::Shape::line(vec![pos2(c.x - 3.5, c.y - 1.5), pos2(c.x, c.y + 2.0), pos2(c.x + 3.5, c.y - 1.5)], Stroke::new(1.4, pal.ink_soft)));
+    m.response.on_hover_text(if off { "Copy VM, or make a template from it" } else { "Copy VM, Make Template: shut it down first" });
+}
+
+/// The VM's power menu: one button, the power symbol in the colour of the VM's state (a ring
+/// turning while an action runs), and an arrow; a click opens the actions, each with its coloured
+/// icon and shortcut, greyed out when it can't run (`entries`: action and whether it can run; None
+/// is a line). A click never runs one by itself.
+fn power_menu(ui: &mut Ui, pal: &Pal, face: Result<&str, Tone>, state: &str, entries: &[Option<(usize, bool)>], out: &mut Vec<Intent>) {
+    let slot = ui.painter().add(egui::Shape::Noop);
+    let m = egui::menu::menu_custom_button(ui, egui::Button::new("").frame(false).min_size(vec2(32.0 + ARROW_W, 30.0)), |ui| {
+        ui.set_min_width(220.0);
+        ui.spacing_mut().item_spacing.y = 1.0;
+        for e in entries {
+            let Some((i, ok)) = *e else {
+                ui.separator();
+                continue;
+            };
+            let a = &ACTIONS[i];
+            let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), if ok { Sense::click() } else { Sense::hover() });
+            if ok && resp.hovered() {
+                ui.painter().rect_filled(r, Rounding::same(5.0), pal.hover);
+            }
+            paint_tool(ui.painter(), Rect::from_min_size(r.min + vec2(4.0, 5.0), vec2(20.0, 20.0)), a.op, ok, pal);
+            let ink = if ok { pal.ink } else { pal.ink_faint };
+            ui.painter().text(pos2(r.min.x + 32.0, r.center().y), Align2::LEFT_CENTER, a.label, FontId::proportional(13.0), ink);
+            ui.painter().text(pos2(r.max.x - 8.0, r.center().y), Align2::RIGHT_CENTER, a.shortcut.text(), FontId::proportional(12.0), pal.ink_faint);
+            if ok && resp.clicked() {
+                out.push(Intent::Action(i));
+                ui.close_menu();
+            }
+        }
+    });
+    let r = m.response.rect;
+    if m.response.hovered() || m.inner.is_some() {
+        ui.painter().set(slot, egui::epaint::RectShape::filled(r, Rounding::same(6.0), pal.hover));
+    }
+    let icon = Rect::from_center_size(pos2(r.min.x + 16.0, r.center().y), vec2(22.0, 22.0));
+    match face {
+        Ok(op) => paint_tool(ui.painter(), icon, op, true, pal),
+        Err(tone) => paint_icon(ui.painter(), icon.shrink(3.0), IconKind::Busy(tone), pal, pal.window),
+    }
+    let c = pos2(r.max.x - ARROW_W / 2.0, r.center().y);
+    ui.painter().add(egui::Shape::line(vec![pos2(c.x - 3.5, c.y - 1.5), pos2(c.x, c.y + 2.0), pos2(c.x + 3.5, c.y - 1.5)], Stroke::new(1.4, pal.ink_soft)));
+    m.response.on_hover_text(format!("Power: {}", state));
 }
 
 /// A console's keyboard button: its menu sends Ctrl+Alt+Del and the keys the desktop keeps.
@@ -4711,6 +6442,39 @@ fn prune(nodes: &mut Vec<Node>, f: &str) {
     nodes.retain(|n| !n.children.is_empty() || n.text.to_lowercase().contains(f));
 }
 
+fn unix_now() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
+/// The local time zone's offset at `t`, in seconds east of UTC (0 where it can't be had).
+fn local_offset(t: i64) -> i64 {
+    #[cfg(unix)]
+    {
+        let tt = t as libc::time_t;
+        // SAFETY: localtime_r only writes the tm it's given; a zeroed tm is a valid one
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        if !unsafe { libc::localtime_r(&tt, &mut tm) }.is_null() {
+            return tm.tm_gmtoff as i64;
+        }
+    }
+    let _ = t;
+    0
+}
+
+/// Why taking, reverting to or deleting a snapshot failed, in plain words where the server's
+/// answer is a known one.
+fn snapshot_problem(e: &ApiError) -> String {
+    match e.code.as_str() {
+        "SR_BACKEND_FAILURE_44" => "There isn't enough free space on the storage for the snapshot's copies of the disks.".into(),
+        "SR_BACKEND_FAILURE_109" => "A disk has too many snapshots in a row. Delete some of this VM's snapshots, give the storage a few minutes to merge the disks, then try again.".into(),
+        "SR_OPERATION_NOT_SUPPORTED" => "The storage its disks are on can't take snapshots.".into(),
+        "OTHER_OPERATION_IN_PROGRESS" | "OPERATION_NOT_ALLOWED" => "Something else is being done to the VM right now. Wait for it to finish, then try again.".into(),
+        "VM_CHECKPOINT_SUSPEND_FAILED" | "VM_CHECKPOINT_RESUME_FAILED" => "Its memory couldn't be saved (its guest tools may be missing or busy). Try without its memory.".into(),
+        "VM_REVERT_FAILED" => "The server couldn't put the VM back; it's been left off.".into(),
+        _ => e.message(),
+    }
+}
+
 fn clock_text() -> String {
     let secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     let t = secs % 86_400;
@@ -4777,6 +6541,35 @@ fn save_settings(s: &Settings) {
 }
 
 /// Earlier servers and the account used on each, newest first.
+/// What was being made when contact was lost (or the app closed), one per line: server, user,
+/// name, and what already had the name. Read at startup as lost: the app was away meanwhile.
+fn load_unfinished() -> Vec<Unfinished> {
+    let Some(dir) = config_dir() else { return vec![] };
+    parse_unfinished(&std::fs::read_to_string(dir.join("unfinished.txt")).unwrap_or_default())
+}
+
+fn parse_unfinished(text: &str) -> Vec<Unfinished> {
+    text.lines()
+        .filter_map(|l| {
+            let mut f = l.split('\t');
+            let (host, user, name) = (f.next()?, f.next()?, f.next()?);
+            let before = f.next().unwrap_or_default().split(',').filter(|r| !r.is_empty()).map(String::from).collect();
+            Some(Unfinished { host: host.into(), user: user.into(), name: name.into(), before, lost: true })
+        })
+        .collect()
+}
+
+fn save_unfinished(list: &[Unfinished]) {
+    let Some(dir) = config_dir() else { return };
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(dir.join("unfinished.txt"), unfinished_text(list));
+}
+
+fn unfinished_text(list: &[Unfinished]) -> String {
+    let clean = |t: &str| t.replace(['\t', '\n'], " ");
+    list.iter().map(|u| format!("{}\t{}\t{}\t{}\n", clean(&u.host), clean(&u.user), clean(&u.name), u.before.join(","))).collect()
+}
+
 fn load_history() -> Vec<(String, String)> {
     let Some(dir) = config_dir() else { return vec![] };
     let text = std::fs::read_to_string(dir.join("servers.txt")).unwrap_or_default();
@@ -4882,4 +6675,23 @@ fn setup_fonts(ctx: &egui::Context) {
         s.text_styles.insert(Small, FontId::proportional(11.0));
         s.text_styles.insert(Heading, FontId::new(18.0, FontFamily::Name("bold".into())));
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unfinished_round_trip() {
+        let list = vec![
+            Unfinished { host: "10.0.0.5".into(), user: "root".into(), name: "Web 2".into(), before: vec![], lost: false },
+            Unfinished { host: "home".into(), user: "root".into(), name: "Desk\tcopy".into(), before: vec!["OpaqueRef:a".into(), "OpaqueRef:b".into()], lost: false },
+        ];
+        let back = parse_unfinished(&unfinished_text(&list));
+        assert_eq!(back.len(), 2);
+        // read back as lost: the app was away meanwhile
+        assert!(back.iter().all(|u| u.lost));
+        assert_eq!((back[0].name.as_str(), back[0].before.len()), ("Web 2", 0));
+        assert_eq!((back[1].name.as_str(), back[1].before.clone()), ("Desk copy", vec!["OpaqueRef:a".to_string(), "OpaqueRef:b".to_string()]));
+    }
 }

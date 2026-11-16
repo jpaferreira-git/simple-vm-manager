@@ -1,6 +1,6 @@
 [package]
 name = "simple-vm-manager"
-version = "1.8.5"
+version = "1.10.3"
 edition = "2021"
 description = "A simple desktop console for XenServer / XCP-ng pools and their VMs' screens (Linux, Windows, macOS)"
 license = "MIT"
@@ -33,6 +33,10 @@ wgpu = { version = "22.1", default-features = false, features = ["dx12", "wgsl"]
 
 [target.'cfg(target_os = "macos")'.dependencies]
 winit = "0.30"
+
+# the local time zone, for when snapshots were taken (already built for other crates)
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [profile.release]
 opt-level = 3
