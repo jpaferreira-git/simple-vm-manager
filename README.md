@@ -22,6 +22,8 @@ affiliated with or endorsed by the makers of XenServer or XCP-ng.
   password in your system's keychain (GNOME Keyring, KWallet or KeePassXC on Linux; Credential Manager
   on Windows; Keychain on macOS; never in the app's own files): the app then reconnects to that server
   each time it starts. Right-click a server to *Forget saved password*.
+- **Disconnect** — at the end of a pool's (or a lone server's) tabs, or on its right-click menu;
+  the app doesn't reconnect to it at the next start.
 - **Resource tree** — *Infrastructure* view (pool → servers → their VMs and storage; shared storage and
   virtual networks in folders) or *Objects* view (grouped by type), with a search box. The sidebar **folds** into a slim icon strip.
 - **Home overview** — servers, running VMs, memory and storage in use at a glance, each server's load
@@ -31,9 +33,9 @@ affiliated with or endorsed by the makers of XenServer or XCP-ng.
   memory, firmware and Secure Boot, boot order, high availability, disks and snapshots; click a value
   to copy it.
 - **Console** — see a running VM's screen and use it with your keyboard and mouse (the keyboard goes
-  to the VM while the mouse is over its screen), with *Send Ctrl+Alt+Del*, a *Send keys* menu for the
-  combinations your desktop keeps for itself (the Windows key, Alt+Tab…) and *Scale to fit*. It
-  reconnects by itself after the VM reboots. A server has a Console tab too: its own text console
+  to the VM while the mouse is over its screen), always scaled to fit. A keyboard button next to
+  the tabs sends Ctrl+Alt+Del and the combinations your desktop keeps for itself (the Windows key,
+  Alt+Tab…). It reconnects by itself after the VM reboots. A server has a Console tab too: its own text console
   (the control domain's, as in XenCenter), where you log in as root.
 - **ISO libraries** — *ISO Library* on the toolbar adds a Windows (SMB) or NFS share of installation
   discs to a pool: just the address (and a login for SMB) up front, protocol versions under
@@ -65,16 +67,19 @@ affiliated with or endorsed by the makers of XenServer or XCP-ng.
   down, what was made is undone and its answer stays there. Once made, the dialog can be closed
   while the VM starts (which can take a while). An ISO the app doesn't recognise still gives a
   readable name ("fedora-coreos-44.20260928.3.1-live-iso.x86_64.iso" → "Fedora CoreOS 44").
-- **Delete VM** — next to a VM's tabs (an icon when the window is narrow) or on its right-click
-  menu. It asks first, and its disks go too unless unticked (a disk another VM also uses stays);
+- **Delete VM** — the bin next to a VM's tabs, or on its right-click menu. It asks first, and its disks go too unless unticked (a disk another VM also uses stays);
   its snapshots go with it, and ISO files in its DVD drive aren't touched. A VM that's on is
   turned off first, the button saying so ("Shut down and delete").
 - **VM power actions** — Start, Shut Down, Reboot, Suspend, Resume, Force Shut Down, Force Reboot,
-  enabled only when the server allows them, with confirmations for the disruptive ones.
+  enabled only when the server allows them, with confirmations for the disruptive ones. They're
+  coloured icons at the right end of a VM's tabs (the Force ones behind the small arrows; on the
+  name's line when the window is narrow), and on its right-click menu.
 - **Keyboard shortcuts** — Ctrl+B start · Ctrl+E shut down · Ctrl+R reboot · Ctrl+Y suspend/resume ·
   F5 refresh.
-- **Light / dark / system theme** — the toolbar's theme button switches light / dark; right-click it to
-  follow the system instead. Your choice is remembered.
+- **Settings** — the gear at the far left of the toolbar: the theme (light, dark, or the same as
+  your desktop), the size of everything (90–125%; Ctrl + and Ctrl - too), and the saved passwords,
+  each with *Forget* (deleted from the keychain; the app stops connecting there as it starts), even
+  for a server no longer in the tree. Your choices are remembered.
 - **Demo server** — try everything without a real server (*Try the Demo Server* on the Home page).
 - Live refresh every 15 s, automatic reconnect. A server that's off is given up on after 6 s
   (the window never waits for it); if it's the one the app logs in through, the pool's other
@@ -148,10 +153,10 @@ building anything. You can also just run `./simple-vm-manager` directly.
 1. Click **Connect** (or the *Connect to a Server* link on the Home page), type the server's name or IP
    address, your user name (usually `root`) and password, and press **Connect**.
 2. The server appears in the sidebar. Expand it to see its hosts and virtual machines.
-3. Select a VM and use the toolbar or right-click it to start, stop, reboot or suspend it.
+3. Select a VM and use the icons next to its tabs, or right-click it, to start, stop, reboot or suspend it.
    Its **Console** tab shows the VM's screen.
-4. Fold the sidebar with the panel button at the far left of the toolbar or the « button next to the
-   search box; switch theme with the **Dark / Light** button at the far right.
+4. Fold the sidebar with the « button next to the search box (the folded strip's top button opens
+   it again); choose the theme under the gear (**Settings**).
 
 Settings live in `~/.config/SimpleVMManager/` (Linux/macOS) or `%APPDATA%\SimpleVMManager\` (Windows):
 `servers.txt` (server names and user names you used) and `settings.txt` (theme, sidebar).

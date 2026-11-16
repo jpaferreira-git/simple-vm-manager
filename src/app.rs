@@ -41,7 +41,8 @@ struct ServerEntry {
     fetching: bool,
     ever: bool,
     failures: u32,
-    busy: HashMap<String, String>,
+    /// VMs with a power action under way: what's being done ("Starting…") and the action.
+    busy: HashMap<String, (String, &'static str)>,
     /// Once the first login works: (true, password) keeps the password in the keychain and
     /// reconnects at startup; (false, _) forgets any saved one. None: leave things as they are.
     pending_save: Option<(bool, String)>,
@@ -90,7 +91,7 @@ enum Msg {
     UploadDone { sr: String, result: Result<(), ApiError> },
     /// Saving an ISO file's description ended.
     DescriptionDone { sid: u32, sr: String, vdi: String, name: String, text: String, result: Result<(), ApiError> },
-    ActionDone { sid: u32, vm: String, log: usize, err: Option<String>, label: &'static str, text: String },
+    ActionDone { sid: u32, vm: String, log: usize, err: Option<String>, label: &'static str, op: &'static str, text: String },
 }
 
 /// A file being copied into an ISO library, from this computer or from the web.
@@ -219,6 +220,9 @@ enum Dialog {
     ConfirmSr { sid: u32, sr: String, text: String },
     /// Deleting an ISO file: server, library, disc, its name, the question.
     ConfirmDeleteIso { sid: u32, sr: String, vdi: String, name: String, text: String },
+    /// The app's settings (the gear on the toolbar); `startup`: the servers it connects to as it
+    /// starts (read when it opens).
+    Settings { startup: Vec<(String, String)> },
     /// Deleting a VM: whether it's on (turned off first), its disks, how many snapshots it has,
     /// and whether its disks go too (ticked to begin with).
     ConfirmDeleteVm { sid: u32, vm: String, name: String, running: bool, disks: Vec<VmDisk>, snapshots: usize, delete_disks: bool },
@@ -256,8 +260,8 @@ enum Intent {
     View(bool),
     Tab(Tab),
     Section(String),
-    Theme(ThemeMode),
-    ToggleTheme,
+    /// Open the Settings dialog.
+    Settings,
     Sidebar(bool),
     SearchFromRail,
     About,
@@ -283,6 +287,8 @@ pub struct App {
     objects_view: bool,
     sidebar_open: bool,
     theme_mode: ThemeMode,
+    /// The interface's size (egui's zoom factor), kept in the settings.
+    zoom: f32,
     pal: Pal,
     applied_dark: Option<bool>,
     tab: Tab,
@@ -344,6 +350,7 @@ impl App {
             objects_view: false,
             sidebar_open: start.sidebar_open.unwrap_or(saved.sidebar_open),
             theme_mode,
+            zoom: saved.zoom,
             pal: theme::LIGHT,
             applied_dark: None,
             tab: Tab::Home,
@@ -371,6 +378,7 @@ impl App {
             started: Instant::now(),
         };
         app.apply_theme(&cc.egui_ctx);
+        cc.egui_ctx.set_zoom_factor(app.zoom);
         if !shot {
             // The keychain may take a moment (or ask to be unlocked): read it in the background.
             let (tx, ctx) = (app.tx.clone(), cc.egui_ctx.clone());
@@ -423,7 +431,7 @@ impl App {
 
     fn save_settings(&self) {
         if self.shot_path.is_none() {
-            save_settings(&Settings { theme: self.theme_mode, sidebar_open: self.sidebar_open });
+            save_settings(&Settings { theme: self.theme_mode, sidebar_open: self.sidebar_open, zoom: self.zoom });
         }
     }
 
@@ -932,10 +940,22 @@ impl App {
                 Msg::KeychainError(e) => {
                     self.dialog = Dialog::Message { title: "Remember password".into(), text: format!("Couldn't save the password in the system's keychain.\n\n{}", e) };
                 }
-                Msg::ActionDone { sid, vm, log, err, label, text } => {
+                Msg::ActionDone { sid, vm, log, err, label, op, text } => {
                     if let Some(s) = self.server_mut(sid) {
                         s.busy.remove(&vm);
                         s.next_refresh = Instant::now(); // re-read right away
+                        // its new state shown now, not the old one until that refresh comes
+                        let now = match op {
+                            "start" | "resume" | "clean_reboot" | "hard_reboot" => Some(PowerState::Running),
+                            "clean_shutdown" | "hard_shutdown" => Some(PowerState::Halted),
+                            "suspend" => Some(PowerState::Suspended),
+                            _ => None,
+                        };
+                        if let (None, Some(p)) = (&err, now) {
+                            if let Some(v) = s.data.as_mut().and_then(|d| d.vms.iter_mut().find(|v| v.rref == vm)) {
+                                v.power = p;
+                            }
+                        }
                     }
                     if let Some(e) = self.log.get_mut(log) {
                         e.status = if err.is_none() { "Done".into() } else { "Failed".into() };
@@ -1110,17 +1130,14 @@ impl App {
 
     // ------------------------------------------------------------------ tree
 
-    fn vm_text(s: &ServerEntry, v: &VmInfo) -> String {
-        match s.busy.get(&v.rref) {
-            Some(b) => format!("{}  ({})", v.name, b),
-            None => v.name.clone(),
-        }
+    fn vm_text(_s: &ServerEntry, v: &VmInfo) -> String {
+        v.name.clone()
     }
+    /// A VM's icon, or, while a power action is under way, a ring turning in that action's colour.
     fn vm_icon(s: &ServerEntry, v: &VmInfo) -> IconKind {
-        if s.busy.contains_key(&v.rref) {
-            IconKind::Busy
-        } else {
-            IconKind::Vm(v.power)
+        match s.busy.get(&v.rref) {
+            Some((_, op)) => IconKind::Busy(Tone::of_action(op)),
+            None => IconKind::Vm(v.power),
         }
     }
 
@@ -1174,7 +1191,7 @@ impl App {
                 let skey = format!("srv:{}", id);
                 let Some(d) = &s.data else {
                     let what = if s.state == ConnState::Connecting { "connecting…" } else { "not connected" };
-                    let icon = if s.state == ConnState::Connecting { IconKind::Busy } else { IconKind::ServerDown };
+                    let icon = if s.state == ConnState::Connecting { IconKind::Busy(Tone::Accent) } else { IconKind::ServerDown };
                     root.children.push(Node::new(skey, format!("{}  ({})", s.conn.hostname(), what), icon, Kind::Server, Some(id), None));
                     continue;
                 };
@@ -1268,12 +1285,12 @@ impl App {
         let (vm_name, server_name, conn) = (vm.name.clone(), s.name(), s.conn.clone());
         let log = self.add_log(sid, &server_name, Some(&vref), &vm_name, &text, "In progress");
         if let Some(s) = self.server_mut(sid) {
-            s.busy.insert(vref.clone(), format!("{}…", a.verb));
+            s.busy.insert(vref.clone(), (format!("{}…", a.verb), a.op));
         }
         let tx = self.tx.clone();
         std::thread::spawn(move || {
             let r = conn.run_action(&vref, &ACTIONS[i]);
-            let _ = tx.send(Msg::ActionDone { sid, vm: vref, log, err: r.err().map(|e| e.message()), label: ACTIONS[i].label, text });
+            let _ = tx.send(Msg::ActionDone { sid, vm: vref, log, err: r.err().map(|e| e.message()), label: ACTIONS[i].label, op: ACTIONS[i].op, text });
         });
     }
 
@@ -1391,16 +1408,7 @@ impl App {
                         self.closed_sections.insert(name);
                     }
                 }
-                Intent::Theme(m) => {
-                    self.theme_mode = m;
-                    self.apply_theme(ctx);
-                    self.save_settings();
-                }
-                Intent::ToggleTheme => {
-                    self.theme_mode = if self.pal.dark { ThemeMode::Light } else { ThemeMode::Dark };
-                    self.apply_theme(ctx);
-                    self.save_settings();
-                }
+                Intent::Settings => self.dialog = Dialog::Settings { startup: load_session() },
                 Intent::Sidebar(open) => {
                     self.sidebar_open = open;
                     self.save_settings();
@@ -1413,7 +1421,7 @@ impl App {
                 Intent::About => {
                     self.dialog = Dialog::Message {
                         title: "About".into(),
-                        text: "Simple VM Manager\n\nA simpler console for virtualization servers: add servers, browse their pools, servers, virtual machines, storage and networks, and start, stop, restart, suspend or resume virtual machines.\n\nRuns on Windows, Linux and macOS, in a light or dark theme. It talks to servers over HTTPS (port 443) and accepts their certificates without asking.".into(),
+                        text: format!("Simple VM Manager {}\n\n{}", env!("CARGO_PKG_VERSION"), "A simpler console for virtualization servers: add servers, browse their pools, servers, virtual machines, storage and networks, and start, stop, restart, suspend or resume virtual machines.\n\nRuns on Windows, Linux and macOS, in a light or dark theme. It talks to servers over HTTPS (port 443) and accepts their certificates without asking."),
                     }
                 }
             }
@@ -1430,62 +1438,24 @@ impl App {
 
     fn toolbar(&self, ui: &mut Ui, sel: &Node, out: &mut Vec<Intent>) {
         let pal = self.pal;
-        let vm = self.vm_of(sel).map(|x| x.2);
-        let shown: Vec<&VmAction> = ACTIONS.iter().filter(|a| a.on_toolbar(vm)).collect();
-        let (theme_op, theme_label) = if pal.dark { ("theme-light", "Light") } else { ("theme-dark", "Dark") };
-        // Force Shut Down / Force Reboot sit in a menu behind a small arrow next to Shut Down / Reboot.
-        let force_of = |op: &str| match op {
-            "clean_shutdown" => ACTIONS.iter().position(|a| a.op == "hard_shutdown"),
-            "clean_reboot" => ACTIONS.iter().position(|a| a.op == "hard_reboot"),
-            _ => None,
-        };
-        let arrows = shown.iter().filter(|a| force_of(a.op).is_some()).count() as f32 * (ARROW_W + 2.0);
-        // When the window is too narrow for every label, buttons show only their icons (the label
-        // becomes a tooltip): first the theme switch (rank 1), then New VM and ISO Library (rank 2),
-        // then all of them.
+        // (A VM's power actions are next to its tabs: see tab_actions; the theme is in Settings.)
+        // When the window is too narrow for every label, buttons show only their icons (the
+        // label becomes a tooltip): first New VM and ISO Library (rank 2), then all of them.
         let fits = |level: u8| {
             let w = |l: &str, rank: u8| if level >= rank { 32.0 } else { tool_width(ui, l) } + 2.0;
-            let buttons: f32 = w("Connect", 3) + shown.iter().map(|a| w(a.label, 3)).sum::<f32>() + w("New VM", 2) + w("ISO Library", 2) + w(theme_label, 1) + arrows;
-            36.0 + 2.0 * 10.0 + 16.0 + buttons <= ui.available_width()
+            let buttons: f32 = w("Connect", 3) + w("New VM", 2) + w("ISO Library", 2);
+            36.0 + 10.0 + 16.0 + buttons + 160.0 <= ui.available_width() // 160: the app's name
         };
         let level = (0..3).find(|&l| fits(l)).unwrap_or(3);
         let compact = |rank: u8| level >= rank;
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
-            let tip = if self.sidebar_open { "Fold the sidebar" } else { "Show the sidebar" };
-            if icon_button(ui, "sidebar", &pal, true, self.sidebar_open).on_hover_text(tip).clicked() {
-                out.push(Intent::Sidebar(!self.sidebar_open));
+            if icon_button(ui, "settings", &pal, true, false).on_hover_text("Settings").clicked() {
+                out.push(Intent::Settings);
             }
             ui.add_space(4.0);
             if tool_button(ui, "connect", "Connect", true, compact(3), &pal).clicked() {
                 out.push(Intent::AddServer);
-            }
-            ui.separator();
-            for a in &shown {
-                if tool_button(ui, a.op, a.label, self.can_run(a, sel), compact(3), &pal).clicked() {
-                    out.extend(ACTIONS.iter().position(|b| std::ptr::eq(b, *a)).map(Intent::Action));
-                }
-                if let Some(fi) = force_of(a.op) {
-                    let force = &ACTIONS[fi];
-                    let enabled = self.can_run(force, sel);
-                    ui.add_enabled_ui(enabled, |ui| {
-                        let m = egui::menu::menu_custom_button(ui, egui::Button::new("").frame(false).min_size(vec2(ARROW_W, 30.0)), |ui| {
-                            ui.set_min_width(170.0);
-                            if ui.button(force.label).clicked() {
-                                out.push(Intent::Action(fi));
-                                ui.close_menu();
-                            }
-                        });
-                        let r = m.response.rect;
-                        if (m.response.hovered() && enabled) || m.inner.is_some() {
-                            ui.painter().rect_filled(r, Rounding::same(6.0), pal.hover);
-                        }
-                        let c = r.center();
-                        let col = if enabled { pal.ink_soft } else { pal.ink_faint };
-                        ui.painter().add(egui::Shape::line(vec![pos2(c.x - 3.5, c.y - 1.5), pos2(c.x, c.y + 2.0), pos2(c.x + 3.5, c.y - 1.5)], Stroke::new(1.4, col)));
-                        m.response.on_hover_text(force.label);
-                    });
-                }
             }
             ui.separator();
             let has_pool = self.servers.iter().any(|s| s.data.is_some());
@@ -1495,20 +1465,15 @@ impl App {
             if tool_button(ui, "iso", "ISO Library", has_pool, compact(2), &pal).on_hover_text("Add a library of installation discs (.iso files) from a Windows or NFS share").clicked() {
                 out.push(Intent::IsoLibrary);
             }
+            // the app's name in the right corner; a click shows About
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                // A click switches light / dark; a right-click also offers following the system.
-                let b = tool_button(ui, theme_op, theme_label, true, compact(1), &pal).on_hover_text("Right-click for more choices");
-                if b.clicked() {
-                    out.push(Intent::ToggleTheme);
+                ui.add_space(8.0);
+                let font = FontId::new(15.5, FontFamily::Name("bold".into()));
+                let text = egui::RichText::new("Simple VM Manager").font(font).color(pal.ink);
+                let name = ui.add(egui::Label::new(text).sense(Sense::click())).on_hover_text("About Simple VM Manager").on_hover_cursor(egui::CursorIcon::PointingHand);
+                if name.clicked() {
+                    out.push(Intent::About);
                 }
-                b.context_menu(|ui| {
-                    for m in [ThemeMode::Light, ThemeMode::Dark, ThemeMode::System] {
-                        if ui.radio(self.theme_mode == m, m.label()).clicked() {
-                            out.push(Intent::Theme(m));
-                            ui.close_menu();
-                        }
-                    }
-                });
             });
         });
     }
@@ -1724,7 +1689,141 @@ impl App {
 
     /// The selected item's name (bold, with softer details beside it) and its tabs, on one line when
     /// they fit and on two otherwise. Returns the room left right of the tabs.
-    fn header_and_tabs(&self, ui: &mut Ui, sel: &Node, tabs: &[Tab], current: Tab, out: &mut Vec<Intent>) -> Rect {
+    /// The connection whose own page (its pool, or its one server) `sel` is, and whether it's
+    /// connected (not just listed after failing).
+    fn root_of(&self, sel: &Node) -> Option<(u32, bool)> {
+        let sid = sel.sid?;
+        if !matches!(sel.kind, Kind::Pool | Kind::Host) || sel.key != format!("srv:{}", sid) {
+            return None;
+        }
+        self.server(sid).map(|s| (sid, s.state != ConnState::Disconnected))
+    }
+
+    /// How wide the buttons at the right end of the tab row are, as icons (0: none): a VM's power
+    /// actions and Delete, a connection's Disconnect, and a console's keyboard.
+    fn tab_actions_width(&self, sel: &Node, current: Tab) -> f32 {
+        let vm = self.vm_of(sel).map(|x| x.2);
+        let mut w = 0.0;
+        if let Some(v) = vm {
+            w += ACTIONS.iter().filter(|a| a.on_toolbar(Some(v))).map(|a| 34.0 + if force_of(a.op).is_some() { ARROW_W } else { 0.0 }).sum::<f32>();
+            w += 11.0 + 32.0; // a separator, then Delete
+        }
+        if self.root_of(sel).is_some() {
+            w += 32.0; // Disconnect (with its name when there's room)
+        }
+        if current == Tab::Console && self.console.is_some() {
+            w += 32.0 + if vm.is_some() || self.root_of(sel).is_some() { 11.0 } else { 0.0 };
+        }
+        if w > 0.0 {
+            w + 8.0
+        } else {
+            0.0
+        }
+    }
+
+    /// At the right end of the tab row, as icons: a console's keyboard (its menu has Ctrl+Alt+Del
+    /// and the other keys the desktop keeps), then a VM's power actions (in their colours; Force
+    /// Shut Down and Force Reboot behind the small arrows) and Delete. When the row hasn't the
+    /// `need`ed room, all of it is behind one "more" button instead, with names.
+    fn tab_actions(&mut self, ui: &mut Ui, free: Rect, sel: &Node, current: Tab, need: f32, out: &mut Vec<Intent>) {
+        let pal = self.pal;
+        let vm = self.vm_of(sel).map(|(s, _, v)| (s.id, v.rref.clone()));
+        // each power action shown: which, whether it can run, and its Force partner's
+        let actions: Vec<(usize, bool, Option<(usize, bool)>)> = match self.vm_of(sel).map(|x| x.2) {
+            Some(v) => ACTIONS
+                .iter()
+                .enumerate()
+                .filter(|(_, a)| a.on_toolbar(Some(v)))
+                .map(|(i, a)| (i, self.can_run(a, sel), force_of(a.op).map(|f| (f, self.can_run(&ACTIONS[f], sel)))))
+                .collect(),
+            None => vec![],
+        };
+        let deleting = vm.as_ref().map_or(false, |(_, r)| self.vm_deleting.contains(r));
+        let root = self.root_of(sel).map(|(sid, connected)| (sid, if connected { "Disconnect" } else { "Remove" }, self.server(sid).map(|s| s.name()).unwrap_or_default()));
+        let mut console = if current == Tab::Console { self.console.as_mut() } else { None };
+        let tip = |i: usize| match ACTIONS[i].shortcut.text() {
+            "" => ACTIONS[i].label.to_string(),
+            k => format!("{}  ({})", ACTIONS[i].label, k),
+        };
+        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(free).layout(egui::Layout::right_to_left(egui::Align::Center)));
+        let ui = &mut child;
+        ui.spacing_mut().item_spacing.x = 2.0;
+        if let Some((sid, label, name)) = root {
+            // a connection's own page: Disconnect at the end (its name too when there's room)
+            let wide = free.width() >= need - 32.0 + flat_button_width(ui, label) + 4.0;
+            let tip = format!("{} {}", if label == "Remove" { "Remove" } else { "Disconnect from" }, name);
+            if flat_button(ui, "disconnect", label, Some(pal.red), true, !wide, &pal).on_hover_text(tip).clicked() {
+                out.push(Intent::Remove(sid));
+            }
+            if let Some(c) = console.as_deref_mut() {
+                vsep(ui, &pal);
+                keys_button(ui, &pal, c);
+            }
+            return;
+        }
+        if free.width() >= need {
+            // right to left: Delete, the power actions, the keyboard
+            if let Some((sid, vref)) = &vm {
+                if flat_button(ui, "trash", "Delete VM…", Some(pal.red), !deleting, true, &pal).clicked() {
+                    out.push(Intent::AskDeleteVm(*sid, vref.clone()));
+                }
+                vsep(ui, &pal);
+                for &(i, ok, force) in actions.iter().rev() {
+                    let clicked = match force {
+                        Some((fi, fok)) => split_tool(ui, &pal, ACTIONS[i].op, &tip(i), ok, fi, fok, out),
+                        None => tool_button(ui, ACTIONS[i].op, &tip(i), ok, true, &pal).clicked(),
+                    };
+                    if clicked {
+                        out.push(Intent::Action(i));
+                    }
+                }
+            }
+            if let Some(c) = console.as_deref_mut() {
+                if vm.is_some() {
+                    vsep(ui, &pal);
+                }
+                keys_button(ui, &pal, c);
+            }
+            return;
+        }
+        // no room: one button with all of it
+        let slot = ui.painter().add(egui::Shape::Noop);
+        let m = egui::menu::menu_custom_button(ui, egui::Button::new("").frame(false).min_size(vec2(30.0, 26.0)), |ui| {
+            ui.set_min_width(200.0);
+            if let Some(c) = console.as_deref_mut() {
+                ui.add_enabled_ui(c.connected(), |ui| ui.menu_button("Send keys", |ui| c.keys_menu(ui)));
+                if vm.is_some() {
+                    ui.separator();
+                }
+            }
+            for &(i, ok, force) in &actions {
+                for (j, can) in std::iter::once((i, ok)).chain(force) {
+                    let a = &ACTIONS[j];
+                    if ui.add_enabled(can, egui::Button::new(a.label).shortcut_text(a.shortcut.text())).clicked() {
+                        out.push(Intent::Action(j));
+                        ui.close_menu();
+                    }
+                }
+            }
+            if let Some((sid, vref)) = &vm {
+                ui.separator();
+                if ui.add_enabled(!deleting, egui::Button::new(egui::RichText::new("Delete VM…").color(pal.red))).clicked() {
+                    out.push(Intent::AskDeleteVm(*sid, vref.clone()));
+                    ui.close_menu();
+                }
+            }
+        });
+        let r = m.response.rect;
+        if m.response.hovered() || m.inner.is_some() {
+            ui.painter().set(slot, egui::epaint::RectShape::filled(r, Rounding::same(5.0), pal.hover));
+        }
+        paint_glyph(ui.painter(), Rect::from_center_size(r.center(), vec2(16.0, 16.0)), "more", pal.ink_soft);
+        m.response.on_hover_text(if vm.is_some() { "Power, Delete and more" } else { "Send keys" });
+    }
+
+    /// The header and the tabs, on one line when they and `actions` (the width the buttons at
+    /// the row's right end want) fit, otherwise the tabs on a line of their own.
+    fn header_and_tabs(&self, ui: &mut Ui, sel: &Node, tabs: &[Tab], current: Tab, actions: f32, out: &mut Vec<Intent>) -> Rect {
         let pal = self.pal;
         let (title, sub) = self.header_text(sel);
         let (title_font, sub_font, tab_font) = (FontId::new(16.0, FontFamily::Name("bold".into())), FontId::proportional(13.0), FontId::proportional(13.5));
@@ -1733,17 +1832,38 @@ impl App {
         let tabs_w: f32 = tabs.iter().map(|t| width(t.label(), &tab_font) + 20.0).sum();
         let avail = ui.available_width();
         let hairline = |ui: &Ui, r: Rect| ui.painter().line_segment([r.left_bottom() - vec2(0.0, 0.5), r.right_bottom() - vec2(0.0, 0.5)], Stroke::new(1.0, pal.border));
-        if head_w + 28.0 + tabs_w + 24.0 <= avail {
+        // everything on one line, the details beside the name giving way first if need be
+        let bare_w = 36.0 + width(&title, &title_font);
+        let one_line = if head_w + 28.0 + tabs_w + 24.0 + actions <= avail {
+            Some((head_w, sub.clone()))
+        } else if actions > 0.0 && bare_w + 28.0 + tabs_w + 24.0 + actions <= avail {
+            Some((bare_w, String::new()))
+        } else {
+            None
+        };
+        if let Some((used, sub)) = one_line {
             let (row, _) = ui.allocate_exact_size(vec2(avail, 46.0), Sense::hover());
             hairline(ui, row);
             self.paint_header(ui, row, sel, &title, &sub, row.center().y);
-            self.paint_tabs(ui, row, row.min.x + head_w + 28.0, tabs, current, out)
+            self.paint_tabs(ui, row, row.min.x + used + 28.0, tabs, current, out)
         } else {
+            // the actions go after the tabs when there's room; otherwise on the name's line (whose
+            // details beside the name give way if need be), still as icons; failing both, they
+            // fold into one button after the tabs
+            let strip_room = avail - 2.0 - tabs_w - 16.0;
+            let on_head = actions > 0.0 && strip_room < actions && avail - bare_w - 14.0 >= actions;
+            let sub = if on_head && avail - head_w - 14.0 < actions { String::new() } else { sub };
+            let used = if sub.is_empty() { bare_w } else { head_w };
             let (head, _) = ui.allocate_exact_size(vec2(avail, 38.0), Sense::hover());
             self.paint_header(ui, head, sel, &title, &sub, head.center().y + 2.0);
             let (strip, _) = ui.allocate_exact_size(vec2(avail, 32.0), Sense::hover());
             hairline(ui, strip);
-            self.paint_tabs(ui, strip, strip.min.x + 2.0, tabs, current, out)
+            let after_tabs = self.paint_tabs(ui, strip, strip.min.x + 2.0, tabs, current, out);
+            if on_head {
+                Rect::from_min_max(pos2(head.min.x + used + 8.0, head.min.y + 4.0), pos2(head.max.x - 6.0, head.max.y))
+            } else {
+                after_tabs
+            }
         }
     }
 
@@ -1769,11 +1889,11 @@ impl App {
                 let what = if sel.rref.as_deref() == Some("nets") { "Virtual Networks" } else { "Shared Storage" };
                 (what.into(), join(vec![Some(format!("in {}", s.name())), recon]))
             }
-            (Kind::Vm, Some((s, d))) => {
+            (Kind::Vm, Some((_, d))) => {
                 let v = sel.rref.as_deref().and_then(|r| d.vm(r));
                 let on = v.and_then(|v| v.host.as_deref()).and_then(|h| d.host(h)).map(|h| format!("on {}", h.name));
-                let busy = v.and_then(|v| s.busy.get(&v.rref)).cloned();
-                (v.map_or_else(|| sel.text.clone(), |v| v.name.clone()), join(vec![on, busy, recon]))
+                // (a power action under way shows as the icon turning)
+                (v.map_or_else(|| sel.text.clone(), |v| v.name.clone()), join(vec![on, recon]))
             }
             (Kind::Pool, Some((s, d))) => (s.name(), join(vec![Some(format!("{} servers", d.hosts.len())), recon])),
             (Kind::Host, Some((_, d))) => {
@@ -2116,7 +2236,7 @@ impl App {
                     g.push(row("UUID", v.uuid.clone()));
                     secs.push(("General".into(), g));
 
-                    let state = s.busy.get(&v.rref).cloned().unwrap_or_else(|| v.power.label().into());
+                    let state = s.busy.get(&v.rref).map(|b| b.0.clone()).unwrap_or_else(|| v.power.label().into());
                     let mut st = vec![row("Power state", state)];
                     let host_name = |h: Option<&str>| h.and_then(|h| d.host(h)).map(|h| h.name.clone());
                     if running {
@@ -2798,6 +2918,12 @@ impl App {
         let mut delete_iso: Option<(u32, String, String, String)> = None;
         // from the Delete VM question: server, VM, its name, whether its disks go too
         let mut delete_vm: Option<(u32, String, String, bool)> = None;
+        // from Settings: the theme and size chosen, a saved password to forget
+        let mut theme: Option<ThemeMode> = None;
+        let mut zoom: Option<f32> = None;
+        let mut forget: Option<(String, String)> = None;
+        let (theme_mode, zoom_now) = (self.theme_mode, self.zoom);
+        let saved_keys: Vec<(String, String)> = self.saved.keys().cloned().collect();
         let mut new_vm: Option<(u32, NewVm, Arc<Trace>)> = None;
         // storage the New VM dialog wants checked: pool, storage, server
         let mut checks: Vec<(u32, String, Option<String>)> = vec![];
@@ -3005,6 +3131,102 @@ impl App {
                     });
                 });
             }
+            Dialog::Settings { startup } => {
+                dialog_window(ctx, "Settings").show(ctx, |ui| {
+                    ui.set_width(440.0);
+                    let label_w = 70.0;
+                    let heading = |ui: &mut Ui, text: &str| {
+                        ui.label(egui::RichText::new(text).font(FontId::new(14.0, FontFamily::Name("bold".into()))).color(pal.ink));
+                        ui.add_space(8.0);
+                    };
+                    let note = |ui: &mut Ui, text: &str| {
+                        ui.horizontal(|ui| {
+                            ui.add_space(label_w + ui.spacing().item_spacing.x + 2.0);
+                            ui.add(egui::Label::new(egui::RichText::new(text).size(12.0).color(pal.ink_soft)).wrap());
+                        });
+                    };
+                    heading(ui, "Appearance");
+                    ui.horizontal(|ui| {
+                        field_label(ui, "Theme:", label_w);
+                        let modes = [ThemeMode::Light, ThemeMode::Dark, ThemeMode::System];
+                        let mut chosen = modes.iter().position(|m| *m == theme_mode).unwrap_or(2);
+                        if crate::isolib::segmented(ui, &pal, &["Light", "Dark", "System"], &mut chosen, ui.available_width()) {
+                            theme = Some(modes[chosen]);
+                        }
+                    });
+                    ui.add_space(2.0);
+                    note(ui, "System follows your desktop's light or dark setting.");
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        field_label(ui, "Size:", label_w);
+                        let mut chosen = ZOOMS.iter().enumerate().min_by(|a, b| (a.1 - zoom_now).abs().total_cmp(&(b.1 - zoom_now).abs())).map_or(1, |(i, _)| i);
+                        let names: Vec<String> = ZOOMS.iter().map(|z| format!("{:.0}%", z * 100.0)).collect();
+                        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+                        if crate::isolib::segmented(ui, &pal, &names, &mut chosen, ui.available_width()) {
+                            zoom = Some(ZOOMS[chosen]);
+                        }
+                    });
+                    ui.add_space(2.0);
+                    note(ui, "How big everything is drawn. Ctrl + and Ctrl - change it too.");
+                    ui.add_space(18.0);
+
+                    heading(ui, "Saved passwords");
+                    let mut rows: Vec<&(String, String)> = saved_keys.iter().collect();
+                    rows.sort();
+                    match keychain {
+                        None => note_left(ui, &pal, "Looking at the system's keychain…"),
+                        Some(false) => note_left(ui, &pal, "This system has no keychain (Secret Service), so passwords can't be saved."),
+                        Some(true) if rows.is_empty() => note_left(ui, &pal, "None yet. Tick Remember password when you connect to keep one."),
+                        Some(true) => {
+                            egui::Frame::none().stroke(Stroke::new(1.0, pal.border)).rounding(Rounding::same(8.0)).show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                ui.spacing_mut().item_spacing.y = 0.0;
+                                for (n, (h, u)) in rows.iter().map(|k| (&k.0, &k.1)).enumerate() {
+                                    if n > 0 {
+                                        let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
+                                        ui.painter().line_segment([r.left_center(), r.right_center()], Stroke::new(1.0, pal.border));
+                                    }
+                                    let w = ui.available_width();
+                                    ui.allocate_ui_with_layout(vec2(w, 40.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                        ui.add_space(12.0);
+                                        let at_start = startup.iter().any(|(sh, su)| sh.eq_ignore_ascii_case(h) && su == u);
+                                        // one line or two, in the middle of the row
+                                        let (big, small) = ui.fonts(|f| (f.row_height(&egui::TextStyle::Body.resolve(ui.style())), f.row_height(&FontId::proportional(11.5))));
+                                        let tall = big + if at_start { small + 1.0 } else { 0.0 };
+                                        ui.vertical(|ui| {
+                                            ui.spacing_mut().item_spacing.y = 1.0;
+                                            ui.add_space(((40.0 - tall) / 2.0).max(0.0));
+                                            ui.label(egui::RichText::new(format!("{}  ·  {}", h, u)).color(pal.ink));
+                                            if at_start {
+                                                ui.label(egui::RichText::new("Connects when the app starts").size(11.5).color(pal.ink_soft));
+                                            }
+                                        });
+                                        let rest = ui.available_width();
+                                        ui.allocate_ui_with_layout(vec2(rest, 40.0), egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                            ui.add_space(6.0);
+                                            let tip = "Delete this password from the keychain; the app stops connecting here when it starts";
+                                            if flat_button(ui, "trash", "Forget", Some(pal.red), true, false, &pal).on_hover_text(tip).clicked() {
+                                                forget = Some(((*h).clone(), (*u).clone()));
+                                            }
+                                        });
+                                    });
+                                }
+                            });
+                        }
+                    }
+                    ui.add_space(6.0);
+                    ui.label(egui::RichText::new("Passwords are kept in your system's keychain, never in the app's own files.").size(12.0).color(pal.ink_soft));
+                    ui.add_space(14.0);
+                    dialog_buttons(ui, |ui| {
+                        if dialog_button(ui, &pal, "check", "Close", Look::Primary, true) || ui.input(|i| i.key_pressed(Key::Escape)) {
+                            close = true;
+                        }
+                    });
+                });
+                if let Some(k) = &forget {
+                    startup.retain(|(h, u)| !(h.eq_ignore_ascii_case(&k.0) && *u == k.1));
+                }
+            }
             Dialog::ConfirmSr { sid, sr, text } => {
                 dialog_window(ctx, "Disconnect ISO Library").show(ctx, |ui| {
                     ui.set_max_width(420.0);
@@ -3067,6 +3289,19 @@ impl App {
         if let Some((sid, sr, vdi, name)) = delete_iso {
             self.dialog = Dialog::None;
             self.delete_iso(sid, sr, vdi, name, ctx);
+        }
+        if let Some(m) = theme {
+            self.theme_mode = m;
+            self.apply_theme(ctx);
+            self.save_settings();
+        }
+        if let Some(z) = zoom {
+            self.zoom = z;
+            ctx.set_zoom_factor(z);
+            self.save_settings();
+        }
+        if let Some((h, u)) = forget {
+            self.keep_password(&h, &u, None);
         }
         if let Some((sid, vm, name, disks)) = delete_vm {
             self.dialog = Dialog::None;
@@ -3147,6 +3382,12 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.apply_theme(ctx); // follows the system theme when set to "Same as the system"
+        // Ctrl + / Ctrl - change the size too: remembered like the choice in Settings
+        let zoom = ctx.zoom_factor();
+        if (zoom - self.zoom).abs() > 0.001 {
+            self.zoom = zoom;
+            self.save_settings();
+        }
         let pal = self.pal;
         self.tick(ctx);
         let tree = self.build_tree();
@@ -3194,6 +3435,20 @@ impl eframe::App for App {
                 "confirm" => out.extend(ACTIONS.iter().position(|a| a.confirm && self.can_run(a, &sel)).map(Intent::Action)),
                 "about" => out.push(Intent::About),
                 "console" => out.push(Intent::Tab(Tab::Console)),
+                "settings" => {
+                    // two made-up saved passwords, one connecting at startup
+                    self.keychain = Some(true);
+                    self.saved.insert(("10.20.0.11".into(), "root".into()), String::new());
+                    self.saved.insert(("lab-xen.example.net".into(), "admin".into()), String::new());
+                    self.dialog = Dialog::Settings { startup: vec![("10.20.0.11".into(), "root".into())] };
+                }
+                "vm-busy" => {
+                    // one VM starting, another shutting down: their icons turning
+                    if let Some(s) = sel.sid.and_then(|id| self.server_mut(id)) {
+                        s.busy.insert("vm-desk".into(), ("Starting…".into(), "start"));
+                        s.busy.insert("vm-web".into(), ("Shutting down…".into(), "clean_shutdown"));
+                    }
+                }
                 "host-console" => {
                     if let Some(sid) = sel.sid {
                         out.push(Intent::Select(format!("host:{}:host-a", sid)));
@@ -3315,20 +3570,10 @@ impl eframe::App for App {
             ui.spacing_mut().item_spacing.y = 0.0;
             let tabs = self.tabs_for(&sel);
             let current = if tabs.contains(&self.tab) { self.tab } else { tabs[0] };
-            let free = self.header_and_tabs(ui, &sel, &tabs, current, &mut out);
-            if current == Tab::Console {
-                if let Some(c) = self.console.as_mut() {
-                    c.tab_controls(ui, free, &pal);
-                }
-            } else if let Some((s, _, v)) = self.vm_of(&sel) {
-                // deleting it, next to its tabs (the power actions are up on the toolbar)
-                let (sid, vm) = (s.id, v.rref.clone());
-                let deleting = self.vm_deleting.contains(&vm);
-                let mut child = ui.new_child(egui::UiBuilder::new().max_rect(free).layout(egui::Layout::right_to_left(egui::Align::Center)));
-                let compact = free.width() < flat_button_width(&child, "Deleting…") + 8.0;
-                if flat_button(&mut child, "trash", if deleting { "Deleting…" } else { "Delete" }, Some(pal.red), !deleting, compact, &pal).on_hover_text("Delete this VM (asks first)").clicked() {
-                    out.push(Intent::AskDeleteVm(sid, vm));
-                }
+            let actions = self.tab_actions_width(&sel, current);
+            let free = self.header_and_tabs(ui, &sel, &tabs, current, actions, &mut out);
+            if actions > 0.0 {
+                self.tab_actions(ui, free, &sel, current, actions, &mut out);
             } else if let Some((s, x)) = self.sr_of(&sel).filter(|(_, x)| x.is_iso()) {
                 // an ISO library's actions, next to its tabs
                 let (sid, sr) = (s.id, x.rref.clone());
@@ -3630,6 +3875,81 @@ const ARROW_W: f32 = 16.0;
 
 /// A labelled toolbar button with a theme-coloured glyph; `compact` shows only the glyph, with the
 /// label as a tooltip.
+/// The interface sizes Settings offers.
+const ZOOMS: [f32; 4] = [0.9, 1.0, 1.1, 1.25];
+
+/// A grey line of explanation, from the left edge.
+fn note_left(ui: &mut Ui, pal: &Pal, text: &str) {
+    ui.add(egui::Label::new(egui::RichText::new(text).size(12.5).color(pal.ink_soft)).wrap());
+}
+
+/// Force Shut Down for Shut Down, Force Reboot for Reboot: in the menu of the small arrow beside it.
+fn force_of(op: &str) -> Option<usize> {
+    match op {
+        "clean_shutdown" => ACTIONS.iter().position(|a| a.op == "hard_shutdown"),
+        "clean_reboot" => ACTIONS.iter().position(|a| a.op == "hard_reboot"),
+        _ => None,
+    }
+}
+
+/// Shut Down or Reboot (`op`) and the small arrow whose menu holds its Force partner
+/// (ACTIONS[`fi`]), as one button in two parts: the mouse over either lights both, a hairline
+/// between them. Whether the main part was clicked.
+fn split_tool(ui: &mut Ui, pal: &Pal, op: &str, tip: &str, enabled: bool, fi: usize, force_ok: bool, out: &mut Vec<Intent>) -> bool {
+    let (r, _) = ui.allocate_exact_size(vec2(32.0 + ARROW_W, 30.0), Sense::hover());
+    let back = ui.painter().add(egui::Shape::Noop);
+    let main_r = Rect::from_min_size(r.min, vec2(32.0, r.height()));
+    let arrow_r = Rect::from_min_max(pos2(main_r.max.x, r.min.y), r.max);
+    let main = ui.interact(main_r, ui.id().with(("split", op)), if enabled { Sense::click() } else { Sense::hover() });
+    paint_tool(ui.painter(), Rect::from_center_size(main_r.center(), vec2(22.0, 22.0)), op, enabled, pal);
+    let main = main.on_hover_text(tip);
+    // the arrow and its menu
+    let force = &ACTIONS[fi];
+    let (mut arrow_lit, mut open) = (false, false);
+    let mut part = ui.new_child(egui::UiBuilder::new().max_rect(arrow_r).layout(egui::Layout::left_to_right(egui::Align::Center)));
+    part.add_enabled_ui(force_ok, |ui| {
+        let m = egui::menu::menu_custom_button(ui, egui::Button::new("").frame(false).min_size(arrow_r.size()), |ui| {
+            ui.set_min_width(170.0);
+            if ui.button(force.label).clicked() {
+                out.push(Intent::Action(fi));
+                ui.close_menu();
+            }
+        });
+        arrow_lit = m.response.hovered() && force_ok;
+        open = m.inner.is_some();
+        m.response.on_hover_text(force.label);
+    });
+    let c = arrow_r.center();
+    let col = if force_ok { pal.ink_soft } else { pal.ink_faint };
+    ui.painter().add(egui::Shape::line(vec![pos2(c.x - 3.5, c.y - 1.5), pos2(c.x, c.y + 2.0), pos2(c.x + 3.5, c.y - 1.5)], Stroke::new(1.4, col)));
+    if (main.hovered() && enabled) || arrow_lit || open {
+        ui.painter().set(back, egui::epaint::RectShape::filled(r, Rounding::same(6.0), pal.hover));
+        ui.painter().line_segment([pos2(main_r.max.x, r.min.y + 7.0), pos2(main_r.max.x, r.max.y - 7.0)], Stroke::new(1.0, pal.border_strong));
+    }
+    main.clicked()
+}
+
+/// A console's keyboard button: its menu sends Ctrl+Alt+Del and the keys the desktop keeps.
+fn keys_button(ui: &mut Ui, pal: &Pal, c: &mut ConsoleView) {
+    let on = c.connected();
+    ui.add_enabled_ui(on, |ui| {
+        let slot = ui.painter().add(egui::Shape::Noop);
+        let m = egui::menu::menu_custom_button(ui, egui::Button::new("").frame(false).min_size(vec2(30.0, 26.0)), |ui| c.keys_menu(ui));
+        let r = m.response.rect;
+        if (m.response.hovered() && on) || m.inner.is_some() {
+            ui.painter().set(slot, egui::epaint::RectShape::filled(r, Rounding::same(5.0), pal.hover));
+        }
+        paint_glyph(ui.painter(), Rect::from_center_size(r.center(), vec2(16.0, 16.0)), "keyboard", if on { pal.ink_soft } else { pal.ink_faint });
+        m.response.on_hover_text("Send keys: Ctrl+Alt+Del, the Windows key, Alt+Tab…");
+    });
+}
+
+/// A thin upright line between groups of buttons.
+fn vsep(ui: &mut Ui, pal: &Pal) {
+    let (r, _) = ui.allocate_exact_size(vec2(9.0, 18.0), Sense::hover());
+    ui.painter().line_segment([r.center_top(), r.center_bottom()], Stroke::new(1.0, pal.border));
+}
+
 fn tool_button(ui: &mut Ui, op: &str, label: &str, enabled: bool, compact: bool, pal: &Pal) -> egui::Response {
     let w = if compact { 32.0 } else { tool_width(ui, label) };
     let sense = if enabled { Sense::click() } else { Sense::hover() };
@@ -3729,17 +4049,26 @@ fn config_dir() -> Option<std::path::PathBuf> {
     } else {
         std::env::var_os("XDG_CONFIG_HOME").map(std::path::PathBuf::from).or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))
     }?;
-    Some(base.join("SimpleVMManager"))
+    let dir = base.join("SimpleVMManager");
+    // while the app was briefly called XenCraft, its settings, servers and sessions lived there:
+    // they move back once
+    let old = base.join("XenCraft");
+    if !dir.exists() && old.is_dir() {
+        let _ = std::fs::rename(&old, &dir);
+    }
+    Some(dir)
 }
 
 struct Settings {
     theme: ThemeMode,
     sidebar_open: bool,
+    /// The interface's size, 1.0 being the system's own (Settings, or Ctrl + / Ctrl -).
+    zoom: f32,
 }
 
 impl Default for Settings {
     fn default() -> Settings {
-        Settings { theme: ThemeMode::System, sidebar_open: true }
+        Settings { theme: ThemeMode::System, sidebar_open: true, zoom: 1.0 }
     }
 }
 
@@ -3751,6 +4080,7 @@ fn load_settings() -> Settings {
             match k.trim() {
                 "theme" => s.theme = ThemeMode::parse(v).unwrap_or(s.theme),
                 "sidebar" => s.sidebar_open = v.trim() != "folded",
+                "zoom" => s.zoom = v.trim().parse::<f32>().ok().filter(|z| (0.5..=3.0).contains(z)).unwrap_or(1.0),
                 _ => {}
             }
         }
@@ -3761,7 +4091,7 @@ fn load_settings() -> Settings {
 fn save_settings(s: &Settings) {
     let Some(dir) = config_dir() else { return };
     let _ = std::fs::create_dir_all(&dir);
-    let text = format!("theme={}\nsidebar={}\n", s.theme.as_str(), if s.sidebar_open { "open" } else { "folded" });
+    let text = format!("theme={}\nsidebar={}\nzoom={:.2}\n", s.theme.as_str(), if s.sidebar_open { "open" } else { "folded" }, s.zoom);
     let _ = std::fs::write(dir.join("settings.txt"), text);
 }
 

@@ -26,13 +26,6 @@ impl ThemeMode {
             ThemeMode::Dark => "dark",
         }
     }
-    pub fn label(self) -> &'static str {
-        match self {
-            ThemeMode::System => "Same as the system",
-            ThemeMode::Light => "Light",
-            ThemeMode::Dark => "Dark",
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug)]

@@ -12,8 +12,11 @@ BIN="$HOME/.local/bin"
 APPS="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
 ICONS="${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor/scalable/apps"
 
+# for a short while the app was called XenCraft: those files go too
+OLD=("$BIN/xencraft" "$APPS/xencraft.desktop" "$ICONS/xencraft.svg")
+
 if [[ "${1:-}" == "--uninstall" ]]; then
-  rm -f "$BIN/simple-vm-manager" "$APPS/simple-vm-manager.desktop" "$ICONS/simple-vm-manager.svg"
+  rm -f "$BIN/simple-vm-manager" "$APPS/simple-vm-manager.desktop" "$ICONS/simple-vm-manager.svg" "${OLD[@]}"
   echo "Removed Simple VM Manager."
   exit 0
 fi
@@ -32,6 +35,7 @@ fi
 install -Dm755 "$SRC" "$BIN/simple-vm-manager"
 install -Dm644 packaging/simple-vm-manager.desktop "$APPS/simple-vm-manager.desktop"
 install -Dm644 packaging/simple-vm-manager.svg "$ICONS/simple-vm-manager.svg"
+rm -f "${OLD[@]}"
 # point the launcher at the user copy, in case ~/.local/bin isn't on PATH
 sed -i "s|^Exec=.*|Exec=$BIN/simple-vm-manager|" "$APPS/simple-vm-manager.desktop"
 command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$APPS" || true

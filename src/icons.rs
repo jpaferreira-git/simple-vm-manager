@@ -13,13 +13,47 @@ pub enum IconKind {
     Host,
     HostOff,
     ServerDown,
-    Busy,
+    /// Something under way: a ring turning, in the colour of what's being done.
+    Busy(Tone),
     Sr,
     /// A library of installation discs.
     IsoSr,
     Net,
     Folder,
     Vm(PowerState),
+}
+
+/// A turning ring's colour: green while a VM starts, red while it shuts down…
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Tone {
+    Accent,
+    Green,
+    Red,
+    Orange,
+    Blue,
+}
+
+impl Tone {
+    /// The colour of a VM power action's button (as on `paint_tool`).
+    pub fn of_action(op: &str) -> Tone {
+        match op {
+            "start" | "resume" | "clean_reboot" => Tone::Green,
+            "clean_shutdown" | "hard_shutdown" => Tone::Red,
+            "hard_reboot" => Tone::Orange,
+            "suspend" => Tone::Blue,
+            _ => Tone::Accent,
+        }
+    }
+
+    pub fn color(self, p: &Pal) -> Color32 {
+        match self {
+            Tone::Accent => p.accent,
+            Tone::Green => p.green,
+            Tone::Red => p.red,
+            Tone::Orange => p.orange,
+            Tone::Blue => p.blue,
+        }
+    }
 }
 
 pub fn state_color(p: &Pal, s: PowerState) -> Color32 {
@@ -99,7 +133,14 @@ pub fn paint_icon(p: &Painter, rect: Rect, kind: IconKind, pal: &Pal, bg: Color3
                 }
             }
         }
-        IconKind::Busy => arc(p, o + vec2(8.0, 8.0), 5.8, -90.0, 180.0, Stroke::new(1.8, pal.accent)),
+        IconKind::Busy(tone) => {
+            // a faint ring, and an arc going round it
+            let col = tone.color(pal);
+            let turn = (p.ctx().input(|i| i.time) * 300.0 % 360.0) as f32;
+            p.circle_stroke(o + vec2(8.0, 8.0), 5.8, Stroke::new(1.8, col.gamma_multiply(0.22)));
+            arc(p, o + vec2(8.0, 8.0), 5.8, turn, turn + 110.0, Stroke::new(1.9, col));
+            p.ctx().request_repaint();
+        }
         IconKind::Sr => {
             p.add(Shape::ellipse_stroke(o + vec2(8.0, 4.0), vec2(5.8, 2.3), s));
             line(p, o, &[(2.2, 4.0), (2.2, 12.0)], s);
@@ -151,7 +192,7 @@ pub fn paint_tool(p: &Painter, rect: Rect, op: &str, enabled: bool, pal: &Pal) {
         _ => pal.icon,
     };
     let col = if enabled { base } else { pal.ink_faint };
-    let neutral = matches!(op, "sidebar" | "theme-dark" | "theme-light");
+    let neutral = matches!(op, "sidebar" | "theme-dark" | "theme-light" | "settings");
     if !neutral {
         let tint = if enabled { col.gamma_multiply(if pal.dark { 0.22 } else { 0.14 }) } else { Color32::TRANSPARENT };
         p.rect_filled(rect.shrink(0.5), Rounding::same(6.0), tint);
@@ -201,6 +242,16 @@ pub fn paint_tool(p: &Painter, rect: Rect, op: &str, enabled: bool, pal: &Pal) {
             line(p, o, &[(13.5, 3.5), (13.5, 7.5)], s);
             line(p, o, &[(5.5, 7.5), (16.5, 7.5), (16.5, 10.5), (14.8, 13.6), (11.0, 15.0), (7.2, 13.6), (5.5, 10.5), (5.5, 7.5)], s);
             line(p, o, &[(11.0, 15.0), (11.0, 19.0)], s);
+        }
+        "settings" => {
+            // a gear: eight teeth round a ring, a hole in the middle
+            for i in 0..8 {
+                let a = (i as f32 * 45.0 + 22.5).to_radians();
+                let d = vec2(a.cos(), a.sin());
+                p.line_segment([c + d * 5.4, c + d * 8.2], Stroke::new(2.6, col));
+            }
+            p.circle_stroke(c, 5.6, Stroke::new(1.8, col));
+            p.circle_stroke(c, 2.1, Stroke::new(1.5, col));
         }
         "sidebar" => {
             let s = Stroke::new(1.6, col);
@@ -359,6 +410,12 @@ pub fn paint_glyph_on(p: &Painter, rect: Rect, name: &str, col: Color32, bg: Col
             line(p, c, &[(0.0, -6.5), (7.0, 5.5), (-7.0, 5.5), (0.0, -6.5)], Stroke::new(1.4, col));
             line(p, c, &[(0.0, -2.2), (0.0, 1.6)], Stroke::new(1.6, col));
             p.circle_filled(c + vec2(0.0, 3.7), 0.95, col);
+        }
+        "more" => {
+            // three dots in a row
+            for x in [-5.0, 0.0, 5.0] {
+                p.circle_filled(c + vec2(x, 0.0), 1.6, col);
+            }
         }
         "error" => {
             // a cross in a circle

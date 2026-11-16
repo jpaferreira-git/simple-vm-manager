@@ -246,7 +246,7 @@ fn note(ui: &mut Ui, pal: &Pal, text: &str) {
 }
 
 /// A row of options, the chosen one raised; returns true when the choice changed.
-fn segmented(ui: &mut Ui, pal: &Pal, options: &[&str], chosen: &mut usize, width: f32) -> bool {
+pub(crate) fn segmented(ui: &mut Ui, pal: &Pal, options: &[&str], chosen: &mut usize, width: f32) -> bool {
     let (r, _) = ui.allocate_exact_size(vec2(width, 26.0), Sense::hover());
     ui.painter().rect_filled(r, Rounding::same(6.0), pal.rail);
     let part = r.width() / options.len() as f32;

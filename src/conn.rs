@@ -797,7 +797,7 @@ impl Connection for RealConnection {
                 address: s(&r, "address"),
                 version: if version.is_empty() { s(&sw, "platform_version") } else { version },
                 cpu_model: s(&cpu, "modelname"),
-                cpu_count: n(&cpu, "count"),
+                cpu_count: n(&cpu, "cpu_count"),
                 mem_total: n(&m, "memory_total"),
                 mem_free: n(&m, "memory_free"),
                 enabled: b(&r, "enabled"),

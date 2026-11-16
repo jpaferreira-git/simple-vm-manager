@@ -4,6 +4,8 @@
 //! makes them from background threads.
 
 const SERVICE: &str = "simple-vm-manager";
+/// Where passwords went while the app was briefly called XenCraft: moved back as they're read.
+const OLD_SERVICE: &str = "xencraft";
 
 fn entry(host: &str, user: &str) -> keyring::Result<keyring::Entry> {
     keyring::Entry::new(SERVICE, &format!("{}@{}", user, host))
@@ -18,7 +20,16 @@ pub fn available() -> bool {
 }
 
 pub fn load(host: &str, user: &str) -> Option<String> {
-    entry(host, user).ok()?.get_password().ok()
+    if let Some(p) = entry(host, user).ok().and_then(|e| e.get_password().ok()) {
+        return Some(p);
+    }
+    // kept under XenCraft, the name the app had for a while: moved back
+    let old = keyring::Entry::new(OLD_SERVICE, &format!("{}@{}", user, host)).ok()?;
+    let p = old.get_password().ok()?;
+    if save(host, user, &p).is_ok() {
+        let _ = old.delete_credential();
+    }
+    Some(p)
 }
 
 pub fn save(host: &str, user: &str, password: &str) -> Result<(), String> {
@@ -27,6 +38,9 @@ pub fn save(host: &str, user: &str, password: &str) -> Result<(), String> {
 
 pub fn forget(host: &str, user: &str) {
     if let Ok(e) = entry(host, user) {
+        let _ = e.delete_credential();
+    }
+    if let Ok(e) = keyring::Entry::new(OLD_SERVICE, &format!("{}@{}", user, host)) {
         let _ = e.delete_credential();
     }
 }
@@ -42,6 +56,22 @@ mod tests {
         let (host, user) = ("keychain-test.invalid", "test-user");
         super::save(host, user, "s3cret pässwörd").unwrap();
         assert_eq!(super::load(host, user).as_deref(), Some("s3cret pässwörd"));
+        super::forget(host, user);
+        assert_eq!(super::load(host, user), None);
+    }
+
+    /// A password kept under XenCraft (the app's name for a while) is found, and moved back:
+    /// cargo test -- --ignored old_name_moves_over
+    #[test]
+    #[ignore]
+    fn old_name_moves_over() {
+        let (host, user) = ("rename-test.invalid", "test-user");
+        let account = format!("{}@{}", user, host);
+        let old = keyring::Entry::new(super::OLD_SERVICE, &account).unwrap();
+        old.set_password("from before").unwrap();
+        assert_eq!(super::load(host, user).as_deref(), Some("from before"));
+        assert!(matches!(old.get_password(), Err(keyring::Error::NoEntry)), "the old entry should be gone");
+        assert_eq!(super::entry(host, user).unwrap().get_password().unwrap(), "from before");
         super::forget(host, user);
         assert_eq!(super::load(host, user), None);
     }
