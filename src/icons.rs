@@ -18,9 +18,24 @@ pub enum IconKind {
     Sr,
     /// A library of installation discs.
     IsoSr,
+    /// A storage (an ISO library or not) with how it's doing: see `SrHealth`.
+    Storage { iso: bool, health: SrHealth },
     Net,
     Folder,
     Vm(PowerState),
+}
+
+/// How a storage is doing, as the dot on its icon.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum SrHealth {
+    /// Mounted where it should be: a green dot.
+    Up,
+    /// Its server is off or not answering: a red dot.
+    Off,
+    /// Some servers that should have it mounted don't: an orange "!".
+    Partly,
+    /// Mounted on no server: a red "!".
+    Nowhere,
 }
 
 /// A turning ring's colour: green while a VM starts, red while it shuts down…
@@ -164,6 +179,19 @@ pub fn paint_icon(p: &Painter, rect: Rect, kind: IconKind, pal: &Pal, bg: Color3
             p.circle_stroke(o + vec2(8.0, 8.0), 6.3, s);
             p.circle_stroke(o + vec2(8.0, 8.0), 1.7, Stroke::new(1.2, pal.icon));
             arc(p, o + vec2(8.0, 8.0), 4.0, 200.0, 265.0, Stroke::new(1.0, pal.icon.gamma_multiply(0.7)));
+        }
+        IconKind::Storage { iso, health } => {
+            paint_icon(p, rect, if iso { IconKind::IsoSr } else { IconKind::Sr }, pal, bg);
+            match health {
+                SrHealth::Up => dot(p, o, pal.green, bg),
+                SrHealth::Off => dot(p, o, pal.red, bg),
+                SrHealth::Partly | SrHealth::Nowhere => {
+                    let c = o + vec2(12.5, 12.5);
+                    p.circle(c, 3.9, if health == SrHealth::Nowhere { pal.red } else { pal.orange }, Stroke::new(1.4, bg));
+                    p.line_segment([c + vec2(0.0, -2.2), c + vec2(0.0, 0.6)], Stroke::new(1.3, Color32::WHITE));
+                    p.circle_filled(c + vec2(0.0, 2.0), 0.75, Color32::WHITE);
+                }
+            }
         }
         IconKind::Folder => {
             line(p, o, &[(1.5, 13.0), (1.5, 3.5), (6.0, 3.5), (7.5, 5.0), (14.5, 5.0), (14.5, 13.0), (1.5, 13.0)], s);

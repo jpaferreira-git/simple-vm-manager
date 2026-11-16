@@ -26,6 +26,14 @@ pub enum IsoAction {
     Close,
     /// Create it in the pool with this id.
     Create(u32, IsoLibrary),
+    /// Give library `sr` of pool `sid`, detached, these settings and mount it again.
+    Reattach(u32, String, IsoLibrary),
+}
+
+/// A detached library being given its settings back: its reference and UUID.
+struct Reattach {
+    sr: String,
+    uuid: String,
 }
 
 pub struct IsoDialog {
@@ -45,6 +53,7 @@ pub struct IsoDialog {
     busy: Option<String>,
     problem: String,
     failure: Option<Failure>,
+    reattach: Option<Reattach>,
 }
 
 impl IsoDialog {
@@ -65,7 +74,14 @@ impl IsoDialog {
             busy: None,
             problem: String::new(),
             failure: None,
+            reattach: None,
         }
+    }
+
+    /// For library `sr` (`name`, `uuid`) of pool `sid`, which the pool has no settings for any more
+    /// (detached): asks where it is, to mount it again as it was.
+    pub fn reattach(sid: u32, pool: String, sr: String, uuid: String, name: String, shared: bool) -> IsoDialog {
+        IsoDialog { name, shared, reattach: Some(Reattach { sr, uuid }), ..IsoDialog::new(sid, vec![(sid, pool)]) }
     }
 
     /// For the screenshot checks: filled in, Advanced open or not.
@@ -80,8 +96,11 @@ impl IsoDialog {
     /// The server couldn't create it: say why, and show what was asked and what came back.
     pub fn failed(&mut self, lib: &IsoLibrary, e: &ApiError) {
         self.busy = None;
-        let (title, hint) = explain(e, lib);
-        let mut transcript = format!("$ {}\n", lib.xe_command());
+        let (mut title, hint) = explain(e, lib);
+        if self.reattach.is_some() && mount_trouble(e).is_none() && e.code != "CONNECTION" && e.code != "RBAC_PERMISSION_DENIED" {
+            title = format!("Couldn't mount '{}'", self.name);
+        }
+        let mut transcript = format!("$ {}\n", lib.xe_command(self.reattach.as_ref().map(|r| r.uuid.as_str())));
         transcript.push_str(&format!("Error code: {}\n", e.code));
         for d in e.details.iter().filter(|d| !d.trim().is_empty()) {
             transcript.push_str(d.trim());
@@ -101,7 +120,10 @@ impl IsoDialog {
         self.failure = None;
         let pool = self.pools.iter().find(|p| p.0 == self.sid).map(|p| p.1.clone()).unwrap_or_default();
         self.busy = Some(format!("Asking {} to connect to {}…", pool, lib.location));
-        IsoAction::Create(self.sid, lib)
+        match &self.reattach {
+            Some(r) => IsoAction::Reattach(self.sid, r.sr.clone(), lib),
+            None => IsoAction::Create(self.sid, lib),
+        }
     }
 
     fn request(&self) -> IsoLibrary {
@@ -121,13 +143,19 @@ impl IsoDialog {
     pub fn ui(&mut self, ctx: &egui::Context, pal: &Pal) -> IsoAction {
         let mut action = IsoAction::None;
         let busy = self.busy.is_some();
-        dialog_window(ctx, "New ISO Library").show(ctx, |ui| {
+        let again = self.reattach.is_some();
+        dialog_window(ctx, if again { "Repair ISO Library" } else { "New ISO Library" }).show(ctx, |ui| {
             ui.set_width(460.0);
             ui.spacing_mut().item_spacing.y = 8.0;
-            ui.label(egui::RichText::new("A shared folder with installation discs (.iso files). Your servers mount it to install new VMs from.").color(pal.ink_soft));
+            let intro = if again {
+                format!("The pool has no settings for reaching '{}' any more. Say where it is, and your servers mount it again, its ISO files and their descriptions as they were.", self.name)
+            } else {
+                "A shared folder with installation discs (.iso files). Your servers mount it to install new VMs from.".to_string()
+            };
+            ui.add(egui::Label::new(egui::RichText::new(intro).color(pal.ink_soft)).wrap());
             ui.add_space(2.0);
             ui.add_enabled_ui(!busy, |ui| {
-                if self.pools.len() > 1 {
+                if self.pools.len() > 1 && !again {
                     ui.horizontal(|ui| {
                         field_label(ui, "Pool:", LABEL_WIDTH);
                         let current = self.pools.iter().find(|p| p.0 == self.sid).map(|p| p.1.clone()).unwrap_or_default();
@@ -138,10 +166,12 @@ impl IsoDialog {
                         });
                     });
                 }
-                ui.horizontal(|ui| {
-                    field_label(ui, "Name:", LABEL_WIDTH);
-                    text_field(ui, pal, &mut self.name, ui.available_width(), false);
-                });
+                if !again {
+                    ui.horizontal(|ui| {
+                        field_label(ui, "Name:", LABEL_WIDTH);
+                        text_field(ui, pal, &mut self.name, ui.available_width(), false);
+                    });
+                }
                 ui.horizontal(|ui| {
                     field_label(ui, "Share type:", LABEL_WIDTH);
                     let mut i = self.nfs as usize;
@@ -196,14 +226,16 @@ impl IsoDialog {
                         });
                         note(ui, pal, "1.0 only for old servers that can't do 3.0.");
                     }
-                    ui.horizontal(|ui| {
-                        field_label(ui, "Description:", LABEL_WIDTH);
-                        text_field(ui, pal, &mut self.description, ui.available_width(), false);
-                    });
-                    ui.horizontal(|ui| {
-                        ui.add_space(LABEL_WIDTH + ui.spacing().item_spacing.x);
-                        ui.checkbox(&mut self.shared, "Available to every server in the pool");
-                    });
+                    if !again {
+                        ui.horizontal(|ui| {
+                            field_label(ui, "Description:", LABEL_WIDTH);
+                            text_field(ui, pal, &mut self.description, ui.available_width(), false);
+                        });
+                        ui.horizontal(|ui| {
+                            ui.add_space(LABEL_WIDTH + ui.spacing().item_spacing.x);
+                            ui.checkbox(&mut self.shared, "Available to every server in the pool");
+                        });
+                    }
                 }
             });
 
@@ -228,7 +260,8 @@ impl IsoDialog {
                 }
                 let ready = !busy && !self.name.trim().is_empty() && !self.location.trim().is_empty();
                 let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if dialog_button(ui, pal, "plus", "Create", Look::Primary, ready) || (ready && enter && self.failure.is_none()) {
+                let (glyph, label) = if again { ("connect", "Repair") } else { ("plus", "Create") };
+                if dialog_button(ui, pal, glyph, label, Look::Primary, ready) || (ready && enter && self.failure.is_none()) {
                     action = self.submit();
                 }
             });
@@ -299,16 +332,44 @@ fn failure_panel(ui: &mut Ui, pal: &Pal, f: &mut Failure) {
 }
 
 /// A plain-words title and advice for the server's error.
-fn explain(e: &ApiError, lib: &IsoLibrary) -> (String, String) {
+/// Why a share couldn't be mounted, from the mount's own message.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum MountTrouble {
+    /// Wrong user name or password, or the servers aren't let in.
+    Refused,
+    /// No such share or folder.
+    NotFound,
+    /// The address doesn't answer the servers.
+    Unreachable,
+    /// The share doesn't speak the protocol version asked for.
+    Unsupported,
+}
+
+pub(crate) fn mount_trouble(e: &ApiError) -> Option<MountTrouble> {
     let all = format!("{} {}", e.code, e.details.join(" ")).to_lowercase();
     let has = |words: &[&str]| words.iter().any(|w| all.contains(w));
+    if has(&["permission denied", "error(13)", "access denied", "logon failure", "nt_status_logon"]) {
+        Some(MountTrouble::Refused)
+    } else if has(&["no such file", "error(2)", "not found", "does not exist", "bad network name", "error(6)"]) {
+        Some(MountTrouble::NotFound)
+    } else if has(&["no route to host", "error(113)", "host is down", "error(112)", "timed out", "connection refused", "error(111)", "unreachable", "could not resolve", "name or service not known", "unable to find suitable address"]) {
+        Some(MountTrouble::Unreachable)
+    } else if has(&["operation not supported", "error(95)", "protocol not supported", "invalid argument", "error(22)", "requested nfs version"]) {
+        Some(MountTrouble::Unsupported)
+    } else {
+        None
+    }
+}
+
+fn explain(e: &ApiError, lib: &IsoLibrary) -> (String, String) {
     if e.code == "CONNECTION" {
         return ("Couldn't reach your XenServer".into(), e.message());
     }
     if e.code == "RBAC_PERMISSION_DENIED" {
         return ("Your account isn't allowed to add storage".into(), "Sign in with an account that has the Pool Admin role.".into());
     }
-    if has(&["permission denied", "error(13)", "access denied", "logon failure", "nt_status_logon"]) {
+    let trouble = mount_trouble(e);
+    if trouble == Some(MountTrouble::Refused) {
         let hint = if lib.nfs {
             "The NFS server refused your XenServer hosts: check that the export allows their addresses."
         } else if lib.username.is_empty() {
@@ -318,16 +379,16 @@ fn explain(e: &ApiError, lib: &IsoLibrary) -> (String, String) {
         };
         return ("The share refused the connection".into(), hint.into());
     }
-    if has(&["no such file", "error(2)", "not found", "does not exist", "bad network name", "error(6)"]) {
+    if trouble == Some(MountTrouble::NotFound) {
         return ("The share or folder wasn't found".into(), "Check the share's name and the folder after it.".into());
     }
-    if has(&["no route to host", "error(113)", "host is down", "error(112)", "timed out", "connection refused", "error(111)", "unreachable", "could not resolve", "name or service not known", "unable to find suitable address"]) {
+    if trouble == Some(MountTrouble::Unreachable) {
         return (
             "Your XenServer hosts couldn't reach that address".into(),
             "Check the address, and that the share's server is on and reachable from the XenServer hosts themselves (not only from this computer).".into(),
         );
     }
-    if has(&["operation not supported", "error(95)", "protocol not supported", "invalid argument", "error(22)", "requested nfs version"]) {
+    if trouble == Some(MountTrouble::Unsupported) {
         return if lib.nfs {
             (format!("The share doesn't speak NFS version {}", lib.nfs_version), "Try another NFS version under Advanced.".into())
         } else {

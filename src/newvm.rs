@@ -300,7 +300,7 @@ impl NewVmDialog {
             }
             NOT_PLUGGED => {
                 let on = host.and_then(|h| self.servers.iter().find(|s| s.rref == h)).map_or("any server".to_string(), |s| s.name.clone());
-                (format!("{} isn't connected.", name), format!("It isn't plugged in on {}. Pick another server, or {}.", on, instead))
+                (format!("{} isn't connected.", name), format!("It isn't mounted on {} (Repair, on its page, mounts it again). Pick another server, or {}.", on, instead))
             }
             _ => (format!("{} isn't working.", name), format!("{} Try again, or {}.", e.message(), instead)),
         }

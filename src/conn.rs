@@ -55,10 +55,12 @@ impl ApiError {
                 self.details.first().map(String::as_str).unwrap_or("its main server")
             ),
             _ => {
-                if self.details.is_empty() {
+                // the server often leaves some of the details empty
+                let details: Vec<&str> = self.details.iter().map(|d| d.trim()).filter(|d| !d.is_empty()).collect();
+                if details.is_empty() {
                     format!("The server said: {}", self.code)
                 } else {
-                    format!("The server said: {} ({})", self.code, self.details.join(", "))
+                    format!("The server said: {} ({})", self.code, details.join(", "))
                 }
             }
         }
@@ -80,6 +82,16 @@ pub trait Connection: Send + Sync {
     fn scan_sr(&self, sr_ref: &str) -> Result<(), ApiError>;
     /// Unplugs the storage from every server and forgets it; nothing on it is deleted.
     fn forget_sr(&self, sr_ref: &str) -> Result<(), ApiError>;
+    /// Mounts a storage again where it isn't (XenCenter's Repair): shared storage first gets a
+    /// connection on each server of the pool that has none (the same settings as the others),
+    /// then each unplugged connection on a server that's on is plugged, the coordinator's first.
+    /// If the coordinator's fails, the rest aren't tried (they'd wait as long for the same share).
+    /// Each server tried, by name, and how it went.
+    fn repair_sr(&self, sr_ref: &str) -> Result<Vec<(String, Result<(), ApiError>)>, ApiError>;
+    /// Gives a library the pool has no settings for any more (detached) new ones, on every server
+    /// of the pool for shared storage (otherwise on the coordinator), and mounts it, keeping its
+    /// discs and their descriptions. If the coordinator can't mount it, nothing is kept.
+    fn reattach_sr(&self, sr_ref: &str, lib: &IsoLibrary) -> Result<(), ApiError>;
     /// Whether a storage answers: plugged into `host` (any server, for None), then rescanned
     /// within CHECK_SECS. A share that's gone away doesn't fail, the server waits for it for
     /// ever: that's NOT_ANSWERING. Each call goes in `trace`, named from `names`.
@@ -389,6 +401,12 @@ fn split_host_port(a: &str) -> (String, Option<u16>) {
     }
 }
 
+/// Whether something answers on that address and port within two seconds.
+fn knock(host: &str, port: u16) -> bool {
+    let Ok(addrs) = (host, port).to_socket_addrs() else { return false };
+    addrs.into_iter().any(|a| TcpStream::connect_timeout(&a, Duration::from_secs(2)).is_ok())
+}
+
 fn tcp_connect(host: &str, port: u16) -> Result<TcpStream, ApiError> {
     let addrs = (host, port).to_socket_addrs().map_err(|e| ApiError::other(format!("Couldn't find {}: {}", host, e)))?;
     let mut last = String::from("no address");
@@ -425,7 +443,13 @@ pub struct RealConnection {
     login: Mutex<()>,
     id: AtomicU64,
     tls: Arc<native_tls::TlsConnector>,
+    /// How many looks in a row each server (by reference) hasn't answered (see `knock_hosts`).
+    silent: Mutex<HashMap<String, u32>>,
 }
+
+/// A server is counted as not answering after this many looks in a row (a look every 15 seconds)
+/// without an answer, so a moment's hiccup on the network doesn't turn it red.
+const SILENT_LOOKS: u32 = 2;
 
 impl RealConnection {
     pub fn new(host_and_port: &str, user: &str, password: &str) -> RealConnection {
@@ -453,6 +477,32 @@ impl RealConnection {
             login: Mutex::new(()),
             id: AtomicU64::new(0),
             tls: Arc::new(tls),
+            silent: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Knocks on each server's management address (all at once, two seconds each at most), as the
+    /// pool counts one that goes down without shutting down as live for ten minutes. A server
+    /// that the pool calls live but that hasn't answered `SILENT_LOOKS` times in a row is marked
+    /// unreachable, but only while the coordinator's address answers: otherwise this computer
+    /// just can't reach the servers directly, and the pool's word is all there is.
+    fn knock_hosts(&self, hosts: &mut [HostInfo]) {
+        if hosts.len() < 2 {
+            return; // a lone server that's down can't be looked at at all
+        }
+        let port = self.port;
+        let answers: Vec<bool> = std::thread::scope(|sc| {
+            let knocks: Vec<_> = hosts.iter().map(|h| h.address.clone()).map(|a| sc.spawn(move || a.is_empty() || knock(&a, port))).collect();
+            knocks.into_iter().map(|k| k.join().unwrap_or(true)).collect()
+        });
+        if !hosts.iter().zip(&answers).any(|(h, a)| h.is_master && *a) {
+            return;
+        }
+        let mut silent = self.silent.lock().unwrap();
+        for (h, answered) in hosts.iter_mut().zip(answers) {
+            let n = silent.entry(h.rref.clone()).or_insert(0);
+            *n = if answered { 0 } else { *n + 1 };
+            h.unreachable = h.live && *n >= SILENT_LOOKS;
         }
     }
 
@@ -808,20 +858,22 @@ impl Connection for RealConnection {
                 enabled: b(&r, "enabled"),
                 control_domain: String::new(), // filled in from the VMs below
                 live: m.get("live").map_or(true, |x| x.as_bool().unwrap_or(true)),
+                unreachable: false, // see knock_hosts
             });
         }
+        self.knock_hosts(&mut pd.hosts);
         // Each storage is plugged into the servers that can use it (a PBD per server): local storage
         // into one, shared storage into all of them.
-        let mut plugged: HashMap<String, Vec<String>> = HashMap::new();
+        let mut plugged: HashMap<String, Vec<(String, bool)>> = HashMap::new();
         let mut configs: HashMap<String, Value> = HashMap::new();
         for (_, r) in self.all("PBD", t)? {
-            plugged.entry(s(&r, "SR")).or_default().push(s(&r, "host"));
+            plugged.entry(s(&r, "SR")).or_default().push((s(&r, "host"), b(&r, "currently_attached")));
             configs.entry(s(&r, "SR")).or_insert_with(|| r.get("device_config").cloned().unwrap_or(Value::Null));
         }
         for (k, r) in self.all("SR", t)? {
             let shared = b(&r, "shared");
-            let hosts = plugged.get(&k).cloned().unwrap_or_default();
-            let host = if !shared && hosts.len() == 1 { Some(hosts[0].clone()) } else { None };
+            let links = plugged.get(&k).cloned().unwrap_or_default();
+            let host = if !shared && links.len() == 1 { Some(links[0].0.clone()) } else { None };
             let config = configs.get(&k).cloned().unwrap_or(Value::Null);
             let share = match s(&config, "type").as_str() {
                 "cifs" => format!("Windows share (SMB {})", or_default(&s(&config, "vers"), "3.0")),
@@ -841,6 +893,7 @@ impl Connection for RealConnection {
                 shared,
                 host,
                 files: vec![], // filled in from the VDIs below
+                links,
             });
         }
         for (k, r) in self.all("network", t)? {
@@ -1023,6 +1076,89 @@ impl Connection for RealConnection {
         }
         self.call("SR.forget", vec![json!(sr_ref)], t).map(|_| ())
     }
+    fn repair_sr(&self, sr: &str) -> Result<Vec<(String, Result<(), ApiError>)>, ApiError> {
+        let t = 30_000;
+        let coordinator = self.all("pool", t)?.values().map(|p| s(p, "master")).next().unwrap_or_default();
+        let hosts = self.all("host", t)?;
+        let metrics = self.all("host_metrics", t)?;
+        let live = |h: &str| hosts.get(h).and_then(|r| metrics.get(&s(r, "metrics"))).map_or(true, |m| m.get("live").map_or(true, |x| x.as_bool().unwrap_or(true)));
+        let name = |h: &str| hosts.get(h).map(|r| s(r, "name_label")).unwrap_or_else(|| h.to_string());
+        let shared = self.call("SR.get_shared", vec![json!(sr)], t)?.as_bool().unwrap_or(false);
+        // (connection, server, mounted)
+        let mut pbds: Vec<(Value, String, bool)> = vec![];
+        let mut config = Value::Null;
+        for p in self.call("SR.get_PBDs", vec![json!(sr)], t)?.as_array().cloned().unwrap_or_default() {
+            let r = self.call("PBD.get_record", vec![p.clone()], t)?;
+            if config.is_null() {
+                config = r.get("device_config").cloned().unwrap_or(Value::Null);
+            }
+            pbds.push((p, s(&r, "host"), b(&r, "currently_attached")));
+        }
+        if pbds.is_empty() {
+            return Err(ApiError { code: "SR_HAS_NO_PBDS".into(), details: vec![sr.to_string()] });
+        }
+        let mut out = vec![];
+        if shared {
+            let without: Vec<String> = hosts.keys().filter(|h| !pbds.iter().any(|p| &p.1 == *h)).cloned().collect();
+            for h in &without {
+                let rec = json!({ "host": h, "SR": sr, "device_config": config, "other_config": {} });
+                match self.call("PBD.create", vec![rec], t) {
+                    Ok(p) => pbds.push((p, h.clone(), false)),
+                    Err(e) => out.push((name(h), Err(e))),
+                }
+            }
+        }
+        pbds.retain(|p| !p.2 && live(&p.1));
+        pbds.sort_by_key(|p| p.1 != coordinator);
+        for (p, h, _) in pbds {
+            // mounting a share that doesn't answer can take a minute or two to give up
+            let r = self.call("PBD.plug", vec![p], 180_000).map(|_| ());
+            let stop = r.is_err() && h == coordinator && shared;
+            out.push((name(&h), r));
+            if stop {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    fn reattach_sr(&self, sr: &str, lib: &IsoLibrary) -> Result<(), ApiError> {
+        let t = 30_000;
+        let coordinator = self.all("pool", t)?.values().map(|p| s(p, "master")).next().unwrap_or_default();
+        let shared = self.call("SR.get_shared", vec![json!(sr)], t)?.as_bool().unwrap_or(false);
+        let mut hosts = vec![coordinator.clone()];
+        if shared {
+            hosts.extend(self.all("host", t)?.keys().filter(|h| **h != coordinator).cloned());
+        }
+        let config: Map<String, Value> = lib.device_config().into_iter().map(|(k, v)| (k, json!(v))).collect();
+        let undo = |made: &[Value]| {
+            for p in made {
+                let _ = self.call("PBD.destroy", vec![p.clone()], t);
+            }
+        };
+        let mut made = vec![];
+        for h in &hosts {
+            let rec = json!({ "host": h, "SR": sr, "device_config": config, "other_config": {} });
+            match self.call("PBD.create", vec![rec], t) {
+                Ok(p) => made.push(p),
+                Err(e) => {
+                    undo(&made);
+                    return Err(e);
+                }
+            }
+        }
+        // the coordinator's first: if the share can't be mounted there, nothing is kept
+        if let Err(e) = self.call("PBD.plug", vec![made[0].clone()], 180_000) {
+            undo(&made);
+            return Err(e);
+        }
+        // a member that can't is left unplugged, for Repair to show
+        for p in &made[1..] {
+            let _ = self.call("PBD.plug", vec![p.clone()], 180_000);
+        }
+        Ok(())
+    }
+
     fn check_sr(&self, sr: &str, host: Option<&str>, names: &HashMap<String, String>, tr: &Trace) -> Result<(), ApiError> {
         let t = 30_000;
         let label = named(names, sr);
@@ -1507,6 +1643,7 @@ impl DemoConnection {
             is_master: master,
             control_domain: format!("dom0-{}", r),
             live: true,
+            unreachable: false,
         };
         d.hosts.push(host("host-a", "demo-host-01", "10.20.0.11", true));
         d.hosts.push(host("host-b", "demo-host-02", "10.20.0.12", false));
@@ -1529,6 +1666,27 @@ impl DemoConnection {
         d.srs.push(sr("sr-usb2", "Removable storage", "udev", 0, 0, Some("host-b"))); // empty: not listed
         d.srs.push(sr("sr-nfs", "Shared NFS storage", "nfs", 4096 * GB, 0, None));
         d.srs.push(SrInfo { location: "//nas/isos".into(), share: "Windows share (SMB 3.0)".into(), files: demo_isos("sr-iso"), ..sr("sr-iso", "ISO library", "iso", 250 * GB, 87 * GB, None) });
+        // the server named in SVM_DEMO_HOST_DOWN went down without shutting down: the pool still
+        // counts it as live, but it doesn't answer
+        if let Ok(down) = std::env::var("SVM_DEMO_HOST_DOWN") {
+            for h in d.hosts.iter_mut().filter(|h| down.split(',').any(|x| x.trim() == h.rref)) {
+                h.unreachable = true;
+            }
+        }
+        // mounted where it belongs; but the storage named in SVM_DEMO_UNMOUNTED (references,
+        // comma-separated) is mounted nowhere, as after the servers started while the share was
+        // off, and the one in SVM_DEMO_DETACHED has no connections at all, so Repair can be tried
+        let listed = |var: &str, r: &str| std::env::var(var).map_or(false, |v| v.split(',').any(|x| x.trim() == r));
+        let all: Vec<String> = d.hosts.iter().map(|h| h.rref.clone()).collect();
+        for x in d.srs.iter_mut() {
+            let on = !listed("SVM_DEMO_UNMOUNTED", &x.rref);
+            x.links = x.host.as_ref().map_or(all.clone(), |h| vec![h.clone()]).into_iter().map(|h| (h, on)).collect();
+            if listed("SVM_DEMO_DETACHED", &x.rref) {
+                x.links.clear();
+                x.location.clear();
+                x.share.clear();
+            }
+        }
         d.networks.push(NetInfo { rref: "net-0".into(), uuid: demo_uuid(), name: "Pool-wide network 0".into(), description: String::new(), bridge: "xenbr0".into(), mtu: 1500 });
         d.networks.push(NetInfo { rref: "net-1".into(), uuid: demo_uuid(), name: "Storage network".into(), description: String::new(), bridge: "xenbr1".into(), mtu: 9000 });
 
@@ -1604,6 +1762,24 @@ fn demo_templates() -> Vec<TemplateInfo> {
 }
 
 /// The discs in the demo's ISO library `sr`, two of them described.
+/// The demo's pretend mount: an address with "unreachable" in it doesn't answer, and the password
+/// "wrong" is refused, so the error page can be tried out.
+fn demo_mount(lib: &IsoLibrary) -> Result<(), ApiError> {
+    let fail = |text: &str| Err(ApiError { code: "SR_BACKEND_FAILURE_222".into(), details: vec![String::new(), text.into(), String::new()] });
+    let host = if lib.nfs { lib.location.split(':').next().unwrap_or("") } else { lib.location.trim_start_matches('/').split('/').next().unwrap_or("") };
+    if lib.location.contains("unreachable") {
+        return if lib.nfs {
+            fail(&format!("ISO mount error [opterr=mount failed with return code 32] mount.nfs: Connection timed out (server {})", host))
+        } else {
+            fail("ISO mount error [opterr=mount failed with return code 32] mount error(113): No route to host. Refer to the mount.cifs(8) manual page (e.g. man mount.cifs) and kernel log messages (dmesg)")
+        };
+    }
+    if lib.password == "wrong" {
+        return fail("ISO mount error [opterr=mount failed with return code 32] mount error(13): Permission denied. Refer to the mount.cifs(8) manual page (e.g. man mount.cifs) and kernel log messages (dmesg)");
+    }
+    Ok(())
+}
+
 fn demo_isos(sr: &str) -> Vec<IsoFile> {
     [
         ("debian-12.7.0-amd64-netinst.iso", 661, "Network install, for small servers"),
@@ -1770,25 +1946,14 @@ impl Connection for DemoConnection {
         recompute(&mut d);
         Ok(())
     }
-    /// Pretends to mount the share: an address with "unreachable" in it doesn't answer, and the
-    /// password "wrong" is refused, so the error page can be tried out.
+    /// Pretends to mount the share: see `demo_mount`.
     fn create_iso_library(&self, lib: &IsoLibrary) -> Result<(), ApiError> {
         std::thread::sleep(Duration::from_millis(900));
-        let fail = |text: &str| Err(ApiError { code: "SR_BACKEND_FAILURE_222".into(), details: vec![String::new(), text.into(), String::new()] });
-        let host = if lib.nfs { lib.location.split(':').next().unwrap_or("") } else { lib.location.trim_start_matches('/').split('/').next().unwrap_or("") };
-        if lib.location.contains("unreachable") {
-            return if lib.nfs {
-                fail(&format!("ISO mount error [opterr=mount failed with return code 32] mount.nfs: Connection timed out (server {})", host))
-            } else {
-                fail("ISO mount error [opterr=mount failed with return code 32] mount error(113): No route to host. Refer to the mount.cifs(8) manual page (e.g. man mount.cifs) and kernel log messages (dmesg)")
-            };
-        }
-        if lib.password == "wrong" {
-            return fail("ISO mount error [opterr=mount failed with return code 32] mount error(13): Permission denied. Refer to the mount.cifs(8) manual page (e.g. man mount.cifs) and kernel log messages (dmesg)");
-        }
+        demo_mount(lib)?;
         let mut d = self.data.lock().unwrap();
         let rref = format!("sr-iso-{}", d.srs.len());
         let files = demo_isos(&rref);
+        let links = d.hosts.iter().map(|h| (h.rref.clone(), true)).collect();
         d.srs.push(SrInfo {
             rref,
             uuid: demo_uuid(),
@@ -1802,7 +1967,43 @@ impl Connection for DemoConnection {
             location: lib.location.clone(),
             share: if lib.nfs { format!("NFS (v{})", lib.nfs_version) } else { format!("Windows share (SMB {})", lib.smb_version) },
             files,
+            links,
         });
+        Ok(())
+    }
+    /// Mounts it everywhere in about a second and a half; but a storage named in
+    /// SVM_DEMO_REPAIR_FAILS doesn't answer on the coordinator.
+    fn repair_sr(&self, sr_ref: &str) -> Result<Vec<(String, Result<(), ApiError>)>, ApiError> {
+        std::thread::sleep(Duration::from_millis(1500));
+        let mut d = self.data.lock().unwrap();
+        let names: HashMap<String, String> = d.hosts.iter().map(|h| (h.rref.clone(), h.name.clone())).collect();
+        let Some(x) = d.srs.iter_mut().find(|x| x.rref == sr_ref) else {
+            return Err(ApiError { code: "HANDLE_INVALID".into(), details: vec!["SR".into(), sr_ref.into()] });
+        };
+        if x.links.is_empty() {
+            return Err(ApiError { code: "SR_HAS_NO_PBDS".into(), details: vec![sr_ref.into()] });
+        }
+        if std::env::var("SVM_DEMO_REPAIR_FAILS").map_or(false, |v| v.split(',').any(|r| r.trim() == sr_ref)) {
+            let lib = IsoLibrary { location: "//unreachable/isos".into(), ..Default::default() };
+            return Ok(vec![(names["host-a"].clone(), demo_mount(&lib))]);
+        }
+        let mut out = vec![];
+        for l in x.links.iter_mut().filter(|l| !l.1) {
+            l.1 = true;
+            out.push((names.get(&l.0).cloned().unwrap_or_default(), Ok(())));
+        }
+        Ok(out)
+    }
+    fn reattach_sr(&self, sr_ref: &str, lib: &IsoLibrary) -> Result<(), ApiError> {
+        std::thread::sleep(Duration::from_millis(1200));
+        demo_mount(lib)?;
+        let mut d = self.data.lock().unwrap();
+        let all: Vec<String> = d.hosts.iter().map(|h| h.rref.clone()).collect();
+        if let Some(x) = d.srs.iter_mut().find(|x| x.rref == sr_ref) {
+            x.links = all.into_iter().map(|h| (h, true)).collect();
+            x.location = lib.location.clone();
+            x.share = if lib.nfs { format!("NFS (v{})", lib.nfs_version) } else { format!("Windows share (SMB {})", lib.smb_version) };
+        }
         Ok(())
     }
     fn scan_sr(&self, _sr_ref: &str) -> Result<(), ApiError> {
@@ -1989,6 +2190,57 @@ impl Connection for DemoConnection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_server_that_stops_answering_is_unreachable() {
+        // the coordinator answers on 127.0.0.1; nothing answers on 127.0.0.2
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let host = |r: &str, addr: &str, master: bool| HostInfo { rref: r.into(), address: addr.into(), is_master: master, live: true, ..Default::default() };
+        let c = RealConnection::new(&format!("127.0.0.1:{}", port), "root", "x");
+        let mut hosts = vec![host("a", "127.0.0.1", true), host("b", "127.0.0.2", false)];
+        c.knock_hosts(&mut hosts);
+        assert!(!hosts[1].unreachable, "one miss isn't enough");
+        c.knock_hosts(&mut hosts);
+        assert!(hosts[1].unreachable && !hosts[0].unreachable);
+        assert!(!hosts[1].is_up() && hosts[0].is_up());
+        // when even the coordinator doesn't answer here, only the pool's word counts
+        let c = RealConnection::new(&format!("127.0.0.1:{}", port), "root", "x");
+        let mut hosts = vec![host("a", "127.0.0.2", true), host("b", "127.0.0.2", false)];
+        for _ in 0..3 {
+            c.knock_hosts(&mut hosts);
+        }
+        assert!(hosts.iter().all(|h| !h.unreachable));
+    }
+
+    #[test]
+    fn repair_mounts_storage_again() {
+        let c = DemoConnection::new();
+        let set_links = |f: &dyn Fn(&mut Vec<(String, bool)>)| f(&mut c.data.lock().unwrap().srs.iter_mut().find(|x| x.rref == "sr-iso").unwrap().links);
+        let trouble = || {
+            let d = c.fetch(0).unwrap();
+            d.sr_trouble(d.sr("sr-iso").unwrap())
+        };
+        assert_eq!(trouble(), None);
+        // unplugged everywhere, as after the servers started while the share was off
+        set_links(&|l| l.iter_mut().for_each(|x| x.1 = false));
+        let t = trouble().unwrap();
+        assert!(t.nowhere && !t.detached);
+        assert_eq!(t.missing, vec!["host-a".to_string(), "host-b".to_string()], "the coordinator first");
+        let tried = c.repair_sr("sr-iso").unwrap();
+        assert_eq!(tried.iter().map(|t| (t.0.as_str(), t.1.is_ok())).collect::<Vec<_>>(), vec![("demo-host-01", true), ("demo-host-02", true)]);
+        assert_eq!(trouble(), None);
+        // detached: Repair has to be told where it is
+        set_links(&|l| l.clear());
+        assert!(trouble().unwrap().detached);
+        assert_eq!(c.repair_sr("sr-iso").unwrap_err().code, "SR_HAS_NO_PBDS");
+        let mut lib = IsoLibrary { location: "//nas/isos".into(), username: "joao".into(), password: "wrong".into(), smb_version: "3.0".into(), ..Default::default() };
+        assert!(c.reattach_sr("sr-iso", &lib).is_err());
+        assert!(trouble().unwrap().detached, "a failed attempt leaves it as it was");
+        lib.password = "right".into();
+        c.reattach_sr("sr-iso", &lib).unwrap();
+        assert_eq!(trouble(), None);
+    }
 
     fn tools(pv: Value, detected: bool) -> (bool, String) {
         let mut vm = VmInfo::default();

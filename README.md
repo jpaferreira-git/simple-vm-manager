@@ -26,6 +26,11 @@ affiliated with or endorsed by the makers of XenServer or XCP-ng.
   the app doesn't reconnect to it at the next start.
 - **Resource tree** — *Infrastructure* view (pool → servers → their VMs and storage; shared storage and
   virtual networks in folders) or *Objects* view (grouped by type), with a search box. The sidebar **folds** into a slim icon strip.
+  A dot on each icon says how it's doing: VMs by power state; servers green when on, red when off
+  or not answering; shared storage and ISO libraries green when mounted, red when their server is
+  down (a server's own local storage and removable drives have none). A server that goes
+  down without shutting down (power cut, crash) turns red within about half a minute, though the
+  pool itself only gives up on it after ten: the app knocks on each server's address as it looks.
 - **Home overview** — servers, running VMs, memory and storage in use at a glance, each server's load
   and the latest activity.
 - **Details** — General, Memory, Storage, Networking and Logs tabs for pools, hosts and VMs, and Console for hosts and VMs.
@@ -51,6 +56,14 @@ affiliated with or endorsed by the makers of XenServer or XCP-ng.
   left and Cancel; the share must be writable by the account the library uses, and names keep only
   letters, digits, dots and hyphens (the ISO driver's rule). Dropping an .iso on the window uploads
   it too, except on Wayland, where the window toolkit doesn't receive dropped files yet.
+  The same actions are on the library's right-click menu.
+- **Storage that isn't mounted** — as when a server started while the NAS was off: the storage gets
+  a "!" in the tree (red when it's mounted nowhere, orange when only some servers lack it), its
+  General tab says where it's missing, and *Repair* (in place of *Rescan*) mounts it again there,
+  the coordinator first, explaining in plain words if the share won't answer. If the pool has lost
+  its settings for it altogether (XenCenter's *Detach*), *Repair* asks where it is and connects the
+  same library again, its discs and their descriptions kept. The app also does this by itself,
+  once, when it finds storage unmounted (Settings → Storage); Logs says how it went.
 - **New VM** — on the toolbar, on a pool's or server's right-click menu, or from an ISO in an ISO
   library: pick the ISO, a size (Small, Medium, Large or your own numbers), the server it runs on
   (or any), where the disk goes (the storage that server sees) and the network (or none). The rest is worked out: the system's template from the ISO's name

@@ -3,7 +3,7 @@
 
 use crate::conn::*;
 use crate::console::{self, ConsoleView};
-use crate::isolib::{IsoAction, IsoDialog};
+use crate::isolib::{mount_trouble, IsoAction, IsoDialog, MountTrouble};
 use crate::newvm::{NewVmAction, NewVmDialog};
 use crate::upload::{UploadAction, UploadDialog};
 use crate::secrets;
@@ -73,6 +73,11 @@ enum Msg {
     IsoDone { sid: u32, lib: IsoLibrary, result: Result<(), ApiError> },
     /// A rescan (forget false) or disconnect (forget true) of a storage ended.
     SrDone { sid: u32, sr: String, name: String, forget: bool, result: Result<(), ApiError> },
+    /// Mounting a storage again ended: each server tried and how it went; `auto`: the app did it
+    /// by itself on finding it unmounted.
+    SrRepaired { sid: u32, sr: String, name: String, auto: bool, result: Result<Vec<(String, Result<(), ApiError>)>, ApiError> },
+    /// Giving a detached library its settings back ended.
+    Reattached { sid: u32, sr: String, lib: IsoLibrary, result: Result<(), ApiError> },
     /// Making a new VM ended: its name, and whether it was to start.
     /// A new VM made (its reference), or why not; `start`: it's being started next.
     VmCreated { sid: u32, name: String, start: bool, result: Result<String, ApiError> },
@@ -260,6 +265,8 @@ enum Intent {
     IsoLibrary,
     RescanSr(u32, String),
     AskForgetSr(u32, String),
+    /// Mount a storage again where it isn't (asking where it is, if the pool has forgotten).
+    RepairSr(u32, String),
     /// Open the Upload dialog of an ISO library.
     Upload(u32, String),
     /// Open the New VM dialog: for this pool (else the selected one), with this ISO's disc.
@@ -329,8 +336,13 @@ pub struct App {
     known_hosts: Vec<(String, String)>,
     /// None while still asking the system whether it has a keychain.
     keychain: Option<bool>,
-    /// Storage being rescanned or disconnected right now.
+    /// Storage being rescanned, repaired or disconnected right now.
     sr_busy: HashSet<String>,
+    /// Mount storage again by itself on finding it unmounted (Settings).
+    auto_repair: bool,
+    /// Storage it has done that for while it stays unmounted (once each), and what to do next.
+    auto_tried: HashSet<(u32, String)>,
+    auto_queue: Vec<(u32, String)>,
     /// Storage checks under way for the New VM dialog: pool, storage, server.
     sr_checking: HashSet<(u32, String, Option<String>)>,
     /// The ISO file whose description is being typed in, if any.
@@ -397,6 +409,9 @@ impl App {
             keychain: None,
             saved: HashMap::new(),
             sr_busy: HashSet::new(),
+            auto_repair: saved.repair,
+            auto_tried: HashSet::new(),
+            auto_queue: vec![],
             sr_checking: HashSet::new(),
             iso_edit: None,
             iso_saving: HashMap::new(),
@@ -443,6 +458,16 @@ impl App {
         if shot && app.shot_show == "welcome" {
             app.shot_ready = true; // Home with nothing connected
         } else if shot {
+            match app.shot_show.as_str() {
+                "sr-unmounted" | "sr-auto-repair" => std::env::set_var("SVM_DEMO_UNMOUNTED", "sr-iso"),
+                "host-down" => std::env::set_var("SVM_DEMO_HOST_DOWN", "host-b"),
+                "sr-repair-failed" => {
+                    std::env::set_var("SVM_DEMO_UNMOUNTED", "sr-iso");
+                    std::env::set_var("SVM_DEMO_REPAIR_FAILS", "sr-iso");
+                }
+                "sr-detached" => std::env::set_var("SVM_DEMO_DETACHED", "sr-iso"),
+                _ => {}
+            }
             app.add_server(Arc::new(DemoConnection::new()));
         }
         app
@@ -471,7 +496,7 @@ impl App {
 
     fn save_settings(&self) {
         if self.shot_path.is_none() {
-            save_settings(&Settings { theme: self.theme_mode, sidebar_open: self.sidebar_open, zoom: self.zoom, updates: self.check_updates });
+            save_settings(&Settings { theme: self.theme_mode, sidebar_open: self.sidebar_open, zoom: self.zoom, updates: self.check_updates, repair: self.auto_repair });
         }
     }
 
@@ -507,6 +532,47 @@ impl App {
         std::thread::spawn(move || {
             let result = if forget { conn.forget_sr(&sr) } else { conn.scan_sr(&sr) };
             let _ = tx.send(Msg::SrDone { sid, sr, name, forget, result });
+            ctx.request_repaint();
+        });
+    }
+
+    /// Repair: mounts a storage again where it isn't; for a library the pool has no settings for
+    /// any more, asks where it is first.
+    fn ask_repair(&mut self, sid: u32, sr: String, ctx: &egui::Context) {
+        let Some(s) = self.server(sid) else { return };
+        let Some(x) = s.data.as_ref().and_then(|d| d.sr(&sr)) else { return };
+        let (detached, iso, pool, uuid, name, shared) = (x.links.is_empty(), x.is_iso(), s.name(), x.uuid.clone(), x.name.clone(), x.shared);
+        if !detached {
+            self.repair_job(sid, sr, false, ctx);
+        } else if iso {
+            self.dialog = Dialog::Iso(Box::new(IsoDialog::reattach(sid, pool, sr, uuid, name, shared)));
+        } else {
+            let text = format!("The pool has no settings for reaching '{}' any more, so it can't be mounted again from here. Attach it again with XenCenter or xe.", name);
+            self.dialog = Dialog::Message { title: "Repair".into(), text };
+        }
+    }
+
+    /// Mounts a storage again where it isn't, in the background.
+    fn repair_job(&mut self, sid: u32, sr: String, auto: bool, ctx: &egui::Context) {
+        let Some(s) = self.server(sid) else { return };
+        let name = s.data.as_ref().and_then(|d| d.sr(&sr)).map(|x| x.name.clone()).unwrap_or_default();
+        let (conn, tx, ctx) = (s.conn.clone(), self.tx.clone(), ctx.clone());
+        self.sr_busy.insert(sr.clone());
+        std::thread::spawn(move || {
+            let result = conn.repair_sr(&sr);
+            let _ = tx.send(Msg::SrRepaired { sid, sr, name, auto, result });
+            ctx.request_repaint();
+        });
+    }
+
+    /// Gives a detached library the settings typed in the Repair dialog, in the background.
+    fn reattach_job(&mut self, sid: u32, sr: String, lib: IsoLibrary, ctx: &egui::Context) {
+        let Some(s) = self.server(sid) else { return };
+        let (conn, tx, ctx) = (s.conn.clone(), self.tx.clone(), ctx.clone());
+        self.sr_busy.insert(sr.clone());
+        std::thread::spawn(move || {
+            let result = conn.reattach_sr(&sr, &lib);
+            let _ = tx.send(Msg::Reattached { sid, sr, lib, result });
             ctx.request_repaint();
         });
     }
@@ -840,12 +906,63 @@ impl App {
                         Err(e) => {
                             let why = if e.code == "VDI_IN_USE" || e.details.join(" ").to_lowercase().contains("in use") {
                                 "A VM still has a disc from this library in its DVD drive. Eject it first, then try again.".to_string()
+                            } else if e.code == "SR_HAS_NO_PBDS" {
+                                "It isn't mounted on the pool's coordinator, so the pool can't look at it. Repair mounts it again.".to_string()
                             } else {
                                 e.message()
                             };
                             let title = if forget { "Disconnect ISO Library" } else { "Rescan" };
                             self.add_log(sid, &server, Some(&sr), &name, &format!("Couldn't {} '{}': {}", if forget { "disconnect" } else { "rescan" }, name, why), "Failed");
                             self.dialog = Dialog::Message { title: title.into(), text: format!("Couldn't {} '{}'.\n\n{}", if forget { "disconnect" } else { "rescan" }, name, why) };
+                        }
+                    }
+                    if let Some(s) = self.server_mut(sid) {
+                        s.next_refresh = Instant::now();
+                    }
+                }
+                Msg::SrRepaired { sid, sr, name, auto, result } => {
+                    self.sr_busy.remove(&sr);
+                    let server = self.server(sid).map(|s| s.name()).unwrap_or_default();
+                    let nfs = self.server(sid).and_then(|s| s.data.as_ref()).and_then(|d| d.sr(&sr)).map_or(false, |x| x.share.starts_with("NFS"));
+                    let tried = result.unwrap_or_else(|e| vec![(String::new(), Err(e))]);
+                    let mounted: Vec<String> = tried.iter().filter(|t| t.1.is_ok()).map(|t| t.0.clone()).collect();
+                    // done by itself: said first, as the line may be cut short
+                    let found = if auto { format!("Found '{}' unmounted; ", name) } else { String::new() };
+                    match tried.into_iter().find_map(|(h, r)| r.err().map(|e| (h, e))) {
+                        None => {
+                            let on = if mounted.is_empty() { String::new() } else { format!(" on {}", mounted.join(", ")) };
+                            let text = if auto { format!("{}mounted it again{}", found, on) } else { format!("Mounted '{}' again{}", name, on) };
+                            self.add_log(sid, &server, Some(&sr), &name, &text, "Done");
+                        }
+                        Some((host, e)) => {
+                            let place = if host.is_empty() { String::new() } else { format!(" on {}", host) };
+                            let text = if auto { format!("{}couldn't mount it again{}: {}", found, place, e.message()) } else { format!("Couldn't mount '{}' again{}: {}", name, place, e.message()) };
+                            self.add_log(sid, &server, Some(&sr), &name, &text, "Failed");
+                            if !auto {
+                                let also = if mounted.is_empty() { String::new() } else { format!("\n\nIt's mounted on {} now.", mounted.join(", ")) };
+                                self.dialog = Dialog::Message { title: "Repair".into(), text: format!("Couldn't mount '{}'{}.\n\n{}{}", name, place, mount_problem(&e, nfs), also) };
+                            }
+                        }
+                    }
+                    if let Some(s) = self.server_mut(sid) {
+                        s.next_refresh = Instant::now();
+                    }
+                }
+                Msg::Reattached { sid, sr, lib, result } => {
+                    self.sr_busy.remove(&sr);
+                    let server = self.server(sid).map(|s| s.name()).unwrap_or_default();
+                    match result {
+                        Ok(()) => {
+                            self.add_log(sid, &server, Some(&sr), &lib.name, &format!("Mounted '{}' again from {}", lib.name, lib.location), "Done");
+                            if matches!(self.dialog, Dialog::Iso(_)) {
+                                self.dialog = Dialog::None;
+                            }
+                        }
+                        Err(e) => {
+                            self.add_log(sid, &server, Some(&sr), &lib.name, &format!("Couldn't mount '{}' from {}: {}", lib.name, lib.location, e.message()), "Failed");
+                            if let Dialog::Iso(d) = &mut self.dialog {
+                                d.failed(&lib, &e);
+                            }
                         }
                     }
                     if let Some(s) = self.server_mut(sid) {
@@ -1127,6 +1244,11 @@ impl App {
                 }
             }
         }
+        for (sid, sr) in std::mem::take(&mut self.auto_queue) {
+            if !self.sr_busy.contains(&sr) {
+                self.repair_job(sid, sr, true, ctx);
+            }
+        }
     }
 
     fn on_fetched(&mut self, id: u32, r: Result<PoolData, ApiError>) {
@@ -1134,6 +1256,23 @@ impl App {
         let Some(idx) = self.servers.iter().position(|s| s.id == id) else { return };
         match r {
             Ok(d) => {
+                // storage found unmounted is mounted again, once while it stays so (not the
+                // detached kind: that needs to be told where it is)
+                if self.auto_repair && (!shot || self.shot_show == "sr-auto-repair") {
+                    for x in &d.srs {
+                        let key = (id, x.rref.clone());
+                        match d.sr_trouble(x) {
+                            Some(t) if !t.detached => {
+                                if self.auto_tried.insert(key.clone()) {
+                                    self.auto_queue.push(key);
+                                }
+                            }
+                            _ => {
+                                self.auto_tried.remove(&key);
+                            }
+                        }
+                    }
+                }
                 let s = &mut self.servers[idx];
                 s.fetching = false;
                 let first = !s.ever;
@@ -1174,11 +1313,12 @@ impl App {
                         match self.shot_show.as_str() {
                             "home" => self.select("root".into()),
                             "storage" => self.select(format!("srv:{}", id)),
-                            "isos" | "iso-disconnect" | "iso-delete" | "iso-describe" | "iso-upload" | "iso-upload-choose" | "iso-upload-web" | "iso-upload-done" => {
+                            "isos" | "iso-disconnect" | "iso-delete" | "iso-describe" | "iso-upload" | "iso-upload-choose" | "iso-upload-web" | "iso-upload-done" | "sr-unmounted" | "sr-detached" | "sr-auto-repair" | "sr-repair-failed" => {
                                 self.expanded.insert(format!("folder:{}:srs", id));
                                 self.select(format!("sr:{}:sr-iso", id));
                             }
                             "search" | "logs" => self.select("root".into()),
+                            "host-down" => self.select(format!("host:{}:host-b", id)),
                             "networks" => {
                                 self.expanded.insert(format!("folder:{}:nets", id));
                                 self.select(format!("folder:{}:nets", id));
@@ -1295,7 +1435,7 @@ impl App {
     fn host_icon(&self, h: &HostInfo) -> IconKind {
         if self.host_busy.contains(&h.rref) {
             IconKind::Busy(Tone::Red)
-        } else if h.enabled && h.live {
+        } else if h.enabled && h.is_up() {
             IconKind::Host
         } else {
             IconKind::HostOff
@@ -1343,7 +1483,7 @@ impl App {
                     cats[2].children.push(Node::new(format!("vm:{}:{}", id, v.rref), Self::vm_text(s, v), Self::vm_icon(s, v), Kind::Vm, Some(id), Some(v.rref.clone())));
                 }
                 for x in d.srs.iter().filter(|x| !x.is_empty_drive()) {
-                    cats[3].children.push(Node::new(format!("sr:{}:{}", id, x.rref), x.name.clone(), sr_icon(x), Kind::Sr, Some(id), Some(x.rref.clone())));
+                    cats[3].children.push(Node::new(format!("sr:{}:{}", id, x.rref), x.name.clone(), sr_icon(d, x, self.sr_busy.contains(&x.rref)), Kind::Sr, Some(id), Some(x.rref.clone())));
                 }
                 for n in &d.networks {
                     cats[4].children.push(Node::new(format!("net:{}:{}", id, n.rref), n.name.clone(), IconKind::Net, Kind::Net, Some(id), Some(n.rref.clone())));
@@ -1372,7 +1512,7 @@ impl App {
                 let mut nets: Vec<&NetInfo> = d.networks.iter().collect();
                 nets.sort_by_key(|n| n.name.to_lowercase());
                 let vm_node = |v: &VmInfo| Node::new(format!("vm:{}:{}", id, v.rref), Self::vm_text(s, v), Self::vm_icon(s, v), Kind::Vm, Some(id), Some(v.rref.clone()));
-                let sr_node = |x: &SrInfo| Node::new(format!("sr:{}:{}", id, x.rref), x.name.clone(), sr_icon(x), Kind::Sr, Some(id), Some(x.rref.clone()));
+                let sr_node = |x: &SrInfo| Node::new(format!("sr:{}:{}", id, x.rref), x.name.clone(), sr_icon(d, x, self.sr_busy.contains(&x.rref)), Kind::Sr, Some(id), Some(x.rref.clone()));
                 let folder = |what: &str, label: &str, kids: Vec<Node>| {
                     let mut f = Node::new(format!("folder:{}:{}", id, what), format!("{} ({})", label, kids.len()), IconKind::Folder, Kind::Folder, Some(id), Some(what.to_string()));
                     f.children = kids;
@@ -1475,6 +1615,7 @@ impl App {
                 Intent::Action(i) => self.request_action(i, sel),
                 Intent::AddServer => self.dialog = Dialog::AddServer { server: String::new(), user: "root".into(), password: String::new(), error: String::new(), remember: self.keychain != Some(false) },
                 Intent::RescanSr(sid, sr) => self.sr_job(sid, sr, false, ctx),
+                Intent::RepairSr(sid, sr) => self.ask_repair(sid, sr, ctx),
                 Intent::SaveDescription(sid, sr, vdi, name, text) => self.save_description(sid, sr, vdi, name, text, ctx),
                 Intent::Upload(sid, sr) => {
                     if let Some(x) = self.server(sid).and_then(|s| s.data.as_ref()).and_then(|d| d.sr(&sr)) {
@@ -1505,7 +1646,7 @@ impl App {
                 Intent::AskShutdownHost(sid, host) => {
                     if let Some(d) = self.server(sid).and_then(|s| s.data.as_ref()) {
                         if let Some(h) = d.host(&host) {
-                            let others = d.hosts.iter().any(|o| o.rref != host && o.enabled && o.live);
+                            let others = d.hosts.iter().any(|o| o.rref != host && o.enabled && o.is_up());
                             let mut moving = vec![];
                             let mut stopping = vec![];
                             for v in d.vms.iter().filter(|v| v.host.as_deref() == Some(host.as_str()) && matches!(v.power, PowerState::Running | PowerState::Paused)) {
@@ -1806,7 +1947,53 @@ impl App {
         if resp.secondary_clicked() {
             out.push(Intent::Select(node.key.clone()));
         }
+        // No menu at all (not even an empty one) for networks, the folders, and storage other than
+        // an ISO library (local disks, DVD drives, USB) unless it needs Repair.
+        let has_menu = match node.kind {
+            Kind::Net | Kind::Folder => false,
+            Kind::Sr => self.sr_of(node).map_or(false, |(s, x)| x.is_iso() || s.data.as_ref().and_then(|d| d.sr_trouble(x)).is_some()),
+            _ => true,
+        };
+        if !has_menu {
+            if open {
+                for c in &node.children {
+                    self.tree_ui(ui, c, depth + 1, out);
+                }
+            }
+            return;
+        }
         resp.context_menu(|ui| match node.kind {
+            Kind::Sr => {
+                // what its page has beside the tabs: an ISO library's actions, Repair when it
+                // isn't mounted somewhere
+                if let Some((s, x)) = self.sr_of(node) {
+                    let (sid, sr, iso) = (s.id, x.rref.clone(), x.is_iso());
+                    let trouble = s.data.as_ref().and_then(|d| d.sr_trouble(x));
+                    let busy = self.sr_busy.contains(&sr);
+                    let uploading = self.uploads.get(&sr).map_or(false, Upload::active);
+                    if iso && ui.add_enabled(!busy && !uploading && trouble.is_none(), egui::Button::new("Upload…")).clicked() {
+                        out.push(Intent::Upload(sid, sr.clone()));
+                        ui.close_menu();
+                    }
+                    if let Some(t) = &trouble {
+                        let label = if busy { "Working…" } else if t.detached { "Repair…" } else { "Repair" };
+                        if ui.add_enabled(!busy, egui::Button::new(label)).clicked() {
+                            out.push(Intent::RepairSr(sid, sr.clone()));
+                            ui.close_menu();
+                        }
+                    } else if ui.add_enabled(!busy, egui::Button::new(if busy { "Working…" } else { "Rescan" })).clicked() {
+                        out.push(Intent::RescanSr(sid, sr.clone()));
+                        ui.close_menu();
+                    }
+                    if iso {
+                        ui.separator();
+                        if ui.add_enabled(!busy && !uploading, egui::Button::new(egui::RichText::new("Disconnect…").color(self.pal.red))).clicked() {
+                            out.push(Intent::AskForgetSr(sid, sr));
+                            ui.close_menu();
+                        }
+                    }
+                }
+            }
             Kind::Vm => {
                 for (i, a) in ACTIONS.iter().enumerate() {
                     if ui.add_enabled(self.can_run(a, node), egui::Button::new(a.label).shortcut_text(a.shortcut.text())).clicked() {
@@ -1932,7 +2119,7 @@ impl App {
         let deleting = vm.as_ref().map_or(false, |(_, r)| self.vm_deleting.contains(r));
         let root = self.root_of(sel).map(|(sid, connected)| (sid, if connected { "Disconnect" } else { "Remove" }, self.server(sid).map(|s| s.name()).unwrap_or_default()));
         // a server: Shut Down, while it's on and not already shutting down
-        let host = self.host_of(sel).map(|(s, h)| (s.id, h.rref.clone(), h.live && !self.host_busy.contains(&h.rref)));
+        let host = self.host_of(sel).map(|(s, h)| (s.id, h.rref.clone(), h.is_up() && !self.host_busy.contains(&h.rref)));
         let mut console = if current == Tab::Console { self.console.as_mut() } else { None };
         let tip = |i: usize| match ACTIONS[i].shortcut.text() {
             "" => ACTIONS[i].label.to_string(),
@@ -2412,6 +2599,16 @@ impl App {
                             row("Description", h.description.clone()),
                             row("Address", h.address.clone()),
                             row("Role", if h.is_master { "Pool coordinator".into() } else { "Pool member".into() }),
+                            row(
+                                "Status",
+                                if !h.live {
+                                    "Off".into()
+                                } else if h.unreachable {
+                                    "Not answering (the pool takes ten minutes to notice)".into()
+                                } else {
+                                    "On".into()
+                                },
+                            ),
                             row("Enabled", if h.enabled { "Yes".into() } else { "No (maintenance mode)".into() }),
                             row("Version", h.version.clone()),
                             row("Running VMs", running.to_string()),
@@ -2523,6 +2720,9 @@ impl App {
                         g.push(row("ISO files", x.files.len().to_string()));
                     }
                     g.push(row("Shared", if x.shared { "Yes".into() } else { "No".into() }));
+                    if x.kind != "udev" {
+                        g.push(row("Status", sr_status(d, x)));
+                    }
                     g.push(row("UUID", x.uuid.clone()));
                     secs.push(("General".into(), g));
                     let pct = if x.size > 0 { format!(" ({}%)", 100 * x.used / x.size) } else { String::new() };
@@ -3121,6 +3321,7 @@ impl App {
         let mut close = false;
         let mut add: Option<(String, String, String, bool)> = None;
         let mut iso: Option<(u32, IsoLibrary)> = None;
+        let mut reattach: Option<(u32, String, IsoLibrary)> = None;
         let mut forget_sr: Option<(u32, String)> = None;
         let mut delete_iso: Option<(u32, String, String, String)> = None;
         // from the Delete VM question: server, VM, its name, whether its disks go too
@@ -3133,6 +3334,7 @@ impl App {
         let mut forget: Option<(String, String)> = None;
         // from Settings and the Update dialog
         let mut updates_on = self.check_updates;
+        let mut repair_on = self.auto_repair;
         let mut check_now = false;
         let mut start_update = false;
         let (update_checking, update_note, blocked) = (self.update_checking, self.update_note.clone(), self.update_blocked());
@@ -3260,6 +3462,7 @@ impl App {
             Dialog::Iso(d) => match d.ui(ctx, &pal) {
                 IsoAction::Close => close = true,
                 IsoAction::Create(sid, lib) => iso = Some((sid, lib)),
+                IsoAction::Reattach(sid, sr, lib) => reattach = Some((sid, sr, lib)),
                 IsoAction::None => {}
             },
             Dialog::NewVm(d) => {
@@ -3544,6 +3747,12 @@ impl App {
                     ui.label(egui::RichText::new("Passwords are kept in your system's keychain, never in the app's own files.").size(12.0).color(pal.ink_soft));
                     ui.add_space(18.0);
 
+                    heading(ui, "Storage");
+                    ui.checkbox(&mut repair_on, "Mount storage again when it's found unmounted");
+                    ui.add_space(2.0);
+                    ui.add(egui::Label::new(egui::RichText::new("As after a server started while the share was off. Each is tried once while it stays so; Logs says how it went.").size(12.0).color(pal.ink_soft)).wrap());
+                    ui.add_space(18.0);
+
                     heading(ui, "Updates");
                     ui.checkbox(&mut updates_on, "Look for a new version when the app starts");
                     ui.add_space(4.0);
@@ -3615,6 +3824,9 @@ impl App {
         if let Some((sid, lib)) = iso {
             self.start_iso_library(sid, lib, ctx);
         }
+        if let Some((sid, sr, lib)) = reattach {
+            self.reattach_job(sid, sr, lib, ctx);
+        }
         if let Some((sid, sr, web)) = upload {
             self.dialog = Dialog::None;
             match web {
@@ -3634,6 +3846,11 @@ impl App {
         }
         if updates_on != self.check_updates {
             self.check_updates = updates_on;
+            self.save_settings();
+        }
+        if repair_on != self.auto_repair {
+            self.auto_repair = repair_on;
+            self.auto_tried.clear();
             self.save_settings();
         }
         if check_now {
@@ -3701,7 +3918,7 @@ impl App {
         ctx.request_repaint();
         self.frames += 1;
         let timed_out = self.started.elapsed() > Duration::from_secs(20);
-        let settled = self.creating == 0 && self.pending_select.is_none() && self.sr_checking.is_empty();
+        let settled = self.creating == 0 && self.pending_select.is_none() && self.sr_checking.is_empty() && self.sr_busy.is_empty() && self.auto_queue.is_empty();
         if !self.shot_requested && ((self.shot_ready && self.frames >= 120 && settled) || timed_out) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot);
             self.shot_requested = true;
@@ -3797,6 +4014,8 @@ impl eframe::App for App {
                 "add-server" => out.push(Intent::AddServer),
                 "confirm" => out.extend(ACTIONS.iter().position(|a| a.confirm && self.can_run(a, &sel)).map(Intent::Action)),
                 "about" => out.push(Intent::About),
+                "sr-detached" | "sr-repair-failed" => out.extend(sel.sid.map(|sid| Intent::RepairSr(sid, "sr-iso".into()))),
+                "sr-auto-repair" => out.push(Intent::Tab(Tab::Logs)),
                 "console" => out.push(Intent::Tab(Tab::Console)),
                 "update" | "update-progress" => {
                     let release = update::Release { version: "9.9.0".into(), page: "https://github.com/jpaferreira-git/simple-vm-manager/releases".into(), download: Some(("https://example.invalid/a.tar.gz".into(), 9_540_306)) };
@@ -3952,22 +4171,32 @@ impl eframe::App for App {
             let free = self.header_and_tabs(ui, &sel, &tabs, current, actions, &mut out);
             if actions > 0.0 {
                 self.tab_actions(ui, free, &sel, current, actions, &mut out);
-            } else if let Some((s, x)) = self.sr_of(&sel).filter(|(_, x)| x.is_iso()) {
-                // an ISO library's actions, next to its tabs
-                let (sid, sr) = (s.id, x.rref.clone());
+            } else if let Some((s, x, trouble)) = self.sr_of(&sel).map(|(s, x)| (s, x, s.data.as_ref().and_then(|d| d.sr_trouble(x)))).filter(|(_, x, t)| x.is_iso() || t.is_some()) {
+                // an ISO library's actions, and Repair for storage that isn't mounted somewhere,
+                // next to its tabs
+                let (sid, sr, iso, broken) = (s.id, x.rref.clone(), x.is_iso(), trouble.is_some());
                 let busy = self.sr_busy.contains(&sr);
                 let uploading = self.uploads.get(&sr).map_or(false, Upload::active);
                 let mut child = ui.new_child(egui::UiBuilder::new().max_rect(free).layout(egui::Layout::right_to_left(egui::Align::Center)));
                 child.spacing_mut().item_spacing.x = 4.0;
                 // with their names when there's room, otherwise as icons
-                let compact = free.width() < flat_button_width(&child, "Disconnect") + flat_button_width(&child, "Working…") + flat_button_width(&child, "Upload") + 16.0;
-                if flat_button(&mut child, "disconnect", "Disconnect", Some(pal.red), !busy && !uploading, compact, &pal).on_hover_text("Stop using this library; nothing on the share is deleted").clicked() {
+                let mut need = flat_button_width(&child, "Working…") + 16.0;
+                if iso {
+                    need += flat_button_width(&child, "Disconnect") + flat_button_width(&child, "Upload");
+                }
+                let compact = free.width() < need;
+                if iso && flat_button(&mut child, "disconnect", "Disconnect", Some(pal.red), !busy && !uploading, compact, &pal).on_hover_text("Stop using this library; nothing on the share is deleted").clicked() {
                     out.push(Intent::AskForgetSr(sid, sr.clone()));
                 }
-                if flat_button(&mut child, "rescan", if busy { "Working…" } else { "Rescan" }, None, !busy, compact, &pal).on_hover_text("Look for ISO files added to or removed from the share").clicked() {
+                if broken {
+                    if flat_button(&mut child, "connect", if busy { "Working…" } else { "Repair" }, Some(pal.green), !busy, compact, &pal).on_hover_text("Mount it again on the servers where it isn't").clicked() {
+                        out.push(Intent::RepairSr(sid, sr.clone()));
+                    }
+                } else if flat_button(&mut child, "rescan", if busy { "Working…" } else { "Rescan" }, None, !busy, compact, &pal).on_hover_text("Look for ISO files added to or removed from the share").clicked() {
                     out.push(Intent::RescanSr(sid, sr.clone()));
                 }
-                if flat_button(&mut child, "upload", "Upload", None, !busy && !uploading, compact, &pal).on_hover_text("Add an .iso file from this computer or from a link on the web").clicked() {
+                let tip = if broken { "It isn't mounted: Repair it first" } else { "Add an .iso file from this computer or from a link on the web" };
+                if iso && flat_button(&mut child, "upload", "Upload", None, !busy && !uploading && !broken, compact, &pal).on_hover_text(tip).on_disabled_hover_text(tip).clicked() {
                     out.push(Intent::Upload(sid, sr));
                 }
             }
@@ -4116,7 +4345,7 @@ fn create_problem(e: &ApiError) -> String {
     match e.code.as_str() {
         "HOST_NOT_ENOUGH_FREE_MEMORY" => "No server has enough free memory for it right now. Pick a smaller size, or stop another VM, then start it.".into(),
         NOT_ANSWERING => format!("{} is offline: it didn't answer in {} seconds, so nothing was made. Turn it on, or pick another, then try again.", e.details.first().map_or("The storage", |n| n.as_str()), CHECK_SECS),
-        NOT_PLUGGED => format!("{} isn't plugged in on the server the VM is for, so nothing was made. Pick another server, then try again.", e.details.first().map_or("The storage", |n| n.as_str())),
+        NOT_PLUGGED => format!("{} isn't mounted on the server the VM is for, so nothing was made. Repair, on its page, mounts it again; or pick another server, then try again.", e.details.first().map_or("The storage", |n| n.as_str())),
         "SR_FULL" => "There isn't enough room on the storage for its disk.".into(),
         "RBAC_PERMISSION_DENIED" | "PERMISSION_DENIED" => "Your account isn't allowed to do that.".into(),
         "VM_SECUREBOOT_CERTIFICATES_MISSING" | "POOL_SECURE_BOOT_CERTIFICATES_MISSING" => {
@@ -4182,12 +4411,68 @@ fn upload_problem(e: &ApiError) -> String {
 }
 
 /// Storage's tree icon: a disc for ISO libraries, a drum for the rest.
-fn sr_icon(x: &SrInfo) -> IconKind {
-    if x.is_iso() {
-        IconKind::IsoSr
-    } else {
-        IconKind::Sr
+/// A storage's icon: a ring turning while it's rescanned, repaired or disconnected; otherwise a
+/// green dot when it's mounted on a server that's up, a red one when its server is off or not
+/// answering, a "!" when it isn't mounted where it should be. A server's own storage (local
+/// disks, DVD drives, USB) has none.
+fn sr_icon(d: &PoolData, x: &SrInfo, busy: bool) -> IconKind {
+    if busy {
+        return IconKind::Busy(Tone::Accent);
     }
+    if x.is_local() {
+        return if x.is_iso() { IconKind::IsoSr } else { IconKind::Sr };
+    }
+    let health = match d.sr_trouble(x) {
+        Some(t) if t.nowhere => SrHealth::Nowhere,
+        Some(_) => SrHealth::Partly,
+        None if mounted_on_up(d, x).next().is_some() => SrHealth::Up,
+        None => SrHealth::Off,
+    };
+    IconKind::Storage { iso: x.is_iso(), health }
+}
+
+/// The servers that are up and have the storage mounted.
+fn mounted_on_up<'a>(d: &'a PoolData, x: &'a SrInfo) -> impl Iterator<Item = &'a HostInfo> {
+    x.links.iter().filter(|l| l.1).filter_map(|l| d.host(&l.0)).filter(|h| h.is_up())
+}
+
+/// Where a storage is mounted, in words.
+fn sr_status(d: &PoolData, x: &SrInfo) -> String {
+    let name = |h: &str| match d.host(h) {
+        Some(h) if h.is_master && d.is_pool() => format!("{} (coordinator)", h.name),
+        Some(h) => h.name.clone(),
+        None => h.to_string(),
+    };
+    match d.sr_trouble(x) {
+        None => {
+            let on: Vec<String> = mounted_on_up(d, x).map(|h| name(&h.rref)).collect();
+            let down = x.links.iter().filter_map(|l| d.host(&l.0)).find(|h| !h.is_up());
+            match (on.len(), down) {
+                (0, Some(h)) if h.live => format!("Not available: {} isn't answering", h.name),
+                (0, Some(h)) => format!("Not available: {} is off", h.name),
+                (0, None) => "Not mounted".into(),
+                (n, _) if n > 1 && n == d.hosts.len() => format!("Mounted on all {} servers", n),
+                _ => format!("Mounted on {}", on.join(", ")),
+            }
+        }
+        Some(t) if t.detached => "Detached: the pool has no settings for reaching it. Repair asks where it is.".into(),
+        Some(t) if t.nowhere => "Not mounted on any server. Repair mounts it again.".into(),
+        Some(t) => format!("Not mounted on {}. Repair mounts it there.", t.missing.iter().map(|h| name(h)).collect::<Vec<_>>().join(", ")),
+    }
+}
+
+/// Why a storage couldn't be mounted again, in plain words where the mount's message is a known
+/// one, then the server's own words.
+fn mount_problem(e: &ApiError, nfs: bool) -> String {
+    let plain = match mount_trouble(e) {
+        Some(MountTrouble::Refused) if nfs => "The NFS server refused the XenServer hosts: check that its export still allows their addresses.",
+        Some(MountTrouble::Refused) => "The share refused the user name and password the pool has for it. If they changed, disconnect the library and add it again with ISO Library.",
+        Some(MountTrouble::NotFound) => "The share or its folder isn't there any more.",
+        Some(MountTrouble::Unreachable) => "The XenServer hosts couldn't reach the share's address. It answering this computer isn't enough: the hosts have to reach it themselves.",
+        Some(MountTrouble::Unsupported) => "The share no longer speaks the protocol version set for it.",
+        None => return e.message(),
+    };
+    format!("{}\n\n{}", plain, e.message())
 }
 
 /// A cell of a table.
@@ -4455,11 +4740,13 @@ struct Settings {
     zoom: f32,
     /// Look on GitHub for a newer version as the app starts.
     updates: bool,
+    /// Mount storage again on finding it unmounted.
+    repair: bool,
 }
 
 impl Default for Settings {
     fn default() -> Settings {
-        Settings { theme: ThemeMode::System, sidebar_open: true, zoom: 1.0, updates: true }
+        Settings { theme: ThemeMode::System, sidebar_open: true, zoom: 1.0, updates: true, repair: true }
     }
 }
 
@@ -4472,6 +4759,7 @@ fn load_settings() -> Settings {
                 "theme" => s.theme = ThemeMode::parse(v).unwrap_or(s.theme),
                 "sidebar" => s.sidebar_open = v.trim() != "folded",
                 "updates" => s.updates = v.trim() != "off",
+                "repair" => s.repair = v.trim() != "off",
                 "zoom" => s.zoom = v.trim().parse::<f32>().ok().filter(|z| (0.5..=3.0).contains(z)).unwrap_or(1.0),
                 _ => {}
             }
@@ -4483,7 +4771,8 @@ fn load_settings() -> Settings {
 fn save_settings(s: &Settings) {
     let Some(dir) = config_dir() else { return };
     let _ = std::fs::create_dir_all(&dir);
-    let text = format!("theme={}\nsidebar={}\nzoom={:.2}\nupdates={}\n", s.theme.as_str(), if s.sidebar_open { "open" } else { "folded" }, s.zoom, if s.updates { "on" } else { "off" });
+    let on = |b: bool| if b { "on" } else { "off" };
+    let text = format!("theme={}\nsidebar={}\nzoom={:.2}\nupdates={}\nrepair={}\n", s.theme.as_str(), if s.sidebar_open { "open" } else { "folded" }, s.zoom, on(s.updates), on(s.repair));
     let _ = std::fs::write(dir.join("settings.txt"), text);
 }
 

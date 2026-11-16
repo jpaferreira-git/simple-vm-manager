@@ -132,6 +132,17 @@ pub struct HostInfo {
     pub control_domain: String,
     /// Up and answering (its metrics say it's live); false once it's shut down.
     pub live: bool,
+    /// The pool still counts it as live, but it doesn't answer: one that goes down without
+    /// shutting down (power cut, crash, cable) stays live for ten minutes, till the pool gives up
+    /// on its heartbeat (xapi's host_assumed_dead_interval). See `RealConnection::knock_hosts`.
+    pub unreachable: bool,
+}
+
+impl HostInfo {
+    /// On and answering.
+    pub fn is_up(&self) -> bool {
+        self.live && !self.unreachable
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -152,6 +163,22 @@ pub struct SrInfo {
     pub share: String,
     /// An ISO library's discs.
     pub files: Vec<IsoFile>,
+    /// Its connections to the servers (PBDs): each one's server, and whether the storage is
+    /// mounted there now. None at all: the pool has no settings for reaching it (detached).
+    pub links: Vec<(String, bool)>,
+}
+
+/// Storage that should be mounted somewhere it isn't.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SrTrouble {
+    /// The servers (on, and that should have it) where it isn't mounted: the pool's coordinator
+    /// first.
+    pub missing: Vec<String>,
+    /// It isn't mounted on any server.
+    pub nowhere: bool,
+    /// The pool has no settings for reaching it any more (XenCenter's Detach does that): Repair
+    /// has to ask where it is.
+    pub detached: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -276,6 +303,12 @@ impl SrInfo {
         self.kind == "udev" && self.size == 0
     }
 
+    /// A server's own storage: its local disks, DVD drives and USB (udev), or anything else not
+    /// shared that isn't an ISO library. It gets no dot or "!" and no Repair.
+    pub fn is_local(&self) -> bool {
+        self.kind == "udev" || (!self.shared && !self.is_iso())
+    }
+
     /// Storage that can go away under the pool: shared storage, and anything reached over the
     /// network or a SAN (NFS, SMB, iSCSI, Fibre Channel, GFS2). A share that's gone doesn't
     /// fail, it never answers, so it's checked before it's used.
@@ -296,6 +329,33 @@ impl PoolData {
     }
     pub fn net(&self, r: &str) -> Option<&NetInfo> {
         self.networks.iter().find(|n| n.rref == r)
+    }
+
+    /// Where a storage should be mounted but isn't, if anywhere: a server that's on and has its
+    /// connection unplugged, or (shared storage) a server of the pool with no connection to it.
+    /// A server's own storage (`is_local`) never is.
+    pub fn sr_trouble(&self, x: &SrInfo) -> Option<SrTrouble> {
+        if x.is_local() {
+            return None;
+        }
+        let nowhere = !x.links.iter().any(|l| l.1);
+        if x.links.is_empty() {
+            return Some(SrTrouble { missing: self.hosts.iter().filter(|h| h.is_up()).map(|h| h.rref.clone()).collect(), nowhere, detached: true });
+        }
+        let mut missing: Vec<&HostInfo> = self
+            .hosts
+            .iter()
+            .filter(|h| h.is_up())
+            .filter(|h| match x.links.iter().find(|l| l.0 == h.rref) {
+                Some(l) => !l.1,
+                None => x.shared,
+            })
+            .collect();
+        missing.sort_by_key(|h| !h.is_master);
+        if missing.is_empty() {
+            return None;
+        }
+        Some(SrTrouble { missing: missing.iter().map(|h| h.rref.clone()).collect(), nowhere, detached: false })
     }
     pub fn any_enabled_host(&self) -> bool {
         self.hosts.iter().any(|h| h.enabled)
@@ -703,16 +763,20 @@ impl IsoLibrary {
         c
     }
 
-    /// The same request as an `xe` command for the server's console, password hidden.
-    pub fn xe_command(&self) -> String {
+    /// The same request as an `xe` command for the server's console, password hidden. With
+    /// `reattach` (the library's UUID), the connection given back to a detached library instead.
+    pub fn xe_command(&self, reattach: Option<&str>) -> String {
         let quote = |v: &str| if v.is_empty() || v.contains(|c: char| c.is_whitespace() || c == '"') { format!("\"{}\"", v.replace('"', "\\\"")) } else { v.to_string() };
-        let mut parts = vec![
-            "xe sr-create".to_string(),
-            "type=iso".into(),
-            "content-type=iso".into(),
-            format!("shared={}", self.shared),
-            format!("name-label={}", quote(&self.name)),
-        ];
+        let mut parts = match reattach {
+            Some(uuid) => vec!["xe pbd-create".to_string(), format!("sr-uuid={}", uuid), "host-uuid=<coordinator>".into()],
+            None => vec![
+                "xe sr-create".to_string(),
+                "type=iso".into(),
+                "content-type=iso".into(),
+                format!("shared={}", self.shared),
+                format!("name-label={}", quote(&self.name)),
+            ],
+        };
         for (k, v) in self.device_config() {
             let v = if k.ends_with("password") { "********".to_string() } else { quote(&v) };
             parts.push(format!("device-config:{}={}", k, v));
@@ -816,9 +880,34 @@ mod iso_tests {
 
     #[test]
     fn xe_command_hides_the_password() {
-        let cmd = smb("\\\\nas\\isos").xe_command();
+        let cmd = smb("\\\\nas\\isos").xe_command(None);
         assert_eq!(cmd, "xe sr-create type=iso content-type=iso shared=true name-label=\"ISO Library\" device-config:location=//nas/isos device-config:type=cifs device-config:vers=3.0 device-config:username=joao device-config:cifspassword=********");
         assert!(!cmd.contains("s3cret"));
+        let again = smb("//nas/isos").xe_command(Some("1234"));
+        assert!(again.starts_with("xe pbd-create sr-uuid=1234 host-uuid=<coordinator> device-config:location=//nas/isos"), "{}", again);
+        assert!(!again.contains("s3cret"));
+    }
+
+    #[test]
+    fn storage_trouble() {
+        let host = |r: &str, master: bool, live: bool| HostInfo { rref: r.into(), is_master: master, live, ..Default::default() };
+        let d = PoolData { hosts: vec![host("b", false, true), host("a", true, true), host("c", false, false)], ..Default::default() };
+        let sr = |shared: bool, links: &[(&str, bool)]| SrInfo { kind: "iso".into(), shared, links: links.iter().map(|(h, on)| (h.to_string(), *on)).collect(), ..Default::default() };
+        // all mounted (the server that's off doesn't count)
+        assert_eq!(d.sr_trouble(&sr(true, &[("a", true), ("b", true), ("c", false)])), None);
+        // unplugged on every server: the coordinator first
+        let t = d.sr_trouble(&sr(true, &[("b", false), ("a", false), ("c", false)])).unwrap();
+        assert_eq!((t.missing, t.nowhere, t.detached), (vec!["a".to_string(), "b".to_string()], true, false));
+        // shared, and a server with no connection to it
+        let t = d.sr_trouble(&sr(true, &[("a", true)])).unwrap();
+        assert_eq!((t.missing, t.nowhere), (vec!["b".to_string()], false));
+        // a server's own storage only counts there
+        assert_eq!(d.sr_trouble(&sr(false, &[("a", true)])), None);
+        // detached
+        assert!(d.sr_trouble(&sr(true, &[])).unwrap().detached);
+        // a server's own storage never: DVD drives, USB, local disks
+        assert_eq!(d.sr_trouble(&SrInfo { kind: "udev".into(), ..Default::default() }), None);
+        assert_eq!(d.sr_trouble(&SrInfo { kind: "lvm".into(), links: vec![("a".into(), false)], ..Default::default() }), None);
     }
 
     #[test]
