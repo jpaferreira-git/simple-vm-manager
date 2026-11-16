@@ -864,8 +864,7 @@ impl RealConnection {
     /// instead of being waited on for the whole time; the task's progress goes to the thread's
     /// watched `Progress`.
     fn call(&self, method: &str, extra: Vec<Value>, timeout_ms: u64) -> Result<Value, ApiError> {
-        let quick = method.starts_with("Async.") || method.starts_with("task.") || method.starts_with("session.") || method.contains(".get_");
-        if timeout_ms > 60_000 && !quick {
+        if runs_as_task(method, timeout_ms) {
             return self.as_task(method, extra, timeout_ms);
         }
         self.call_now(method, extra, timeout_ms)
@@ -967,6 +966,20 @@ impl RealConnection {
     fn all(&self, cls: &str, timeout_ms: u64) -> Result<Map<String, Value>, ApiError> {
         Ok(self.call(&format!("{}.get_all_records", cls), vec![], timeout_ms)?.as_object().cloned().unwrap_or_default())
     }
+}
+
+/// The calls that can take long and that the server can run as a task (an Async form): only
+/// these go as tasks. A field's setter (set_*, add_to_*, remove_from_*) has no Async form: the
+/// server answers "No async mode for this operation".
+const TASKS: [&str; 27] = [
+    "VM.clone", "VM.copy", "VM.provision", "VM.snapshot", "VM.checkpoint", "VM.revert", "VM.start", "VM.start_on", "VM.resume", "VM.resume_on",
+    "VM.suspend", "VM.clean_shutdown", "VM.hard_shutdown", "VM.clean_reboot", "VM.hard_reboot", "VM.destroy", "VDI.create", "VDI.destroy",
+    "VBD.eject", "VBD.insert", "PBD.plug", "PBD.unplug", "SR.create", "SR.scan", "SR.forget", "host.evacuate", "host.shutdown",
+];
+
+/// Whether a call runs as a task on the server (see `call`): one allowed over a minute that can.
+fn runs_as_task(method: &str, timeout_ms: u64) -> bool {
+    timeout_ms > 60_000 && TASKS.contains(&method)
 }
 
 /// A task's result: the reference (or value) inside its <value>…</value>, or nothing.
@@ -2886,6 +2899,21 @@ mod tests {
     }
 
     #[test]
+    fn only_long_calls_run_as_tasks() {
+        // what failed making a VM from a template: a setter has no Async form
+        for setter in ["VM.set_is_a_template", "VM.set_name_description", "VM.set_VCPUs_max", "VM.set_memory_limits", "VM.add_to_platform", "VM.remove_from_other_config", "VM.set_affinity"] {
+            assert!(!runs_as_task(setter, 120_000), "{}", setter);
+        }
+        assert!(runs_as_task("VM.clone", 120_000) && runs_as_task("VM.copy", 6 * 3_600_000) && runs_as_task("PBD.plug", 180_000));
+        // every power action
+        for a in ACTIONS.iter() {
+            assert!(runs_as_task(a.method, ACTION_TIMEOUT_MS), "{}", a.method);
+        }
+        // a quick call stays a call
+        assert!(!runs_as_task("VM.clone", 30_000) && !runs_as_task("task.get_record", 120_000));
+    }
+
+    #[test]
     fn calls_noted_without_passwords() {
         let args = vec![json!("OpaqueRef:abc"), json!("Web 2"), json!({ "device_config": { "location": "//nas/isos", "cifspassword": "s3cret" } })];
         let text = args_text(&args);
@@ -2900,6 +2928,20 @@ mod tests {
         assert_eq!(lines[0], (Said::Asked, "VM.clone  OpaqueRef:abc  \"x\"".to_string()));
         assert_eq!(lines[1], (Said::Error, "Error code: VM_BAD_POWER_STATE".to_string()));
         assert_eq!(lines[2], (Said::Error, "running".to_string()));
+    }
+
+    /// Against a fake server that, like a real one, has no Async form for setters
+    /// (SVM_FAKE_XAPI=host:port): a VM made from a template of the user's.
+    #[test]
+    #[ignore]
+    fn from_template_live() {
+        let addr = std::env::var("SVM_FAKE_XAPI").expect("SVM_FAKE_XAPI");
+        let c = RealConnection::new(&addr, "root", "x");
+        let spec = NewVm { name: "ubuntuOS-test".into(), template: "OpaqueRef:tpl".into(), vcpus: 2, cores_per_socket: 2, memory: 2 * GB, sr: "OpaqueRef:sr".into(), from_template: true, keep_nics: true, description: "test".into(), ..Default::default() };
+        let tr = Trace::default();
+        let made = c.create_vm(&spec, &tr);
+        eprintln!("{}", tr.text());
+        assert_eq!(made.unwrap(), "OpaqueRef:newvm");
     }
 
     #[test]
