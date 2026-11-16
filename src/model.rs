@@ -585,6 +585,13 @@ pub fn fmt_when(t: i64, now: i64, offset: i64) -> String {
     }
 }
 
+/// A time of day: `t` (seconds since 1970) moved by `offset` (seconds east of UTC), "14:59:24";
+/// with " UTC" after it when `utc` (the time zone wasn't known).
+pub fn fmt_clock(t: i64, offset: i64, utc: bool) -> String {
+    let s = (t + offset).rem_euclid(86_400);
+    format!("{:02}:{:02}:{:02}{}", s / 3600, s / 60 % 60, s % 60, if utc { " UTC" } else { "" })
+}
+
 /// A date and time in full, local: "16 Nov 2026, 08:42" (as a new snapshot's name).
 pub fn fmt_date_time(t: i64, offset: i64) -> String {
     const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
@@ -1003,6 +1010,14 @@ mod iso_tests {
         }
         // a suspended VM isn't on any server
         assert!(d.host_down_for(&vm("b", PowerState::Suspended)).is_none());
+    }
+
+    #[test]
+    fn clock_times() {
+        let t = parse_xen_time("20261116T11:42:05Z").unwrap();
+        assert_eq!(fmt_clock(t, -3 * 3600, false), "08:42:05"); // Brazil
+        assert_eq!(fmt_clock(t, 0, true), "11:42:05 UTC");
+        assert_eq!(fmt_clock(parse_xen_time("20261116T01:00:00Z").unwrap(), -3 * 3600, false), "22:00:00"); // the day before, there
     }
 
     #[test]

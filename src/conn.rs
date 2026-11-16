@@ -982,6 +982,13 @@ fn runs_as_task(method: &str, timeout_ms: u64) -> bool {
     timeout_ms > 60_000 && TASKS.contains(&method)
 }
 
+/// A network the servers keep for themselves, not shown (as XenCenter doesn't): the host internal
+/// management network (the guest installer network, on older versions), and any marked
+/// HideFromXenCenter.
+fn hidden_network(other_config: &Value) -> bool {
+    ["is_host_internal_management_network", "is_guest_installer_network", "HideFromXenCenter"].iter().any(|k| s(other_config, k) == "true")
+}
+
 /// A task's result: the reference (or value) inside its <value>…</value>, or nothing.
 fn task_value(result: &str) -> Value {
     let inner = result.trim().trim_start_matches("<value>").trim_end_matches("</value>").trim();
@@ -1198,7 +1205,13 @@ impl Connection for RealConnection {
                 links,
             });
         }
+        // every network's name (a VM's card may be on one that isn't shown)
+        let mut net_names: HashMap<String, String> = HashMap::new();
         for (k, r) in self.all("network", t)? {
+            net_names.insert(k.clone(), s(&r, "name_label"));
+            if hidden_network(r.get("other_config").unwrap_or(&Value::Null)) {
+                continue;
+            }
             pd.networks.push(NetInfo {
                 rref: k,
                 uuid: s(&r, "uuid"),
@@ -1266,7 +1279,6 @@ impl Connection for RealConnection {
         let guests = self.all("VM_guest_metrics", t)?;
         let vm_metrics = self.all("VM_metrics", t)?;
         let sr_names: HashMap<String, String> = pd.srs.iter().map(|x| (x.rref.clone(), x.name.clone())).collect();
-        let net_names: HashMap<String, String> = pd.networks.iter().map(|x| (x.rref.clone(), x.name.clone())).collect();
         let sr_hosts: HashMap<String, String> = pd.srs.iter().filter_map(|x| x.host.clone().map(|h| (x.rref.clone(), h))).collect();
         // each server's control domain (dom0), for its console
         let mut dom0: HashMap<String, String> = HashMap::new();
@@ -2896,6 +2908,15 @@ mod tests {
         eprintln!("{} after {:.0} s; progress {:?}; {}", e.code, t.elapsed().as_secs_f32(), p.fraction(), e.message());
         assert_eq!(e.code, LOST_CONTACT);
         assert!(p.fraction().unwrap_or(0.0) > 0.0);
+    }
+
+    #[test]
+    fn servers_own_networks_hidden() {
+        assert!(hidden_network(&json!({ "is_guest_installer_network": "true", "is_host_internal_management_network": "true" })));
+        assert!(hidden_network(&json!({ "HideFromXenCenter": "true" })));
+        assert!(hidden_network(&json!({ "is_guest_installer_network": "true" })));
+        assert!(!hidden_network(&json!({})));
+        assert!(!hidden_network(&Value::Null));
     }
 
     #[test]

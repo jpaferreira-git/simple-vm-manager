@@ -6475,10 +6475,11 @@ fn snapshot_problem(e: &ApiError) -> String {
     }
 }
 
+/// The time now, as the logs show it: by this computer's clock ("14:59:24"); in UTC, said so,
+/// where its time zone can't be had.
 fn clock_text() -> String {
-    let secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    let t = secs % 86_400;
-    format!("{:02}:{:02}:{:02} UTC", t / 3600, (t / 60) % 60, t % 60)
+    let now = unix_now();
+    fmt_clock(now, local_offset(now), !cfg!(unix))
 }
 
 fn config_dir() -> Option<std::path::PathBuf> {
