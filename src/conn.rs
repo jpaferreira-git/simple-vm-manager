@@ -18,6 +18,8 @@ pub const MAX_LOGIN_ATTEMPTS: usize = 8;
 /// How long reaching a server may take: a server that's off doesn't refuse, it just never
 /// answers, so without this each try would wait for the whole call's time.
 pub const CONNECT_TIMEOUT_MS: u64 = 6_000;
+/// How long a pool may take to say which updates its servers lack (seconds).
+const UPDATES_WITHIN: u64 = 15 * 60;
 pub const ACTION_TIMEOUT_MS: u64 = 86_400_000; // XenAPI.Session.STANDARD_TIMEOUT
 pub const DEMO_ACTION_MS: u64 = 1500; // estimated
 /// A storage check's error codes (see `Connection::check_sr`): it didn't answer in time; it isn't
@@ -88,6 +90,19 @@ fn said(method: &str, args: &[Value]) {
     if let Some(w) = watched() {
         w.trace.push(Said::Asked, format!("{}  {}", method, args_text(args)).trim_end().to_string());
     }
+}
+
+/// Notes the app's own remark in the watched job's details.
+fn note(text: impl Into<String>) {
+    if let Some(w) = watched() {
+        w.trace.push(Said::Note, text);
+    }
+}
+
+/// Minutes and seconds, "4 min 12 s".
+fn took_text(d: Duration) -> String {
+    let s = d.as_secs();
+    if s < 60 { format!("{} s", s) } else { format!("{} min {} s", s / 60, s % 60) }
 }
 
 /// Notes in the watched job's details how its last call went.
@@ -249,6 +264,36 @@ pub trait Connection: Send + Sync {
     /// The last ten minutes of a server's load and its running VMs', from the server itself (its
     /// uuid and address).
     fn host_perf(&self, host_uuid: &str, host_address: &str) -> Result<HostPerf, ApiError>;
+    /// The updates the pool's servers lack, as last fetched from its update channel (its
+    /// /updates answer).
+    fn pool_updates(&self) -> Result<PoolUpdates, ApiError>;
+    /// Fetches the latest updates from the pool's update channel (pool.sync_updates): the hash to
+    /// install them by.
+    fn sync_updates(&self) -> Result<String, ApiError>;
+    /// Why the pool can't be updated now (pool.check_update_readiness); none when it can.
+    fn update_readiness(&self) -> Result<Vec<String>, ApiError>;
+    /// Installs the updates last fetched (by their `hash`) on a server; what it said about them
+    /// (livepatches that failed…).
+    fn apply_updates(&self, host_ref: &str, hash: &str) -> Result<Vec<String>, ApiError>;
+    /// What a server must still do for the updates installed on it (its pending guidances, the
+    /// recommended ones too: "reboot_host", "restart_toolstack"…).
+    fn pending_guidance(&self, host_ref: &str) -> Result<Vec<String>, ApiError>;
+    /// The running VMs that can't move off a server, and why (host.get_vms_which_prevent_evacuation:
+    /// an error code and its details, like "VM_REQUIRES_SR").
+    fn vms_blocking_evacuation(&self, host_ref: &str) -> Result<Vec<(String, String)>, ApiError>;
+    /// Empties a server: no new VMs sent to it, the VMs that can't move stopped (with `stop`; without,
+    /// it fails before anything when there are any), the rest moved to the other servers. The VMs
+    /// it stopped, and how many it moved. (Taking VMs again if a step fails.)
+    fn empty_host(&self, host_ref: &str, stop: bool) -> Result<(Vec<String>, usize), ApiError>;
+    /// Restarts a server (emptied first) and waits, up to `limit`, till it answers again.
+    fn restart_host_and_wait(&self, host_ref: &str, limit: Duration) -> Result<(), ApiError>;
+    /// Restarts a server's toolstack and waits till it answers again.
+    fn restart_toolstack(&self, host_ref: &str) -> Result<(), ApiError>;
+    /// The server takes VMs again: asked till it does (one that's just restarted may not at
+    /// once), for up to five minutes.
+    fn enable_host(&self, host_ref: &str) -> Result<(), ApiError>;
+    /// Starts a VM on a server.
+    fn start_vm_on(&self, vm_ref: &str, host_ref: &str) -> Result<(), ApiError>;
     /// Deletes a snapshot and its own copies of the disks (and its saved memory). The ones that
     /// couldn't be deleted (the snapshot is gone by then): each one's name and why.
     fn delete_snapshot(&self, snapshot_ref: &str) -> Result<Vec<String>, ApiError>;
@@ -877,32 +922,84 @@ impl RealConnection {
     /// `shutdown_host` and `reboot_host`: no new VMs sent to it, the VMs that can't leave stopped,
     /// the rest moved, then it goes off or restarts; enabled again if a step fails.
     fn host_off(&self, host: &str, reboot: bool) -> Result<(), ApiError> {
+        self.emptied(host, true)?;
+        let done = self.call(if reboot { "host.reboot" } else { "host.shutdown" }, vec![json!(host)], ACTION_TIMEOUT_MS).map(|_| ());
+        if done.is_err() {
+            let _ = self.call("host.enable", vec![json!(host)], 60_000);
+        }
+        done
+    }
+
+    /// The running VMs that can't move off a server, and why.
+    fn blocking(&self, host: &str) -> Result<Vec<(String, String)>, ApiError> {
         let t = 60_000;
+        let stuck = self.call("host.get_vms_which_prevent_evacuation", vec![json!(host)], t)?;
+        let mut out = vec![];
+        for (vm, why) in stuck.as_object().cloned().unwrap_or_default() {
+            if matches!(self.call("VM.get_power_state", vec![json!(vm)], t)?.as_str(), Some("Running") | Some("Paused")) {
+                let why = why.as_array().map(|a| a.iter().map(val_str).collect::<Vec<_>>().join(" ")).unwrap_or_else(|| val_str(&why));
+                out.push((vm, why));
+            }
+        }
+        Ok(out)
+    }
+
+    /// No new VMs sent to a server, the VMs that can't move elsewhere stopped (with `stop`;
+    /// without, it fails first when there are any), the rest moved: the VMs it stopped. Enabled
+    /// again if a step fails.
+    fn emptied(&self, host: &str, stop: bool) -> Result<(Vec<String>, usize), ApiError> {
+        let t = 60_000;
+        if !stop {
+            let stuck = self.blocking(host)?;
+            if !stuck.is_empty() {
+                return Err(ApiError { code: "VMS_CANT_MOVE".into(), details: stuck.into_iter().map(|s| s.0).collect() });
+            }
+        }
         self.call("host.disable", vec![json!(host)], t)?;
-        let done = (|| -> Result<(), ApiError> {
-            // the VMs that can't move elsewhere stop
+        let done = (|| -> Result<(Vec<String>, usize), ApiError> {
+            let mut stopped = vec![];
             let stuck = self.call("host.get_vms_which_prevent_evacuation", vec![json!(host)], t)?;
             for vm in stuck.as_object().map(|o| o.keys().cloned().collect::<Vec<_>>()).unwrap_or_default() {
                 let power = self.call("VM.get_power_state", vec![json!(vm)], t)?;
                 let clean = match power.as_str() {
                     Some("Halted") | Some("Suspended") => continue,
-                    Some("Running") => self.call("VM.clean_shutdown", vec![json!(vm)], ACTION_TIMEOUT_MS).map(|_| ()),
+                    // (one that couldn't move a moment ago: never stopped when asked not to)
+                    _ if !stop => return Err(ApiError { code: "VMS_CANT_MOVE".into(), details: vec![vm] }),
+                    // cleanly when its guest tools let it be (asked first, not tried and failed)
+                    Some("Running") if self.call_raw("VM.get_allowed_operations", vec![json!(vm)], t).ok().and_then(|v| v.as_array().map(|a| a.iter().any(|o| o.as_str() == Some("clean_shutdown")))).unwrap_or(true) => {
+                        self.call("VM.clean_shutdown", vec![json!(vm)], ACTION_TIMEOUT_MS).map(|_| ())
+                    }
+                    Some("Running") => {
+                        note("no guest tools to shut it down cleanly: turned off instead");
+                        Err(ApiError::other("no clean shutdown"))
+                    }
                     _ => Err(ApiError::other("not running")),
                 };
                 if clean.is_err() {
                     self.call("VM.hard_shutdown", vec![json!(vm)], ACTION_TIMEOUT_MS)?;
                 }
+                stopped.push(vm);
             }
-            // the rest move to the other servers, then it goes off (or restarts)
+            // what's left running there moves (its control domain stays)
+            let left = self
+                .call("host.get_resident_VMs", vec![json!(host)], t)?
+                .as_array()
+                .map(|a| a.iter().filter(|vm| !self.call("VM.get_is_control_domain", vec![(*vm).clone()], t).ok().and_then(|x| x.as_bool()).unwrap_or(true)).count())
+                .unwrap_or(0);
             self.call("host.evacuate", vec![json!(host)], ACTION_TIMEOUT_MS)?;
-            self.call(if reboot { "host.reboot" } else { "host.shutdown" }, vec![json!(host)], ACTION_TIMEOUT_MS)?;
-            Ok(())
+            Ok((stopped, left))
         })();
         if done.is_err() {
             let _ = self.call("host.enable", vec![json!(host)], t);
         }
         done
     }
+
+    /// The pool's reference.
+    fn pool_ref(&self) -> Result<Value, ApiError> {
+        self.call("pool.get_all", vec![], 30_000)?.as_array().and_then(|a| a.first().cloned()).ok_or_else(|| ApiError::other("the server named no pool"))
+    }
+
     fn call(&self, method: &str, extra: Vec<Value>, timeout_ms: u64) -> Result<Value, ApiError> {
         if runs_as_task(method, timeout_ms) {
             return self.as_task(method, extra, timeout_ms);
@@ -1015,7 +1112,7 @@ impl RealConnection {
         let agent = ureq::AgentBuilder::new().tls_connector(self.tls.clone()).timeout_connect(Duration::from_secs(5)).timeout(Duration::from_secs(15)).build();
         let get = |start: i64| -> Result<String, ApiError> {
             let url = format!("https://{}{}/rrd_updates?session_id={}&start={}&cf=AVERAGE&interval=5&host={}", at, port, session, start, host);
-            agent.get(&url).call().map_err(|e| ApiError::other(e.to_string()))?.into_string().map_err(|e| ApiError::other(e.to_string()))
+            agent.get(&url).call().map_err(web_error)?.into_string().map_err(|e| ApiError::other(e.to_string()))
         };
         let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
         let mut text = get(now - 600)?;
@@ -1041,11 +1138,11 @@ impl RealConnection {
 /// The calls that can take long and that the server can run as a task (an Async form): only
 /// these go as tasks. A field's setter (set_*, add_to_*, remove_from_*) has no Async form: the
 /// server answers "No async mode for this operation".
-const TASKS: [&str; 32] = [
+const TASKS: [&str; 34] = [
     "VM.clone", "VM.copy", "VM.provision", "VM.snapshot", "VM.checkpoint", "VM.revert", "VM.start", "VM.start_on", "VM.resume", "VM.resume_on",
     "VM.suspend", "VM.clean_shutdown", "VM.hard_shutdown", "VM.clean_reboot", "VM.hard_reboot", "VM.destroy", "VDI.create", "VDI.destroy",
     "VDI.resize", "VBD.eject", "VBD.insert", "VBD.plug", "VIF.plug", "VIF.unplug", "VIF.move", "PBD.plug", "PBD.unplug", "SR.create", "SR.scan",
-    "SR.forget", "host.evacuate", "host.shutdown",
+    "SR.forget", "host.evacuate", "host.shutdown", "pool.sync_updates", "host.apply_updates",
 ];
 
 /// Whether a call runs as a task on the server (see `call`): one allowed over a minute that can.
@@ -1089,6 +1186,37 @@ fn to_error(err: &Value) -> ApiError {
         code = val_str(err);
     }
     ApiError { code, details }
+}
+
+/// A web request's error in words, never with its address: the address carries the session's id,
+/// which is as good as the password while it lasts.
+fn web_error(e: ureq::Error) -> ApiError {
+    match e {
+        ureq::Error::Status(code, r) => ApiError::other(format!("the server answered {} {}", code, r.status_text())),
+        ureq::Error::Transport(t) => {
+            let mut parts = vec![t.kind().to_string()];
+            parts.extend(t.message().map(String::from));
+            parts.extend(std::error::Error::source(&t).map(|c| c.to_string()));
+            parts.dedup();
+            ApiError::other(hide_session(&parts.join(": ")))
+        }
+    }
+}
+
+/// `text` with any session id in it hidden: what follows "session_id=" up to a "&", a space or a
+/// ": " (an OpaqueRef has colons of its own).
+fn hide_session(text: &str) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(i) = rest.find("session_id=") {
+        out.push_str(&rest[..i + 11]);
+        out.push('…');
+        rest = &rest[i + 11..];
+        let end = rest.char_indices().find(|&(k, c)| c == '&' || c.is_whitespace() || (c == ':' && rest[k + 1..].starts_with(' '))).map_or(rest.len(), |(k, _)| k);
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 fn or_default(v: &str, default: &str) -> String {
@@ -1206,10 +1334,27 @@ impl Connection for RealConnection {
     fn fetch(&self, t: u64) -> Result<PoolData, ApiError> {
         let mut pd = PoolData::default();
         let mut master = String::new();
+        let mut repos: Vec<String> = vec![];
         for (_, r) in self.all("pool", t)? {
             pd.name = s(&r, "name_label");
             master = s(&r, "master");
             pd.default_sr = Some(s(&r, "default_SR")).filter(|x| !x.is_empty() && x != "OpaqueRef:NULL");
+            repos = list(&r, "repositories");
+            pd.last_update_sync = parse_xen_time(&s(&r, "last_update_sync"));
+        }
+        // its update channel: the enabled repository that has updates (not the base one)
+        if !repos.is_empty() {
+            let all = self.all("Repository", t).unwrap_or_default();
+            let enabled: Vec<&Value> = repos.iter().filter_map(|r| all.get(r)).collect();
+            if let Some(r) = enabled.iter().find(|r| b(r, "update")).or(enabled.first()) {
+                let last = s(r, "binary_url").trim_end_matches('/').rsplit('/').next().unwrap_or_default().to_lowercase();
+                pd.update_channel = Some(match last.as_str() {
+                    "normal" => "Normal".to_string(),
+                    "earlyaccess" => "Early access".to_string(),
+                    _ => or_default(&s(r, "name_label"), "Its own"),
+                });
+                pd.update_bundle = s(r, "origin") == "bundle";
+            }
         }
         let metrics = self.all("host_metrics", t)?;
         for (k, r) in self.all("host", t)? {
@@ -1238,6 +1383,9 @@ impl Connection for RealConnection {
                 edition: s(&r, "edition"),
                 license_name: r.get("license_params").map(|l| s(l, "sku_marketing_name")).unwrap_or_default(),
                 license_expiry: r.get("license_params").and_then(|l| parse_xen_time(&s(l, "expiry"))),
+                updates_applied: s(&r, "latest_synced_updates_applied"),
+                pending_guidance: list(&r, "pending_guidances").into_iter().chain(list(&r, "pending_guidances_recommended")).collect(),
+                last_update: parse_xen_time(&s(&r, "last_software_update")),
                 nics: vec![], // filled in from the PIFs below
             });
         }
@@ -1807,6 +1955,177 @@ impl Connection for RealConnection {
         })
     }
 
+    fn pool_updates(&self) -> Result<PoolUpdates, ApiError> {
+        let (coordinator, session) = self.session(20_000)?;
+        let at = if coordinator.contains(':') && !coordinator.starts_with('[') { format!("[{}]", coordinator) } else { coordinator };
+        let port = if self.port == DEFAULT_PORT { String::new() } else { format!(":{}", self.port) };
+        // (the first time after a fetch, the coordinator asks each server what it lacks before it
+        // answers: minutes, on a pool of a few servers)
+        let agent = ureq::AgentBuilder::new().tls_connector(self.tls.clone()).timeout_connect(Duration::from_secs(5)).timeout(Duration::from_secs(UPDATES_WITHIN)).build();
+        let url = format!("https://{}{}/updates?session_id={}", at, port, session);
+        said("GET /updates", &[]);
+        let began = Instant::now();
+        let got = match agent.get(&url).call() {
+            Ok(r) => r.into_string().map_err(|e| ApiError::other(e.to_string())),
+            // (no channel set up, or never fetched from)
+            Err(ureq::Error::Status(404, _)) => Err(ApiError { code: "NO_REPOSITORY_ENABLED".into(), details: vec![] }),
+            Err(ureq::Error::Transport(t)) if std::error::Error::source(&t).map_or(false, |c| c.to_string().contains("timed out")) => {
+                Err(ApiError::other(format!("the server didn't answer within {} minutes", UPDATES_WITHIN / 60)))
+            }
+            Err(e) => Err(web_error(e)),
+        };
+        let r = got.and_then(|text| parse_pool_updates(&text).map_err(ApiError::other));
+        answered(&r.as_ref().map(|p| json!(format!("{} updates", p.updates.len()))).map_err(|e| e.clone()), began.elapsed());
+        r
+    }
+
+    fn sync_updates(&self) -> Result<String, ApiError> {
+        let pool = self.pool_ref()?;
+        let t = 3_600_000;
+        // (no client ID needed since XenServer 8.4; older servers take only the token's two)
+        let full = vec![pool.clone(), json!(false), json!(""), json!(""), json!(""), json!("")];
+        let hash = match self.call("pool.sync_updates", full, t) {
+            Err(e) if e.code == "MESSAGE_PARAMETER_COUNT_MISMATCH" => self.call("pool.sync_updates", vec![pool, json!(false), json!(""), json!("")], t)?,
+            r => r?,
+        };
+        Ok(val_str(&hash))
+    }
+
+    fn update_readiness(&self) -> Result<Vec<String>, ApiError> {
+        let pool = self.pool_ref()?;
+        let r = self.call("pool.check_update_readiness", vec![pool, json!(false)], 120_000)?;
+        Ok(r.as_array()
+            .map(|a| {
+                a.iter()
+                    .map(|x| match x {
+                        Value::Array(parts) => parts.iter().map(val_str).collect::<Vec<_>>().join(" "),
+                        x => val_str(x),
+                    })
+                    .filter(|x| !x.trim().is_empty())
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    fn apply_updates(&self, host: &str, hash: &str) -> Result<Vec<String>, ApiError> {
+        let r = self.call("host.apply_updates", vec![json!(host), json!(hash)], 7_200_000)?;
+        Ok(r.as_array()
+            .map(|a| a.iter().map(|x| if let Value::Array(p) = x { p.iter().map(val_str).collect::<Vec<_>>().join(" ") } else { val_str(x) }).filter(|x| !x.is_empty()).collect())
+            .unwrap_or_default())
+    }
+
+    fn pending_guidance(&self, host: &str) -> Result<Vec<String>, ApiError> {
+        let mut out = vec![];
+        for field in ["host.get_pending_guidances", "host.get_pending_guidances_recommended"] {
+            match self.call(field, vec![json!(host)], 30_000) {
+                Ok(v) => out.extend(v.as_array().map(|a| a.iter().map(val_str).collect::<Vec<_>>()).unwrap_or_default()),
+                // (older servers have only the first)
+                Err(e) if e.code == "MESSAGE_METHOD_UNKNOWN" && !out.is_empty() => {}
+                Err(e) if e.code == "MESSAGE_METHOD_UNKNOWN" => {}
+                Err(e) => return Err(e),
+            }
+        }
+        out.dedup();
+        Ok(out)
+    }
+
+    fn vms_blocking_evacuation(&self, host: &str) -> Result<Vec<(String, String)>, ApiError> {
+        self.blocking(host)
+    }
+
+    fn empty_host(&self, host: &str, stop: bool) -> Result<(Vec<String>, usize), ApiError> {
+        self.emptied(host, stop)
+    }
+
+    fn restart_host_and_wait(&self, host: &str, limit: Duration) -> Result<(), ApiError> {
+        let t = 30_000;
+        let boot = || self.call("host.get_other_config", vec![json!(host)], t).map(|o| s(&o, "boot_time"));
+        let before = boot().unwrap_or_default();
+        self.call("host.reboot", vec![json!(host)], ACTION_TIMEOUT_MS)?;
+        // back: it started again (a new boot time), or it was seen gone and is live again. While
+        // it restarts, asking fails (the coordinator's own restart: every call): expected, so
+        // these looks aren't noted, only the wait
+        let began = Instant::now();
+        note("restarting: it doesn't answer for a few minutes, as expected; waiting for it to come back…");
+        let quiet = |m: &str, args: Vec<Value>| self.call_raw(m, args, t);
+        let end = began + limit;
+        let mut gone = false;
+        std::thread::sleep(Duration::from_secs(20));
+        loop {
+            let live = (|| -> Result<bool, ApiError> {
+                let started = s(&quiet("host.get_other_config", vec![json!(host)])?, "boot_time");
+                let m = quiet("host.get_metrics", vec![json!(host)])?;
+                let live = quiet("host_metrics.get_live", vec![m])?.as_bool().unwrap_or(false);
+                Ok(live && (gone || (!started.is_empty() && started != before)))
+            })();
+            let was_gone = gone;
+            match live {
+                Ok(true) => {
+                    note(format!("back after {}", took_text(began.elapsed())));
+                    return Ok(());
+                }
+                Ok(false) => gone |= quiet("host.get_metrics", vec![json!(host)]).and_then(|m| quiet("host_metrics.get_live", vec![m])).map_or(true, |l| l.as_bool() == Some(false)),
+                Err(_) => gone = true,
+            }
+            // its two halves: going down (it's still seen live), then starting up again
+            if gone && !was_gone {
+                note(format!("went down after {}; now waiting for it to start up again (its console shows how that goes)", took_text(began.elapsed())));
+            }
+            if Instant::now() >= end {
+                return Err(ApiError::other(format!("it didn't answer again within {} minutes", limit.as_secs() / 60)));
+            }
+            std::thread::sleep(Duration::from_secs(15));
+        }
+    }
+
+    fn restart_toolstack(&self, host: &str) -> Result<(), ApiError> {
+        self.call("host.restart_agent", vec![json!(host)], 60_000)?;
+        // it restarts after ten seconds; then answers again within a minute or two (asking fails
+        // meanwhile, as expected: not noted)
+        let began = Instant::now();
+        note("its toolstack restarts: it doesn't answer for a minute or so, as expected; waiting…");
+        std::thread::sleep(Duration::from_secs(25));
+        let end = Instant::now() + Duration::from_secs(600);
+        loop {
+            if self.call_raw("host.get_enabled", vec![json!(host)], 15_000).is_ok() {
+                note(format!("answering again after {}", took_text(began.elapsed())));
+                return Ok(());
+            }
+            if Instant::now() >= end {
+                return Err(ApiError::other("its toolstack didn't answer again within 10 minutes"));
+            }
+            std::thread::sleep(Duration::from_secs(5));
+        }
+    }
+
+    fn enable_host(&self, host: &str) -> Result<(), ApiError> {
+        // asked quietly: one just back says it's still starting up (HOST_STILL_BOOTING), as
+        // expected, then takes VMs once it's done; only five minutes of that is a problem
+        said("host.enable", &[json!(host)]);
+        let began = Instant::now();
+        let mut last = self.call_raw("host.enable", vec![json!(host)], 60_000).err();
+        let mut said_waiting = false;
+        loop {
+            if self.call_raw("host.get_enabled", vec![json!(host)], 30_000).ok().and_then(|v| v.as_bool()) == Some(true) {
+                note(if said_waiting { format!("taking VMs again after {}", took_text(began.elapsed())) } else { "taking VMs".to_string() });
+                return Ok(());
+            }
+            if began.elapsed() >= Duration::from_secs(300) {
+                return Err(last.unwrap_or_else(|| ApiError::other("it still doesn't take VMs after five minutes")));
+            }
+            if !said_waiting {
+                note("still starting up: it takes VMs once it's done; waiting…");
+                said_waiting = true;
+            }
+            std::thread::sleep(Duration::from_secs(10));
+            last = self.call_raw("host.enable", vec![json!(host)], 60_000).err();
+        }
+    }
+
+    fn start_vm_on(&self, vm: &str, host: &str) -> Result<(), ApiError> {
+        self.call("VM.start_on", vec![json!(vm), json!(host), json!(false), json!(false)], ACTION_TIMEOUT_MS).map(|_| ())
+    }
+
     fn revert_vm(&self, snap: &str) -> Result<(), ApiError> {
         let t = 60_000;
         let vm = self.call("VM.get_snapshot_of", vec![json!(snap)], t)?.as_str().unwrap_or_default().to_string();
@@ -2255,6 +2574,8 @@ fn demo_uuid() -> String {
 
 pub struct DemoConnection {
     data: Mutex<PoolData>,
+    /// What its update channel has for its servers.
+    updates: Mutex<PoolUpdates>,
 }
 
 impl DemoConnection {
@@ -2299,6 +2620,9 @@ impl DemoConnection {
             brand: "XenServer".into(),
             edition: "xenserver-premium".into(),
             license_name: String::new(),
+            updates_applied: String::new(),
+            pending_guidance: vec![],
+            last_update: None,
             // till 31 July next year
             license_expiry: parse_xen_time(&format!("{}0731T00:00:00Z", 1971 + SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0) / 31_556_952)),
             nics: vec![
@@ -2338,6 +2662,12 @@ impl DemoConnection {
                     "trial" => (h.edition, h.license_expiry) = ("trial".into(), None),
                     _ => {}
                 }
+            }
+        }
+        // the servers named in SVM_DEMO_DISABLED are on but don't take VMs (left so by a restart)
+        if let Ok(off) = std::env::var("SVM_DEMO_DISABLED") {
+            for h in d.hosts.iter_mut().filter(|h| off.split(',').any(|x| x.trim() == h.rref)) {
+                h.enabled = false;
             }
         }
         // the servers named in SVM_DEMO_FULL are small for their VMs: little memory left, more
@@ -2439,7 +2769,50 @@ impl DemoConnection {
             t.nics.push(VmNic { device: "0".into(), vif: format!("{}-vif-0", r), net: "net-0".into(), mac: format!("aa:16:3e:7e:00:{:02x}", disk), network: "Pool-wide network 0".into(), ip: String::new() });
             d.user_templates.push(t);
         }
-        DemoConnection { data: Mutex::new(d) }
+        // its update channel: fetched three days ago; two security updates among five, the second
+        // server lacking four (SVM_DEMO_UPDATES=none: every server has every one)
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|t| t.as_secs() as i64).unwrap_or(0);
+        (d.update_channel, d.last_update_sync) = (Some("Normal".into()), Some(now - 3 * 86_400 - 5000));
+        let none = std::env::var("SVM_DEMO_UPDATES").map_or(false, |v| v == "none");
+        for h in d.hosts.iter_mut() {
+            h.updates_applied = if none { "yes".into() } else { "no".into() };
+        }
+        let update = |id: &str, summary: &str, kind: &str, severity: &str, days: i64, guidance: &[&str], description: &str| UpdateInfo {
+            id: id.into(),
+            summary: summary.into(),
+            description: description.into(),
+            kind: kind.into(),
+            severity: severity.into(),
+            issued: Some((now - days * 86_400) / 86_400 * 86_400),
+            url: format!("https://docs.xenserver.com/en-us/xenserver/8/whats-new/normal#{}", id.to_lowercase()),
+            guidance: guidance.iter().map(|g| g.to_string()).collect(),
+        };
+        let updates = vec![
+            update("XSU-2026-1104", "Xen hypervisor: fixes CVE-2026-31012 and CVE-2026-31013", "SecurityFix", "High", 6, &["RebootHost"], "A guest could read memory of other guests through a flaw in the handling of nested page tables."),
+            update("XSU-2026-1101", "OpenSSL: fixes CVE-2026-2290", "SecurityFix", "None", 9, &["RestartToolstack"], "A crafted TLS handshake could make the management service stop answering."),
+            update("XSU-2026-1029", "Storage migration no longer stalls at 99%", "BugFix", "None", 14, &["RestartToolstack"], "Moving a VM's disk between NFS repositories could wait for ever on its last step."),
+            update("XSU-2026-1022", "Network drivers for Broadcom NetXtreme-E cards", "BugFix", "None", 21, &["RebootHost"], "Fixes link flaps under heavy load."),
+            update("XSU-2026-1015", "XenServer VM Tools for Windows 9.4.2", "Improvement", "None", 28, &[], "The tools' ISO, for VMs to install."),
+        ];
+        let lacking = |ids: &[&str]| -> HostUpdates {
+            let mut guidance: Vec<String> = vec![];
+            for g in updates.iter().filter(|u| ids.contains(&u.id.as_str())).flat_map(|u| u.guidance.clone()) {
+                if !guidance.contains(&g) {
+                    guidance.push(g);
+                }
+            }
+            HostUpdates { updates: ids.iter().map(|i| i.to_string()).collect(), guidance, packages: ids.len() * 3, ..Default::default() }
+        };
+        let hosts = if none {
+            vec![HostUpdates { host: "host-a".into(), ..Default::default() }, HostUpdates { host: "host-b".into(), ..Default::default() }]
+        } else {
+            vec![
+                HostUpdates { host: "host-a".into(), ..lacking(&["XSU-2026-1104", "XSU-2026-1101", "XSU-2026-1029", "XSU-2026-1022", "XSU-2026-1015"]) },
+                HostUpdates { host: "host-b".into(), ..lacking(&["XSU-2026-1104", "XSU-2026-1101", "XSU-2026-1029", "XSU-2026-1015"]) },
+            ]
+        };
+        let found = PoolUpdates { hash: "6f1c0e9a".into(), updates, hosts };
+        DemoConnection { data: Mutex::new(d), updates: Mutex::new(found) }
     }
 
     /// New VM from one of the user's templates: the calls a real server gets, with made-up answers.
@@ -3180,6 +3553,144 @@ impl Connection for DemoConnection {
         out.nics = nics;
         Ok(out)
     }
+    fn pool_updates(&self) -> Result<PoolUpdates, ApiError> {
+        said("GET /updates", &[]);
+        std::thread::sleep(Duration::from_millis(300));
+        Ok(self.updates.lock().unwrap().clone())
+    }
+    /// A few seconds, as if fetching from the channel.
+    fn sync_updates(&self) -> Result<String, ApiError> {
+        said("pool.sync_updates", &[json!("OpaqueRef:demo-pool"), json!(false)]);
+        demo_work(3000);
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|t| t.as_secs() as i64).unwrap_or(0);
+        self.data.lock().unwrap().last_update_sync = Some(now);
+        Ok(self.updates.lock().unwrap().hash.clone())
+    }
+    fn update_readiness(&self) -> Result<Vec<String>, ApiError> {
+        said("pool.check_update_readiness", &[json!("OpaqueRef:demo-pool"), json!(false)]);
+        std::thread::sleep(Duration::from_millis(600));
+        Ok(vec![])
+    }
+    /// A couple of seconds; then it lacks none, and must restart (or restart its toolstack) when
+    /// they asked for that.
+    fn apply_updates(&self, host: &str, hash: &str) -> Result<Vec<String>, ApiError> {
+        said("host.apply_updates", &[json!(host), json!(hash)]);
+        demo_work(2500);
+        let mut u = self.updates.lock().unwrap();
+        if hash != u.hash {
+            return Err(ApiError { code: "UPDATEINFO_HASH_MISMATCH".into(), details: vec![] });
+        }
+        let Some(h) = u.hosts.iter_mut().find(|h| h.host == host) else { return Err(ApiError { code: "HANDLE_INVALID".into(), details: vec!["host".into(), host.into()] }) };
+        let pending: Vec<String> = if h.guidance.iter().any(|g| g == "RebootHost") {
+            vec!["reboot_host".into()]
+        } else if h.guidance.iter().any(|g| g == "RestartToolstack") {
+            vec!["restart_toolstack".into()]
+        } else {
+            vec![]
+        };
+        *h = HostUpdates { host: host.into(), ..Default::default() };
+        let mut d = self.data.lock().unwrap();
+        if let Some(h) = d.hosts.iter_mut().find(|h| h.rref == host) {
+            (h.pending_guidance, h.updates_applied) = (pending, "yes".into());
+            h.last_update = Some(SystemTime::now().duration_since(UNIX_EPOCH).map(|t| t.as_secs() as i64).unwrap_or(0));
+        }
+        Ok(vec![])
+    }
+    fn pending_guidance(&self, host: &str) -> Result<Vec<String>, ApiError> {
+        said("host.get_pending_guidances", &[json!(host)]);
+        Ok(self.data.lock().unwrap().host(host).map(|h| h.pending_guidance.clone()).unwrap_or_default())
+    }
+    /// Those on its own storage (or, with no other server on, all of them).
+    fn vms_blocking_evacuation(&self, host: &str) -> Result<Vec<(String, String)>, ApiError> {
+        said("host.get_vms_which_prevent_evacuation", &[json!(host)]);
+        std::thread::sleep(Duration::from_millis(300));
+        let d = self.data.lock().unwrap();
+        let other = d.hosts.iter().any(|h| h.rref != host && h.enabled && h.live);
+        Ok(d.vms
+            .iter()
+            .filter(|v| v.host.as_deref() == Some(host) && matches!(v.power, PowerState::Running | PowerState::Paused))
+            .filter_map(|v| match (v.storage_host.as_deref() == Some(host), other) {
+                (true, _) => Some((v.rref.clone(), format!("VM_REQUIRES_SR {} {}", v.rref, v.disks.first().map_or("", |x| x.sr.as_str())))),
+                (false, false) => Some((v.rref.clone(), "NO_HOSTS_AVAILABLE".to_string())),
+                _ => None,
+            })
+            .collect())
+    }
+    fn empty_host(&self, host: &str, stop: bool) -> Result<(Vec<String>, usize), ApiError> {
+        if !stop {
+            let stuck = self.vms_blocking_evacuation(host)?;
+            if !stuck.is_empty() {
+                return Err(ApiError { code: "VMS_CANT_MOVE".into(), details: stuck.into_iter().map(|s| s.0).collect() });
+            }
+        }
+        said("host.evacuate", &[json!(host)]);
+        std::thread::sleep(Duration::from_millis(1800));
+        let mut d = self.data.lock().unwrap();
+        let other = d.hosts.iter().find(|h| h.rref != host && h.enabled && h.live).map(|h| h.rref.clone());
+        let (mut stopped, mut moved) = (vec![], 0);
+        for v in d.vms.iter_mut().filter(|v| v.host.as_deref() == Some(host) && matches!(v.power, PowerState::Running | PowerState::Paused)) {
+            if v.storage_host.as_deref() == Some(host) || other.is_none() {
+                (v.power, v.host) = (PowerState::Halted, None);
+                stopped.push(v.rref.clone());
+            } else {
+                v.host = other.clone();
+                moved += 1;
+            }
+        }
+        if let Some(h) = d.hosts.iter_mut().find(|h| h.rref == host) {
+            h.enabled = false;
+        }
+        recompute(&mut d);
+        Ok((stopped, moved))
+    }
+    /// A few seconds off, then back with a new start time.
+    fn restart_host_and_wait(&self, host: &str, _limit: Duration) -> Result<(), ApiError> {
+        said("host.reboot", &[json!(host)]);
+        let set = |live: bool| {
+            let mut d = self.data.lock().unwrap();
+            if let Some(h) = d.hosts.iter_mut().find(|h| h.rref == host) {
+                h.live = live;
+                if live {
+                    h.boot_time = Some(SystemTime::now().duration_since(UNIX_EPOCH).map(|t| t.as_secs() as i64).unwrap_or(0));
+                    h.pending_guidance.clear();
+                }
+            }
+        };
+        let began = Instant::now();
+        note("restarting: it doesn't answer for a few minutes, as expected; waiting for it to come back…");
+        std::thread::sleep(Duration::from_millis(1500));
+        set(false);
+        note(format!("went down after {}; now waiting for it to start up again (its console shows how that goes)", took_text(began.elapsed())));
+        std::thread::sleep(Duration::from_millis(6000));
+        set(true);
+        note(format!("back after {}", took_text(began.elapsed())));
+        Ok(())
+    }
+    fn restart_toolstack(&self, host: &str) -> Result<(), ApiError> {
+        said("host.restart_agent", &[json!(host)]);
+        std::thread::sleep(Duration::from_millis(2000));
+        if let Some(h) = self.data.lock().unwrap().hosts.iter_mut().find(|h| h.rref == host) {
+            h.pending_guidance.retain(|g| g != "restart_toolstack");
+        }
+        Ok(())
+    }
+    fn enable_host(&self, host: &str) -> Result<(), ApiError> {
+        said("host.enable", &[json!(host)]);
+        if let Some(h) = self.data.lock().unwrap().hosts.iter_mut().find(|h| h.rref == host) {
+            h.enabled = true;
+        }
+        Ok(())
+    }
+    fn start_vm_on(&self, vm: &str, host: &str) -> Result<(), ApiError> {
+        said("VM.start_on", &[json!(vm), json!(host)]);
+        std::thread::sleep(Duration::from_millis(800));
+        let mut d = self.data.lock().unwrap();
+        if let Some(v) = d.vms.iter_mut().find(|v| v.rref == vm) {
+            (v.power, v.host) = (PowerState::Running, Some(host.to_string()));
+        }
+        recompute(&mut d);
+        Ok(())
+    }
     /// About a second; a VM has to be off.
     fn make_template(&self, source: &str, name: &str, description: &str) -> Result<String, ApiError> {
         said("VM.clone", &[json!(source), json!(name)]);
@@ -3256,6 +3767,29 @@ impl Connection for DemoConnection {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn demo_update_keeps_movable_vms_running() {
+        let c = DemoConnection::new();
+        let power = |c: &DemoConnection, vm: &str| c.data.lock().unwrap().vm(vm).map(|v| (v.power, v.host.clone()));
+        let (stopped, moved) = c.empty_host("host-a", true).unwrap();
+        assert!(stopped.is_empty() && moved == 2, "{:?} {}", stopped, moved);
+        c.restart_host_and_wait("host-a", Duration::from_secs(60)).unwrap();
+        c.enable_host("host-a").unwrap();
+        let (stopped, _) = c.empty_host("host-b", true).unwrap();
+        assert_eq!(stopped, vec!["vm-mail".to_string()]);
+        assert_eq!(power(&c, "vm-web"), Some((PowerState::Running, Some("host-a".into()))));
+    }
+
+
+    #[test]
+    fn session_ids_hidden() {
+        let e = "https://192.168.1.2/updates?session_id=OpaqueRef:35b80484-8a58-93ff-2875-f33182c20aa3: Network Error: timed out";
+        assert_eq!(hide_session(e), "https://192.168.1.2/updates?session_id=…: Network Error: timed out");
+        assert_eq!(hide_session("/rrd_updates?session_id=OpaqueRef:ab-cd&start=5 x"), "/rrd_updates?session_id=…&start=5 x");
+        assert_eq!(hide_session("nothing here"), "nothing here");
+    }
+
     use super::*;
 
 

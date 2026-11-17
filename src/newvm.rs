@@ -750,7 +750,7 @@ impl NewVmDialog {
                 ui.add(egui::Label::new(egui::RichText::new(e.as_str()).color(pal.red)).wrap());
             }
             if let (Some(tr), true) = (&self.trace, busy || made || refused) {
-                transcript(ui, pal, tr, &mut self.copied, busy);
+                transcript(ui, pal, tr, &mut self.copied, busy, None);
             }
             dialog_buttons(ui, |ui| {
                 if made {
@@ -1219,8 +1219,8 @@ fn note(ui: &mut Ui, pal: &Pal, text: &str) {
 }
 
 /// Each call made to the server and its answer, as in a terminal (the latest at the bottom),
-/// with Copy.
-pub(crate) fn transcript(ui: &mut Ui, pal: &Pal, tr: &Trace, copied: &mut Option<Instant>, running: bool) {
+/// with Copy; `height` tall always when given, else as tall as the window leaves room for.
+pub(crate) fn transcript(ui: &mut Ui, pal: &Pal, tr: &Trace, copied: &mut Option<Instant>, running: bool, height: Option<f32>) {
     let lines = tr.lines();
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("What the server said").size(12.0).color(pal.ink_soft));
@@ -1241,7 +1241,11 @@ pub(crate) fn transcript(ui: &mut Ui, pal: &Pal, tr: &Trace, copied: &mut Option
     let room = (ui.ctx().screen_rect().height() - ui.min_rect().height() - 160.0).clamp(90.0, 300.0);
     egui::Frame::none().fill(Color32::from_rgb(13, 17, 23)).rounding(Rounding::same(6.0)).inner_margin(egui::Margin::same(10.0)).show(ui, |ui| {
         ui.set_width(ui.available_width());
-        egui::ScrollArea::vertical().max_height(room).auto_shrink([false, true]).stick_to_bottom(true).show(ui, |ui| {
+        let area = match height {
+            Some(h) => egui::ScrollArea::vertical().min_scrolled_height(h).max_height(h).auto_shrink([false, false]),
+            None => egui::ScrollArea::vertical().max_height(room).auto_shrink([false, true]),
+        };
+        area.stick_to_bottom(true).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 2.0;
             let line = |ui: &mut Ui, text: String, col: Color32| {
                 ui.add(egui::Label::new(egui::RichText::new(text).monospace().size(11.5).color(col)).wrap());

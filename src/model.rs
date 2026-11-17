@@ -489,6 +489,14 @@ pub struct HostInfo {
     pub edition: String,
     pub license_name: String,
     pub license_expiry: Option<i64>,
+    /// Whether it has every update its pool last fetched from its update channel: "yes", "no" or
+    /// "unknown" (latest_synced_updates_applied); empty on servers without update channels.
+    pub updates_applied: String,
+    /// What it must still do for updates installed on it to take effect (pending_guidances and
+    /// the recommended ones, like "reboot_host", "restart_toolstack").
+    pub pending_guidance: Vec<String>,
+    /// When updates were last installed on it.
+    pub last_update: Option<i64>,
     /// Its network cards: the physical ones and bonds (a bond's members and VLANs are in those).
     pub nics: Vec<HostNic>,
 }
@@ -542,7 +550,11 @@ impl HostInfo {
 /// How something stands: fine, worth a look, or wrong.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Standing {
+    /// Not known (grey).
+    Unknown,
     Good,
+    /// Something waiting, not urgent (yellow: the palette's orange).
+    Pending,
     Watch,
     Bad,
 }
@@ -632,6 +644,184 @@ pub struct PoolData {
     /// The templates people made (from their VMs or snapshots), not the built-in ones; they have
     /// disks of their own, copied into each VM made from them.
     pub user_templates: Vec<VmInfo>,
+    /// Where its updates come from: its update channel's name ("Normal", "Early access"), or None
+    /// when it has none (XCP-ng, older versions, one never set up); and whether that's an offline
+    /// bundle (uploaded, not fetched).
+    pub update_channel: Option<String>,
+    pub update_bundle: bool,
+    /// When its updates were last fetched from the channel.
+    pub last_update_sync: Option<i64>,
+}
+
+/// An update a pool's update channel has.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct UpdateInfo {
+    pub id: String,
+    pub summary: String,
+    pub description: String,
+    /// Its type as the channel names it ("SecurityFix", "BugFix", "Improvement"… on XenServer;
+    /// "security", "bugfix", "enhancement" elsewhere), and "High" or "None".
+    pub kind: String,
+    pub severity: String,
+    pub issued: Option<i64>,
+    pub url: String,
+    /// What a server must do for it to take effect ("RebootHost", "RestartToolstack",
+    /// "EvacuateHost"…): the mandatory and the recommended.
+    pub guidance: Vec<String>,
+}
+
+impl UpdateInfo {
+    pub fn is_security(&self) -> bool {
+        self.kind.to_lowercase().contains("security")
+    }
+
+    /// Its type in words: "Security", "Bug fix", "Improvement", "New feature", or as it's named.
+    pub fn kind_words(&self) -> String {
+        let k = self.kind.to_lowercase();
+        if k.contains("security") {
+            "Security".into()
+        } else if k.contains("bug") {
+            "Bug fix".into()
+        } else if k.contains("enhancement") || k.contains("improvement") {
+            "Improvement".into()
+        } else if k.contains("feature") {
+            "New feature".into()
+        } else if k.is_empty() {
+            "Update".into()
+        } else {
+            self.kind.clone()
+        }
+    }
+}
+
+/// What a server lacks of its pool's updates.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct HostUpdates {
+    pub host: String,
+    /// The updates' ids.
+    pub updates: Vec<String>,
+    /// What it must do once they're installed (as in `UpdateInfo::guidance`).
+    pub guidance: Vec<String>,
+    /// How many packages change, and how many livepatches can be applied without a restart.
+    pub packages: usize,
+    pub livepatches: usize,
+}
+
+impl HostUpdates {
+    /// It must restart for them to take effect.
+    pub fn needs_restart(&self) -> bool {
+        self.guidance.iter().any(|g| g == "RebootHost" || g == "EvacuateHost")
+    }
+}
+
+/// The updates a pool's servers lack, as last fetched from its channel (its /updates answer), and
+/// the hash to install them by.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PoolUpdates {
+    pub hash: String,
+    pub updates: Vec<UpdateInfo>,
+    pub hosts: Vec<HostUpdates>,
+}
+
+impl PoolUpdates {
+    /// The updates some server lacks, security first, then the newest.
+    pub fn wanted(&self) -> Vec<&UpdateInfo> {
+        let mut out: Vec<&UpdateInfo> = self.updates.iter().filter(|u| self.hosts.iter().any(|h| h.updates.contains(&u.id))).collect();
+        out.sort_by_key(|u| (!u.is_security(), std::cmp::Reverse(u.issued.unwrap_or(0)), u.id.clone()));
+        out
+    }
+}
+
+/// A pool's /updates answer: {"hosts": [{"ref", "guidance": {"mandatory": [..], "recommended":
+/// [..], …}, "RPMS": [..], "updates": [ids], "livepatches": [..]}], "updates": [{"id", "summary",
+/// "description", "type", "severity", "issued", "URL", "guidance"…}], "hash"}; older servers'
+/// "recommended-guidance" and "absolute-guidance" too.
+pub fn parse_pool_updates(text: &str) -> Result<PoolUpdates, String> {
+    use serde_json::Value;
+    let v: Value = serde_json::from_str(text).map_err(|e| format!("its answer isn't JSON ({})", e))?;
+    let st = |o: &Value, k: &str| -> String {
+        match o.get(k) {
+            Some(Value::String(x)) => x.clone(),
+            Some(Value::Null) | None => String::new(),
+            Some(x) => x.to_string(),
+        }
+    };
+    let strings = |o: Option<&Value>| -> Vec<String> {
+        match o {
+            Some(Value::Array(a)) => a.iter().map(|x| x.as_str().map(String::from).unwrap_or_else(|| x.to_string())).collect(),
+            Some(Value::String(x)) if !x.is_empty() => vec![x.clone()],
+            _ => vec![],
+        }
+    };
+    let guidance = |o: &Value| -> Vec<String> {
+        let mut g: Vec<String> = vec![];
+        if let Some(Value::Object(m)) = o.get("guidance") {
+            for k in ["mandatory", "recommended"] {
+                g.extend(strings(m.get(k)));
+            }
+        }
+        for k in ["absolute-guidance", "recommended-guidance"] {
+            g.extend(strings(o.get(k)));
+        }
+        g.dedup();
+        let mut seen = vec![];
+        g.retain(|x| if seen.contains(x) { false } else { seen.push(x.clone()); true });
+        g
+    };
+    let updates = v
+        .get("updates")
+        .and_then(|u| u.as_array())
+        .map(|a| {
+            a.iter()
+                .map(|u| UpdateInfo {
+                    id: st(u, "id"),
+                    summary: st(u, "summary"),
+                    description: st(u, "description"),
+                    kind: st(u, "type"),
+                    severity: st(u, "severity"),
+                    issued: parse_xen_time(&st(u, "issued")).or_else(|| st(u, "issued").split_whitespace().next().and_then(|d| parse_xen_time(&format!("{}T00:00:00Z", d)))),
+                    // (one without a page says "None": then its security bulletin's, when it names one)
+                    url: Some(st(u, "URL").trim().to_string())
+                        .filter(|x| x.starts_with("https://") || x.starts_with("http://"))
+                        .or_else(|| bulletin(&format!("{} {}", st(u, "description"), st(u, "summary"))))
+                        .unwrap_or_default(),
+                    guidance: guidance(u),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let hosts = v
+        .get("hosts")
+        .and_then(|h| h.as_array())
+        .map(|a| {
+            a.iter()
+                .map(|h| HostUpdates {
+                    host: st(h, "ref"),
+                    updates: strings(h.get("updates")),
+                    guidance: guidance(h),
+                    packages: h.get("RPMS").and_then(|r| r.as_array()).map_or(0, |r| r.len()),
+                    livepatches: h.get("livepatches").and_then(|r| r.as_array()).map_or(0, |r| r.len()),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(PoolUpdates { hash: st(&v, "hash"), updates, hosts })
+}
+
+/// The page of the first Citrix security bulletin `text` names ("… Security Bulletin CTX697170").
+fn bulletin(text: &str) -> Option<String> {
+    let at = text.find("CTX")?;
+    let digits: String = text[at + 3..].chars().take_while(|c| c.is_ascii_digit()).collect();
+    (digits.len() >= 4).then(|| format!("https://support.citrix.com/support-home/kbsearch/article?articleNumber=CTX{}", digits))
+}
+
+/// How long ago, in days, as people say it: "today", "yesterday", "3 days ago".
+pub fn days_ago(t: i64, now: i64) -> String {
+    match (now - t).max(0) / 86_400 {
+        0 => "today".into(),
+        1 => "yesterday".into(),
+        n => format!("{} days ago", n),
+    }
 }
 
 /// A built-in VM template: what it sets up and recommends.
@@ -808,6 +998,41 @@ impl PoolData {
             }
             Some(t) => (format!("{}, until {}", name, fmt_date(t)), fine),
             None => (name, fine),
+        })
+    }
+
+    /// Its updates in words and how they stand: security updates waiting is wrong (red); other
+    /// updates waiting, or servers to restart for installed ones, are pending (yellow); only every
+    /// server with every update is fine (green); never fetched, or not set up, isn't known. `found` is its /updates answer when read. None when
+    /// it has no update channel to speak of (XCP-ng, older versions).
+    pub fn update_status(&self, found: Option<&PoolUpdates>, now: i64) -> Option<(String, Standing)> {
+        if self.update_channel.is_none() {
+            // XenServer 8 and later have channels: one never set up says so (XCP-ng updates otherwise)
+            let channels = self.hosts.iter().any(|h| !h.updates_applied.is_empty() && !h.brand.to_lowercase().contains("xcp"));
+            return channels.then(|| ("No update channel set up".to_string(), Standing::Unknown));
+        }
+        let restart: Vec<&str> = self.hosts.iter().filter(|h| h.pending_guidance.iter().any(|g| g.starts_with("reboot_host"))).map(|h| h.name.as_str()).collect();
+        if !restart.is_empty() {
+            let who = if restart.len() == 1 { restart[0].to_string() } else { format!("{} servers", restart.len()) };
+            return Some((format!("Installed; {} must restart", who), Standing::Pending));
+        }
+        let Some(t) = self.last_update_sync else { return Some(("Not checked yet".to_string(), Standing::Unknown)) };
+        let checked = format!("checked {}", days_ago(t, now));
+        let plural = |n: usize| if n == 1 { "" } else { "s" };
+        Some(match found {
+            Some(p) => {
+                let wanted = p.wanted();
+                let security = wanted.iter().filter(|u| u.is_security()).count();
+                match (wanted.len(), security) {
+                    (0, _) if p.hosts.iter().all(|h| h.packages == 0) => (format!("Up to date  ·  {}", checked), Standing::Good),
+                    (0, _) => (format!("Updates waiting  ·  {}", checked), Standing::Pending),
+                    (n, 0) => (format!("{} update{}, none for security  ·  {}", n, plural(n), checked), Standing::Pending),
+                    (n, k) => (format!("{} security update{}, {} in all  ·  {}", k, plural(k), n, checked), Standing::Bad),
+                }
+            }
+            // (till its list is read: what its servers say)
+            None if self.hosts.iter().any(|h| h.updates_applied == "no") => (format!("Updates waiting  ·  {}", checked), Standing::Pending),
+            None => (format!("Up to date  ·  {}", checked), Standing::Good),
         })
     }
 
@@ -1474,6 +1699,54 @@ mod iso_tests {
         assert_eq!(p.times, vec![105, 110]);
         assert!((p.cpu[0] - 0.05).abs() < 1e-9 && (p.cpu[1] - 0.4).abs() < 1e-9);
         assert_eq!(rrd_end(quoted), Some(110));
+    }
+
+    #[test]
+    fn pool_updates_read() {
+        let json = r#"{"hosts":[{"ref":"OpaqueRef:a","guidance":{"mandatory":["RebootHost"],"recommended":["RestartToolstack"],"full":[],"livepatch":[]},
+            "RPMS":["xen-4.17.x86_64.rpm","kernel.rpm"],"updates":["XS-1","XS-2"],"livepatches":[]},
+            {"ref":"OpaqueRef:b","guidance":{"mandatory":[],"recommended":[],"full":[],"livepatch":[]},"RPMS":[],"updates":[],"livepatches":[]}],
+            "updates":[{"id":"XS-1","summary":"Bug fixes","description":"d","special-info":"","URL":"https://x","type":"bugfix","issued":"2026-11-02 00:00:00","severity":"None","livepatches":[],"guidance":{"mandatory":["RestartToolstack"]},"title":"t"},
+            {"id":"XS-2","summary":"Xen fix","type":"SecurityFix","issued":"20261110T00:00:00Z","severity":"High","URL":"None","guidance":{"mandatory":["RebootHost"]},
+             "description":"For more information, see the related Security Bulletin CTX697170."},
+            {"id":"XS-3","summary":"Other","type":"BugFix","URL":"None","description":"Nothing named"},
+            {"id":"XS-0","summary":"Old","type":"security"}],
+            "hash":"abc"}"#;
+        let p = parse_pool_updates(json).unwrap();
+        assert_eq!(p.hash, "abc");
+        assert_eq!(p.hosts[0].updates, vec!["XS-1", "XS-2"]);
+        assert_eq!(p.hosts[0].guidance, vec!["RebootHost", "RestartToolstack"]);
+        assert!(p.hosts[0].needs_restart() && !p.hosts[1].needs_restart());
+        assert_eq!(p.hosts[0].packages, 2);
+        // the ones some server lacks: security first (XS-0 is lacked by none)
+        assert_eq!(p.wanted().iter().map(|u| u.id.as_str()).collect::<Vec<_>>(), vec!["XS-2", "XS-1"]);
+        assert_eq!(p.updates[0].issued, parse_xen_time("20261102T00:00:00Z"));
+        assert!(parse_pool_updates("<html>").is_err());
+        // its page; else its security bulletin's; else none ("None")
+        assert_eq!(p.updates[0].url, "https://x");
+        assert_eq!(p.updates[1].url, "https://support.citrix.com/support-home/kbsearch/article?articleNumber=CTX697170");
+        assert_eq!(p.updates[2].url, "");
+        // XenServer's own names for the types
+        assert!(p.updates[1].is_security() && !p.updates[0].is_security());
+        assert_eq!((p.updates[1].kind_words(), p.updates[0].kind_words()), ("Security".to_string(), "Bug fix".to_string()));
+
+        // how a pool stands
+        let now = 1_800_000_000;
+        let host = |applied: &str| HostInfo { updates_applied: applied.into(), ..Default::default() };
+        let mut d = PoolData { hosts: vec![host("no")], update_channel: Some("Normal".into()), last_update_sync: Some(now - 2 * 86_400), ..Default::default() };
+        assert_eq!(d.update_status(Some(&p), now), Some(("1 security update, 2 in all  ·  checked 2 days ago".to_string(), Standing::Bad)));
+        assert_eq!(d.update_status(None, now).unwrap().1, Standing::Pending);
+        // none for security: pending, not wrong
+        let fixes = PoolUpdates { updates: p.updates.iter().filter(|u| !u.is_security()).cloned().collect(), ..p.clone() };
+        assert_eq!(d.update_status(Some(&fixes), now).unwrap().1, Standing::Pending);
+        let done = PoolUpdates { hosts: vec![HostUpdates::default()], ..p.clone() };
+        assert_eq!(d.update_status(Some(&done), now), Some(("Up to date  ·  checked 2 days ago".to_string(), Standing::Good)));
+        d.hosts[0].pending_guidance = vec!["reboot_host".into()];
+        assert_eq!(d.update_status(Some(&done), now).unwrap().1, Standing::Pending);
+        d.update_channel = None;
+        assert_eq!(d.update_status(None, now).unwrap().1, Standing::Unknown);
+        d.hosts[0].brand = "XCP-ng".into(); // updates otherwise
+        assert_eq!(d.update_status(None, now), None);
     }
 
     #[test]

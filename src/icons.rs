@@ -253,6 +253,7 @@ pub fn tool_color(op: &str, pal: &Pal) -> Color32 {
         "power-paused" => pal.orange,
         "newvm" => pal.blue,
         "iso" => pal.orange,
+        "updates" => Color32::from_rgb(150, 110, 230),
         _ => pal.icon,
     }
 }
@@ -293,6 +294,13 @@ pub fn paint_tool_glyph(p: &Painter, rect: Rect, op: &str, enabled: bool, pal: &
             p.circle_stroke(c, 7.2, Stroke::new(1.8, col));
             p.circle_stroke(c, 2.0, Stroke::new(1.5, col));
             arc(p, c, 4.7, 200.0, 265.0, Stroke::new(1.3, col));
+        }
+        "updates" => {
+            // a box with an arrow coming down into it
+            let s = Stroke::new(1.8, col);
+            line(p, o, &[(11.0, 3.0), (11.0, 12.5)], s);
+            line(p, o, &[(7.2, 8.8), (11.0, 12.6), (14.8, 8.8)], s);
+            line(p, o, &[(5.5, 11.0), (4.0, 11.0), (4.0, 18.5), (18.0, 18.5), (18.0, 11.0), (16.5, 11.0)], s);
         }
         "newvm" => {
             // a screen on its stand, a plus on it

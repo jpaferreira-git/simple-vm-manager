@@ -65,11 +65,16 @@ struct Fact {
     dot: Option<Color32>,
     copy: bool,
     faint: bool,
+    /// A click on it does something (it lights up under the mouse); and what's said under the mouse.
+    link: bool,
+    tip: String,
+    /// A small button after its value (its label), and whether it can be clicked now.
+    button: Option<(&'static str, bool)>,
 }
 
 impl Fact {
     fn new(label: &'static str, value: impl Into<String>) -> Fact {
-        Fact { label, value: value.into(), dot: None, copy: false, faint: false }
+        Fact { label, value: value.into(), dot: None, copy: false, faint: false, link: false, tip: String::new(), button: None }
     }
 }
 
@@ -127,7 +132,7 @@ impl App {
     /// How a server is doing: its dot's colour, and in words.
     fn host_state(&self, h: &HostInfo) -> (Color32, String) {
         let pal = &self.pal;
-        if self.host_rebooting.contains(&h.rref) {
+        if self.host_rebooting.contains_key(&h.rref) {
             (pal.accent, "Restarting…".into())
         } else if self.host_busy.contains(&h.rref) {
             (pal.red, "Shutting down…".into())
@@ -198,7 +203,11 @@ impl App {
         let (dot, state) = this.host_state(h);
         let here: Vec<&VmInfo> = d.vms.iter().filter(|v| v.home() == Some(h.rref.as_str())).collect();
         let running = here.iter().filter(|v| v.power == PowerState::Running).count();
-        let mut left = vec![Fact { dot: Some(dot), ..Fact::new("State", state) }];
+        // on, but not taking VMs (as left by a restart, or maintenance): a button to take them again
+        let enabling = this.host_enabling.contains(&h.rref);
+        let disabled = h.is_up() && !h.enabled && !this.host_busy.contains(&h.rref) && !this.host_rebooting.contains_key(&h.rref);
+        let button = disabled.then(|| if enabling { ("Asking…", false) } else { ("Take VMs again", true) });
+        let mut left = vec![Fact { dot: Some(dot), button, ..Fact::new("State", state) }];
         if let (true, Some(t)) = (h.is_up(), h.boot_time) {
             left.push(Fact::new("Up for", fmt_duration(now - t)));
         }
@@ -248,7 +257,9 @@ impl App {
         let up = h.is_up();
         egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
             page(ui, |ui, w| {
-                facts(ui, &pal, w, &left, &right);
+                if facts(ui, &pal, w, &left, &right) {
+                    out.push(Intent::EnableHost(sid, h.rref.clone()));
+                }
                 ui.add_space(24.0);
                 section(ui, &pal, "Load  ·  the last ten minutes");
                 load_tiles(ui, &pal, w, cpus, load);
@@ -320,11 +331,7 @@ impl App {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|t| t.as_secs() as i64).unwrap_or(0);
         let running = d.vms.iter().filter(|v| v.power == PowerState::Running).count();
         let versions = d.versions();
-        let tone = |st: Standing| match st {
-            Standing::Good => pal.green,
-            Standing::Watch => pal.orange,
-            Standing::Bad => pal.red,
-        };
+        let tone = |st: Standing| crate::pool_update::tone(&pal, st);
         let mut line = vec![match versions.len() {
             0 => Fact { faint: true, ..Fact::new("Version", "Unknown") },
             1 => Fact::new("Version", versions[0].clone()),
@@ -332,6 +339,13 @@ impl App {
         }];
         if let Some((text, st)) = d.license(now) {
             line.push(Fact { dot: Some(tone(st)), ..Fact::new("License", text) });
+        }
+        // its updates (a click opens them)
+        // (when they were checked: under the mouse, and in the dialog)
+        if let Some((text, st)) = this.pool_update_status(s.id) {
+            let (short, when) = text.split_once("  ·  ").map_or((text.clone(), String::new()), |(a, b)| (a.to_string(), b.to_string()));
+            let tip = if when.is_empty() { "Click to see them".to_string() } else { format!("{}{}; click to see them", when[..1].to_uppercase(), &when[1..]) };
+            line.push(Fact { dot: Some(tone(st)), link: true, tip, ..Fact::new("Updates", short) });
         }
 
         // its load: its servers' added up (those read so far)
@@ -384,7 +398,9 @@ impl App {
         let sid = s.id;
         egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
             page(ui, |ui, w| {
-                strip(ui, &pal, w, &line);
+                if strip(ui, &pal, w, &line).map_or(false, |i| line[i].link) {
+                    out.push(Intent::PoolUpdates(Some(sid)));
+                }
                 ui.add_space(22.0);
                 section(ui, &pal, "Load  ·  the last ten minutes");
                 load_tiles(ui, &pal, w, cpus, load);
@@ -461,14 +477,16 @@ fn grid(ui: &mut Ui, w: f32, out: &mut Vec<Intent>, cards: [Card; 4], keys: [&st
 }
 
 /// The facts at the top in two columns (one under the other in a narrow page).
-fn facts(ui: &mut Ui, pal: &Pal, w: f32, left: &[Fact], right: &[Fact]) {
-    let column = |ui: &mut Ui, cw: f32, list: &[Fact]| {
+/// (Whether a fact's button was clicked.)
+fn facts(ui: &mut Ui, pal: &Pal, w: f32, left: &[Fact], right: &[Fact]) -> bool {
+    let mut clicked = false;
+    let mut column = |ui: &mut Ui, cw: f32, list: &[Fact]| {
         ui.vertical(|ui| {
             ui.set_width(cw);
             ui.spacing_mut().item_spacing.y = 0.0;
             let label_w = list.iter().map(|f| ui.painter().layout_no_wrap(f.label.to_string(), FontId::proportional(13.0), pal.ink).size().x).fold(0.0, f32::max) + 24.0;
             for f in list {
-                fact(ui, pal, cw, label_w, f);
+                clicked |= fact(ui, pal, cw, label_w, f).1;
             }
         });
     };
@@ -486,31 +504,42 @@ fn facts(ui: &mut Ui, pal: &Pal, w: f32, left: &[Fact], right: &[Fact]) {
             ui.spacing_mut().item_spacing.y = 0.0;
             let label_w = all.iter().map(|f| ui.painter().layout_no_wrap(f.label.to_string(), FontId::proportional(13.0), pal.ink).size().x).fold(0.0, f32::max) + 24.0;
             for f in all {
-                fact(ui, pal, w, label_w, f);
+                clicked |= fact(ui, pal, w, label_w, f).1;
             }
         });
     }
+    clicked
 }
 
 /// Facts on one line, one after the other (on more when they don't fit), each its label then its
 /// value; a long one cut short, all of it under the mouse.
-fn strip(ui: &mut Ui, pal: &Pal, w: f32, list: &[Fact]) {
-    let gap = 36.0;
+fn strip(ui: &mut Ui, pal: &Pal, w: f32, list: &[Fact]) -> Option<usize> {
+    let gap = 32.0;
     let label = |f: &Fact| ui.painter().layout_no_wrap(f.label.to_string(), FontId::proportional(13.0), pal.ink).size().x;
     let value = |f: &Fact| ui.painter().layout_no_wrap(f.value.clone(), FontId::proportional(14.0), pal.ink).size().x + if f.dot.is_some() { 14.0 } else { 0.0 };
     let wants: Vec<(f32, f32)> = list.iter().map(|f| (label(f) + 12.0, value(f))).collect();
+    let mut clicked = None;
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing = vec2(gap, 0.0);
-        for (f, (lw, vw)) in list.iter().zip(wants) {
-            fact(ui, pal, (lw + vw).min(w), lw, f);
+        for (i, (f, (lw, vw))) in list.iter().zip(wants).enumerate() {
+            if fact(ui, pal, (lw + vw).min(w), lw, f).0.clicked() {
+                clicked = Some(i);
+            }
         }
     });
+    clicked
 }
 
-/// A fact: its label, then its value (cut short to fit, all of it under the mouse).
-fn fact(ui: &mut Ui, pal: &Pal, w: f32, label_w: f32, f: &Fact) {
-    let (r, _) = ui.allocate_exact_size(vec2(w, 30.0), Sense::hover());
+/// A fact: its label, then its value (cut short to fit, all of it under the mouse), and its
+/// button. Its response, and whether its button was clicked.
+fn fact(ui: &mut Ui, pal: &Pal, w: f32, label_w: f32, f: &Fact) -> (egui::Response, bool) {
+    let (r, resp) = ui.allocate_exact_size(vec2(w, 30.0), if f.link { Sense::click() } else { Sense::hover() });
+    let resp = if f.link { resp.on_hover_cursor(egui::CursorIcon::PointingHand) } else { resp };
+    let resp = if f.tip.is_empty() { resp } else { resp.on_hover_text(&f.tip) };
     let p = ui.painter().clone();
+    if f.link && resp.hovered() {
+        p.rect_filled(r.expand2(vec2(8.0, -1.0)), Rounding::same(6.0), pal.hover);
+    }
     p.text(pos2(r.min.x, r.center().y), Align2::LEFT_CENTER, f.label, FontId::proportional(13.0), pal.ink_faint);
     let mut x = r.min.x + label_w;
     if let Some(c) = f.dot {
@@ -519,7 +548,8 @@ fn fact(ui: &mut Ui, pal: &Pal, w: f32, label_w: f32, f: &Fact) {
     }
     let copy = f.copy && !f.value.is_empty();
     let (text, col) = if f.value.is_empty() { ("None", pal.ink_faint) } else { (f.value.as_str(), if f.faint { pal.ink_faint } else { pal.ink }) };
-    let (g, cut) = fit(&p, text, FontId::proportional(14.0), col, r.max.x - x - if copy { 30.0 } else { 0.0 });
+    let button_w = f.button.map_or(0.0, |(label, _)| p.layout_no_wrap(label.to_string(), FontId::proportional(12.5), pal.ink).size().x + 34.0);
+    let (g, cut) = fit(&p, text, FontId::proportional(14.0), col, r.max.x - x - if copy { 30.0 } else { 0.0 } - button_w);
     let gr = Rect::from_min_size(pos2(x, r.center().y - g.size().y / 2.0), g.size());
     p.galley(gr.min, g, col);
     if cut {
@@ -536,6 +566,18 @@ fn fact(ui: &mut Ui, pal: &Pal, w: f32, label_w: f32, f: &Fact) {
             ui.ctx().copy_text(f.value.clone());
         }
     }
+    // its button: an outlined pill, the accent's text
+    let mut pressed = false;
+    if let Some((label, enabled)) = f.button {
+        let bw = button_w - 14.0;
+        let b = Rect::from_min_size(pos2(gr.max.x + 14.0, r.center().y - 12.0), vec2(bw, 24.0));
+        let hit = ui.interact(b, ui.id().with(("fact-button", f.label)), if enabled { Sense::click() } else { Sense::hover() });
+        let hit = if enabled { hit.on_hover_cursor(egui::CursorIcon::PointingHand) } else { hit };
+        p.rect(b, Rounding::same(12.0), if enabled && hit.hovered() { pal.hover } else { Color32::TRANSPARENT }, Stroke::new(1.0_f32, if enabled { pal.accent.gamma_multiply(0.7) } else { pal.border }));
+        p.text(b.center(), Align2::CENTER_CENTER, label, FontId::proportional(12.5), if enabled { pal.accent } else { pal.ink_faint });
+        pressed = enabled && hit.clicked();
+    }
+    (resp, pressed)
 }
 
 /// Servers' loads as one: their CPUs weighed by how many each has (the weight given with each),

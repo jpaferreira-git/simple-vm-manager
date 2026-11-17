@@ -17,6 +17,7 @@ affiliated with or endorsed by the makers of XenServer or XCP-ng.
 | ![A VM's snapshots](docs/screenshot-dark-snapshots.png) | ![Taking a snapshot](docs/screenshot-dark-snapshot-take.png) |
 | ![Your templates](docs/screenshot-dark-templates.png) | ![A new VM from a template](docs/screenshot-dark-new-vm-template.png) |
 | ![A server's Overview](docs/screenshot-dark-host.png) | ![A pool's Overview](docs/screenshot-dark-pool.png) |
+| ![A pool's updates](docs/screenshot-dark-updates.png) | ![Updating a pool](docs/screenshot-dark-updating.png) |
 
 ## Features
 
@@ -60,6 +61,21 @@ affiliated with or endorsed by the makers of XenServer or XCP-ng.
   storage. When something is wrong (a server off or not answering, storage not mounted, the license
   running out, servers on different versions) its Details tab gets an orange dot and says what,
   under *Needs attention*.
+- **Pool updates** — *Updates* on the toolbar, or the Updates item on a pool's Overview: green
+  only when every server has every update, yellow when updates are waiting (none for security) or
+  a server must still restart for ones installed, red when security updates are waiting (the
+  toolbar's dot says the same). For XenServer 8 and later, from the pool's update channel: what's
+  waiting (security first, each with its kind, date and what it asks of the server; a click opens
+  its page), each server's share, and *Check now* to fetch the latest from the channel. *Install*
+  goes server by server, the coordinator first: the pool checked for readiness, the server's VMs
+  moved to the others, the updates installed, the server restarted when they need it (or only its
+  toolstack) and back before the next. VMs that can't move (on a server's own storage, no room
+  elsewhere…) are never shut down unless you choose so: the update then won't start, every server
+  checked first, saying which VMs and why; or, if you choose, they're shut down for their server's
+  restart and started again after. Each step shows as it goes (how long it's been), with every
+  call to the servers and their answers below it, as in a terminal (with Copy); a server's restart
+  is waited for quietly (going down, then starting up again), and the end says plainly anything
+  left to do by hand.
 - **Details** — a VM's tabs are Overview, Snapshots, Console, Logs and Details: the less used
   things (tags, guest tools, virtualization, high availability, every disk and card with its
   position and MAC), click a value to copy it. Pools and servers have Overview, Storage,
@@ -136,7 +152,8 @@ affiliated with or endorsed by the makers of XenServer or XCP-ng.
   shut down (their disks on that server's own storage), and warns when it's the pool's coordinator.
   Then it goes the way the pool expects: no new VMs sent to it, those VMs shut down, the rest moved,
   then the server; if a step fails it takes VMs again. A restarting server turns green and ringed
-  in the tree, and Activities says when it's back.
+  in the tree, and Activities says when it's back. A server that's on but not taking VMs (as one
+  left disabled) says so on its Overview, with *Take VMs again*, and in its pool's Details.
 - **VM power actions** — Start, Shut Down, Reboot, Suspend, Resume, Force Shut Down, Force Reboot,
   enabled only when the server allows them, with confirmations for the disruptive ones. They're
   all behind one button at the right end of a VM's tabs: the power symbol in the colour of the

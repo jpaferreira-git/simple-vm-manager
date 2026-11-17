@@ -5,6 +5,7 @@ use crate::conn::*;
 use crate::console::{self, ConsoleView};
 use crate::isolib::{mount_trouble, IsoAction, IsoDialog, MountTrouble};
 use crate::newvm::{NewVmAction, NewVmDialog};
+use crate::pool_update::{PoolUpdateAction, PoolUpdateDialog, PoolView, UpdateRun};
 use crate::upload::{UploadAction, UploadDialog};
 use crate::secrets;
 use crate::update;
@@ -93,6 +94,14 @@ enum Msg {
     Perf { vm: String, result: Result<Perf, ApiError> },
     /// A server's last ten minutes and its VMs', for its Overview and its pool's.
     HostPerf { host: String, result: Result<HostPerf, ApiError> },
+    /// A pool's updates read; fetched from its channel; installed (or why not).
+    PoolUpdatesRead { sid: u32, result: Result<PoolUpdates, ApiError> },
+    PoolSynced { sid: u32, log: usize, result: Result<String, ApiError> },
+    PoolUpdated { sid: u32, log: usize, result: Result<String, String> },
+    /// A server is restarting for an update, or is back from it.
+    UpdateRestarting { host: String, back: bool },
+    /// Asking a server to take VMs again ended.
+    HostEnabled { sid: u32, host: String, name: String, log: usize, result: Result<(), ApiError> },
     /// A look at a running VM's screen, for its Overview (width, height, RGBA), or why not.
     Thumb { vm: String, result: Result<(usize, usize, Vec<u8>), String> },
     /// Saving a snapshot's description ended.
@@ -280,6 +289,8 @@ enum Dialog {
     Message { title: String, text: String },
     Iso(Box<IsoDialog>),
     Upload(Box<UploadDialog>),
+    /// A pool's updates: what's waiting, fetching, installing.
+    PoolUpdate(Box<PoolUpdateDialog>),
     NewVm(Box<NewVmDialog>),
     /// Disconnect (forget) an ISO library?
     ConfirmSr { sid: u32, sr: String, text: String },
@@ -337,6 +348,8 @@ enum Intent {
     Remove(u32),
     ForgetPassword(u32),
     IsoLibrary,
+    /// A pool's updates (this pool's, else the first).
+    PoolUpdates(Option<u32>),
     RescanSr(u32, String),
     AskForgetSr(u32, String),
     /// Mount a storage again where it isn't (asking where it is, if the pool has forgotten).
@@ -374,6 +387,8 @@ enum Intent {
     /// Ask before shutting a server down: pool, server.
     /// Ask before shutting a server down, or (true) restarting it.
     AskShutdownHost(u32, String, bool),
+    /// A server that isn't taking VMs (disabled) takes them again.
+    EnableHost(u32, String),
     /// Hide a finished upload's card.
     DismissUpload(String),
     /// Files dropped on the window.
@@ -478,7 +493,16 @@ pub struct App {
     /// Servers being shut down (or restarted) right now.
     host_busy: HashSet<String>,
     /// Servers restarted from here that aren't back yet.
-    host_rebooting: HashSet<String>,
+    host_rebooting: HashMap<String, i64>,
+    /// Each pool's updates as last read (its /updates), and those being read; those fetching from
+    /// their channel (and why the last fetch failed); updates under way.
+    pool_updates: HashMap<u32, (Instant, Result<PoolUpdates, String>)>,
+    pool_updates_busy: HashMap<u32, Instant>,
+    pool_syncing: HashSet<u32>,
+    pool_sync_error: HashMap<u32, String>,
+    pool_runs: HashMap<u32, Arc<UpdateRun>>,
+    /// Servers being asked to take VMs again.
+    host_enabling: HashSet<String>,
     /// A new VM to select (and the tab to show) once it's in the tree.
     pending_select: Option<(String, Tab)>,
     /// VMs being made right now (a check's screenshot waits for them).
@@ -556,7 +580,13 @@ impl App {
             iso_deleting: HashSet::new(),
             vm_deleting: HashSet::new(),
             host_busy: HashSet::new(),
-            host_rebooting: HashSet::new(),
+            host_rebooting: HashMap::new(),
+            pool_updates: HashMap::new(),
+            pool_updates_busy: HashMap::new(),
+            pool_syncing: HashSet::new(),
+            pool_sync_error: HashMap::new(),
+            pool_runs: HashMap::new(),
+            host_enabling: HashSet::new(),
             pending_select: None,
             creating: 0,
             uploads: HashMap::new(),
@@ -876,6 +906,134 @@ impl App {
             crate::conn::watch(&prog);
             let result = if reboot { conn.reboot_host(&host) } else { conn.shutdown_host(&host) };
             let _ = tx.send(Msg::HostShutdown { sid, host, name, reboot, log, result });
+            ctx.request_repaint();
+        });
+    }
+
+    /// A log entry ends: how it went, and (when given) what it says now.
+    fn end_log(&mut self, log: usize, status: &str, text: Option<String>) {
+        if let Some(e) = self.log.get_mut(log) {
+            e.status = status.into();
+            if let Some(t) = text {
+                e.text = t;
+            }
+        }
+    }
+
+    /// A server's pool is looked at again right away.
+    fn refresh_soon(&mut self, sid: u32) {
+        if let Some(s) = self.server_mut(sid) {
+            s.next_refresh = Instant::now();
+        }
+    }
+
+    /// Each pool with an update channel has its updates read (its /updates, which asks the
+    /// server only, not the channel) every fifteen minutes, and again after a fetch or an update.
+    fn poll_pool_updates(&mut self, ctx: &egui::Context) {
+        let due: Vec<(u32, Arc<dyn Connection>)> = self
+            .servers
+            .iter()
+            .filter(|s| s.data.as_ref().map_or(false, |d| d.update_channel.is_some() && d.last_update_sync.is_some()))
+            .filter(|s| self.pool_updates.get(&s.id).map_or(true, |(t, _)| t.elapsed() >= Duration::from_secs(900)))
+            .filter(|s| !self.pool_updates_busy.contains_key(&s.id) && !self.pool_syncing.contains(&s.id))
+            .map(|s| (s.id, s.conn.clone()))
+            .collect();
+        for (sid, conn) in due {
+            self.pool_updates_busy.insert(sid, Instant::now());
+            let (tx, ctx) = (self.tx.clone(), ctx.clone());
+            std::thread::spawn(move || {
+                let result = conn.pool_updates();
+                let _ = tx.send(Msg::PoolUpdatesRead { sid, result });
+                ctx.request_repaint();
+            });
+        }
+    }
+
+    /// A pool's updates in words, and how they stand (None when it has no channel to speak of).
+    fn pool_update_status(&self, sid: u32) -> Option<(String, Standing)> {
+        let d = self.server(sid)?.data.as_ref()?;
+        if self.pool_runs.get(&sid).map_or(false, |r| r.ended().is_none()) {
+            return Some(("Updating now…".into(), Standing::Unknown));
+        }
+        let found = self.pool_updates.get(&sid).and_then(|(_, r)| r.as_ref().ok());
+        d.update_status(found, crate::pool_update::now())
+    }
+
+    /// What the Updates dialog shows of a pool.
+    fn pool_view(&self, sid: u32) -> PoolView {
+        let s = self.server(sid);
+        let d = s.and_then(|s| s.data.as_ref());
+        let mut hosts: Vec<(String, String, bool, bool)> = vec![];
+        if let Some(d) = d {
+            let mut hs: Vec<&HostInfo> = d.hosts.iter().collect();
+            hs.sort_by_key(|h| (!h.is_master, h.name.to_lowercase()));
+            hosts = hs.iter().map(|h| (h.rref.clone(), h.name.clone(), h.is_up(), h.pending_guidance.iter().any(|g| g.starts_with("reboot_host")))).collect();
+        }
+        PoolView {
+            pools: self.servers.iter().filter(|s| s.data.is_some()).map(|s| (s.id, s.name())).collect(),
+            name: s.map(|s| s.name()).unwrap_or_default(),
+            channel: d.and_then(|d| d.update_channel.clone()),
+            bundle: d.map_or(false, |d| d.update_bundle),
+            xcp: d.map_or(false, |d| d.hosts.iter().any(|h| h.brand.to_lowercase().contains("xcp"))),
+            status: self.pool_update_status(sid),
+            found: self.pool_updates.get(&sid).map(|(_, r)| r.clone()),
+            never_checked: d.map_or(false, |d| d.last_update_sync.is_none()),
+            reading: self.pool_updates_busy.get(&sid).map(|t| t.elapsed()),
+            vm_names: d.map(|d| d.vms.iter().map(|v| (v.rref.clone(), v.name.clone())).collect()).unwrap_or_default(),
+            stuck: d
+                .map(|d| {
+                    d.vms
+                        .iter()
+                        .filter(|v| matches!(v.power, PowerState::Running | PowerState::Paused) && v.host.is_some() && v.host == v.storage_host)
+                        .filter_map(|v| d.host(v.host.as_deref()?).map(|h| (h.rref.clone(), h.name.clone(), v.name.clone())))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            hosts,
+            checking: self.pool_syncing.contains(&sid),
+            check_error: self.pool_sync_error.get(&sid).cloned(),
+            run: self.pool_runs.get(&sid).cloned(),
+        }
+    }
+
+    /// Fetches a pool's latest updates from its channel, in the background.
+    fn sync_pool(&mut self, sid: u32, ctx: &egui::Context) {
+        let Some((conn, server)) = self.server(sid).map(|s| (s.conn.clone(), s.name())) else { return };
+        if !self.pool_syncing.insert(sid) {
+            return;
+        }
+        self.pool_sync_error.remove(&sid);
+        let log = self.add_log(sid, &server, None, &server, &format!("Fetching {}'s updates from its channel", server), "In progress");
+        let prog = self.progress(log);
+        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            crate::conn::watch(&prog);
+            let result = conn.sync_updates();
+            let _ = tx.send(Msg::PoolSynced { sid, log, result });
+            ctx.request_repaint();
+        });
+    }
+
+    /// Updates a pool as `plan` says, in the background: its steps in the Updates dialog, the
+    /// calls in Activities.
+    fn update_pool(&mut self, sid: u32, plan: crate::pool_update::Plan, ctx: &egui::Context) {
+        let Some((conn, server)) = self.server(sid).map(|s| (s.conn.clone(), s.name())) else { return };
+        if self.pool_runs.get(&sid).map_or(false, |r| r.ended().is_none()) {
+            return;
+        }
+        let log = self.add_log(sid, &server, None, &server, &format!("Updating {}", server), "In progress");
+        let prog = self.progress(log);
+        let run = Arc::new(UpdateRun::new(prog.trace.clone()));
+        self.pool_runs.insert(sid, run.clone());
+        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            crate::conn::watch(&prog);
+            let say = tx.clone();
+            let restarting = move |host: &str, back: bool| {
+                let _ = say.send(Msg::UpdateRestarting { host: host.to_string(), back });
+            };
+            let result = crate::pool_update::run(conn.as_ref(), &plan, &run, &restarting);
+            let _ = tx.send(Msg::PoolUpdated { sid, log, result });
             ctx.request_repaint();
         });
     }
@@ -1511,7 +1669,7 @@ impl App {
                                 e.status = "Done".into();
                             }
                             // restarting: its going away and coming back are expected
-                            self.host_rebooting.insert(host.clone());
+                            self.host_rebooting.insert(host.clone(), crate::pool_update::now());
                         }
                         Ok(()) => {
                             if let Some(e) = self.log.get_mut(log) {
@@ -1802,6 +1960,59 @@ impl App {
                     self.host_perf_busy.remove(&host);
                     self.host_perf.insert(host, (Instant::now(), result.map_err(|e| e.message())));
                 }
+                Msg::PoolUpdatesRead { sid, result } => {
+                    self.pool_updates_busy.remove(&sid);
+                    let result = result.map_err(|e| if e.code == "NO_REPOSITORY_ENABLED" { "its update channel hasn't been fetched from yet".to_string() } else { e.message() });
+                    self.pool_updates.insert(sid, (Instant::now(), result));
+                }
+                Msg::PoolSynced { sid, log, result } => {
+                    self.pool_syncing.remove(&sid);
+                    self.pool_updates.remove(&sid); // read again
+                    self.refresh_soon(sid);
+                    let server = self.server(sid).map(|s| s.name()).unwrap_or_default();
+                    match result {
+                        Ok(_) => {
+                            self.pool_sync_error.remove(&sid);
+                            self.end_log(log, "Done", None);
+                        }
+                        Err(e) => {
+                            self.pool_sync_error.insert(sid, e.message());
+                            self.end_log(log, "Failed", Some(format!("Couldn't fetch {}'s updates: {}", server, e.message())));
+                        }
+                    }
+                }
+                Msg::PoolUpdated { sid, log, result } => {
+                    self.pool_updates.remove(&sid);
+                    self.refresh_soon(sid);
+                    let server = self.server(sid).map(|s| s.name()).unwrap_or_default();
+                    match &result {
+                        Ok(said) => self.end_log(log, "Done", Some(format!("Updated {}: {}", server, said))),
+                        Err(why) => self.end_log(log, "Failed", Some(format!("Couldn't update {}: {}", server, why))),
+                    }
+                    if let Some(run) = self.pool_runs.get(&sid) {
+                        run.finish(result);
+                    }
+                }
+                Msg::HostEnabled { sid, host, name, log, result } => {
+                    self.host_enabling.remove(&host);
+                    match result {
+                        Ok(()) => {
+                            self.end_log(log, "Done", None);
+                            if let Some(h) = self.server_mut(sid).and_then(|s| s.data.as_mut()).and_then(|d| d.hosts.iter_mut().find(|h| h.rref == host)) {
+                                h.enabled = true;
+                            }
+                        }
+                        Err(e) => self.end_log(log, "Failed", Some(format!("'{}' still isn't taking VMs: {}", name, host_problem(&e)))),
+                    }
+                    self.refresh_soon(sid);
+                }
+                Msg::UpdateRestarting { host, back } => {
+                    if back {
+                        self.host_rebooting.remove(&host);
+                    } else {
+                        self.host_rebooting.insert(host, crate::pool_update::now());
+                    }
+                }
                 Msg::Thumb { vm, result } => {
                     self.thumb_busy.remove(&vm);
                     let t = self.thumbs.entry(vm.clone()).or_default();
@@ -1904,13 +2115,18 @@ impl App {
                 for h in &d.hosts {
                     let was = before.get(&h.rref).copied().unwrap_or(true);
                     if was && !h.is_up() {
-                        let rebooting = self.host_rebooting.contains(&h.rref);
+                        let rebooting = self.host_rebooting.contains_key(&h.rref);
                         let expected = (self.host_busy.contains(&h.rref) || rebooting) && !h.live;
                         let what = if rebooting { "is restarting" } else if h.live { "isn't answering" } else { "is off" };
                         changes.push((h.rref.clone(), h.name.clone(), format!("{} {}", h.name, what), if expected { "Done" } else { "Failed" }));
                     } else if !was && h.is_up() {
-                        let back = if self.host_rebooting.remove(&h.rref) { "is back" } else { "answers again" };
+                        let back = if self.host_rebooting.remove(&h.rref).is_some() { "is back" } else { "answers again" };
                         changes.push((h.rref.clone(), h.name.clone(), format!("{} {}", h.name, back), "Done"));
+                    } else if h.is_up() && self.host_rebooting.get(&h.rref).map_or(false, |since| h.boot_time.map_or(false, |b| b >= since - 60)) {
+                        // back without being seen gone: the coordinator, whose restart took the
+                        // connection with it (it started after it was told to restart)
+                        self.host_rebooting.remove(&h.rref);
+                        changes.push((h.rref.clone(), h.name.clone(), format!("{} is back", h.name), "Done"));
                     }
                 }
                 let s = &mut self.servers[idx];
@@ -1952,7 +2168,7 @@ impl App {
                     if shot && is_demo {
                         match self.shot_show.as_str() {
                             "home" => self.select("root".into()),
-                            "storage" | "pool" | "pool-details" => self.select(format!("srv:{}", id)),
+                            "storage" | "pool" | "pool-details" | "pool-updates" | "pool-updating" | "pool-update-stopped" => self.select(format!("srv:{}", id)),
                             "isos" | "iso-disconnect" | "iso-delete" | "iso-describe" | "iso-upload" | "iso-upload-choose" | "iso-upload-web" | "iso-upload-done" | "sr-unmounted" | "sr-detached" | "sr-auto-repair" | "sr-repair-failed" => {
                                 self.expanded.insert(format!("folder:{}:srs", id));
                                 self.select(format!("sr:{}:sr-iso", id));
@@ -2114,7 +2330,7 @@ impl App {
     /// A server's icon: off when disabled or shut down; a red ring turning while it shuts down, a
     /// green one while it restarts.
     fn host_icon(&self, h: &HostInfo) -> IconKind {
-        if self.host_rebooting.contains(&h.rref) {
+        if self.host_rebooting.contains_key(&h.rref) {
             IconKind::Busy(Tone::Green)
         } else if self.host_busy.contains(&h.rref) {
             IconKind::Busy(Tone::Red)
@@ -2343,6 +2559,20 @@ impl App {
                         self.dialog = Dialog::ConfirmDeleteIso { sid, sr, vdi, name: f.name.clone(), text };
                     }
                 }
+                Intent::EnableHost(sid, host) => {
+                    let Some((conn, server, name)) = self.server(sid).and_then(|s| Some((s.conn.clone(), s.name(), s.data.as_ref()?.host(&host)?.name.clone()))) else { continue };
+                    if self.host_enabling.insert(host.clone()) {
+                        let log = self.add_log(sid, &server, None, &name, &format!("Letting '{}' take VMs again", name), "In progress");
+                        let prog = self.progress(log);
+                        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+                        std::thread::spawn(move || {
+                            crate::conn::watch(&prog);
+                            let result = conn.enable_host(&host);
+                            let _ = tx.send(Msg::HostEnabled { sid, host, name, log, result });
+                            ctx.request_repaint();
+                        });
+                    }
+                }
                 Intent::AskShutdownHost(sid, host, reboot) => {
                     if let Some(d) = self.server(sid).and_then(|s| s.data.as_ref()) {
                         if let Some(h) = d.host(&host) {
@@ -2474,6 +2704,16 @@ impl App {
                         self.dialog = Dialog::ConfirmSr { sid, sr, text };
                     }
                 }
+                Intent::PoolUpdates(sid) => {
+                    let pools: Vec<u32> = self.servers.iter().filter(|s| s.data.is_some()).map(|s| s.id).collect();
+                    if let Some(sid) = sid.or(sel.sid).filter(|id| pools.contains(id)).or(pools.first().copied()) {
+                        // an update that ended is behind it: the list again
+                        if self.pool_runs.get(&sid).map_or(false, |r| r.ended().is_some()) {
+                            self.pool_runs.remove(&sid);
+                        }
+                        self.dialog = Dialog::PoolUpdate(Box::new(PoolUpdateDialog::new(sid)));
+                    }
+                }
                 Intent::IsoLibrary => {
                     let pools: Vec<(u32, String)> = self.servers.iter().filter(|s| s.data.is_some()).map(|s| (s.id, s.name())).collect();
                     let sid = sel.sid.filter(|id| pools.iter().any(|p| p.0 == *id)).or(pools.first().map(|p| p.0));
@@ -2559,7 +2799,7 @@ impl App {
         // label becomes a tooltip): first New VM and ISO Library (rank 2), then all of them.
         let fits = |level: u8| {
             let w = |l: &str, rank: u8| if level >= rank { 32.0 } else { tool_width(ui, l) } + 2.0;
-            let buttons: f32 = w("Connect", 3) + w("New VM", 2) + w("ISO Library", 2);
+            let buttons: f32 = w("Connect", 3) + w("New VM", 2) + w("ISO Library", 2) + w("Updates", 2);
             36.0 + 40.0 + 10.0 + 16.0 + buttons + 160.0 <= ui.available_width() // 160: the app's name
         };
         let level = (0..3).find(|&l| fits(l)).unwrap_or(3);
@@ -2584,6 +2824,21 @@ impl App {
             if tool_button(ui, "iso", "ISO Library", has_pool, compact(2), &pal).on_hover_text("Add a library of installation discs (.iso files) from a Windows or NFS share").clicked() {
                 out.push(Intent::IsoLibrary);
             }
+            // a pool's updates: a red dot when one has security updates waiting, a yellow one (the
+            // network tiles' "out") when one has others, or a server to restart for them
+            let worst = self.servers.iter().filter_map(|s| self.pool_update_status(s.id)).map(|st| st.1).filter(|st| matches!(st, Standing::Pending | Standing::Bad)).max();
+            let resp = tool_button(ui, "updates", "Updates", has_pool, compact(2), &pal);
+            if let Some(st) = worst {
+                ui.painter().circle_filled(resp.rect.min + vec2(24.0, 6.0), 4.0, if st == Standing::Bad { pal.red } else { pal.orange });
+            }
+            let tip = match worst {
+                Some(Standing::Bad) => "Install your pools' updates: one has security updates waiting",
+                Some(_) => "Install your pools' updates: one has updates waiting",
+                None => "Install your pools' updates",
+            };
+            if resp.on_hover_text(tip).clicked() {
+                out.push(Intent::PoolUpdates(sel.sid));
+            }
             // the app's name in the right corner; a click shows About
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add_space(8.0);
@@ -2603,10 +2858,16 @@ impl App {
     fn pool_issues(&self, s: &ServerEntry) -> Vec<(String, String)> {
         let mut out = vec![];
         let Some(d) = &s.data else { return out };
-        if s.state == ConnState::Reconnecting {
+        // (a server restarting, as asked, isn't a problem; nor is the connection its coordinator's
+        // restart takes with it)
+        let restarting = |h: &HostInfo| self.host_rebooting.contains_key(&h.rref);
+        if s.state == ConnState::Reconnecting && !d.hosts.iter().any(|h| h.is_master && restarting(h)) {
             out.push(("Connection".to_string(), "Lost; reconnecting…".to_string()));
         }
-        for h in d.hosts.iter().filter(|h| !h.is_up()) {
+        for h in d.hosts.iter().filter(|h| h.is_up() && !h.enabled && !restarting(h) && !self.host_busy.contains(&h.rref)) {
+            out.push((h.name.clone(), "Is on but isn't taking new VMs (its Overview has Take VMs again)".to_string()));
+        }
+        for h in d.hosts.iter().filter(|h| !h.is_up() && !restarting(h)) {
             let unknown = d.vms.iter().filter(|v| d.host_down_for(v).map_or(false, |x| x.rref == h.rref)).count();
             let what = if h.live { "Isn't answering" } else { "Is off" };
             let more = match unknown {
@@ -2647,10 +2908,13 @@ impl App {
                 }
                 continue;
             };
-            if s.state == ConnState::Reconnecting {
+            // (a server restarting, as asked, isn't a problem; nor the connection its coordinator's
+            // restart takes with it)
+            let restarting = |h: &HostInfo| self.host_rebooting.contains_key(&h.rref);
+            if s.state == ConnState::Reconnecting && !d.hosts.iter().any(|h| h.is_master && restarting(h)) {
                 out.push((format!("srv:{}", s.id), format!("Lost the connection to {}", s.name()), "Reconnecting…".into()));
             }
-            for h in d.hosts.iter().filter(|h| !h.is_up()) {
+            for h in d.hosts.iter().filter(|h| !h.is_up() && !restarting(h)) {
                 let what = if h.live { "isn't answering" } else { "is off" };
                 let vms: Vec<&str> = d.vms.iter().filter(|v| d.host_down_for(v).map_or(false, |x| x.rref == h.rref)).map(|v| v.name.as_str()).collect();
                 let detail = match vms.len() {
@@ -3211,7 +3475,7 @@ impl App {
         let off = self.vm_of(sel).map_or(false, |(s, _, v)| v.power == PowerState::Halted && !s.busy.contains_key(&v.rref));
         let root = self.root_of(sel).map(|(sid, connected)| (sid, if connected { "Disconnect" } else { "Remove" }, self.server(sid).map(|s| s.name()).unwrap_or_default()));
         // a server: Restart and Shut Down, while it's on and not already going off
-        let host = self.host_of(sel).map(|(s, h)| (s.id, h.rref.clone(), h.is_up() && !self.host_busy.contains(&h.rref) && !self.host_rebooting.contains(&h.rref)));
+        let host = self.host_of(sel).map(|(s, h)| (s.id, h.rref.clone(), h.is_up() && !self.host_busy.contains(&h.rref) && !self.host_rebooting.contains_key(&h.rref)));
         let mut console = if current == Tab::Console { self.console.as_mut() } else { None };
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(free).layout(egui::Layout::right_to_left(egui::Align::Center)));
         let ui = &mut child;
@@ -4936,7 +5200,18 @@ impl App {
             Dialog::LogDetail { index, .. } => upload_fraction(*index),
             _ => None,
         };
+        // the Updates dialog: what it shows of its pool, and what's asked of it
+        let pool_view = match &self.dialog {
+            Dialog::PoolUpdate(d) => Some(self.pool_view(d.sid)),
+            _ => None,
+        };
+        let mut pool_action = PoolUpdateAction::None;
         match &mut self.dialog {
+            Dialog::PoolUpdate(d) => {
+                if let Some(v) = &pool_view {
+                    pool_action = d.ui(ctx, &pal, v);
+                }
+            }
             Dialog::None => {}
             Dialog::AddServer { server, user, password, error, remember } => {
                 dialog_window(ctx, "Connect to Server").show(ctx, |ui| {
@@ -5650,7 +5925,7 @@ impl App {
                             if !running && lines.last().map_or(false, |l| l.0 == Said::Asked) {
                                 shown.push(if e.status == "Failed" { Said::Error } else { Said::Answer }, if e.status == "Failed" { e.text.clone() } else { "OK".into() });
                             }
-                            crate::newvm::transcript(ui, &pal, &shown, copied, running);
+                            crate::newvm::transcript(ui, &pal, &shown, copied, running, None);
                         }
                         if running {
                             ui.ctx().request_repaint_after(Duration::from_millis(500));
@@ -5675,6 +5950,39 @@ impl App {
                         }
                     });
                 });
+            }
+        }
+        // (the screenshot of an update under way: it starts once the list is read)
+        // (and one that stops: a VM can't move, and none is to be shut down)
+        let shot_update = matches!(self.shot_show.as_str(), "pool-updating" | "pool-update-stopped");
+        if self.shot_path.is_some() && shot_update && matches!(pool_action, PoolUpdateAction::None) {
+            if let Some(v) = pool_view.as_ref().filter(|v| v.run.is_none()) {
+                if let Some(plan) = v.plan(true, self.shot_show == "pool-updating") {
+                    pool_action = PoolUpdateAction::Install(plan);
+                }
+            }
+        }
+        match pool_action {
+            PoolUpdateAction::None => {}
+            PoolUpdateAction::Close => close = true,
+            PoolUpdateAction::Pick(sid) => self.dialog = Dialog::PoolUpdate(Box::new(PoolUpdateDialog::new(sid))),
+            PoolUpdateAction::Reread => {
+                if let Dialog::PoolUpdate(d) = &self.dialog {
+                    let sid = d.sid;
+                    self.pool_updates.remove(&sid);
+                }
+            }
+            PoolUpdateAction::Check => {
+                if let Dialog::PoolUpdate(d) = &self.dialog {
+                    let sid = d.sid;
+                    self.sync_pool(sid, ctx);
+                }
+            }
+            PoolUpdateAction::Install(plan) => {
+                if let Dialog::PoolUpdate(d) = &self.dialog {
+                    let sid = d.sid;
+                    self.update_pool(sid, plan, ctx);
+                }
             }
         }
         if close {
@@ -5821,7 +6129,9 @@ impl App {
         let Some(path) = self.shot_path.clone() else { return };
         ctx.request_repaint();
         self.frames += 1;
-        let timed_out = self.started.elapsed() > Duration::from_secs(20);
+        // SVM_SHOT_WAIT: at least this many seconds first (to see something long, like an update)
+        let wait = std::env::var("SVM_SHOT_WAIT").ok().and_then(|w| w.parse::<u64>().ok()).unwrap_or(0);
+        let timed_out = self.started.elapsed() > Duration::from_secs(20 + wait);
         let settled = self.creating == 0
             && self.pending_select.is_none()
             && self.sr_checking.is_empty()
@@ -5831,7 +6141,7 @@ impl App {
             && self.vm_saving.is_empty()
             && self.edit_queue.is_empty()
             && self.servers.iter().all(|s| s.busy.is_empty() && !s.fetching && s.next_refresh > Instant::now());
-        if !self.shot_requested && ((self.shot_ready && self.frames >= 120 && settled) || timed_out) {
+        if !self.shot_requested && ((self.shot_ready && self.frames >= 120 && settled && self.started.elapsed() >= Duration::from_secs(wait)) || timed_out) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot);
             self.shot_requested = true;
         }
@@ -5882,6 +6192,7 @@ impl eframe::App for App {
         }
         let pal = self.pal;
         self.tick(ctx);
+        self.poll_pool_updates(ctx);
         let tree = self.build_tree();
         if let Some((key, tab)) = self.pending_select.clone() {
             if tree.find(&key).is_some() {
@@ -5929,6 +6240,7 @@ impl eframe::App for App {
                 "sr-detached" | "sr-repair-failed" => out.extend(sel.sid.map(|sid| Intent::RepairSr(sid, "sr-iso".into()))),
                 "snapshots" => out.push(Intent::Tab(Tab::Snapshots)),
                 "details" | "host-details" | "pool-details" => out.push(Intent::Tab(Tab::Details)),
+                "pool-updates" | "pool-updating" | "pool-update-stopped" => out.push(Intent::PoolUpdates(sel.sid)),
                 "new-vm-template" => out.extend(sel.sid.map(|sid| Intent::NewVmFromTemplate(sid, "tpl-web".into()))),
                 "make-template" => out.extend(sel.sid.map(|sid| Intent::MakeTemplate(sid, "vm-desk".into()))),
                 "make-template-snapshot" => {
