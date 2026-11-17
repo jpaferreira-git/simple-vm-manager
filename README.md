@@ -16,6 +16,7 @@ affiliated with or endorsed by the makers of XenServer or XCP-ng.
 | ![Creating a VM](docs/screenshot-dark-new-vm.png) | ![A new VM's advanced options](docs/screenshot-dark-new-vm-advanced.png) |
 | ![A VM's snapshots](docs/screenshot-dark-snapshots.png) | ![Taking a snapshot](docs/screenshot-dark-snapshot-take.png) |
 | ![Your templates](docs/screenshot-dark-templates.png) | ![A new VM from a template](docs/screenshot-dark-new-vm-template.png) |
+| ![A server's Overview](docs/screenshot-dark-host.png) | ![A pool's Overview](docs/screenshot-dark-pool.png) |
 
 ## Features
 
@@ -36,10 +37,33 @@ affiliated with or endorsed by the makers of XenServer or XCP-ng.
   pool itself only gives up on it after ten: the app knocks on each server's address as it looks.
 - **Home overview** — servers, running VMs, memory and storage in use at a glance, each server's load
   and the latest activity.
-- **Details** — General, Memory, Storage, Networking and Logs tabs for pools, hosts and VMs, Console for hosts and VMs, and Snapshots for VMs.
-  A VM's General tab shows its tags, operating system, uptime, IP addresses, guest tools, CPUs and
-  memory, firmware and Secure Boot, boot order, high availability, disks and snapshots; click a value
-  to copy it.
+- **A VM's Overview** — what matters most, at a glance and to change right there: its name and
+  description (each with a pencil), its state in a pill (where it runs, for how long), its system
+  and address (to copy); its load over the last ten minutes, live (CPU, memory, disk and network,
+  each a little graph); and four cards: **CPUs and memory** (steppers, applied while it's off),
+  **Startup** (starts with its server, the boot order of a BIOS VM), **Disks** (add one, grow one,
+  remove one; the ISO in its DVD drive, or none) and **Network** (another network for a card, add
+  or remove a card). What can be done while it runs can be; the rest says to shut it down first.
+  In a narrow window the graphs go two by two and the cards one under another.
+- **A server's Overview** — how it's doing (state, time up, address, role, version, CPUs, memory,
+  VMs running), its load over the last ten minutes, live (CPU, memory, its VMs' disks, its network
+  cards), and four cards: **Capacity** (its memory as a bar: what the server keeps, what its VMs
+  have, what's free; the virtual CPUs given out against the real ones), **VMs on this server** (the
+  busiest first, each with its CPU's last ten minutes, its CPU now and its memory; a click shows
+  it), **Storage** (each one it uses, how full) and **Network** (each card: its traffic now, its
+  network, address and speed, the management card marked, an unplugged one said so). Near a limit
+  (memory almost all taken, CPUs busy, more virtual CPUs than real ones, storage nearly full) the
+  card turns amber, then red, saying what that means.
+- **A pool's Overview** — one line with its version and its license (green; amber when it runs out
+  within 30 days or is a trial; red once it has run out), then its servers' load added up, its
+  capacity, its servers (each with its CPU and memory), all its VMs (the busiest first) and its
+  storage. When something is wrong (a server off or not answering, storage not mounted, the license
+  running out, servers on different versions) its Details tab gets an orange dot and says what,
+  under *Needs attention*.
+- **Details** — a VM's tabs are Overview, Snapshots, Console, Logs and Details: the less used
+  things (tags, guest tools, virtualization, high availability, every disk and card with its
+  position and MAC), click a value to copy it. Pools and servers have Overview, Storage,
+  Networking, Logs and Details, and servers a Console.
 - **Console** — see a running VM's screen and use it with your keyboard and mouse (the keyboard goes
   to the VM while the mouse is over its screen), always scaled to fit. A keyboard button next to
   the tabs sends Ctrl+Alt+Del and the combinations your desktop keeps for itself (the Windows key,
@@ -107,11 +131,12 @@ affiliated with or endorsed by the makers of XenServer or XCP-ng.
   it's on, puts it back, and then leaves it as it was at the time: resumed, started again, or off.
   The bin deletes one, with its copies of the disks. In a narrow window the tab keeps Revert and
   Delete in view, dropping the other columns first.
-- **Shut down a server** — the red power icon at the end of a server's tabs. It asks first, saying
-  which VMs move to the pool's other servers and which are shut down (their disks on that server's
-  own storage), and warns when it's the pool's coordinator. Then it goes the way the pool expects:
-  no new VMs sent to it, those VMs shut down, the rest moved, then the server; if a step fails it
-  takes VMs again.
+- **Shut down or restart a server** — the red power icon and the green restart icon at the end of a
+  server's tabs. Each asks first, saying which VMs move to the pool's other servers and which are
+  shut down (their disks on that server's own storage), and warns when it's the pool's coordinator.
+  Then it goes the way the pool expects: no new VMs sent to it, those VMs shut down, the rest moved,
+  then the server; if a step fails it takes VMs again. A restarting server turns green and ringed
+  in the tree, and Activities says when it's back.
 - **VM power actions** — Start, Shut Down, Reboot, Suspend, Resume, Force Shut Down, Force Reboot,
   enabled only when the server allows them, with confirmations for the disruptive ones. They're
   all behind one button at the right end of a VM's tabs: the power symbol in the colour of the

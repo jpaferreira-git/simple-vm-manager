@@ -229,8 +229,18 @@ pub fn paint_icon(p: &Painter, rect: Rect, kind: IconKind, pal: &Pal, bg: Color3
 
 /// A 22×22 toolbar glyph on a soft tinted square, in its action's colour (adapts to the theme).
 pub fn paint_tool(p: &Painter, rect: Rect, op: &str, enabled: bool, pal: &Pal) {
-    let c = rect.center();
-    let base = match op {
+    let col = if enabled { tool_color(op, pal) } else { pal.ink_faint };
+    let neutral = matches!(op, "sidebar" | "theme-dark" | "theme-light" | "settings");
+    if !neutral {
+        let tint = if enabled { col.gamma_multiply(if pal.dark { 0.22 } else { 0.14 }) } else { Color32::TRANSPARENT };
+        p.rect_filled(rect.shrink(0.5), Rounding::same(6.0), tint);
+    }
+    paint_tool_glyph(p, rect, op, enabled, pal);
+}
+
+/// A toolbar glyph's colour: its action's (a VM's state's, for the power menu's face).
+pub fn tool_color(op: &str, pal: &Pal) -> Color32 {
+    match op {
         "clean_shutdown" | "hard_shutdown" => pal.red,
         "clean_reboot" => pal.green,
         "hard_reboot" => pal.orange,
@@ -244,13 +254,13 @@ pub fn paint_tool(p: &Painter, rect: Rect, op: &str, enabled: bool, pal: &Pal) {
         "newvm" => pal.blue,
         "iso" => pal.orange,
         _ => pal.icon,
-    };
-    let col = if enabled { base } else { pal.ink_faint };
-    let neutral = matches!(op, "sidebar" | "theme-dark" | "theme-light" | "settings");
-    if !neutral {
-        let tint = if enabled { col.gamma_multiply(if pal.dark { 0.22 } else { 0.14 }) } else { Color32::TRANSPARENT };
-        p.rect_filled(rect.shrink(0.5), Rounding::same(6.0), tint);
     }
+}
+
+/// `paint_tool`'s glyph alone, without its square (for a button that draws its own).
+pub fn paint_tool_glyph(p: &Painter, rect: Rect, op: &str, enabled: bool, pal: &Pal) {
+    let c = rect.center();
+    let col = if enabled { tool_color(op, pal) } else { pal.ink_faint };
     let s = Stroke::new(2.0, col);
     let o = rect.min;
     match op {
@@ -402,6 +412,30 @@ pub fn paint_glyph_on(p: &Painter, rect: Rect, name: &str, col: Color32, bg: Col
             p.rect_stroke(Rect::from_min_size(o + vec2(1.0, 4.0), vec2(11.0, 8.0)), Rounding::same(1.4), s);
             line(p, o, &[(4.0, 14.5), (9.0, 14.5)], s);
             line(p, o, &[(6.5, 12.0), (6.5, 14.5)], s);
+        }
+        "cpu" => {
+            // a processor: a square chip, its core, pins on every side
+            p.rect_stroke(Rect::from_center_size(c, vec2(9.0, 9.0)), Rounding::same(1.5), s);
+            p.rect_filled(Rect::from_center_size(c, vec2(3.4, 3.4)), Rounding::same(0.5), col);
+            let pin = Stroke::new(1.2, col);
+            for d in [-2.5f32, 0.0, 2.5] {
+                line(p, c, &[(d, -4.5), (d, -7.0)], pin);
+                line(p, c, &[(d, 4.5), (d, 7.0)], pin);
+                line(p, c, &[(-4.5, d), (-7.0, d)], pin);
+                line(p, c, &[(4.5, d), (7.0, d)], pin);
+            }
+        }
+        "boot" => {
+            // a list in order: a dot and a line, three times
+            for y in [-4.5f32, 0.0, 4.5] {
+                p.circle_filled(c + vec2(-5.2, y), 1.3, col);
+                line(p, c, &[(-2.2, y), (6.5, y)], s);
+            }
+        }
+        "shield" => {
+            // a shield (firmware, Secure Boot)
+            let pts: Vec<Pos2> = [(0.0, -6.8), (5.6, -4.6), (5.4, 0.6), (3.6, 4.0), (0.0, 6.8), (-3.6, 4.0), (-5.4, 0.6), (-5.6, -4.6)].iter().map(|(x, y)| c + vec2(*x, *y)).collect();
+            p.add(Shape::closed_line(pts, s));
         }
         "memory" => {
             // a memory module: the board, three chips, the pins below

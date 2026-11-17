@@ -193,6 +193,107 @@ fn run(conn: &dyn Connection, vm_ref: &str, shared: &Mutex<Shared>, rx: &mpsc::R
     }
 }
 
+// ---------------------------------------------------------------- a look at the screen
+
+/// One look at a VM's screen, for its Overview: connects (as a shared viewer, so a console open
+/// elsewhere stays open), takes the whole screen once and leaves. With `wake`, it first taps Ctrl
+/// in the VM, as the Console tab does, to wake a display that went dark to save power, and gives it
+/// a moment to come back; otherwise it sends the VM nothing. The picture comes scaled down to
+/// `max_w` pixels wide at most: its width, height and RGBA bytes.
+pub fn snapshot(conn: &dyn Connection, vm_ref: &str, max_w: usize, wake: bool) -> Result<(usize, usize, Vec<u8>), String> {
+    let mut s = conn.open_console(vm_ref).map_err(|e| e.message())?;
+    s.set_read_timeout(Some(Duration::from_secs(10))).map_err(io_err)?;
+    let (w, h) = handshake(&mut s)?;
+    let shared = Mutex::new(Shared { status: Status::Connected, screen: Some(Screen::new(w as usize, h as usize)), scancodes: false });
+    s.write_all(&set_pixel_format()).map_err(io_err)?;
+    s.write_all(&set_encodings()).map_err(io_err)?;
+    if wake {
+        for down in [true, false] {
+            s.write_all(&encode_input(Input::Key { down, keysym: CTRL.0, scancode: CTRL.1 }, false)).map_err(io_err)?;
+        }
+        s.flush().map_err(io_err)?;
+        std::thread::sleep(Duration::from_millis(2500));
+    }
+    s.write_all(&update_request(false, w, h)).map_err(io_err)?;
+    s.flush().map_err(io_err)?;
+    let (mut inb, mut parser, mut chunk) = (InBuf::default(), Parser::new(), vec![0u8; 256 * 1024]);
+    let until = Instant::now() + Duration::from_secs(15);
+    // (a screen that changes size first says so, then needs asking again; and news without any of
+    // the screen, such as the server saying it takes scancodes, can come before it)
+    let mut asks = 0;
+    loop {
+        match parser.step(&mut inb, &shared)? {
+            Step::Progress => continue,
+            Step::UpdateDone if std::mem::take(&mut parser.resized) && asks < 3 => {
+                asks += 1;
+                let (w, h) = shared.lock().unwrap().screen.as_ref().map(|sc| (sc.width as u16, sc.height as u16)).unwrap_or((w, h));
+                s.write_all(&update_request(false, w, h)).map_err(io_err)?;
+                s.flush().map_err(io_err)?;
+                continue;
+            }
+            Step::UpdateDone if parser.painted => break,
+            Step::UpdateDone => continue,
+            Step::NeedMore => {}
+        }
+        if Instant::now() > until {
+            return Err("Its screen took too long to come.".into());
+        }
+        match s.read(&mut chunk) {
+            Ok(0) => return Err("The console connection was closed.".into()),
+            Ok(n) => inb.data.extend_from_slice(&chunk[..n]),
+            Err(e) => return Err(io_err(e)),
+        }
+    }
+    let screen = shared.into_inner().unwrap().screen.ok_or("No screen came.")?;
+    Ok(shrink(&screen.rgba, screen.width, screen.height, max_w))
+}
+
+/// A picture made smaller (each pixel the average of the ones it covers) to `max_w` wide at most.
+fn shrink(rgba: &[u8], w: usize, h: usize, max_w: usize) -> (usize, usize, Vec<u8>) {
+    if w <= max_w || w == 0 || h == 0 {
+        return (w, h, rgba.to_vec());
+    }
+    let (nw, nh) = (max_w, ((h * max_w) as f64 / w as f64).round().max(1.0) as usize);
+    let mut out = vec![0u8; nw * nh * 4];
+    for y in 0..nh {
+        let (y0, y1) = (y * h / nh, ((y + 1) * h / nh).max(y * h / nh + 1));
+        for x in 0..nw {
+            let (x0, x1) = (x * w / nw, ((x + 1) * w / nw).max(x * w / nw + 1));
+            let mut sum = [0u32; 3];
+            for yy in y0..y1 {
+                for xx in x0..x1 {
+                    let i = (yy * w + xx) * 4;
+                    for c in 0..3 {
+                        sum[c] += rgba[i + c] as u32;
+                    }
+                }
+            }
+            let n = ((y1 - y0) * (x1 - x0)) as u32;
+            let o = (y * nw + x) * 4;
+            out[o..o + 4].copy_from_slice(&[(sum[0] / n) as u8, (sum[1] / n) as u8, (sum[2] / n) as u8, 255]);
+        }
+    }
+    (nw, nh, out)
+}
+
+/// The demo server's VMs' screen in small (their pretend text console, waiting for a login), in
+/// `r`.
+pub fn paint_demo_screen(p: &egui::Painter, r: Rect, vm_name: &str, os: &str) {
+    let demo = DemoTerm::new(vm_name, os);
+    let size = vec2(720.0, 400.0);
+    let s = (r.width() / size.x).min(r.height() / size.y);
+    let img = Rect::from_center_size(r.center(), size * s);
+    let p = p.with_clip_rect(img);
+    p.rect_filled(img, 0.0, Color32::BLACK);
+    let line_h = img.height() / 25.0;
+    let font = FontId::monospace(16.0 * s * 0.9);
+    let mut lines = demo.lines.clone();
+    lines.push(format!("{}_", demo.prompt()));
+    for (i, l) in lines.iter().enumerate() {
+        p.text(pos2(img.min.x + 6.0 * s, img.min.y + 6.0 * s + i as f32 * line_h), Align2::LEFT_TOP, l, font.clone(), Color32::from_gray(200));
+    }
+}
+
 // ---------------------------------------------------------------- RFB messages
 
 fn read_n(s: &mut ConsoleStream, n: usize) -> Result<Vec<u8>, String> {
@@ -344,6 +445,8 @@ struct Parser {
     rects_left: Option<u16>,
     zlib: flate2::Decompress, // one zlib stream for the whole connection, as ZRLE requires
     resized: bool,
+    /// Some of the screen has come (not only news such as its size).
+    painted: bool,
 }
 
 fn be16(b: &[u8]) -> u16 {
@@ -355,7 +458,7 @@ fn be32(b: &[u8]) -> u32 {
 
 impl Parser {
     fn new() -> Parser {
-        Parser { rects_left: None, zlib: flate2::Decompress::new(true), resized: false }
+        Parser { rects_left: None, zlib: flate2::Decompress::new(true), resized: false, painted: false }
     }
 
     fn step(&mut self, inb: &mut InBuf, shared: &Mutex<Shared>) -> Result<Step, String> {
@@ -428,6 +531,7 @@ impl Parser {
                         _ => zrle(sc, inflated.as_deref().unwrap_or(&[]), x, y, w, h)?,
                     }
                     sc.dirty = true;
+                    self.painted = true;
                 }
             }
         }

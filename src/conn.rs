@@ -214,6 +214,9 @@ pub trait Connection: Send + Sync {
     /// shut down fails, as for a VM without guest tools), the rest moved to the pool's other
     /// servers, then the server itself. If any step fails it's enabled again.
     fn shutdown_host(&self, host_ref: &str) -> Result<(), ApiError>;
+    /// Restarts a server, as `shutdown_host` (its VMs stopped or moved) but restarting it; it
+    /// takes new VMs again once it's back.
+    fn reboot_host(&self, host_ref: &str) -> Result<(), ApiError>;
     /// Deletes a VM: turned off first if it isn't (forced), its snapshots, then the VM; with
     /// `disks`, then the disks only it and its snapshots use (a disk another VM has stays). DVD
     /// drives just go, the ISO files in them untouched. The disks that couldn't be deleted (the
@@ -238,6 +241,14 @@ pub trait Connection: Send + Sync {
     /// Copies a VM that's off, named `name`: in an instant on its own storage (`sr` None), or in
     /// full onto `sr`. Its reference.
     fn copy_vm(&self, vm_ref: &str, name: &str, sr: Option<&str>) -> Result<String, ApiError>;
+    /// Changes a VM (see `VmChange`): what can be done while it runs is; a disk or card added to a
+    /// running VM is plugged in when it can be (else at its next start).
+    fn edit_vm(&self, vm_ref: &str, change: &VmChange) -> Result<(), ApiError>;
+    /// The last ten minutes of a running VM's load, from the server it runs on (its address).
+    fn vm_perf(&self, vm_uuid: &str, host_address: &str) -> Result<Perf, ApiError>;
+    /// The last ten minutes of a server's load and its running VMs', from the server itself (its
+    /// uuid and address).
+    fn host_perf(&self, host_uuid: &str, host_address: &str) -> Result<HostPerf, ApiError>;
     /// Deletes a snapshot and its own copies of the disks (and its saved memory). The ones that
     /// couldn't be deleted (the snapshot is gone by then): each one's name and why.
     fn delete_snapshot(&self, snapshot_ref: &str) -> Result<Vec<String>, ApiError>;
@@ -863,6 +874,35 @@ impl RealConnection {
     /// so that a server that goes away part way (a power cut) is noticed within `LOST_AFTER`
     /// instead of being waited on for the whole time; the task's progress goes to the thread's
     /// watched `Progress`.
+    /// `shutdown_host` and `reboot_host`: no new VMs sent to it, the VMs that can't leave stopped,
+    /// the rest moved, then it goes off or restarts; enabled again if a step fails.
+    fn host_off(&self, host: &str, reboot: bool) -> Result<(), ApiError> {
+        let t = 60_000;
+        self.call("host.disable", vec![json!(host)], t)?;
+        let done = (|| -> Result<(), ApiError> {
+            // the VMs that can't move elsewhere stop
+            let stuck = self.call("host.get_vms_which_prevent_evacuation", vec![json!(host)], t)?;
+            for vm in stuck.as_object().map(|o| o.keys().cloned().collect::<Vec<_>>()).unwrap_or_default() {
+                let power = self.call("VM.get_power_state", vec![json!(vm)], t)?;
+                let clean = match power.as_str() {
+                    Some("Halted") | Some("Suspended") => continue,
+                    Some("Running") => self.call("VM.clean_shutdown", vec![json!(vm)], ACTION_TIMEOUT_MS).map(|_| ()),
+                    _ => Err(ApiError::other("not running")),
+                };
+                if clean.is_err() {
+                    self.call("VM.hard_shutdown", vec![json!(vm)], ACTION_TIMEOUT_MS)?;
+                }
+            }
+            // the rest move to the other servers, then it goes off (or restarts)
+            self.call("host.evacuate", vec![json!(host)], ACTION_TIMEOUT_MS)?;
+            self.call(if reboot { "host.reboot" } else { "host.shutdown" }, vec![json!(host)], ACTION_TIMEOUT_MS)?;
+            Ok(())
+        })();
+        if done.is_err() {
+            let _ = self.call("host.enable", vec![json!(host)], t);
+        }
+        done
+    }
     fn call(&self, method: &str, extra: Vec<Value>, timeout_ms: u64) -> Result<Value, ApiError> {
         if runs_as_task(method, timeout_ms) {
             return self.as_task(method, extra, timeout_ms);
@@ -963,6 +1003,36 @@ impl RealConnection {
         }
     }
 
+    /// The last ten minutes of the records of the server at `address` (the coordinator when
+    /// empty), every five seconds: its running VMs', and its own too when `host`; read by `read`,
+    /// which says how many points it found. With none, the server's clock may be behind this
+    /// computer's: asked again from its own time.
+    fn rrd<T>(&self, address: &str, host: bool, read: impl Fn(&str) -> (T, usize)) -> Result<T, ApiError> {
+        let (coordinator, session) = self.session(20_000)?;
+        let at = if address.is_empty() { coordinator } else { address.to_string() };
+        let at = if at.contains(':') && !at.starts_with('[') { format!("[{}]", at) } else { at };
+        let port = if self.port == DEFAULT_PORT { String::new() } else { format!(":{}", self.port) };
+        let agent = ureq::AgentBuilder::new().tls_connector(self.tls.clone()).timeout_connect(Duration::from_secs(5)).timeout(Duration::from_secs(15)).build();
+        let get = |start: i64| -> Result<String, ApiError> {
+            let url = format!("https://{}{}/rrd_updates?session_id={}&start={}&cf=AVERAGE&interval=5&host={}", at, port, session, start, host);
+            agent.get(&url).call().map_err(|e| ApiError::other(e.to_string()))?.into_string().map_err(|e| ApiError::other(e.to_string()))
+        };
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+        let mut text = get(now - 600)?;
+        let (mut got, mut n) = read(&text);
+        if n < 2 {
+            if let Some(end) = rrd_end(&text).filter(|e| (*e - now).abs() > 5) {
+                text = get(end - 600)?;
+                (got, n) = read(&text);
+            }
+        }
+        if n < 2 {
+            let head: String = text.trim().chars().take(160).collect();
+            return Err(ApiError::other(format!("the server sent no figures for it ({} bytes): {}", text.len(), head)));
+        }
+        Ok(got)
+    }
+
     fn all(&self, cls: &str, timeout_ms: u64) -> Result<Map<String, Value>, ApiError> {
         Ok(self.call(&format!("{}.get_all_records", cls), vec![], timeout_ms)?.as_object().cloned().unwrap_or_default())
     }
@@ -971,10 +1041,11 @@ impl RealConnection {
 /// The calls that can take long and that the server can run as a task (an Async form): only
 /// these go as tasks. A field's setter (set_*, add_to_*, remove_from_*) has no Async form: the
 /// server answers "No async mode for this operation".
-const TASKS: [&str; 27] = [
+const TASKS: [&str; 32] = [
     "VM.clone", "VM.copy", "VM.provision", "VM.snapshot", "VM.checkpoint", "VM.revert", "VM.start", "VM.start_on", "VM.resume", "VM.resume_on",
     "VM.suspend", "VM.clean_shutdown", "VM.hard_shutdown", "VM.clean_reboot", "VM.hard_reboot", "VM.destroy", "VDI.create", "VDI.destroy",
-    "VBD.eject", "VBD.insert", "PBD.plug", "PBD.unplug", "SR.create", "SR.scan", "SR.forget", "host.evacuate", "host.shutdown",
+    "VDI.resize", "VBD.eject", "VBD.insert", "VBD.plug", "VIF.plug", "VIF.unplug", "VIF.move", "PBD.plug", "PBD.unplug", "SR.create", "SR.scan",
+    "SR.forget", "host.evacuate", "host.shutdown",
 ];
 
 /// Whether a call runs as a task on the server (see `call`): one allowed over a minute that can.
@@ -1077,13 +1148,7 @@ fn vm_details(vm: &mut VmInfo, r: &Value, guest: &Value, metrics: &Value) {
     if vm.virt_mode == "HVM" {
         let boot = r.get("HVM_boot_params").unwrap_or(&null);
         vm.firmware = if s(boot, "firmware") == "uefi" { "UEFI" } else { "BIOS" }.into();
-        let order: Vec<&str> = s(boot, "order").chars().filter_map(|c| match c {
-            'c' => Some("Disk"),
-            'd' => Some("DVD drive"),
-            'n' => Some("Network"),
-            _ => None,
-        }).collect();
-        vm.boot_order = order.join(", ");
+        vm.boot_order = boot_text(&s(boot, "order"));
     }
     if vm.firmware == "UEFI" {
         vm.secure_boot = match s(r.get("platform").unwrap_or(&null), "secureboot").as_str() {
@@ -1168,6 +1233,12 @@ impl Connection for RealConnection {
                 control_domain: String::new(), // filled in from the VMs below
                 live: m.get("live").map_or(true, |x| x.as_bool().unwrap_or(true)),
                 unreachable: false, // see knock_hosts
+                boot_time: r.get("other_config").map(|o| s(o, "boot_time")).and_then(|t| t.trim().parse::<f64>().ok()).filter(|t| *t > 0.0).map(|t| t as i64),
+                brand: s(&sw, "product_brand"),
+                edition: s(&r, "edition"),
+                license_name: r.get("license_params").map(|l| s(l, "sku_marketing_name")).unwrap_or_default(),
+                license_expiry: r.get("license_params").and_then(|l| parse_xen_time(&s(l, "expiry"))),
+                nics: vec![], // filled in from the PIFs below
             });
         }
         self.knock_hosts(&mut pd.hosts);
@@ -1220,6 +1291,31 @@ impl Connection for RealConnection {
                 bridge: s(&r, "bridge"),
                 mtu: n(&r, "MTU"),
             });
+        }
+        // each server's network cards: the physical ones and bonds, not a bond's members or VLANs
+        // (if these can't be read, the rest still shows)
+        let pif_metrics = self.all("PIF_metrics", t).unwrap_or_default();
+        for (_, r) in self.all("PIF", t).unwrap_or_default() {
+            let null = |k: &str| matches!(s(&r, k).as_str(), "" | "OpaqueRef:NULL");
+            let vlan = r.get("VLAN").map_or(-1, |_| n(&r, "VLAN"));
+            if !null("bond_slave_of") || vlan >= 0 || (!b(&r, "physical") && list(&r, "bond_master_of").is_empty()) {
+                continue;
+            }
+            let m = pif_metrics.get(&s(&r, "metrics")).cloned().unwrap_or(Value::Null);
+            let nic = HostNic {
+                device: s(&r, "device"),
+                network: net_names.get(&s(&r, "network")).cloned().unwrap_or_default(),
+                ip: s(&r, "IP"),
+                management: b(&r, "management"),
+                carrier: b(&m, "carrier"),
+                speed: n(&m, "speed"),
+            };
+            if let Some(h) = pd.hosts.iter_mut().find(|h| h.rref == s(&r, "host")) {
+                h.nics.push(nic);
+            }
+        }
+        for h in pd.hosts.iter_mut() {
+            h.nics.sort_by(|a, b| a.device.cmp(&b.device));
         }
         let vbds = self.all("VBD", t)?;
         let vdis = self.all("VDI", t)?;
@@ -1340,8 +1436,9 @@ impl Connection for RealConnection {
             for vbd_ref in list(&r, "VBDs") {
                 let Some(vbd) = vbds.get(&vbd_ref) else { continue };
                 let cd = s(vbd, "type") == "CD";
-                let mut d = VmDisk { device: s(vbd, "userdevice"), kind: if cd { "DVD drive".into() } else { "Disk".into() }, ..Default::default() };
+                let mut d = VmDisk { device: s(vbd, "userdevice"), kind: if cd { "DVD drive".into() } else { "Disk".into() }, vbd: vbd_ref.clone(), ..Default::default() };
                 if let Some(vdi) = vdis.get(&s(vbd, "VDI")) {
+                    d.vdi = s(vbd, "VDI");
                     if vm.storage_host.is_none() {
                         vm.storage_host = sr_hosts.get(&s(vdi, "SR")).cloned();
                     }
@@ -1365,7 +1462,7 @@ impl Connection for RealConnection {
                 if vm.ip.is_empty() && !ip.is_empty() {
                     vm.ip = ip.clone();
                 }
-                vm.nics.push(VmNic { mac: s(vif, "MAC"), network: net_names.get(&s(vif, "network")).cloned().unwrap_or_default(), ip, device: dev });
+                vm.nics.push(VmNic { vif: vif_ref.clone(), net: s(vif, "network"), mac: s(vif, "MAC"), network: net_names.get(&s(vif, "network")).cloned().unwrap_or_default(), ip, device: dev });
             }
             vm.nics.sort_by(|a, b| a.device.cmp(&b.device));
             if user_template {
@@ -1592,6 +1689,122 @@ impl Connection for RealConnection {
             Some(sr) => self.call("VM.copy", vec![json!(vm), json!(name), json!(sr)], 6 * 3_600_000)?,
         };
         Ok(made.as_str().unwrap_or_default().to_string())
+    }
+
+    fn edit_vm(&self, vm: &str, change: &VmChange) -> Result<(), ApiError> {
+        let (t, long) = (30_000, 600_000);
+        let running = || self.call("VM.get_power_state", vec![json!(vm)], t).map(|p| p.as_str() == Some("Running"));
+        // a map's key set afresh (an old value goes first; it may not be there)
+        let set_key = |obj: &str, map: &str, r: &str, k: &str, v: &str| -> Result<(), ApiError> {
+            let _ = self.call(&format!("{}.remove_from_{}", obj, map), vec![json!(r), json!(k)], t);
+            self.call(&format!("{}.add_to_{}", obj, map), vec![json!(r), json!(k), json!(v)], t).map(|_| ())
+        };
+        match change {
+            VmChange::Name(n) => self.call("VM.set_name_label", vec![json!(vm), json!(n)], t).map(|_| ()),
+            VmChange::Description(d) => self.call("VM.set_name_description", vec![json!(vm), json!(d)], t).map(|_| ()),
+            VmChange::AutoPowerOn(on) => {
+                set_key("VM", "other_config", vm, "auto_poweron", if *on { "true" } else { "false" })?;
+                // the pool has to allow it too
+                if *on {
+                    let pool = self.call("pool.get_all", vec![], t)?.as_array().and_then(|a| a.first().cloned()).unwrap_or(Value::Null);
+                    let pool = pool.as_str().unwrap_or_default().to_string();
+                    set_key("pool", "other_config", &pool, "auto_poweron", "true")?;
+                }
+                Ok(())
+            }
+            VmChange::BootOrder(order) => set_key("VM", "HVM_boot_params", vm, "order", order),
+            VmChange::Resources { vcpus, cores_per_socket, memory } => {
+                let r = self.call("VM.get_record", vec![json!(vm)], t)?;
+                let order = if *vcpus > n(&r, "VCPUs_max") { ["VM.set_VCPUs_max", "VM.set_VCPUs_at_startup"] } else { ["VM.set_VCPUs_at_startup", "VM.set_VCPUs_max"] };
+                for m in order {
+                    self.call(m, vec![json!(vm), json!(vcpus)], t)?;
+                }
+                set_key("VM", "platform", vm, "cores-per-socket", &cores_per_socket.to_string())?;
+                let floor = n(&r, "memory_static_min").min(*memory);
+                self.call("VM.set_memory_limits", vec![json!(vm), json!(floor), json!(memory), json!(memory), json!(memory)], t).map(|_| ())
+            }
+            VmChange::AddDisk { name, size, sr } => {
+                let device = self.call("VM.get_allowed_VBD_devices", vec![json!(vm)], t)?.as_array().and_then(|a| a.first().cloned()).and_then(|d| d.as_str().map(String::from)).ok_or_else(|| ApiError::other("The VM has no room for another disk."))?;
+                let record = json!({
+                    "name_label": name, "name_description": "Created by Simple VM Manager", "SR": sr,
+                    "virtual_size": size, "type": "user", "sharable": false, "read_only": false,
+                    "other_config": {}, "xenstore_data": {}, "sm_config": { "vmhint": vm }, "tags": [],
+                });
+                let vdi = self.call("VDI.create", vec![record], long)?.as_str().unwrap_or_default().to_string();
+                let drive = json!({
+                    "VM": vm, "VDI": vdi, "userdevice": device, "bootable": false, "mode": "RW", "type": "Disk", "unpluggable": true,
+                    "empty": false, "other_config": { "owner": "" }, "qos_algorithm_type": "", "qos_algorithm_params": {}, "device": "", "currently_attached": false,
+                });
+                let vbd = match self.call("VBD.create", vec![drive], t) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let _ = self.call("VDI.destroy", vec![json!(vdi)], long);
+                        return Err(e);
+                    }
+                };
+                // plugged in now if it can be (a VM without its tools gets it at its next start)
+                if running()? {
+                    let _ = self.call("VBD.plug", vec![vbd], long);
+                }
+                Ok(())
+            }
+            VmChange::GrowDisk { vdi, size } => self.call("VDI.resize", vec![json!(vdi), json!(size)], long).map(|_| ()),
+            VmChange::RemoveDisk { vbd, vdi } => {
+                self.call("VBD.destroy", vec![json!(vbd)], t)?;
+                // the disk too, unless something else has it
+                let others = self.call("VDI.get_VBDs", vec![json!(vdi)], t)?.as_array().map_or(0, |a| a.len());
+                if others == 0 {
+                    self.call("VDI.destroy", vec![json!(vdi)], long)?;
+                }
+                Ok(())
+            }
+            VmChange::Dvd { vbd, iso } => {
+                if !self.call("VBD.get_empty", vec![json!(vbd)], t)?.as_bool().unwrap_or(true) {
+                    self.call("VBD.eject", vec![json!(vbd)], long)?;
+                }
+                if let Some(iso) = iso {
+                    self.call("VBD.insert", vec![json!(vbd), json!(iso)], long)?;
+                }
+                Ok(())
+            }
+            VmChange::AddNic { net } => {
+                let device = self.call("VM.get_allowed_VIF_devices", vec![json!(vm)], t)?.as_array().and_then(|a| a.first().cloned()).and_then(|d| d.as_str().map(String::from)).ok_or_else(|| ApiError::other("The VM has no room for another network card."))?;
+                let mtu = self.call("network.get_MTU", vec![json!(net)], t).map(|m| n(&json!({ "m": m }), "m")).unwrap_or(1500);
+                let card = json!({
+                    "device": device, "network": net, "VM": vm, "MAC": "", "MTU": mtu.max(68), "other_config": {},
+                    "qos_algorithm_type": "", "qos_algorithm_params": {}, "locking_mode": "network_default",
+                    "ipv4_allowed": [], "ipv6_allowed": [], "currently_attached": false,
+                });
+                let vif = self.call("VIF.create", vec![card], t)?;
+                if running()? {
+                    let _ = self.call("VIF.plug", vec![vif], long);
+                }
+                Ok(())
+            }
+            VmChange::MoveNic { vif, net } => self.call("VIF.move", vec![json!(vif), json!(net)], long).map(|_| ()),
+            VmChange::RemoveNic { vif } => {
+                if self.call("VIF.get_currently_attached", vec![json!(vif)], t)?.as_bool().unwrap_or(false) {
+                    self.call("VIF.unplug", vec![json!(vif)], long)?;
+                }
+                self.call("VIF.destroy", vec![json!(vif)], t).map(|_| ())
+            }
+        }
+    }
+
+    fn vm_perf(&self, uuid: &str, address: &str) -> Result<Perf, ApiError> {
+        self.rrd(address, false, |text| {
+            let p = parse_rrd_updates(text, uuid);
+            let n = p.times.len();
+            (p, n)
+        })
+    }
+
+    fn host_perf(&self, uuid: &str, address: &str) -> Result<HostPerf, ApiError> {
+        self.rrd(address, true, |text| {
+            let p = parse_host_rrd(text, uuid);
+            let n = p.host.times.len();
+            (p, n)
+        })
     }
 
     fn revert_vm(&self, snap: &str) -> Result<(), ApiError> {
@@ -1875,31 +2088,10 @@ impl Connection for RealConnection {
         Ok(left)
     }
     fn shutdown_host(&self, host: &str) -> Result<(), ApiError> {
-        let t = 60_000;
-        self.call("host.disable", vec![json!(host)], t)?;
-        let done = (|| -> Result<(), ApiError> {
-            // the VMs that can't move elsewhere stop
-            let stuck = self.call("host.get_vms_which_prevent_evacuation", vec![json!(host)], t)?;
-            for vm in stuck.as_object().map(|o| o.keys().cloned().collect::<Vec<_>>()).unwrap_or_default() {
-                let power = self.call("VM.get_power_state", vec![json!(vm)], t)?;
-                let clean = match power.as_str() {
-                    Some("Halted") | Some("Suspended") => continue,
-                    Some("Running") => self.call("VM.clean_shutdown", vec![json!(vm)], ACTION_TIMEOUT_MS).map(|_| ()),
-                    _ => Err(ApiError::other("not running")),
-                };
-                if clean.is_err() {
-                    self.call("VM.hard_shutdown", vec![json!(vm)], ACTION_TIMEOUT_MS)?;
-                }
-            }
-            // the rest move to the other servers, then it goes off
-            self.call("host.evacuate", vec![json!(host)], ACTION_TIMEOUT_MS)?;
-            self.call("host.shutdown", vec![json!(host)], ACTION_TIMEOUT_MS)?;
-            Ok(())
-        })();
-        if done.is_err() {
-            let _ = self.call("host.enable", vec![json!(host)], t);
-        }
-        done
+        self.host_off(host, false)
+    }
+    fn reboot_host(&self, host: &str) -> Result<(), ApiError> {
+        self.host_off(host, true)
     }
 
     /// VDI.create in the library (sm_config "path" names the file on the share), then the bytes in
@@ -2066,6 +2258,25 @@ pub struct DemoConnection {
 }
 
 impl DemoConnection {
+    /// A server's VMs leave it: those on its own storage (or with nowhere to go) stop, the others
+    /// move to another server that's on.
+    fn host_off(&self, host: &str) -> Result<(), ApiError> {
+        std::thread::sleep(Duration::from_millis(1800));
+        let mut d = self.data.lock().unwrap();
+        if d.host(host).is_none() {
+            return Err(ApiError { code: "HANDLE_INVALID".into(), details: vec!["host".into(), host.into()] });
+        }
+        let other = d.hosts.iter().find(|h| h.rref != host && h.enabled && h.live).map(|h| h.rref.clone());
+        for v in d.vms.iter_mut().filter(|v| v.host.as_deref() == Some(host) && matches!(v.power, PowerState::Running | PowerState::Paused)) {
+            if v.storage_host.as_deref() == Some(host) || other.is_none() {
+                v.power = PowerState::Halted;
+                v.host = None;
+            } else {
+                v.host = other.clone();
+            }
+        }
+        Ok(())
+    }
     pub fn new() -> DemoConnection {
         let mut d = PoolData { name: "Demo Pool".into(), templates: demo_templates(), ..Default::default() };
         let host = |r: &str, name: &str, addr: &str, master: bool| HostInfo {
@@ -2084,6 +2295,17 @@ impl DemoConnection {
             control_domain: format!("dom0-{}", r),
             live: true,
             unreachable: false,
+            boot_time: Some(SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0) - if master { 34 * 86400 + 7380 } else { 9 * 86400 + 600 }),
+            brand: "XenServer".into(),
+            edition: "xenserver-premium".into(),
+            license_name: String::new(),
+            // till 31 July next year
+            license_expiry: parse_xen_time(&format!("{}0731T00:00:00Z", 1971 + SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0) / 31_556_952)),
+            nics: vec![
+                HostNic { device: "eth0".into(), network: "Pool-wide network 0".into(), ip: addr.into(), management: true, carrier: true, speed: 1000 },
+                HostNic { device: "eth1".into(), network: "Storage network".into(), ip: addr.replace("10.20.", "10.30."), management: false, carrier: true, speed: 10000 },
+                HostNic { device: "eth2".into(), network: "Pool-wide network 2".into(), ip: String::new(), management: false, carrier: false, speed: 0 },
+            ],
         };
         d.hosts.push(host("host-a", "demo-host-01", "10.20.0.11", true));
         d.hosts.push(host("host-b", "demo-host-02", "10.20.0.12", false));
@@ -2106,6 +2328,25 @@ impl DemoConnection {
         d.srs.push(sr("sr-usb2", "Removable storage", "udev", 0, 0, Some("host-b"))); // empty: not listed
         d.srs.push(sr("sr-nfs", "Shared NFS storage", "nfs", 4096 * GB, 0, None));
         d.srs.push(SrInfo { location: "//nas/isos".into(), share: "Windows share (SMB 3.0)".into(), files: demo_isos("sr-iso"), ..sr("sr-iso", "ISO library", "iso", 250 * GB, 87 * GB, None) });
+        // SVM_DEMO_LICENSE: the pool's license runs out soon, has run out, or is a trial
+        if let Ok(how) = std::env::var("SVM_DEMO_LICENSE") {
+            let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+            for h in d.hosts.iter_mut() {
+                match how.as_str() {
+                    "soon" => h.license_expiry = Some(now + 12 * 86_400 + 3600),
+                    "expired" => h.license_expiry = Some(now - 5 * 86_400),
+                    "trial" => (h.edition, h.license_expiry) = ("trial".into(), None),
+                    _ => {}
+                }
+            }
+        }
+        // the servers named in SVM_DEMO_FULL are small for their VMs: little memory left, more
+        // virtual CPUs than real ones (to see their Overview's warnings)
+        if let Ok(full) = std::env::var("SVM_DEMO_FULL") {
+            for h in d.hosts.iter_mut().filter(|h| full.split(',').any(|x| x.trim() == h.rref)) {
+                (h.mem_total, h.cpu_count) = (26 * GB, 8);
+            }
+        }
         // the server named in SVM_DEMO_HOST_DOWN went down without shutting down: the pool still
         // counts it as live, but it doesn't answer
         if let Ok(down) = std::env::var("SVM_DEMO_HOST_DOWN") {
@@ -2132,7 +2373,7 @@ impl DemoConnection {
 
         let vms: [(&str, &str, &str, PowerState, Option<&str>, &str, &str, i64, i64, &str, i64); 6] = [
             ("vm-web", "Web Server", "Public website front end", PowerState::Running, Some("host-a"), "Ubuntu 24.04 LTS", "10.20.1.21", 4, 4, "sr-nfs", 40),
-            ("vm-db", "Database", "Main database server", PowerState::Running, Some("host-a"), "Rocky Linux 9", "10.20.1.22", 8, 16, "sr-nfs", 200),
+            ("vm-db", "Database", "Main database server: PostgreSQL 15 for the website, the shop and the team's own tools, backed up to the NAS every night", PowerState::Running, Some("host-a"), "Rocky Linux 9", "10.20.1.22", 8, 16, "sr-nfs", 200),
             ("vm-mail", "Mail Relay", "Outgoing mail", PowerState::Running, Some("host-b"), "Debian 12", "10.20.1.23", 2, 2, "sr-local2", 20),
             ("vm-build", "Build Agent", "Builds and tests", PowerState::Suspended, Some("host-b"), "Windows Server 2022", "", 4, 8, "sr-nfs", 120),
             ("vm-desk", "Test Desktop", "For trying updates", PowerState::Halted, None, "Windows 11", "", 2, 4, "sr-local1", 64),
@@ -2161,10 +2402,10 @@ impl DemoConnection {
                 vcpus: *cpus,
                 allowed: vec![],
                 disks: vec![
-                    VmDisk { name: format!("{} disk 0", name), device: "0".into(), sr: srr.to_string(), sr_name, kind: "Disk".into(), size: disk * GB },
-                    VmDisk { name: "(empty)".into(), device: "3".into(), kind: "DVD drive".into(), ..Default::default() },
+                    VmDisk { name: format!("{} disk 0", name), device: "0".into(), vbd: format!("{}-vbd-0", r), vdi: format!("{}-vdi-0", r), sr: srr.to_string(), sr_name, kind: "Disk".into(), size: disk * GB },
+                    VmDisk { name: "(empty)".into(), device: "3".into(), vbd: format!("{}-vbd-3", r), kind: "DVD drive".into(), ..Default::default() },
                 ],
-                nics: vec![VmNic { device: "0".into(), mac: format!("aa:16:3e:{:02x}:10:{:02x}", i + 1, 0x20 + i), network: "Pool-wide network 0".into(), ip: ip.to_string() }],
+                nics: vec![VmNic { device: "0".into(), vif: format!("{}-vif-0", r), net: "net-0".into(), mac: format!("aa:16:3e:{:02x}:10:{:02x}", i + 1, 0x20 + i), network: "Pool-wide network 0".into(), ip: ip.to_string() }],
                 ..Default::default()
             });
             demo_details(d.vms.last_mut().unwrap());
@@ -2194,8 +2435,8 @@ impl DemoConnection {
                 boot_order: "Disk, DVD drive, Network".into(),
                 ..Default::default()
             };
-            t.disks.push(VmDisk { name: format!("{} disk 0", name), device: "0".into(), sr: "sr-nfs".into(), sr_name: "Shared NFS storage".into(), kind: "Disk".into(), size: disk * GB });
-            t.nics.push(VmNic { device: "0".into(), mac: format!("aa:16:3e:7e:00:{:02x}", disk), network: "Pool-wide network 0".into(), ip: String::new() });
+            t.disks.push(VmDisk { name: format!("{} disk 0", name), device: "0".into(), vbd: format!("{}-vbd-0", r), vdi: format!("{}-vdi-0", r), sr: "sr-nfs".into(), sr_name: "Shared NFS storage".into(), kind: "Disk".into(), size: disk * GB });
+            t.nics.push(VmNic { device: "0".into(), vif: format!("{}-vif-0", r), net: "net-0".into(), mac: format!("aa:16:3e:7e:00:{:02x}", disk), network: "Pool-wide network 0".into(), ip: String::new() });
             d.user_templates.push(t);
         }
         DemoConnection { data: Mutex::new(d) }
@@ -2230,7 +2471,7 @@ impl DemoConnection {
         (vm.vcpus, vm.mem_static_max, vm.mem_dyn_min, vm.mem_dyn_max, vm.affinity) = (v.vcpus, v.memory, v.memory, v.memory, v.host.clone());
         if !v.keep_nics {
             let net = v.network.as_deref().and_then(|r| d.networks.iter().find(|n| n.rref == r));
-            vm.nics = net.map(|n| VmNic { device: "0".into(), mac: "aa:bb:cc:00:11:23".into(), network: n.name.clone(), ip: String::new() }).into_iter().collect();
+            vm.nics = net.map(|n| VmNic { device: "0".into(), vif: format!("{}-vif-0", rref), net: n.rref.clone(), mac: "aa:bb:cc:00:11:23".into(), network: n.name.clone(), ip: String::new() }).into_iter().collect();
         }
         d.vms.push(vm);
         recompute(&mut d);
@@ -2268,6 +2509,28 @@ fn demo_templates() -> Vec<TemplateInfo> {
 /// The discs in the demo's ISO library `sr`, two of them described.
 /// The demo's stand-in for a server task: `ms` of work, its progress reported to the thread's
 /// watched `Progress`.
+/// A VM's made-up ten minutes (see `DemoConnection::vm_perf`).
+fn demo_perf(v: &VmInfo) -> Perf {
+    let seed = v.name.bytes().map(|b| b as f64).sum::<f64>();
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|t| t.as_secs() as i64).unwrap_or(0) / 5 * 5;
+    let mut p = Perf::default();
+    for i in 0..120 {
+        let t = now - (119 - i) * 5;
+        let x = t as f64 / 37.0 + seed;
+        let wave = |k: f64| ((x * k).sin() * 0.5 + 0.5) * ((x * k * 0.37 + 1.3).sin() * 0.3 + 0.7);
+        p.times.push(t);
+        p.cpu.push((0.08 + 0.35 * wave(1.0)).min(1.0));
+        p.mem_total.push(v.mem_dyn_max as f64);
+        p.mem_used.push(v.mem_dyn_max as f64 * (0.48 + 0.04 * wave(0.2)));
+        p.disk_read.push(2.0e6 * wave(2.3).powi(3));
+        p.disk_write.push(0.8e6 * wave(1.7).powi(2));
+        p.net_rx.push(5.0e5 * wave(1.3));
+        p.net_tx.push(1.5e5 * wave(0.9));
+    }
+    p.mem_inside = v.tools_installed;
+    p
+}
+
 fn demo_work(ms: u64) {
     let watch = watched();
     let steps = (ms / 100).max(1);
@@ -2333,6 +2596,7 @@ fn demo_isos(sr: &str) -> Vec<IsoFile> {
         ("ubuntu-24.04.1-live-server-amd64.iso", 2_700, "Ubuntu Server LTS, for the web servers"),
         ("Win11_24H2_English_x64.iso", 5_800, ""),
         ("windows-server-2025.iso", 5_200, ""),
+        ("26100.1742.240906-0331.ge_release_svc_refresh_CLIENT_IOT_LTSC_EVAL_x64FRE_en-us.iso", 4_900, "Windows 11 IoT Enterprise LTSC, to try"),
     ]
     .iter()
     .enumerate()
@@ -2692,12 +2956,12 @@ impl Connection for DemoConnection {
             allowed: vec!["start".into(), "start_on".into()],
             ..Default::default()
         };
-        vm.disks.push(VmDisk { device: "0".into(), name: format!("{} disk", v.name), sr: v.sr.clone(), sr_name, kind: "Disk".into(), size: v.disk });
+        vm.disks.push(VmDisk { device: "0".into(), name: format!("{} disk", v.name), vbd: format!("{}-vbd-0", rref), vdi: format!("{}-vdi-0", rref), sr: v.sr.clone(), sr_name, kind: "Disk".into(), size: v.disk });
         if let Some((lib, file, size)) = iso {
-            vm.disks.push(VmDisk { device: "3".into(), name: file, sr_name: lib, kind: "DVD drive".into(), size, ..Default::default() });
+            vm.disks.push(VmDisk { device: "3".into(), name: file, vbd: format!("{}-vbd-3", rref), vdi: v.iso.clone(), sr_name: lib, kind: "DVD drive".into(), size, ..Default::default() });
         }
         if let Some(net) = network {
-            vm.nics.push(VmNic { device: "0".into(), mac: "aa:bb:cc:00:11:22".into(), network: net, ip: String::new() });
+            vm.nics.push(VmNic { device: "0".into(), vif: format!("{}-vif-0", rref), net: v.network.clone().unwrap_or_default(), mac: "aa:bb:cc:00:11:22".into(), network: net, ip: String::new() });
         }
         d.vms.push(vm);
         recompute(&mut d);
@@ -2740,20 +3004,15 @@ impl Connection for DemoConnection {
     }
     /// Its VMs on its own storage stop, the others move to another server, and it's off.
     fn shutdown_host(&self, host: &str) -> Result<(), ApiError> {
-        std::thread::sleep(Duration::from_millis(1800));
+        self.host_off(host)?;
         let mut d = self.data.lock().unwrap();
-        let other = d.hosts.iter().find(|h| h.rref != host && h.enabled && h.live).map(|h| h.rref.clone());
-        for v in d.vms.iter_mut().filter(|v| v.host.as_deref() == Some(host) && matches!(v.power, PowerState::Running | PowerState::Paused)) {
-            if v.storage_host.as_deref() == Some(host) || other.is_none() {
-                v.power = PowerState::Halted;
-                v.host = None;
-            } else {
-                v.host = other.clone();
-            }
-        }
         let h = d.hosts.iter_mut().find(|h| h.rref == host).ok_or_else(|| ApiError { code: "HANDLE_INVALID".into(), details: vec!["host".into(), host.into()] })?;
         (h.enabled, h.live, h.mem_free) = (false, false, 0);
         Ok(())
+    }
+    /// As `shutdown_host`, but it's back on at once (its VMs stay where they went).
+    fn reboot_host(&self, host: &str) -> Result<(), ApiError> {
+        self.host_off(host)
     }
     fn set_vdi_description(&self, vdi_ref: &str, text: &str) -> Result<(), ApiError> {
         std::thread::sleep(Duration::from_millis(400));
@@ -2793,6 +3052,133 @@ impl Connection for DemoConnection {
         v.snapshots.insert(0, SnapshotInfo { rref: rref.clone(), name: name.into(), description: description.into(), time, memory, was_running });
         v.parent = Some(rref.clone());
         Ok(rref)
+    }
+    /// Half a second (a disk a second and a half), as a real server would take it.
+    fn edit_vm(&self, vm: &str, change: &VmChange) -> Result<(), ApiError> {
+        let method = match change {
+            VmChange::Name(_) => "VM.set_name_label",
+            VmChange::Description(_) => "VM.set_name_description",
+            VmChange::AutoPowerOn(_) => "VM.add_to_other_config",
+            VmChange::BootOrder(_) => "VM.add_to_HVM_boot_params",
+            VmChange::Resources { .. } => "VM.set_memory_limits",
+            VmChange::AddDisk { .. } => "VDI.create",
+            VmChange::GrowDisk { .. } => "VDI.resize",
+            VmChange::RemoveDisk { .. } => "VBD.destroy",
+            VmChange::Dvd { iso: Some(_), .. } => "VBD.insert",
+            VmChange::Dvd { iso: None, .. } => "VBD.eject",
+            VmChange::AddNic { .. } => "VIF.create",
+            VmChange::MoveNic { .. } => "VIF.move",
+            VmChange::RemoveNic { .. } => "VIF.destroy",
+        };
+        said(method, &[json!(vm)]);
+        demo_work(if matches!(change, VmChange::AddDisk { .. } | VmChange::GrowDisk { .. }) { 1500 } else { 500 });
+        let mut d = self.data.lock().unwrap();
+        let (nets, srs) = (d.networks.clone(), d.srs.clone());
+        let v = d.vms.iter_mut().find(|v| v.rref == vm).ok_or_else(|| ApiError { code: "HANDLE_INVALID".into(), details: vec!["VM".into(), vm.into()] })?;
+        let off = v.power == PowerState::Halted;
+        let bad = || Err(ApiError { code: "VM_BAD_POWER_STATE".into(), details: vec![] });
+        let next = |used: Vec<&str>, skip: &[&str]| (0..16).map(|i| i.to_string()).find(|d| !used.contains(&d.as_str()) && !skip.contains(&d.as_str())).unwrap_or_default();
+        match change {
+            VmChange::Name(n) => v.name = n.clone(),
+            VmChange::Description(x) => v.description = x.clone(),
+            VmChange::AutoPowerOn(on) => v.auto_power_on = *on,
+            VmChange::BootOrder(o) => v.boot_order = boot_text(o),
+            VmChange::Resources { vcpus, memory, .. } => {
+                if !off {
+                    return bad();
+                }
+                (v.vcpus, v.vcpus_max, v.mem_static_max, v.mem_dyn_min, v.mem_dyn_max) = (*vcpus, *vcpus, *memory, *memory, *memory);
+            }
+            VmChange::AddDisk { name, size, sr } => {
+                let device = next(v.disks.iter().map(|k| k.device.as_str()).collect(), &["3"]);
+                let sr_name = srs.iter().find(|x| x.rref == *sr).map(|x| x.name.clone()).unwrap_or_default();
+                v.disks.push(VmDisk { name: name.clone(), device: device.clone(), vbd: format!("{}-vbd-{}", vm, device), vdi: format!("{}-vdi-{}", vm, device), sr: sr.clone(), sr_name, kind: "Disk".into(), size: *size });
+                v.disks.sort_by(|a, b| a.device.cmp(&b.device));
+            }
+            VmChange::GrowDisk { vdi, size } => {
+                if !off {
+                    return bad();
+                }
+                if let Some(k) = v.disks.iter_mut().find(|k| k.vdi == *vdi) {
+                    k.size = k.size.max(*size);
+                }
+            }
+            VmChange::RemoveDisk { vbd, .. } => {
+                if !off {
+                    return bad();
+                }
+                v.disks.retain(|k| k.vbd != *vbd);
+            }
+            VmChange::Dvd { vbd, iso } => {
+                let file = iso.as_deref().and_then(|i| srs.iter().find_map(|x| x.files.iter().find(|f| f.vdi == i).map(|f| (x.name.clone(), f.name.clone(), f.size))));
+                if let Some(k) = v.disks.iter_mut().find(|k| k.vbd == *vbd) {
+                    match file {
+                        Some((lib, name, size)) => (k.name, k.sr_name, k.size, k.vdi) = (name, lib, size, iso.clone().unwrap_or_default()),
+                        None => (k.name, k.sr_name, k.size, k.vdi) = ("(empty)".into(), String::new(), 0, String::new()),
+                    }
+                }
+            }
+            VmChange::AddNic { net } => {
+                let device = next(v.nics.iter().map(|n| n.device.as_str()).collect(), &[]);
+                let name = nets.iter().find(|n| n.rref == *net).map(|n| n.name.clone()).unwrap_or_default();
+                v.nics.push(VmNic { device: device.clone(), vif: format!("{}-vif-{}", vm, device), net: net.clone(), mac: format!("aa:16:3e:5c:00:{:02}", device.parse::<u8>().unwrap_or(0)), network: name, ip: String::new() });
+            }
+            VmChange::MoveNic { vif, net } => {
+                let name = nets.iter().find(|n| n.rref == *net).map(|n| n.name.clone()).unwrap_or_default();
+                if let Some(n) = v.nics.iter_mut().find(|n| n.vif == *vif) {
+                    (n.net, n.network) = (net.clone(), name);
+                }
+            }
+            VmChange::RemoveNic { vif } => v.nics.retain(|n| n.vif != *vif),
+        }
+        Ok(())
+    }
+    /// A made-up but lively ten minutes: CPU and traffic going up and down, memory steady.
+    fn vm_perf(&self, uuid: &str, _host_address: &str) -> Result<Perf, ApiError> {
+        std::thread::sleep(Duration::from_millis(150));
+        let d = self.data.lock().unwrap();
+        let v = d.vms.iter().find(|v| v.uuid == uuid).ok_or_else(|| ApiError { code: "HANDLE_INVALID".into(), details: vec!["VM".into(), uuid.into()] })?;
+        Ok(demo_perf(v))
+    }
+    /// Its running VMs' made-up ten minutes, and the server's from theirs: their CPUs on its own
+    /// and a little of its own, its memory as it stands give or take, their traffic on its first
+    /// card and their disks' on its storage card.
+    fn host_perf(&self, uuid: &str, _host_address: &str) -> Result<HostPerf, ApiError> {
+        std::thread::sleep(Duration::from_millis(150));
+        let d = self.data.lock().unwrap();
+        let h = d.hosts.iter().find(|h| h.uuid == uuid).ok_or_else(|| ApiError { code: "HANDLE_INVALID".into(), details: vec!["host".into(), uuid.into()] })?;
+        let vms: Vec<&VmInfo> = d.vms.iter().filter(|v| v.host.as_deref() == Some(h.rref.as_str()) && v.power == PowerState::Running).collect();
+        let mut out = HostPerf { vms: vms.iter().map(|v| (v.uuid.clone(), demo_perf(v))).collect(), ..Default::default() };
+        let times = demo_perf(&VmInfo::default()).times;
+        let mut nics: Vec<(String, Vec<f64>, Vec<f64>)> = h.nics.iter().map(|n| (n.device.clone(), vec![], vec![])).collect();
+        let p = &mut out.host;
+        p.mem_inside = true;
+        for (i, t) in times.iter().enumerate() {
+            let x = *t as f64 / 29.0 + h.cpu_count as f64;
+            let own = (x.sin() * 0.5 + 0.5) * 0.4 + 0.2;
+            let busy: f64 = vms.iter().zip(&out.vms).map(|(v, (_, q))| q.cpu[i] * v.vcpus as f64).sum();
+            let sum = |f: fn(&Perf) -> &Vec<f64>| -> f64 { out.vms.iter().map(|(_, q)| f(q)[i]).sum() };
+            p.times.push(*t);
+            p.cpu.push(((busy + own) / h.cpu_count.max(1) as f64).min(1.0));
+            p.mem_total.push(h.mem_total as f64);
+            p.mem_used.push((h.mem_total - h.mem_free) as f64 + 0.3e9 * own);
+            p.disk_read.push(sum(|q| &q.disk_read));
+            p.disk_write.push(sum(|q| &q.disk_write));
+            let (rx, tx) = (sum(|q| &q.net_rx) + 3.0e3 * own, sum(|q| &q.net_tx) + 2.0e3 * own);
+            for n in nics.iter_mut() {
+                let (a, b) = match n.0.as_str() {
+                    "eth0" => (rx, tx),
+                    "eth1" => (p.disk_write[i] * 1.02, p.disk_read[i] * 1.02),
+                    _ => (0.0, 0.0),
+                };
+                n.1.push(a);
+                n.2.push(b);
+            }
+            p.net_rx.push(nics.iter().map(|n| n.1[i]).sum());
+            p.net_tx.push(nics.iter().map(|n| n.2[i]).sum());
+        }
+        out.nics = nics;
+        Ok(out)
     }
     /// About a second; a VM has to be off.
     fn make_template(&self, source: &str, name: &str, description: &str) -> Result<String, ApiError> {
@@ -2871,6 +3257,9 @@ impl Connection for DemoConnection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+
+
 
     #[test]
     fn a_server_that_stops_answering_is_unreachable() {
@@ -2965,6 +3354,34 @@ mod tests {
         assert_eq!(made.unwrap(), "OpaqueRef:newvm");
     }
 
+    /// Every change to a VM against a fake server that, like a real one, has no Async form for
+    /// setters (SVM_FAKE_XAPI=host:port).
+    #[test]
+    #[ignore]
+    fn edit_vm_live() {
+        let addr = std::env::var("SVM_FAKE_XAPI").expect("SVM_FAKE_XAPI");
+        let c = RealConnection::new(&addr, "root", "x");
+        let gb = 1024 * 1024 * 1024;
+        for ch in [
+            VmChange::Name("x".into()),
+            VmChange::Description("y".into()),
+            VmChange::AutoPowerOn(true),
+            VmChange::BootOrder("dcn".into()),
+            VmChange::Resources { vcpus: 4, cores_per_socket: 4, memory: 4 * gb },
+            VmChange::AddDisk { name: "d".into(), size: 20 * gb, sr: "OpaqueRef:sr".into() },
+            VmChange::GrowDisk { vdi: "OpaqueRef:vdi".into(), size: 30 * gb },
+            VmChange::RemoveDisk { vbd: "OpaqueRef:vbd".into(), vdi: "OpaqueRef:vdi".into() },
+            VmChange::Dvd { vbd: "OpaqueRef:cd".into(), iso: Some("OpaqueRef:iso".into()) },
+            VmChange::AddNic { net: "OpaqueRef:net".into() },
+            VmChange::MoveNic { vif: "OpaqueRef:vif".into(), net: "OpaqueRef:net2".into() },
+            VmChange::RemoveNic { vif: "OpaqueRef:vif".into() },
+        ] {
+            let r = c.edit_vm("OpaqueRef:vm", &ch);
+            eprintln!("{:?}: {:?}", ch, r);
+            assert!(r.is_ok());
+        }
+    }
+
     #[test]
     fn task_results() {
         assert_eq!(task_value("<value>OpaqueRef:1234</value>"), json!("OpaqueRef:1234"));
@@ -2977,6 +3394,43 @@ mod tests {
         assert!(p.silent_for().is_some());
         p.heard(true);
         assert!(p.silent_for().is_none());
+    }
+
+    #[test]
+    fn vm_changes() {
+        let c = DemoConnection::new();
+        let vm = |c: &DemoConnection| c.fetch(0).unwrap().vm("vm-desk").cloned().unwrap();
+        let gb = |n: i64| n * 1024 * 1024 * 1024;
+        c.edit_vm("vm-desk", &VmChange::Name("Desk".into())).unwrap();
+        c.edit_vm("vm-desk", &VmChange::Resources { vcpus: 4, cores_per_socket: 4, memory: gb(6) }).unwrap();
+        c.edit_vm("vm-desk", &VmChange::AddDisk { name: "data".into(), size: gb(20), sr: "sr-local1".into() }).unwrap();
+        c.edit_vm("vm-desk", &VmChange::AddNic { net: "net-1".into() }).unwrap();
+        c.edit_vm("vm-desk", &VmChange::Dvd { vbd: "vm-desk-vbd-3".into(), iso: Some("sr-iso-vdi-2".into()) }).unwrap();
+        c.edit_vm("vm-desk", &VmChange::AutoPowerOn(true)).unwrap();
+        let v = vm(&c);
+        assert_eq!((v.name.as_str(), v.vcpus, v.mem_dyn_max, v.auto_power_on), ("Desk", 4, gb(6), true));
+        let added = v.disks.iter().find(|k| k.name == "data").unwrap().clone();
+        assert_eq!((added.device.as_str(), added.size), ("1", gb(20)));
+        assert_eq!(v.nics.len(), 2);
+        assert!(v.disks.iter().any(|k| k.kind != "Disk" && k.vdi == "sr-iso-vdi-2"));
+        // grown, moved, ejected, removed
+        c.edit_vm("vm-desk", &VmChange::GrowDisk { vdi: added.vdi.clone(), size: gb(30) }).unwrap();
+        let nic = vm(&c).nics[1].vif.clone();
+        c.edit_vm("vm-desk", &VmChange::MoveNic { vif: nic.clone(), net: "net-0".into() }).unwrap();
+        c.edit_vm("vm-desk", &VmChange::Dvd { vbd: "vm-desk-vbd-3".into(), iso: None }).unwrap();
+        let v = vm(&c);
+        assert_eq!(v.disks.iter().find(|k| k.vdi == added.vdi).unwrap().size, gb(30));
+        assert_eq!(v.nics[1].network, "Pool-wide network 0");
+        assert!(v.disks.iter().any(|k| k.kind != "Disk" && k.vdi.is_empty()));
+        c.edit_vm("vm-desk", &VmChange::RemoveDisk { vbd: added.vbd.clone(), vdi: added.vdi.clone() }).unwrap();
+        c.edit_vm("vm-desk", &VmChange::RemoveNic { vif: nic }).unwrap();
+        let v = vm(&c);
+        assert!(v.disks.iter().all(|k| k.vdi != added.vdi) && v.nics.len() == 1);
+        // a running VM's CPUs and memory wait for it to be off
+        assert_eq!(c.edit_vm("vm-web", &VmChange::Resources { vcpus: 2, cores_per_socket: 2, memory: gb(2) }).unwrap_err().code, "VM_BAD_POWER_STATE");
+        // the boot order both ways
+        assert_eq!(boot_text("dcn"), "DVD drive, Disk, Network");
+        assert_eq!(boot_letters("DVD drive, Disk, Network"), "dcn");
     }
 
     #[test]
@@ -3187,6 +3641,18 @@ mod tests {
     }
 
     #[test]
+    fn demo_reboot_host() {
+        let c = DemoConnection::new();
+        // demo-host-02 restarts: Mail Relay (on its own storage) stops, it stays on
+        c.reboot_host("host-b").unwrap();
+        let d = c.data.lock().unwrap().clone();
+        let h = d.host("host-b").unwrap();
+        assert!(h.enabled && h.live);
+        assert_eq!(d.vm("vm-mail").unwrap().power, PowerState::Halted);
+        assert!(c.reboot_host("host-x").is_err());
+    }
+
+    #[test]
     fn demo_shutdown_host() {
         let c = DemoConnection::new();
         // demo-host-02: Mail Relay's disk is on its own storage, so it stops
@@ -3227,7 +3693,7 @@ mod tests {
         // in a shut-down VM's drive, or in none: gone
         c.delete_iso("sr-iso-vdi-1").unwrap();
         c.delete_iso("sr-iso-vdi-0").unwrap();
-        assert_eq!(names(), vec!["ubuntu-24.04.1-live-server-amd64.iso", "Win11_24H2_English_x64.iso", "windows-server-2025.iso"]);
+        assert_eq!(names()[..3], ["ubuntu-24.04.1-live-server-amd64.iso", "Win11_24H2_English_x64.iso", "windows-server-2025.iso"]);
         assert_eq!(c.delete_iso("sr-iso-vdi-0").unwrap_err().code, "HANDLE_INVALID");
     }
 

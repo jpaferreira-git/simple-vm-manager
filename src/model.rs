@@ -36,6 +36,9 @@ impl PowerState {
 pub struct VmDisk {
     pub name: String,
     pub device: String,
+    /// Its drive (VBD) and disc (VDI; empty for an empty DVD drive), to change them.
+    pub vbd: String,
+    pub vdi: String,
     /// Its storage (reference), and what it's called.
     pub sr: String,
     pub sr_name: String,
@@ -46,6 +49,9 @@ pub struct VmDisk {
 #[derive(Clone, Debug, Default)]
 pub struct VmNic {
     pub device: String,
+    /// The card (VIF) and its network's reference, to change them.
+    pub vif: String,
+    pub net: String,
     pub mac: String,
     pub network: String,
     pub ip: String,
@@ -108,6 +114,315 @@ pub struct VmInfo {
     pub ips: Vec<String>,
 }
 
+/// A change to a VM, made on its Overview.
+#[derive(Clone, Debug, PartialEq)]
+pub enum VmChange {
+    Name(String),
+    Description(String),
+    /// Starts when its server does (other_config auto_poweron, with the pool's).
+    AutoPowerOn(bool),
+    /// A BIOS VM's boot order, as letters: c disk, d DVD drive, n network ("cdn").
+    BootOrder(String),
+    /// CPUs (and how many to a socket) and memory; the VM has to be off.
+    Resources { vcpus: i64, cores_per_socket: i64, memory: i64 },
+    AddDisk { name: String, size: i64, sr: String },
+    /// Larger only; the VM has to be off.
+    GrowDisk { vdi: String, size: i64 },
+    /// Its drive goes, and the disk with it unless something else has it; the VM has to be off.
+    RemoveDisk { vbd: String, vdi: String },
+    /// An ISO in the DVD drive `vbd`, or none.
+    Dvd { vbd: String, iso: Option<String> },
+    AddNic { net: String },
+    MoveNic { vif: String, net: String },
+    RemoveNic { vif: String },
+}
+
+impl VmChange {
+    /// What's being done, for the logs: "Renaming 'Web' to 'Web 2'".
+    pub fn text(&self, vm: &str) -> String {
+        match self {
+            VmChange::Name(n) => format!("Renaming VM '{}' to '{}'", vm, n),
+            VmChange::Description(_) => format!("Changing the description of VM '{}'", vm),
+            VmChange::AutoPowerOn(true) => format!("Making VM '{}' start with its server", vm),
+            VmChange::AutoPowerOn(false) => format!("Making VM '{}' stay off when its server starts", vm),
+            VmChange::BootOrder(_) => format!("Changing the boot order of VM '{}'", vm),
+            VmChange::Resources { vcpus, memory, .. } => format!("Giving VM '{}' {} CPU{} and {} of memory", vm, vcpus, if *vcpus == 1 { "" } else { "s" }, fmt_bytes(*memory)),
+            VmChange::AddDisk { size, .. } => format!("Adding a {} disk to VM '{}'", fmt_bytes(*size), vm),
+            VmChange::GrowDisk { size, .. } => format!("Growing a disk of VM '{}' to {}", vm, fmt_bytes(*size)),
+            VmChange::RemoveDisk { .. } => format!("Removing a disk from VM '{}'", vm),
+            VmChange::Dvd { iso: Some(_), .. } => format!("Putting an ISO in the DVD drive of VM '{}'", vm),
+            VmChange::Dvd { iso: None, .. } => format!("Ejecting the DVD of VM '{}'", vm),
+            VmChange::AddNic { .. } => format!("Adding a network card to VM '{}'", vm),
+            VmChange::MoveNic { .. } => format!("Moving a network card of VM '{}' to another network", vm),
+            VmChange::RemoveNic { .. } => format!("Removing a network card from VM '{}'", vm),
+        }
+    }
+}
+
+/// A BIOS VM's boot order (HVM_boot_params order: c disk, d DVD drive, n network) in words.
+pub fn boot_text(letters: &str) -> String {
+    letters
+        .chars()
+        .filter_map(|c| match c {
+            'c' => Some("Disk"),
+            'd' => Some("DVD drive"),
+            'n' => Some("Network"),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The other way round: "Disk, DVD drive, Network" as "cdn".
+pub fn boot_letters(text: &str) -> String {
+    text.split(", ")
+        .filter_map(|w| match w {
+            "Disk" => Some('c'),
+            "DVD drive" => Some('d'),
+            "Network" => Some('n'),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A VM's recent load, from its server's records (one point every 5 seconds, the last 10
+/// minutes), oldest first.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Perf {
+    pub times: Vec<i64>,
+    /// CPU in use, 0 to 1 (all its CPUs together).
+    pub cpu: Vec<f64>,
+    /// Memory in use (what its tools say the system uses, else what it has), and what it has;
+    /// bytes.
+    pub mem_used: Vec<f64>,
+    pub mem_total: Vec<f64>,
+    /// Its guest tools say how much memory is free inside it (memory_internal_free): without
+    /// them, or with tools that don't say (XenServer VM Tools for Windows 9), what it uses isn't
+    /// known and `mem_used` is all it has.
+    pub mem_inside: bool,
+    /// Disk and network, bytes per second.
+    pub disk_read: Vec<f64>,
+    pub disk_write: Vec<f64>,
+    pub net_rx: Vec<f64>,
+    pub net_tx: Vec<f64>,
+}
+
+/// The server's own time at the end of an rrd_updates answer (XML <end> or JSON "end"): its clock
+/// may differ from this computer's.
+pub fn rrd_end(text: &str) -> Option<i64> {
+    let t = text.trim_start();
+    if t.starts_with('{') {
+        let i = t.find("\"end\"")?;
+        let rest = t[i + 5..].trim_start_matches([':', ' ', '"']);
+        return rest.split(|c: char| !c.is_ascii_digit()).next()?.parse().ok();
+    }
+    t.split("<end>").nth(1)?.split("</end>").next()?.trim().parse().ok()
+}
+
+/// A server's rrd_updates answer read for VM `uuid` (XML, or JSON from newer servers): its CPUs
+/// averaged, its memory, its disks' and network cards' traffic added up. Gaps (NaN) count as
+/// nothing.
+pub fn parse_rrd_updates(text: &str, uuid: &str) -> Perf {
+    let (legend, rows) = rrd_table(text);
+    perf_from(&legend, rows, uuid)
+}
+
+/// A server's recent load and its VMs', from one rrd_updates answer (asked with host=true).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct HostPerf {
+    /// The server's: its CPUs averaged, its memory in use (everything but what's free) and all of
+    /// it, its VMs' disks added up, and its network cards' traffic added up.
+    pub host: Perf,
+    /// Each network card's (its device, like "eth0"): in and out, bytes per second.
+    pub nics: Vec<(String, Vec<f64>, Vec<f64>)>,
+    /// Each VM running there (its uuid), as `parse_rrd_updates` reads it.
+    pub vms: Vec<(String, Perf)>,
+}
+
+impl HostPerf {
+    pub fn vm(&self, uuid: &str) -> Option<&Perf> {
+        self.vms.iter().find(|v| v.0 == uuid).map(|v| &v.1)
+    }
+}
+
+/// A server's rrd_updates answer read for the server `uuid` and the VMs in it.
+pub fn parse_host_rrd(text: &str, uuid: &str) -> HostPerf {
+    #[derive(Clone, Copy, PartialEq)]
+    enum C {
+        Cpu,
+        CpuAvg,
+        MemTotal,
+        MemFree,
+        /// a card's traffic (which card), and all of its physical cards' (aggr)
+        Rx(usize),
+        Tx(usize),
+        AllRx,
+        AllTx,
+        Other,
+    }
+    let (legend, mut rows) = rrd_table(text);
+    rows.sort_by_key(|r| r.0);
+    let mut uuids: Vec<&str> = legend.iter().filter_map(|e| e.split(":vm:").nth(1)?.split(':').next()).collect();
+    uuids.sort();
+    uuids.dedup();
+    let vms: Vec<(String, Perf)> = uuids.iter().map(|u| (u.to_string(), perf_from(&legend, rows.clone(), u))).collect();
+    let prefix = format!(":host:{}:", uuid);
+    let mut devices: Vec<String> = vec![];
+    let cols: Vec<C> = legend
+        .iter()
+        .map(|e| match e.split_once(prefix.as_str()).map(|(_, n)| n) {
+            Some(n) if n.starts_with("cpu") && n.len() > 3 && n[3..].chars().all(|c| c.is_ascii_digit()) => C::Cpu,
+            Some("cpu_avg") => C::CpuAvg,
+            Some("memory_total_kib") => C::MemTotal,
+            Some("memory_free_kib") => C::MemFree,
+            Some("pif_aggr_rx") => C::AllRx,
+            Some("pif_aggr_tx") => C::AllTx,
+            Some(n) if n.starts_with("pif_") && (n.ends_with("_rx") || n.ends_with("_tx")) && n.len() > 7 => {
+                let dev = &n[4..n.len() - 3];
+                if dev == "lo" {
+                    return C::Other;
+                }
+                let i = devices.iter().position(|d| d == dev).unwrap_or_else(|| {
+                    devices.push(dev.to_string());
+                    devices.len() - 1
+                });
+                if n.ends_with("_rx") {
+                    C::Rx(i)
+                } else {
+                    C::Tx(i)
+                }
+            }
+            _ => C::Other,
+        })
+        .collect();
+    let has = |c: C| cols.contains(&c);
+    let cpus = cols.iter().filter(|c| **c == C::Cpu).count();
+    let mut nics: Vec<(String, Vec<f64>, Vec<f64>)> = devices.iter().map(|d| (d.clone(), vec![], vec![])).collect();
+    let mut host = Perf { mem_inside: true, ..Default::default() };
+    for (k, (t, vals)) in rows.iter().enumerate() {
+        let sum = |want: C| -> f64 { cols.iter().zip(vals).filter(|(c, _)| **c == want).map(|(_, v)| *v).sum() };
+        host.times.push(*t);
+        host.cpu.push(if cpus > 0 { sum(C::Cpu) / cpus as f64 } else { sum(C::CpuAvg) }.clamp(0.0, 1.0));
+        let (total, free) = (sum(C::MemTotal) * 1024.0, sum(C::MemFree) * 1024.0);
+        host.mem_total.push(total);
+        host.mem_used.push((total - free).max(0.0));
+        for (i, n) in nics.iter_mut().enumerate() {
+            n.1.push(sum(C::Rx(i)));
+            n.2.push(sum(C::Tx(i)));
+        }
+        // all the cards': the server's own count when it has one (a bond's members aren't counted twice)
+        host.net_rx.push(if has(C::AllRx) { sum(C::AllRx) } else { nics.iter().map(|n| n.1[k]).sum() });
+        host.net_tx.push(if has(C::AllTx) { sum(C::AllTx) } else { nics.iter().map(|n| n.2[k]).sum() });
+        host.disk_read.push(vms.iter().map(|v| v.1.disk_read.get(k).copied().unwrap_or(0.0)).sum());
+        host.disk_write.push(vms.iter().map(|v| v.1.disk_write.get(k).copied().unwrap_or(0.0)).sum());
+    }
+    nics.sort_by(|a, b| a.0.cmp(&b.0));
+    HostPerf { host, nics, vms }
+}
+
+/// An rrd_updates answer's legend (its columns' names) and rows (a time and a value per column),
+/// from XML or JSON.
+fn rrd_table(text: &str) -> (Vec<String>, Vec<(i64, Vec<f64>)>) {
+    if text.trim_start().starts_with('{') {
+        return rrd_json(text);
+    }
+    rrd_xml(text)
+}
+
+/// {"meta": {…, "legend": […]}, "data": [{"t": …, "values": […]}, …]}, read leniently: servers
+/// send its numbers in quotes or not, and NaN bare.
+fn rrd_json(text: &str) -> (Vec<String>, Vec<(i64, Vec<f64>)>) {
+    let number = |s: &str| s.trim().trim_matches('"').trim().parse::<f64>().ok().filter(|v| v.is_finite()).unwrap_or(0.0);
+    let Some(l) = text.find("legend") else { return (vec![], vec![]) };
+    let (Some(a), Some(b)) = (text[l..].find('['), text[l..].find(']')) else { return (vec![], vec![]) };
+    let legend: Vec<String> = text[l + a + 1..l + b].split(',').map(|s| s.trim().trim_matches('"').to_string()).filter(|s| !s.is_empty()).collect();
+    let mut rows: Vec<(i64, Vec<f64>)> = vec![];
+    let data = &text[l + b..];
+    let data = &data[data.find("data").unwrap_or(0)..];
+    // each row: an object, its time before its values
+    for obj in data.split('{').skip(1) {
+        let Some(v) = obj.find("values") else { continue };
+        let t = obj[..v].split_once(':').and_then(|(_, x)| x.trim_start_matches([' ', '"']).split(|c: char| !c.is_ascii_digit()).next()?.parse::<i64>().ok());
+        let after = &obj[v..];
+        let (Some(a), Some(b)) = (after.find('['), after.find(']')) else { continue };
+        if let Some(t) = t {
+            rows.push((t, after[a + 1..b].split(',').map(number).collect()));
+        }
+    }
+    (legend, rows)
+}
+
+fn rrd_xml(xml: &str) -> (Vec<String>, Vec<(i64, Vec<f64>)>) {
+    let tags = |name: &str| -> Vec<String> {
+        let (open, close) = (format!("<{}>", name), format!("</{}>", name));
+        let mut out = vec![];
+        let mut rest = xml;
+        while let Some(i) = rest.find(&open) {
+            let after = &rest[i + open.len()..];
+            let Some(j) = after.find(&close) else { break };
+            out.push(after[..j].to_string());
+            rest = &after[j + close.len()..];
+        }
+        out
+    };
+    let mut rows: Vec<(i64, Vec<f64>)> = vec![];
+    for row in tags("row") {
+        let t = row.split("<t>").nth(1).and_then(|x| x.split("</t>").next()).and_then(|x| x.trim().parse::<i64>().ok());
+        let vals: Vec<f64> = row.split("<v>").skip(1).map(|x| x.split("</v>").next().unwrap_or("").trim().parse::<f64>().ok().filter(|v| v.is_finite()).unwrap_or(0.0)).collect();
+        if let Some(t) = t {
+            rows.push((t, vals));
+        }
+    }
+    (tags("entry"), rows)
+}
+
+/// The figures for VM `uuid` from a legend (its columns' names) and rows (a time and a value per
+/// column).
+fn perf_from(legend: &[String], mut rows: Vec<(i64, Vec<f64>)>, uuid: &str) -> Perf {
+    #[derive(Clone, Copy, PartialEq)]
+    enum C {
+        Cpu,
+        Mem,
+        MemFree,
+        Read,
+        Write,
+        Rx,
+        Tx,
+        Other,
+    }
+    let prefix = format!(":vm:{}:", uuid);
+    let cols: Vec<C> = legend
+        .iter()
+        .map(|e| match e.split_once(prefix.as_str()).map(|(_, n)| n) {
+            Some(n) if n.starts_with("cpu") && n[3..].chars().all(|c| c.is_ascii_digit()) && n.len() > 3 => C::Cpu,
+            Some("memory") => C::Mem,
+            Some("memory_internal_free") => C::MemFree,
+            Some(n) if n.starts_with("vbd_") && n.ends_with("_read") => C::Read,
+            Some(n) if n.starts_with("vbd_") && n.ends_with("_write") => C::Write,
+            Some(n) if n.starts_with("vif_") && n.ends_with("_rx") => C::Rx,
+            Some(n) if n.starts_with("vif_") && n.ends_with("_tx") => C::Tx,
+            _ => C::Other,
+        })
+        .collect();
+    let cpus = cols.iter().filter(|c| **c == C::Cpu).count().max(1) as f64;
+    rows.sort_by_key(|r| r.0);
+    let mut p = Perf::default();
+    for (t, vals) in rows {
+        let sum = |want: C| -> f64 { cols.iter().zip(&vals).filter(|(c, _)| **c == want).map(|(_, v)| *v).sum() };
+        let (mem, free) = (sum(C::Mem), sum(C::MemFree) * 1024.0);
+        p.times.push(t);
+        p.cpu.push((sum(C::Cpu) / cpus).clamp(0.0, 1.0));
+        p.mem_total.push(mem);
+        p.mem_used.push(if free > 0.0 && free < mem { mem - free } else { mem });
+        p.mem_inside |= free > 0.0;
+        p.disk_read.push(sum(C::Read));
+        p.disk_write.push(sum(C::Write));
+        p.net_rx.push(sum(C::Rx));
+        p.net_tx.push(sum(C::Tx));
+    }
+    p
+}
+
 /// A VM's snapshot: its disks as they were, and maybe its memory.
 #[derive(Clone, Debug, Default)]
 pub struct SnapshotInfo {
@@ -165,6 +480,33 @@ pub struct HostInfo {
     /// shutting down (power cut, crash, cable) stays live for ten minutes, till the pool gives up
     /// on its heartbeat (xapi's host_assumed_dead_interval). See `RealConnection::knock_hosts`.
     pub unreachable: bool,
+    /// When it last started, in seconds since 1970 (its other_config's boot_time).
+    pub boot_time: Option<i64>,
+    /// Its product's name, like "XenServer" or "XCP-ng".
+    pub brand: String,
+    /// Its license: its edition as the server names it ("xenserver-premium", "trial"…), its name
+    /// for people (sku_marketing_name, when it says), and when it runs out.
+    pub edition: String,
+    pub license_name: String,
+    pub license_expiry: Option<i64>,
+    /// Its network cards: the physical ones and bonds (a bond's members and VLANs are in those).
+    pub nics: Vec<HostNic>,
+}
+
+/// A server's network card (a PIF).
+#[derive(Clone, Debug, Default)]
+pub struct HostNic {
+    /// Like "eth0" or "bond0".
+    pub device: String,
+    /// The name of the network it's on.
+    pub network: String,
+    /// Its address, when it has one (the card the server is managed through, a storage card).
+    pub ip: String,
+    /// The server is managed through it.
+    pub management: bool,
+    /// A cable is in and the link is up, at `speed` Mbit/s (0 when not known).
+    pub carrier: bool,
+    pub speed: i64,
 }
 
 impl HostInfo {
@@ -172,7 +514,41 @@ impl HostInfo {
     pub fn is_up(&self) -> bool {
         self.live && !self.unreachable
     }
+
+    /// Its license's name for people: the server's own, else its edition's words ("Premium
+    /// Edition"); empty when it has none to speak of (XCP-ng).
+    pub fn edition_name(&self) -> String {
+        if !self.license_name.is_empty() {
+            return self.license_name.clone();
+        }
+        let e = self.edition.trim().to_lowercase();
+        if e.is_empty() || e == "xcp-ng" {
+            return String::new();
+        }
+        let words: Vec<String> = e.trim_start_matches("xenserver-").split(['-', '_', ' ']).filter(|w| !w.is_empty()).map(|w| w[..1].to_uppercase() + &w[1..]).collect();
+        format!("{} Edition", words.join(" "))
+    }
+
+    /// Its version with its product's name: "XenServer 8.4.0".
+    pub fn version_text(&self) -> String {
+        match (self.brand.is_empty(), self.version.is_empty()) {
+            (_, true) => String::new(),
+            (true, false) => self.version.clone(),
+            (false, false) => format!("{} {}", self.brand, self.version),
+        }
+    }
 }
+
+/// How something stands: fine, worth a look, or wrong.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum Standing {
+    Good,
+    Watch,
+    Bad,
+}
+
+/// A license running out sooner than this is worth a look.
+const LICENSE_SOON: i64 = 30 * 86_400;
 
 #[derive(Clone, Debug, Default)]
 pub struct SrInfo {
@@ -406,6 +782,49 @@ impl PoolData {
         }
         Some(SrTrouble { missing: missing.iter().map(|h| h.rref.clone()).collect(), nowhere, detached: false })
     }
+    /// The pool's license in words (its edition, till when or how soon it runs out) and how it
+    /// stands: running out within 30 days, a trial, or not the same on every server is worth a
+    /// look; run out is wrong. None when its servers have no license to speak of (XCP-ng).
+    pub fn license(&self, now: i64) -> Option<(String, Standing)> {
+        let hosts: Vec<&HostInfo> = self.hosts.iter().filter(|h| !h.edition_name().is_empty()).collect();
+        let main = hosts.iter().find(|h| h.is_master).or(hosts.first())?;
+        let name = main.edition_name();
+        let mixed = hosts.iter().any(|h| h.edition != main.edition);
+        let trial = ["trial", "free"].iter().any(|w| main.edition.to_lowercase().contains(w));
+        // (one that never runs out says so with a date far away)
+        let expiry = hosts.iter().filter_map(|h| h.license_expiry).filter(|t| *t < now + 10 * 365 * 86_400).min();
+        let fine = if trial || mixed { Standing::Watch } else { Standing::Good };
+        let name = if mixed { format!("{} (not on every server)", name) } else { name };
+        Some(match expiry {
+            Some(t) if t <= now => (format!("{}, ran out on {}", name, fmt_date(t)), Standing::Bad),
+            Some(t) if t - now <= LICENSE_SOON => {
+                let days = (t - now) / 86_400;
+                let when = match days {
+                    0 => "today".to_string(),
+                    1 => "tomorrow".to_string(),
+                    n => format!("in {} days", n),
+                };
+                (format!("{}, runs out {}", name, when), Standing::Watch)
+            }
+            Some(t) => (format!("{}, until {}", name, fmt_date(t)), fine),
+            None => (name, fine),
+        })
+    }
+
+    /// Its servers' versions ("XenServer 8.4.0"), the coordinator's first: more than one while
+    /// it's being upgraded.
+    pub fn versions(&self) -> Vec<String> {
+        let mut hosts: Vec<&HostInfo> = self.hosts.iter().collect();
+        hosts.sort_by_key(|h| !h.is_master);
+        let mut out: Vec<String> = vec![];
+        for v in hosts.iter().map(|h| h.version_text()).filter(|v| !v.is_empty()) {
+            if !out.contains(&v) {
+                out.push(v);
+            }
+        }
+        out
+    }
+
     pub fn any_enabled_host(&self) -> bool {
         self.hosts.iter().any(|h| h.enabled)
     }
@@ -598,6 +1017,13 @@ pub fn fmt_date_time(t: i64, offset: i64) -> String {
     let lt = t + offset;
     let (y, m, d) = civil_from_days(lt.div_euclid(86_400));
     format!("{} {} {}, {:02}:{:02}", d, MONTHS[(m - 1) as usize], y, lt.rem_euclid(86_400) / 3600, lt.rem_euclid(3600) / 60)
+}
+
+/// A day as people write it: "12 Mar 2027" (UTC).
+pub fn fmt_date(t: i64) -> String {
+    const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    let (y, m, d) = civil_from_days(t.div_euclid(86_400));
+    format!("{} {} {}", d, MONTHS[(m - 1) as usize], y)
 }
 
 pub fn parse_xen_time(t: &str) -> Option<i64> {
@@ -1010,6 +1436,80 @@ mod iso_tests {
         }
         // a suspended VM isn't on any server
         assert!(d.host_down_for(&vm("b", PowerState::Suspended)).is_none());
+    }
+
+    #[test]
+    fn rrd_updates_read() {
+        let xml = r#"<xport><meta><start>100</start><step>5</step><end>110</end><rows>2</rows><columns>8</columns><legend>
+            <entry>AVERAGE:vm:u1:cpu0</entry><entry>AVERAGE:vm:u1:cpu1</entry><entry>AVERAGE:vm:u1:memory</entry>
+            <entry>AVERAGE:vm:u1:memory_internal_free</entry><entry>AVERAGE:vm:u1:vbd_xvda_read</entry><entry>AVERAGE:vm:u1:vbd_xvda_read_latency</entry>
+            <entry>AVERAGE:vm:u1:vif_0_rx</entry><entry>AVERAGE:vm:u2:cpu0</entry></legend></meta><data>
+            <row><t>110</t><v>0.5</v><v>0.3</v><v>4294967296</v><v>1048576</v><v>2048</v><v>9</v><v>NaN</v><v>1.0</v></row>
+            <row><t>105</t><v>0.1</v><v>0.1</v><v>4294967296</v><v>2097152</v><v>0</v><v>9</v><v>100</v><v>1.0</v></row>
+            </data></xport>"#;
+        let p = parse_rrd_updates(xml, "u1");
+        assert_eq!(p.times, vec![105, 110]); // oldest first
+        assert!((p.cpu[1] - 0.4).abs() < 1e-9 && (p.cpu[0] - 0.1).abs() < 1e-9); // averaged over its two CPUs, not the other VM's
+        assert_eq!(p.mem_total[1], 4294967296.0);
+        assert_eq!(p.mem_used[1], 4294967296.0 - 1048576.0 * 1024.0);
+        assert!(p.mem_inside);
+        assert_eq!((p.disk_read[1], p.net_rx[1], p.net_rx[0]), (2048.0, 0.0, 100.0)); // latency left out, NaN as nothing
+    }
+
+    #[test]
+    fn rrd_updates_json_and_end() {
+        let json = r#"{"meta":{"start":100,"step":5,"end":110,"rows":2,"columns":2,"legend":["AVERAGE:vm:u1:cpu0","AVERAGE:vm:u1:memory"]},
+            "data":[{"t":110,"values":[0.5,2048]},{"t":105,"values":[0.25,"NaN"]}]}"#;
+        let p = parse_rrd_updates(json, "u1");
+        assert_eq!(p.times, vec![105, 110]);
+        assert_eq!((p.cpu[0], p.cpu[1], p.mem_total[1]), (0.25, 0.5, 2048.0));
+        // no memory_internal_free (Windows with XenServer VM Tools 9, or no tools): what it uses isn't known
+        assert!(!p.mem_inside);
+        assert_eq!(rrd_end(json), Some(110));
+        assert_eq!(rrd_end("<xport><meta><start>1</start><end>1700000600</end></meta></xport>"), Some(1700000600));
+        // a XenServer's: its numbers in quotes, NaN bare
+        let quoted = r#"{"meta":{"start":"100","step":"5","end":"110","rows":"2","columns":"3","legend":["AVERAGE:vm:u1:cpu0","AVERAGE:vm:u1:cpu1","AVERAGE:vm:u2:cpu0"]},
+            "data":[{"t":"110","values":["0.5","0.3",NaN]},{"t":"105","values":[0.1,NaN,"0.9"]}]}"#;
+        let p = parse_rrd_updates(quoted, "u1");
+        assert_eq!(p.times, vec![105, 110]);
+        assert!((p.cpu[0] - 0.05).abs() < 1e-9 && (p.cpu[1] - 0.4).abs() < 1e-9);
+        assert_eq!(rrd_end(quoted), Some(110));
+    }
+
+    #[test]
+    fn pool_license() {
+        let now = 1_800_000_000;
+        let host = |master: bool, edition: &str, name: &str, expiry: Option<i64>| HostInfo { is_master: master, edition: edition.into(), license_name: name.into(), license_expiry: expiry, ..Default::default() };
+        let pool = |hosts: Vec<HostInfo>| PoolData { hosts, ..Default::default() };
+        let far = now + 400 * 86_400;
+        assert_eq!(pool(vec![host(true, "xenserver-premium", "", Some(far))]).license(now), Some((format!("Premium Edition, until {}", fmt_date(far)), Standing::Good)));
+        assert_eq!(pool(vec![host(true, "xenserver-premium", "XenServer Premium Edition", Some(now + 3 * 86_400))]).license(now).unwrap(), ("XenServer Premium Edition, runs out in 3 days".to_string(), Standing::Watch));
+        assert_eq!(pool(vec![host(true, "xenserver-premium", "", Some(now - 10))]).license(now).unwrap().1, Standing::Bad);
+        // never runs out (a date far away); a trial; not the same everywhere
+        assert_eq!(pool(vec![host(true, "xenserver-standard", "", Some(now + 30 * 365 * 86_400))]).license(now), Some(("Standard Edition".to_string(), Standing::Good)));
+        assert_eq!(pool(vec![host(true, "trial", "", None)]).license(now).unwrap().1, Standing::Watch);
+        assert_eq!(pool(vec![host(false, "xenserver-standard", "", None), host(true, "xenserver-premium", "", None)]).license(now), Some(("Premium Edition (not on every server)".to_string(), Standing::Watch)));
+        // XCP-ng: none
+        assert_eq!(pool(vec![host(true, "xcp-ng", "", None)]).license(now), None);
+    }
+
+    #[test]
+    fn host_rrd_read() {
+        let json = r#"{"meta":{"start":100,"step":5,"end":110,"rows":2,"columns":10,"legend":[
+            "AVERAGE:host:h1:cpu0","AVERAGE:host:h1:cpu1","AVERAGE:host:h1:cpu_avg","AVERAGE:host:h1:memory_total_kib","AVERAGE:host:h1:memory_free_kib",
+            "AVERAGE:host:h1:pif_eth0_rx","AVERAGE:host:h1:pif_eth1_rx","AVERAGE:host:h1:pif_lo_rx",
+            "AVERAGE:vm:u1:cpu0","AVERAGE:vm:u1:vbd_xvda_read"]},
+            "data":[{"t":110,"values":[0.5,0.3,0.4,1024,256,100,50,999,0.7,4096]},{"t":105,"values":[0.1,0.1,0.1,1024,512,0,0,0,0.2,0]}]}"#;
+        let p = parse_host_rrd(json, "h1");
+        assert_eq!(p.host.times, vec![105, 110]);
+        assert!((p.host.cpu[1] - 0.4).abs() < 1e-9); // its CPUs averaged (cpu_avg not counted twice)
+        assert_eq!((p.host.mem_total[1], p.host.mem_used[1], p.host.mem_used[0]), (1024.0 * 1024.0, 768.0 * 1024.0, 512.0 * 1024.0));
+        // its cards (not the loopback), each and together; its VMs' disks added up
+        assert_eq!(p.nics.iter().map(|n| n.0.as_str()).collect::<Vec<_>>(), vec!["eth0", "eth1"]);
+        assert_eq!((p.nics[0].1[1], p.host.net_rx[1]), (100.0, 150.0));
+        assert_eq!(p.host.disk_read[1], 4096.0);
+        assert!((p.vm("u1").unwrap().cpu[1] - 0.7).abs() < 1e-9);
+        assert!(p.vm("u2").is_none());
     }
 
     #[test]

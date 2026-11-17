@@ -21,18 +21,20 @@ struct Args {
     show: String,
     theme: Option<theme::ThemeMode>,
     sidebar_open: Option<bool>,
-    /// The screenshot window's width (as narrow as 760, the app's least, to check a tight layout).
+    /// The screenshot window's width: 760 (the app's least, to check a tight layout) to 2560.
     width: f32,
+    /// Its height: 480 to 1600 (740 by default), to see the bottom of a long page.
+    height: f32,
 }
 
 fn main() -> eframe::Result {
     // --screenshot <file.png>: start with the demo server, draw about 120 frames, save the window, exit.
     // --show home|welcome|objects|networks|storage|isos|search|logs|vm|console|add-server|confirm|about|iso|
     // iso-advanced|iso-error|iso-disconnect|iso-describe|iso-upload|
-    // iso-upload-choose|iso-upload-web|iso-upload-done|iso-delete|new-vm|new-vm-advanced|new-vm-custom|new-vm-no-start|new-vm-created|new-vm-offline|vm-delete|host-console|vm-busy|settings|update|update-progress|host-shutdown|
+    // iso-upload-choose|iso-upload-web|iso-upload-done|iso-delete|new-vm|new-vm-advanced|new-vm-custom|new-vm-no-start|new-vm-created|new-vm-offline|vm-delete|host-console|vm-busy|settings|update|update-progress|host-shutdown|host-restart|pool|pool-details|host-details|
     // sr-unmounted|sr-detached|sr-auto-repair|sr-repair-failed|host-down|snapshots|snapshot-take|
     // snapshot-revert|snapshot-delete|snapshot-taken|templates|template|new-vm-template|make-template|
-    // make-template-snapshot|copy-vm|template-made|vm-off|activities|log-detail picks what the screenshot shows (default: a VM's
+    // make-template-snapshot|copy-vm|template-made|vm-off|vm-edited|vm-bios|vm-rename|host|details|activities|log-detail picks what the screenshot shows (default: a VM's
     // General tab; welcome is Home with no server; storage, search, logs, console and isos show that
     // tab; iso-describe an ISO's description being typed; iso-upload a demo upload under way, -done its
     // finished card; iso-upload-choose and -web the Upload dialog's two steps; sr-unmounted the ISO
@@ -41,10 +43,11 @@ fn main() -> eframe::Result {
     // sr-repair-failed Repair's answer when the share doesn't, host-down a server that went down
     // without shutting down, snapshots the Web Server's Snapshots tab (the others with a dialog over
     // it); the rest open a dialog).
-    // --theme system|light|dark and --sidebar open|folded override the saved choices; --width 760…1180
-    // makes the screenshot narrower.
+    // --theme system|light|dark and --sidebar open|folded override the saved choices; --width 760…2560
+    // sets the screenshot window's width (1180 by default; wider to check a wide layout), --height
+    // 480…1600 its height (740 by default).
     let argv: Vec<String> = std::env::args().collect();
-    let mut args = Args { shot: None, show: "vm".into(), theme: None, sidebar_open: None, width: 1180.0 };
+    let mut args = Args { shot: None, show: "vm".into(), theme: None, sidebar_open: None, width: 1180.0, height: 740.0 };
     let mut i = 1;
     while i < argv.len() {
         let next = argv.get(i + 1).cloned();
@@ -66,7 +69,11 @@ fn main() -> eframe::Result {
                 i += 1;
             }
             ("--width", Some(v)) => {
-                args.width = v.parse::<f32>().unwrap_or(1180.0).clamp(760.0, 1180.0);
+                args.width = v.parse::<f32>().unwrap_or(1180.0).clamp(760.0, 2560.0);
+                i += 1;
+            }
+            ("--height", Some(v)) => {
+                args.height = v.parse::<f32>().unwrap_or(740.0).clamp(480.0, 1600.0);
                 i += 1;
             }
             _ => {}
@@ -84,7 +91,7 @@ fn main() -> eframe::Result {
     if shot.is_some() {
         // never take focus during a check; on Windows also sit behind other windows (it still draws there).
         // A fixed size, so tiling window managers float it and every screenshot comes out the same.
-        let size = [args.width, 740.0];
+        let size = [args.width, args.height];
         viewport = viewport.with_active(false).with_inner_size(size).with_min_inner_size(size).with_max_inner_size(size);
         if cfg!(windows) {
             viewport = viewport.with_window_level(egui::WindowLevel::AlwaysOnBottom);
