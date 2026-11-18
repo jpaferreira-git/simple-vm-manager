@@ -262,6 +262,12 @@ pub trait Connection: Send + Sync {
     fn create_nfs_storage(&self, st: &NfsStorage) -> Result<String, ApiError>;
     /// The folders an NFS server shares, as the pool's coordinator sees them (SR.probe).
     fn nfs_exports(&self, server: &str) -> Result<Vec<String>, ApiError>;
+    /// Makes a network (on a VLAN of a card of every server, or private); its reference. A VLAN
+    /// that can't be made takes the new network away again.
+    fn create_network(&self, n: &NewNetwork) -> Result<String, ApiError>;
+    /// Deletes a network: its VLAN first (from every server's card), then the network. One with
+    /// cards on it (VMs', templates', snapshots') is refused by the server.
+    fn delete_network(&self, net: &str) -> Result<(), ApiError>;
     /// Looks at the storage again for files added or removed (SR.scan).
     fn scan_sr(&self, sr_ref: &str) -> Result<(), ApiError>;
     /// Unplugs the storage from every server and forgets it; nothing on it is deleted.
@@ -1381,6 +1387,10 @@ fn list(o: &Value, k: &str) -> Vec<String> {
 }
 
 /// The General tab's details of a VM, from its record, its guest tools' report and its metrics.
+/// Where a template this app makes keeps when it was made (seconds since 1970): XenServer keeps no
+/// date of its own for that.
+const CREATED_KEY: &str = "simple_vm_manager_created";
+
 fn vm_details(vm: &mut VmInfo, r: &Value, guest: &Value, metrics: &Value) {
     let null = Value::Null;
     let other = r.get("other_config").unwrap_or(&null);
@@ -1427,6 +1437,8 @@ fn vm_details(vm: &mut VmInfo, r: &Value, guest: &Value, metrics: &Value) {
         vm.mem_actual = n(metrics, "memory_actual");
         vm.started = parse_xen_time(&s(metrics, "start_time"));
     }
+    // (the server's "never" is the start of 1970)
+    vm.created = s(other, CREATED_KEY).trim().parse::<i64>().ok().or_else(|| parse_xen_time(&s(metrics, "install_time"))).filter(|t| *t > 86_400);
     // The tools report their version as major / minor / micro; without tools the server says -1.
     let pv = guest.get("PV_drivers_version").unwrap_or(&null);
     let version: Vec<i64> = ["major", "minor", "micro"].iter().filter_map(|k| s(pv, k).trim().parse().ok()).collect();
@@ -1590,14 +1602,20 @@ impl Connection for RealConnection {
                 description: s(&r, "name_description"),
                 bridge: s(&r, "bridge"),
                 mtu: n(&r, "MTU"),
+                device: String::new(), // from the PIFs below
+                vlan: -1,
             });
         }
         // each server's network cards: the physical ones and bonds, not a bond's members or VLANs
-        // (if these can't be read, the rest still shows)
+        // (if these can't be read, the rest still shows); and each network's card and VLAN
         let pif_metrics = self.all("PIF_metrics", t).unwrap_or_default();
+        let mut cards: HashMap<String, (String, i64)> = HashMap::new();
         for (_, r) in self.all("PIF", t).unwrap_or_default() {
             let null = |k: &str| matches!(s(&r, k).as_str(), "" | "OpaqueRef:NULL");
             let vlan = r.get("VLAN").map_or(-1, |_| n(&r, "VLAN"));
+            if null("bond_slave_of") {
+                cards.entry(s(&r, "network")).or_insert((s(&r, "device"), vlan));
+            }
             if !null("bond_slave_of") || vlan >= 0 || (!b(&r, "physical") && list(&r, "bond_master_of").is_empty()) {
                 continue;
             }
@@ -1616,6 +1634,11 @@ impl Connection for RealConnection {
         }
         for h in pd.hosts.iter_mut() {
             h.nics.sort_by(|a, b| a.device.cmp(&b.device));
+        }
+        for net in pd.networks.iter_mut() {
+            if let Some((device, vlan)) = cards.get(&net.rref) {
+                (net.device, net.vlan) = (device.clone(), *vlan);
+            }
         }
         let vbds = self.all("VBD", t)?;
         let vdis = self.all("VDI", t)?;
@@ -1812,6 +1835,47 @@ impl Connection for RealConnection {
         Ok(sr.as_str().unwrap_or_default().to_string())
     }
 
+    fn create_network(&self, nw: &NewNetwork) -> Result<String, ApiError> {
+        let t = 60_000;
+        let record = json!({ "name_label": nw.name, "name_description": nw.description, "MTU": nw.mtu, "other_config": {}, "tags": [] });
+        let net = val_str(&self.call("network.create", vec![record], t)?);
+        if let Some((device, tag)) = &nw.vlan {
+            // the coordinator's card of that name: the pool makes the VLAN on every server's
+            let coordinator = self.all("pool", t)?.values().map(|p| s(p, "master")).next().unwrap_or_default();
+            let pif = self.all("PIF", t)?.into_iter().find(|(_, p)| {
+                s(p, "host") == coordinator && s(p, "device") == *device && n(p, "VLAN") < 0 && matches!(s(p, "bond_slave_of").as_str(), "" | "OpaqueRef:NULL")
+            });
+            let made = match pif {
+                Some((pif, _)) => self.call("pool.create_VLAN_from_PIF", vec![json!(pif), json!(net), json!(tag)], 300_000).map(|_| ()),
+                None => Err(ApiError::other(format!("the pool's coordinator has no card called {}", device))),
+            };
+            if let Err(e) = made {
+                note("the VLAN couldn't be made: the new network is taken away again");
+                let _ = self.call("network.destroy", vec![json!(net)], t);
+                return Err(e);
+            }
+        }
+        Ok(net)
+    }
+
+    fn delete_network(&self, net: &str) -> Result<(), ApiError> {
+        let t = 60_000;
+        for pif in self.call("network.get_PIFs", vec![json!(net)], t)?.as_array().cloned().unwrap_or_default() {
+            let r = self.call("PIF.get_record", vec![pif.clone()], t)?;
+            if n(&r, "VLAN") < 0 {
+                return Err(ApiError { code: "NETWORK_CONTAINS_PIF".into(), details: vec![s(&r, "device")] });
+            }
+            // a VLAN: taken off its card (the server unplugs it first)
+            let vlan = s(&r, "VLAN_master_of");
+            if !matches!(vlan.as_str(), "" | "OpaqueRef:NULL") {
+                self.call("VLAN.destroy", vec![json!(vlan)], 120_000)?;
+            } else {
+                self.call("PIF.destroy", vec![pif], 120_000)?;
+            }
+        }
+        self.call("network.destroy", vec![json!(net)], t).map(|_| ())
+    }
+
     /// SR.probe with only the server: the NFS driver answers with the list of its exports (as an
     /// error, "the folder is missing", that carries the list), or with it as the result.
     fn nfs_exports(&self, server: &str) -> Result<Vec<String>, ApiError> {
@@ -2003,6 +2067,10 @@ impl Connection for RealConnection {
                 self.call("VM.set_is_a_template", vec![json!(tpl), json!(true)], t)?;
             }
             self.call("VM.set_name_description", vec![json!(tpl), json!(description)], t)?;
+            // when it was made, which XenServer doesn't keep (a clone has its source's install date)
+            let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+            let _ = self.call("VM.remove_from_other_config", vec![json!(tpl), json!(CREATED_KEY)], t);
+            self.call("VM.add_to_other_config", vec![json!(tpl), json!(CREATED_KEY), json!(now.to_string())], t)?;
             Ok(())
         })();
         if let Err(e) = done {
@@ -3030,8 +3098,9 @@ impl DemoConnection {
                 x.share.clear();
             }
         }
-        d.networks.push(NetInfo { rref: "net-0".into(), uuid: demo_uuid(), name: "Pool-wide network 0".into(), description: String::new(), bridge: "xenbr0".into(), mtu: 1500 });
-        d.networks.push(NetInfo { rref: "net-1".into(), uuid: demo_uuid(), name: "Storage network".into(), description: String::new(), bridge: "xenbr1".into(), mtu: 9000 });
+        d.networks.push(NetInfo { rref: "net-0".into(), uuid: demo_uuid(), name: "Pool-wide network 0".into(), description: String::new(), bridge: "xenbr0".into(), mtu: 1500, device: "eth0".into(), vlan: -1 });
+        d.networks.push(NetInfo { rref: "net-1".into(), uuid: demo_uuid(), name: "Storage network".into(), description: String::new(), bridge: "xenbr1".into(), mtu: 9000, device: "eth1".into(), vlan: -1 });
+        d.networks.push(NetInfo { rref: "net-2".into(), uuid: demo_uuid(), name: "Office VLAN".into(), description: "192.168.10.0/24".into(), bridge: "xapi0".into(), mtu: 1500, device: "eth0".into(), vlan: 10 });
 
         let vms: [(&str, &str, &str, PowerState, Option<&str>, &str, &str, i64, i64, &str, i64); 6] = [
             ("vm-web", "Web Server", "Public website front end", PowerState::Running, Some("host-a"), "Ubuntu 24.04 LTS", "10.20.1.21", 4, 4, "sr-nfs", 40),
@@ -3074,12 +3143,15 @@ impl DemoConnection {
         }
         recompute(&mut d);
         // two templates made from VMs like these, ready to copy
-        let made: [(&str, &str, &str, &str, i64, i64, i64); 2] = [
-            ("tpl-web", "Ubuntu 24.04 web server", "nginx and PHP 8.3, generalized", "Ubuntu 24.04 LTS", 2, 4, 40),
-            ("tpl-win", "Windows Server 2022 base", "Sysprepped, with the October updates", "Windows Server 2022", 4, 8, 80),
+        // (each made a number of days ago)
+        let made: [(&str, &str, &str, &str, i64, i64, i64, i64); 2] = [
+            ("tpl-web", "Ubuntu 24.04 web server", "nginx and PHP 8.3, generalized", "Ubuntu 24.04 LTS", 2, 4, 40, 12),
+            ("tpl-win", "Windows Server 2022 base", "Sysprepped, with the October updates", "Windows Server 2022", 4, 8, 80, 41),
         ];
-        for (r, name, description, os, cpus, mem, disk) in made {
+        let today = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+        for (r, name, description, os, cpus, mem, disk, days) in made {
             let mut t = VmInfo {
+                created: Some(today - days * 86_400 - 5 * 3600),
                 rref: r.into(),
                 uuid: demo_uuid(),
                 name: name.into(),
@@ -3259,6 +3331,7 @@ fn demo_copy(from: &VmInfo, rref: &str, name: &str, description: &str, sr: Optio
     v.name = name.to_string();
     v.description = description.to_string();
     (v.power, v.host, v.started, v.mem_actual, v.parent) = (PowerState::Halted, None, None, 0, None);
+    v.created = SystemTime::now().duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs() as i64);
     v.snapshots.clear();
     v.allowed.clear();
     (v.ip, v.ips) = (String::new(), vec![]);
@@ -3531,6 +3604,37 @@ impl Connection for DemoConnection {
         });
         answered(&Ok(json!(rref)), Duration::from_millis(2000));
         Ok(rref)
+    }
+    /// About a second; VLAN 666 is taken.
+    fn create_network(&self, nw: &NewNetwork) -> Result<String, ApiError> {
+        said("network.create", &[json!({ "name_label": nw.name, "MTU": nw.mtu })]);
+        std::thread::sleep(Duration::from_millis(600));
+        if let Some((device, tag)) = &nw.vlan {
+            said("pool.create_VLAN_from_PIF", &[json!(format!("{}-pif-host-a", device)), json!("new"), json!(tag)]);
+            std::thread::sleep(Duration::from_millis(600));
+            if *tag == 666 {
+                let e = ApiError { code: "PIF_VLAN_EXISTS".into(), details: vec![format!("{}-pif-host-a", device)] };
+                answered(&Err(e.clone()), Duration::from_millis(600));
+                return Err(e);
+            }
+        }
+        let mut d = self.data.lock().unwrap();
+        let rref = format!("net-{}", d.networks.len());
+        let bridge = format!("xapi{}", d.networks.iter().filter(|n| n.bridge.starts_with("xapi")).count());
+        let (device, vlan) = nw.vlan.clone().unwrap_or((String::new(), -1));
+        d.networks.push(NetInfo { rref: rref.clone(), uuid: demo_uuid(), name: nw.name.clone(), description: nw.description.clone(), bridge, mtu: nw.mtu, device, vlan });
+        Ok(rref)
+    }
+    /// About a second; one with a card on it is refused.
+    fn delete_network(&self, net: &str) -> Result<(), ApiError> {
+        said("network.destroy", &[json!(net)]);
+        std::thread::sleep(Duration::from_millis(800));
+        let mut d = self.data.lock().unwrap();
+        if d.vms.iter().chain(&d.user_templates).any(|v| v.nics.iter().any(|n| n.net == net)) {
+            return Err(ApiError { code: "NETWORK_CONTAINS_VIF".into(), details: vec![] });
+        }
+        d.networks.retain(|n| n.rref != net);
+        Ok(())
     }
     fn nfs_exports(&self, server: &str) -> Result<Vec<String>, ApiError> {
         std::thread::sleep(Duration::from_millis(1200));

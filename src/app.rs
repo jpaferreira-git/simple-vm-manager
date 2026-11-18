@@ -4,6 +4,7 @@
 use crate::conn::*;
 use crate::console::{self, ConsoleView};
 use crate::isolib::{mount_trouble, IsoAction, IsoDialog, MountTrouble};
+use crate::newnet::{NetworkAction, NetworkDialog, PoolCards};
 use crate::newsr::{Guest, StorageAction, StorageDialog};
 use crate::newvm::{NewVmAction, NewVmDialog};
 use crate::movevm::{MoveAction, MoveDialog};
@@ -82,6 +83,10 @@ enum Msg {
     StorageDone { sid: u32, st: NfsStorage, log: usize, result: Result<String, ApiError> },
     /// The folders an NFS server shares, asked for by the New VM Storage dialog.
     Exports { server: String, result: Result<Vec<String>, ApiError> },
+    /// A new network was made (its reference), or not; `log`: its entry in Activities.
+    NetworkMade { sid: u32, nw: NewNetwork, log: usize, result: Result<String, ApiError> },
+    /// A network was deleted, or not.
+    NetworkDeleted { sid: u32, name: String, log: usize, result: Result<(), ApiError> },
     /// A rescan (forget false) or disconnect (forget true) of a storage ended.
     SrDone { sid: u32, sr: String, name: String, forget: bool, result: Result<(), ApiError> },
     /// Mounting a storage again ended: each server tried and how it went; `auto`: the app did it
@@ -174,6 +179,16 @@ impl Upload {
 /// How long a finished upload's card stays.
 const DONE_CARD: Duration = Duration::from_secs(8);
 
+/// A VM New Template can be made from: its pool, the VM, its name, how it's listed, and why it
+/// can't be now (a caution's title and text), if it can't.
+struct TemplateSource {
+    sid: u32,
+    vm: String,
+    name: String,
+    label: String,
+    why: Option<(String, String)>,
+}
+
 /// A row of a list of ISO files: its pool, its library and the file; `lib`, in the list of every
 /// library, the library's name (and its pool's, with several pools).
 struct IsoRow {
@@ -251,11 +266,14 @@ struct Node {
     /// Shown after the name in a softer colour, and not searched (who's logged in to a connection).
     note: String,
     children: Vec<Node>,
+    /// In the tree but not drawn (Templates and Virtual Networks, on the toolbar's pages instead):
+    /// its pages still open.
+    hidden: bool,
 }
 
 impl Node {
     fn new(key: String, text: String, icon: IconKind, kind: Kind, sid: Option<u32>, rref: Option<String>) -> Node {
-        Node { key, text, icon, kind, sid, rref, note: String::new(), children: vec![] }
+        Node { key, text, icon, kind, sid, rref, note: String::new(), children: vec![], hidden: false }
     }
     fn find(&self, key: &str) -> Option<&Node> {
         if self.key == key {
@@ -283,6 +301,8 @@ enum Tab {
     IsoLibrary,
     /// Every pool's storage for VMs' disks (All servers).
     VmStorage,
+    /// Every pool's networks (All servers).
+    Networks,
     Snapshots,
     /// The Templates folder's list.
     Templates,
@@ -303,6 +323,7 @@ impl Tab {
             Tab::IsoFiles => "ISO Files",
             Tab::IsoLibrary => "ISO Library",
             Tab::VmStorage => "VM Storage",
+            Tab::Networks => "Networks",
             Tab::Snapshots => "Snapshots",
             Tab::Templates => "Templates",
             Tab::Logs => "Logs",
@@ -345,8 +366,13 @@ enum Dialog {
     ConfirmRevert { sid: u32, snap: String, vm_name: String, snap_name: String, text: String, first: bool },
     ConfirmDeleteSnapshot { sid: u32, snap: String, vm_name: String, snap_name: String, memory: bool },
     /// Make Template: from `source` (VM `vm`, off, or one of its snapshots), `from` saying which in
-    /// words; `power_cut`: a snapshot of its disks taken while it was running.
-    MakeTemplate { sid: u32, vm: String, source: String, from: String, name: String, description: String, power_cut: bool, focus: bool },
+    /// words; `power_cut`: a snapshot of its disks taken while it was running. `pick`: the VMs to
+    /// choose from (New Template, on the Templates page), empty when it's for one VM.
+    MakeTemplate { sid: u32, vm: String, source: String, from: String, name: String, description: String, power_cut: bool, focus: bool, pick: Vec<TemplateSource> },
+    /// New Network.
+    NewNetwork(Box<NetworkDialog>),
+    /// Deleting a network: pool, network, its name, what happens in words.
+    ConfirmDeleteNetwork { sid: u32, net: String, name: String, text: String },
     /// Copy VM: where its disks can go (reference, label, whether it's where they are now: an
     /// instant copy), and which.
     CopyVm { sid: u32, vm: String, vm_name: String, name: String, stores: Vec<(String, String, bool)>, store: usize, focus: bool },
@@ -389,6 +415,16 @@ enum Intent {
     VmStorage,
     /// The New VM Storage dialog.
     NewStorage,
+    /// The Templates page: every pool's templates (the toolbar's Templates).
+    Templates,
+    /// Make Template, choosing the VM.
+    NewTemplate,
+    /// The Networks page: every pool's networks (the toolbar's Networks).
+    Networks,
+    /// The New Network dialog.
+    NewNetwork,
+    /// Ask before deleting a network: pool, network.
+    AskDeleteNetwork(u32, String),
     /// A pool's updates (this pool's, else the first).
     PoolUpdates(Option<u32>),
     RescanSr(u32, String),
@@ -1389,6 +1425,62 @@ impl App {
         });
     }
 
+    /// Each pool's network cards a VLAN can go on (its coordinator's: physical cards and bonds,
+    /// with the network on each), and the VLANs it has already.
+    fn network_cards(&self) -> Vec<PoolCards> {
+        self.servers
+            .iter()
+            .filter_map(|s| {
+                let d = s.data.as_ref()?;
+                let coordinator = d.hosts.iter().find(|h| h.is_master).or(d.hosts.first())?;
+                let cards = coordinator.nics.iter().map(|n| (n.device.clone(), n.network.clone())).collect();
+                let taken = d.networks.iter().filter(|n| n.vlan >= 0).map(|n| (n.device.clone(), n.vlan, n.name.clone())).collect();
+                Some(PoolCards { sid: s.id, cards, taken })
+            })
+            .collect()
+    }
+
+    /// Deletes network `net` of pool `sid` in the background.
+    fn delete_network(&mut self, sid: u32, net: String, name: String, ctx: &egui::Context) {
+        let Some(s) = self.server(sid) else { return };
+        let (conn, server) = (s.conn.clone(), s.name());
+        let vlan = s.data.as_ref().and_then(|d| d.net(&net)).map_or(false, |n| n.vlan >= 0);
+        let log = self.add_log(sid, &server, None, &name, &format!("Deleting network '{}'", name), "In progress");
+        if vlan {
+            self.if_closed(log, format!("'{}' may be left without its VLAN on some servers: delete it again.", name));
+        }
+        let prog = self.progress(log);
+        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            crate::conn::watch(&prog);
+            let result = conn.delete_network(&net);
+            let _ = tx.send(Msg::NetworkDeleted { sid, name, log, result });
+            ctx.request_repaint();
+        });
+    }
+
+    /// Asks pool `sid` to make network `nw` in the background.
+    fn start_network(&mut self, sid: u32, nw: NewNetwork, ctx: &egui::Context) {
+        let Some(s) = self.server(sid) else { return };
+        let (conn, server) = (s.conn.clone(), s.name());
+        let how = match &nw.vlan {
+            Some((card, tag)) => format!(" (VLAN {} on {})", tag, card),
+            None => " (private)".to_string(),
+        };
+        let log = self.add_log(sid, &server, None, &nw.name, &format!("Making network '{}'{}", nw.name, how), "In progress");
+        if nw.vlan.is_some() {
+            self.if_closed(log, format!("'{}' may be left made without its VLAN: delete it on the Networks page.", nw.name));
+        }
+        let prog = self.progress(log);
+        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            crate::conn::watch(&prog);
+            let result = conn.create_network(&nw);
+            let _ = tx.send(Msg::NetworkMade { sid, nw, log, result });
+            ctx.request_repaint();
+        });
+    }
+
     /// Asks pool `sid` which folders NFS server `server` shares, in the background.
     fn browse_exports(&mut self, sid: u32, server: String, ctx: &egui::Context) {
         let Some(conn) = self.server(sid).map(|s| s.conn.clone()) else { return };
@@ -1651,6 +1743,36 @@ impl App {
                             }
                         }
                     }
+                }
+                Msg::NetworkMade { sid, nw, log, result } => match result {
+                    Ok(_) => {
+                        self.end_log(log, "Done", None);
+                        if matches!(self.dialog, Dialog::NewNetwork(_)) {
+                            self.dialog = Dialog::None;
+                        }
+                        self.refresh_soon(sid);
+                    }
+                    Err(e) => {
+                        self.end_log(log, "Failed", Some(format!("Couldn't make network '{}': {}", nw.name, e.message())));
+                        if let Dialog::NewNetwork(d) = &mut self.dialog {
+                            d.failed(&nw, &e);
+                        }
+                    }
+                },
+                Msg::NetworkDeleted { sid, name, log, result } => {
+                    match result {
+                        Ok(()) => self.end_log(log, "Done", None),
+                        Err(e) => {
+                            let why = match e.code.as_str() {
+                                "NETWORK_CONTAINS_VIF" => "cards are still on it (a VM's, a template's or a snapshot's): move or remove them first".to_string(),
+                                "NETWORK_CONTAINS_PIF" => "it's a network card's own network: it goes only with the card".to_string(),
+                                _ => e.message(),
+                            };
+                            self.end_log(log, "Failed", Some(format!("Couldn't delete network '{}': {}", name, why)));
+                            self.dialog = Dialog::Message { title: "Delete Network".into(), text: format!("Couldn't delete '{}': {}.", name, why) };
+                        }
+                    }
+                    self.refresh_soon(sid);
                 }
                 Msg::Exports { server, result } => {
                     if let Dialog::NewStorage(d) = &mut self.dialog {
@@ -2074,12 +2196,13 @@ impl App {
                                 e.status = "Done".into();
                             }
                             // the new one opened, once the server's been read again
-                            let key = if template { format!("tpl:{}:{}", sid, made) } else { format!("vm:{}:{}", sid, made) };
+                            // (a template: the Templates page, where it's listed)
                             if template {
-                                self.expanded.insert(format!("folder:{}:tpls", sid));
                                 self.expanded.insert("cat:tpls".into());
+                                self.pending_select = Some(("root".into(), Tab::Templates));
+                            } else {
+                                self.pending_select = Some((format!("vm:{}:{}", sid, made), Tab::General));
                             }
-                            self.pending_select = Some((key, Tab::General));
                         }
                         Err(e) => {
                             let why = snapshot_problem(&e);
@@ -2425,14 +2548,10 @@ impl App {
                             "search" | "logs" => self.select("root".into()),
                             "host-down" => self.select(format!("host:{}:host-b", id)),
                             "host" | "host-details" | "host-shutdown" | "host-restart" => self.select(format!("host:{}:host-a", id)),
-                            "templates" => {
-                                self.expanded.insert(format!("folder:{}:tpls", id));
-                                self.select(format!("folder:{}:tpls", id));
-                            }
-                            "template" => {
-                                self.expanded.insert(format!("folder:{}:tpls", id));
-                                self.select(format!("tpl:{}:tpl-web", id));
-                            }
+                            "templates" | "networks" | "networks-sorted" | "delete-network" | "new-network" | "new-network-error" => self.select("root".into()),
+                            "template" => self.select(format!("tpl:{}:tpl-web", id)),
+                            // a running VM chosen: it can't be made a template now
+                            "new-template" => self.select(format!("vm:{}:vm-web", id)),
                             "make-template" | "copy-vm" | "template-made" | "vm-off" | "vm-edited" | "move-vm-off" => self.select(format!("vm:{}:vm-desk", id)),
                             "move-vm-local" => self.select(format!("vm:{}:vm-mail", id)),
                             "sr-shared" => {
@@ -2440,10 +2559,6 @@ impl App {
                                 self.select(format!("sr:{}:sr-nfs", id));
                             }
                             "vm-bios" => self.select(format!("vm:{}:vm-db", id)),
-                            "networks" => {
-                                self.expanded.insert(format!("folder:{}:nets", id));
-                                self.select(format!("folder:{}:nets", id));
-                            }
                             "objects" => {
                                 self.objects_view = true;
                                 self.expanded.insert("cat:vms".into());
@@ -2678,6 +2793,8 @@ impl App {
                 let folder = |what: &str, label: &str, kids: Vec<Node>| {
                     let mut f = Node::new(format!("folder:{}:{}", id, what), format!("{} ({})", label, kids.len()), IconKind::Folder, Kind::Folder, Some(id), Some(what.to_string()));
                     f.children = kids;
+                    // templates and networks have their own pages on the toolbar
+                    f.hidden = what == "tpls" || what == "nets";
                     f
                 };
                 // Each server holds its VMs and then its own storage (local disks, DVD drives, USB);
@@ -2899,11 +3016,11 @@ impl App {
                     let date = fmt_date_time(unix_now(), local_offset(unix_now()));
                     if let Some(v) = d.vm(&source) {
                         let (name, description) = (format!("{} template", v.name), format!("From '{}', {}", v.name, date));
-                        self.dialog = Dialog::MakeTemplate { sid, vm: v.rref.clone(), source, from: format!("'{}' (it stays as it is)", v.name), name, description, power_cut: false, focus: true };
+                        self.dialog = Dialog::MakeTemplate { sid, vm: v.rref.clone(), source, from: format!("'{}' (it stays as it is)", v.name), name, description, power_cut: false, focus: true, pick: vec![] };
                     } else if let Some((v, x)) = d.vms.iter().find_map(|v| v.snapshot(&source).map(|x| (v, x))) {
                         let (name, description) = (format!("{} – {}", v.name, x.name), format!("From the snapshot '{}' of '{}'", x.name, v.name));
                         let from = format!("the snapshot '{}' of '{}'", x.name, v.name);
-                        self.dialog = Dialog::MakeTemplate { sid, vm: v.rref.clone(), source, from, name, description, power_cut: x.was_running, focus: true };
+                        self.dialog = Dialog::MakeTemplate { sid, vm: v.rref.clone(), source, from, name, description, power_cut: x.was_running, focus: true, pick: vec![] };
                     }
                 }
                 Intent::CopyVm(sid, vm) => {
@@ -2988,6 +3105,73 @@ impl App {
                 Intent::VmStorage => {
                     self.select("root".into());
                     self.tab = Tab::VmStorage;
+                }
+                Intent::Templates => {
+                    self.select("root".into());
+                    self.tab = Tab::Templates;
+                }
+                Intent::Networks => {
+                    self.select("root".into());
+                    self.tab = Tab::Networks;
+                }
+                Intent::NewTemplate => {
+                    // every VM of every pool, the ones that can't be made a template now saying why
+                    let mut pick: Vec<TemplateSource> = vec![];
+                    let pools = self.servers.iter().filter(|s| s.data.is_some()).count();
+                    for s in &self.servers {
+                        let Some(d) = s.data.as_ref() else { continue };
+                        for v in &d.vms {
+                            let why = if let Some(b) = s.busy.get(&v.rref) {
+                                Some((format!("'{}' is busy.", v.name), format!("It's {}: wait till that's done.", b.0.trim_end_matches('…').to_lowercase())))
+                            } else if v.power != PowerState::Halted {
+                                Some((
+                                    format!("'{}' is {}.", v.name, v.power.label().to_lowercase()),
+                                    format!("A template is made from a shut-down VM: shut '{}' down first, or make the template from one of its snapshots (on its Snapshots tab).", v.name),
+                                ))
+                            } else {
+                                None
+                            };
+                            let state = if v.power == PowerState::Halted { String::new() } else { format!("  ({})", v.power.label().to_lowercase()) };
+                            let label = if pools > 1 { format!("{}  ·  {}{}", v.name, s.name(), state) } else { format!("{}{}", v.name, state) };
+                            pick.push(TemplateSource { sid: s.id, vm: v.rref.clone(), name: v.name.clone(), label, why });
+                        }
+                    }
+                    pick.sort_by_key(|p| (p.why.is_some(), p.label.to_lowercase()));
+                    // the selected VM first, if it's one; else the first that can be
+                    let first = sel.rref.as_ref().filter(|_| sel.kind == Kind::Vm).and_then(|r| pick.iter().position(|p| &p.vm == r)).unwrap_or(0);
+                    if let Some(p) = pick.get(first) {
+                        let date = fmt_date_time(unix_now(), local_offset(unix_now()));
+                        let (sid, vm, name, description) = (p.sid, p.vm.clone(), format!("{} template", p.name), format!("From '{}', {}", p.name, date));
+                        let from = format!("'{}' (it stays as it is)", p.name);
+                        self.dialog = Dialog::MakeTemplate { sid, vm: vm.clone(), source: vm, from, name, description, power_cut: false, focus: true, pick };
+                    } else {
+                        self.dialog = Dialog::Message { title: "New Template".into(), text: "There's no VM to make a template from yet.".into() };
+                    }
+                }
+                Intent::AskDeleteNetwork(sid, net) => {
+                    let Some(n) = self.server(sid).and_then(|s| s.data.as_ref()).and_then(|d| d.net(&net)) else { continue };
+                    // what changes, what doesn't, and how to have it back (it's only offered while no
+                    // VM's or template's card is on it)
+                    let text = if n.vlan >= 0 {
+                        format!(
+                            "The pool stops using VLAN {vlan} on {card}, on every server.\n\n\
+                             No VM or template has a card on it, so nothing loses its connection; {card} and its other networks go on as they are. Your switch isn't changed: VLAN {vlan} stays set up there.\n\n\
+                             To have it back, make it again with New Network (VLAN {vlan} on {card}).",
+                            vlan = n.vlan,
+                            card = n.device
+                        )
+                    } else {
+                        "No VM or template has a card on it, so nothing loses its connection. It's private (no card): nothing outside the servers is involved.\n\nTo have it back, make it again with New Network.".to_string()
+                    };
+                    self.dialog = Dialog::ConfirmDeleteNetwork { sid, net, name: n.name.clone(), text };
+                }
+                Intent::NewNetwork => {
+                    let pools: Vec<(u32, String)> = self.servers.iter().filter(|s| s.data.is_some()).map(|s| (s.id, s.name())).collect();
+                    let sid = sel.sid.filter(|id| pools.iter().any(|p| p.0 == *id)).or(pools.first().map(|p| p.0));
+                    if let Some(sid) = sid {
+                        let cards = self.network_cards();
+                        self.dialog = Dialog::NewNetwork(Box::new(NetworkDialog::new(sid, pools, cards)));
+                    }
                 }
                 Intent::NewIsoLibrary => {
                     let pools: Vec<(u32, String)> = self.servers.iter().filter(|s| s.data.is_some()).map(|s| (s.id, s.name())).collect();
@@ -3087,7 +3271,7 @@ impl App {
         // then all of them.
         let fits = |level: u8| {
             let w = |l: &str, rank: u8| if level >= rank { 32.0 } else { tool_width(ui, l) } + 2.0;
-            let buttons: f32 = w("Connect", 3) + w("New VM", 2) + w("ISO Library", 2) + w("VM Storage", 2) + w("Updates", 2);
+            let buttons: f32 = w("Connect", 3) + w("New VM", 2) + w("ISO Library", 2) + w("VM Storage", 2) + w("Templates", 2) + w("Networks", 2) + w("Updates", 2);
             36.0 + 40.0 + 10.0 + 16.0 + buttons + 160.0 <= ui.available_width() // 160: the app's name
         };
         let level = (0..3).find(|&l| fits(l)).unwrap_or(3);
@@ -3114,6 +3298,12 @@ impl App {
             }
             if tool_button(ui, "storage", "VM Storage", has_pool, compact(2), &pal).on_hover_text("Where your VMs' disks are, and adding shared storage for them").clicked() {
                 out.push(Intent::VmStorage);
+            }
+            if tool_button(ui, "templates", "Templates", has_pool, compact(2), &pal).on_hover_text("Your templates, and making one from a VM").clicked() {
+                out.push(Intent::Templates);
+            }
+            if tool_button(ui, "networks", "Networks", has_pool, compact(2), &pal).on_hover_text("Your VMs' networks, and adding one").clicked() {
+                out.push(Intent::Networks);
             }
             // a pool's updates: a red dot when one has security updates waiting, a yellow one (the
             // network tiles' "out") when one has others, or a server to restart for them
@@ -3533,7 +3723,7 @@ impl App {
         let p = ui.painter();
         let x0 = rect.min.x + 6.0 + depth as f32 * 16.0;
         let selected = node.key == self.selected;
-        let has_kids = !node.children.is_empty();
+        let has_kids = node.children.iter().any(|c| !c.hidden);
         let open = has_kids && (self.expanded.contains(&node.key) || !self.search.trim().is_empty());
         let font = FontId::proportional(13.0);
         let mut tw = p.layout_no_wrap(node.text.clone(), font.clone(), pal.ink).size().x;
@@ -3620,7 +3810,7 @@ impl App {
         };
         if !has_menu {
             if open {
-                for c in &node.children {
+                for c in node.children.iter().filter(|c| !c.hidden) {
                     self.tree_ui(ui, c, depth + 1, out);
                 }
             }
@@ -3756,7 +3946,7 @@ impl App {
             }
         });
         if open {
-            for c in &node.children {
+            for c in node.children.iter().filter(|c| !c.hidden) {
                 self.tree_ui(ui, c, depth + 1, out);
             }
         }
@@ -4121,7 +4311,7 @@ impl App {
     fn tabs_for(&self, sel: &Node) -> Vec<Tab> {
         let has_data = sel.sid.and_then(|id| self.server(id)).map_or(false, |s| s.data.is_some());
         match sel.kind {
-            Kind::Root => vec![Tab::Home, Tab::IsoLibrary, Tab::VmStorage, Tab::Search, Tab::Logs],
+            Kind::Root => vec![Tab::Home, Tab::IsoLibrary, Tab::VmStorage, Tab::Templates, Tab::Networks, Tab::Search, Tab::Logs],
             Kind::Category => vec![Tab::Home, Tab::Search, Tab::Logs],
             Kind::Sr if self.sr_of(sel).map_or(false, |(_, x)| x.is_iso()) => vec![Tab::General, Tab::IsoFiles, Tab::Logs],
             Kind::Folder if sel.rref.as_deref() == Some("nets") => vec![Tab::Networking],
@@ -4734,7 +4924,8 @@ impl App {
         let mut widths: Vec<f32> = headers.iter().map(|h| measure(h, &head_font)).collect();
         for r in rows {
             for (i, c) in r.iter().enumerate().take(widths.len()) {
-                let w = match c {
+                let w = match c.plain() {
+                    Cell::By(..) => 0.0,
                     Cell::Text(t) => measure(t, &font),
                     Cell::Usage(_, t) => 120.0 + measure(t, &font),
                     Cell::Status(t) => 16.0 + measure(t, &font),
@@ -4754,7 +4945,7 @@ impl App {
                 // Room to spare (a wide window): the columns with words in them share it, each in
                 // proportion to its width, as a web page's table does; a usage bar's column and a
                 // column of buttons (no heading) keep theirs.
-                let flex: Vec<usize> = (0..widths.len()).filter(|&i| !headers.get(i).map_or(true, |h| h.is_empty()) && !rows.iter().any(|r| matches!(r.get(i), Some(Cell::Usage(..))))).collect();
+                let flex: Vec<usize> = (0..widths.len()).filter(|&i| !headers.get(i).map_or(true, |h| h.is_empty()) && !rows.iter().any(|r| matches!(r.get(i).map(Cell::plain), Some(Cell::Usage(..))))).collect();
                 let base: f32 = flex.iter().map(|&i| widths[i]).sum();
                 if base > 0.0 {
                     let grow = (avail - sum) / base;
@@ -4769,7 +4960,7 @@ impl App {
                 // but not below 120 points, and never a usage bar's; only past that does the table
                 // scroll sideways.
                 let least = 120.0 + 2.0 * pad;
-                let fixed: Vec<bool> = (0..widths.len()).map(|i| rows.iter().any(|r| matches!(r.get(i), Some(Cell::Usage(..))))).collect();
+                let fixed: Vec<bool> = (0..widths.len()).map(|i| rows.iter().any(|r| matches!(r.get(i).map(Cell::plain), Some(Cell::Usage(..))))).collect();
                 let mut over = sum - avail;
                 while over > 0.5 {
                     let Some(wi) = (0..widths.len()).filter(|&i| !fixed[i] && widths[i] > least).max_by(|&a, &b| widths[a].total_cmp(&widths[b])) else { break };
@@ -4804,8 +4995,42 @@ impl App {
                 Some(at)
             }).collect();
             let p = ui.painter().clone();
+            // a click on a heading sorts by its column: up, then down, then as it came
+            let sort_id = egui::Id::new(("table-sort", id));
+            let mut sort: Option<(usize, bool)> = ui.data(|d| d.get_temp(sort_id)).flatten();
             for (i, h) in headers.iter().enumerate() {
-                p.text(pos2(xs[i] + pad, area.min.y + head_h / 2.0), Align2::LEFT_CENTER, *h, head_font.clone(), pal.ink_soft);
+                let sortable = !h.is_empty() && rows.iter().any(|r| r.get(i).and_then(Cell::key).is_some());
+                let cell = Rect::from_min_size(pos2(xs[i] + 4.0, area.min.y), vec2((widths[i] - 8.0).max(1.0), head_h));
+                let resp = if sortable { Some(ui.interact(cell, ui.id().with((id, "head", i)), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand)) } else { None };
+                let hot = resp.as_ref().map_or(false, |r| r.hovered());
+                let t = p.text(pos2(xs[i] + pad, area.min.y + head_h / 2.0), Align2::LEFT_CENTER, *h, head_font.clone(), if hot { pal.ink } else { pal.ink_soft });
+                if let Some((_, up)) = sort.filter(|s| s.0 == i) {
+                    let c = pos2(t.max.x + 9.0, t.center().y);
+                    let pts = if up { vec![c + vec2(-3.5, 2.0), c + vec2(3.5, 2.0), c + vec2(0.0, -2.5)] } else { vec![c + vec2(-3.5, -2.0), c + vec2(3.5, -2.0), c + vec2(0.0, 2.5)] };
+                    p.add(egui::Shape::convex_polygon(pts, pal.accent, Stroke::NONE));
+                }
+                if resp.map_or(false, |r| r.clicked()) {
+                    sort = match sort {
+                        Some((c, true)) if c == i => Some((i, false)),
+                        Some((c, false)) if c == i => None,
+                        _ => Some((i, true)),
+                    };
+                    ui.data_mut(|d| d.insert_temp(sort_id, sort));
+                }
+            }
+            // the rows in that order (those with nothing to sort by last, either way)
+            let mut order: Vec<usize> = (0..rows.len()).collect();
+            if let Some((col, up)) = sort {
+                let keys: Vec<Option<SortKey>> = rows.iter().map(|r| r.get(col).and_then(Cell::key)).collect();
+                order.sort_by(|&a, &b| match (&keys[a], &keys[b]) {
+                    (Some(x), Some(y)) => {
+                        let o = key_order(x, y);
+                        if up { o } else { o.reverse() }
+                    }
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => std::cmp::Ordering::Equal,
+                });
             }
             // each column's right edge in the header can be dragged to resize it (a double click
             // gives it back its own width)
@@ -4840,14 +5065,16 @@ impl App {
             if rows.is_empty() {
                 p.text(pos2(area.min.x + pad, area.min.y + head_h + row_h / 2.0), Align2::LEFT_CENTER, "Nothing to show", font.clone(), pal.ink_soft);
             }
-            for (ri, r) in rows.iter().enumerate() {
-                let rr = Rect::from_min_size(pos2(area.min.x, area.min.y + head_h + ri as f32 * row_h), vec2(total_w, row_h));
+            // (each row is known by where it is in `rows`, wherever it's shown)
+            for (di, &ri) in order.iter().enumerate() {
+                let r = &rows[ri];
+                let rr = Rect::from_min_size(pos2(area.min.x, area.min.y + head_h + di as f32 * row_h), vec2(total_w, row_h));
                 let resp = ui.interact(rr, ui.id().with((id, ri)), if clickable { Sense::click() } else { Sense::hover() });
                 // (the pointer may be on a button in the row, which then counts as hovered instead)
                 let hot = resp.hovered() || ui.rect_contains_pointer(rr);
                 if hot {
                     p.rect_filled(rr.shrink2(vec2(2.0, 2.0)), Rounding::same(6.0), pal.hover);
-                } else if ri > 0 {
+                } else if di > 0 {
                     p.line_segment([pos2(rr.min.x + pad, rr.min.y), pos2(rr.max.x - pad, rr.min.y)], Stroke::new(1.0_f32, pal.border.gamma_multiply(0.6)));
                 }
                 if resp.clicked() {
@@ -4857,7 +5084,8 @@ impl App {
                     let mut x = xs[i] + pad;
                     let room = widths[i] - 2.0 * pad;
                     let cy = rr.center().y;
-                    let text = match c {
+                    let text = match c.plain() {
+                        Cell::By(..) => continue,
                         Cell::Text(t) => t,
                         Cell::Usage(f, t) => {
                             usage_bar(&p, Rect::from_min_size(pos2(x, cy - 2.5), vec2(110.0, 5.0)), *f, &pal);
@@ -4979,9 +5207,10 @@ impl App {
                 let desc_w = if editing { 240.0 } else { (measure(&f.description) + 34.0).min(380.0) };
                 let mut cells = vec![Cell::Icon(IconKind::IsoSr, f.name.clone())];
                 if let Some(lib) = &r.lib {
-                    cells.push(Cell::Custom(measure(lib).min(260.0)));
+                    cells.push(Cell::by_text(lib, Cell::Custom(measure(lib).min(260.0))));
                 }
-                cells.extend([Cell::Text(fmt_bytes(f.size)), Cell::Custom(desc_w), Cell::Custom(56.0)]);
+                let desc = if f.description.trim().is_empty() { Cell::Custom(desc_w) } else { Cell::by_text(&f.description, Cell::Custom(desc_w)) };
+                cells.extend([Cell::Text(fmt_bytes(f.size)), desc, Cell::Custom(56.0)]);
                 cells
             })
             .collect();
@@ -5353,12 +5582,12 @@ impl App {
                     None if t.x.size > 0 => Cell::Usage((t.x.used as f32 / t.x.size as f32).clamp(0.0, 1.0), format!("{} of {}", fmt_bytes(t.x.used), fmt_bytes(t.x.size))),
                     None => Cell::Text("—".into()),
                 };
-                let mut cells = vec![Cell::Custom(24.0 + measure(&t.x.name))];
+                let mut cells = vec![Cell::by_text(&t.x.name, Cell::Custom(24.0 + measure(&t.x.name)))];
                 if pools > 1 {
                     cells.push(Cell::Text(t.pool.clone()));
                 }
                 // the last: Default on the pool's default, Make Default on the others under the mouse
-                cells.extend([Cell::Text(sr_kind_words(&t.x)), Cell::Custom(measure(&t.place).min(300.0)), usage, Cell::Custom(104.0)]);
+                cells.extend([Cell::Text(sr_kind_words(&t.x)), Cell::by_text(&t.place, Cell::Custom(measure(&t.place).min(300.0))), usage, Cell::Custom(104.0)]);
                 cells
             })
             .collect();
@@ -5476,15 +5705,20 @@ impl App {
             .map(|x| {
                 cols.iter()
                     .map(|c| match c {
-                        Col::Name => Cell::Custom(24.0 + measure(&x.name) + if parent.as_deref() == Some(x.rref.as_str()) { PILL + 8.0 } else { 0.0 }),
+                        Col::Name => Cell::by_text(&x.name, Cell::Custom(24.0 + measure(&x.name) + if parent.as_deref() == Some(x.rref.as_str()) { PILL + 8.0 } else { 0.0 })),
                         Col::Taken => {
                             let when = x.time.map(|t| fmt_when(t, now, offset)).unwrap_or_else(|| "—".into());
-                            Cell::Custom(measure(&when) + if x.memory && !cols.contains(&Col::Holds) { 26.0 } else { 0.0 })
+                            let c = Cell::Custom(measure(&when) + if x.memory && !cols.contains(&Col::Holds) { 26.0 } else { 0.0 });
+                            match x.time {
+                                Some(t) => Cell::by_num(t as f64, c),
+                                None => c,
+                            }
                         }
                         Col::Holds => Cell::Text(if x.memory { "Disks and memory" } else { "Disks" }.into()),
                         Col::Description => {
                             let editing = self.snap_edit.as_ref().map_or(false, |e| e.vdi == x.rref);
-                            Cell::Custom(if editing { 240.0 } else { (measure(&x.description) + 34.0).min(380.0) })
+                            let c = Cell::Custom(if editing { 240.0 } else { (measure(&x.description) + 34.0).min(380.0) });
+                            if x.description.trim().is_empty() { c } else { Cell::by_text(&x.description, c) }
                         }
                         Col::Actions => Cell::Custom(86.0),
                     })
@@ -5645,32 +5879,51 @@ impl App {
 
     /// The Templates folder: the user's templates, each with its system, size and description, and
     /// New VM and Delete at the row's end; a click on a row opens it.
+    /// Templates made from VMs: a pool's (its Templates folder), or every pool's (the toolbar's
+    /// Templates, All servers' tab), each with New VM and Delete; a click opens one.
     fn templates_tab(&mut self, ui: &mut Ui, sel: &Node, out: &mut Vec<Intent>) {
         let pal = self.pal;
-        let Some(s) = sel.sid.and_then(|id| self.server(id)) else { return };
-        let Some(d) = s.data.as_ref() else { return };
-        let sid = s.id;
-        let mut tpls = d.user_templates.clone();
-        tpls.sort_by_key(|t| t.name.to_lowercase());
-        let busy: Vec<bool> = tpls.iter().map(|t| s.busy.contains_key(&t.rref)).collect();
+        let all = sel.kind == Kind::Root;
+        // (pool, its name, the template, busy)
+        let mut tpls: Vec<(u32, String, VmInfo, bool)> = vec![];
+        for s in self.servers.iter().filter(|s| all || Some(s.id) == sel.sid) {
+            let Some(d) = s.data.as_ref() else { continue };
+            tpls.extend(d.user_templates.iter().map(|t| (s.id, s.name(), t.clone(), s.busy.contains_key(&t.rref))));
+        }
+        tpls.sort_by_key(|t| t.2.name.to_lowercase());
+        let pools = tpls.iter().map(|t| t.0).collect::<HashSet<_>>().len();
         ui.add_space(10.0);
         ui.label(egui::RichText::new(format!("{} template{}", tpls.len(), if tpls.len() == 1 { "" } else { "s" })).color(pal.ink_soft));
-        ui.label(egui::RichText::new("Made from your VMs (Make Template, by the copy button next to a VM's camera), to make new VMs from.").size(12.0).color(pal.ink_faint));
+        ui.label(egui::RichText::new("Made from your VMs, to make new VMs from: New Template picks the VM.").size(12.0).color(pal.ink_faint));
         let wide = ui.available_width() >= 640.0;
-        let mut headers = vec!["Name", "System", "Size"];
+        let mut headers = vec!["Name"];
+        if all && pools > 1 {
+            headers.push("Pool");
+        }
+        headers.extend(["System", "Size", "Created"]);
         if wide {
             headers.push("Description");
         }
         headers.push("");
+        let offset = local_offset(unix_now());
         let rows: Vec<Vec<Cell>> = tpls
             .iter()
-            .map(|t| {
+            .map(|(_, pool, t, _)| {
                 let disk: i64 = t.disks.iter().filter(|k| k.kind == "Disk").map(|k| k.size).sum();
-                let mut r = vec![
-                    Cell::Icon(IconKind::Template, t.name.clone()),
+                let mut r = vec![Cell::Icon(IconKind::Template, t.name.clone())];
+                if all && pools > 1 {
+                    r.push(Cell::Text(pool.clone()));
+                }
+                // the day it was made
+                let created = match t.created {
+                    Some(c) => Cell::by_num(c as f64, Cell::Text(fmt_date_time(c, offset).split(',').next().unwrap_or_default().to_string())),
+                    None => Cell::Text("—".into()),
+                };
+                r.extend([
                     Cell::Text(or(&t.os, "—").into()),
                     Cell::Text(format!("{} CPU{}  ·  {}  ·  {} disk", t.vcpus, if t.vcpus == 1 { "" } else { "s" }, fmt_bytes(t.mem_dyn_max), fmt_bytes(disk))),
-                ];
+                    created,
+                ]);
                 if wide {
                     r.push(Cell::Text(or(&t.description, "—").into()));
                 }
@@ -5680,8 +5933,8 @@ impl App {
             .collect();
         let (mut new_vm, mut delete) = (None, None);
         let opened = self.table_with(ui, "tpls", &headers, &rows, true, &mut |ui, row, _col, r, hot| {
-            let t = &tpls[row];
-            if busy[row] {
+            let (sid, _, t, busy) = &tpls[row];
+            if *busy {
                 return;
             }
             let p = ui.painter().clone();
@@ -5692,7 +5945,7 @@ impl App {
             }
             paint_glyph(&p, Rect::from_center_size(nb.center(), vec2(16.0, 16.0)), "newvm", if nresp.hovered() { pal.accent } else if hot { pal.ink_soft } else { pal.ink_faint });
             if nresp.clicked() {
-                new_vm = Some(t.rref.clone());
+                new_vm = Some((*sid, t.rref.clone()));
             }
             let b = Rect::from_center_size(pos2(r.max.x - 13.0, r.center().y), vec2(26.0, 26.0));
             let resp = ui.interact(b, ui.id().with(("tdel", &t.rref)), Sense::click()).on_hover_text("Delete this template…");
@@ -5701,15 +5954,87 @@ impl App {
             }
             paint_glyph(&p, Rect::from_center_size(b.center(), vec2(16.0, 16.0)), "trash", if resp.hovered() { pal.red } else if hot { pal.ink_soft } else { pal.ink_faint });
             if resp.clicked() {
-                delete = Some(t.rref.clone());
+                delete = Some((*sid, t.rref.clone()));
             }
         });
-        if let Some(t) = new_vm {
+        if let Some((sid, t)) = new_vm {
             out.push(Intent::NewVmFromTemplate(sid, t));
-        } else if let Some(t) = delete {
+        } else if let Some((sid, t)) = delete {
             out.push(Intent::AskDeleteTemplate(sid, t));
         } else if let Some(i) = opened {
-            out.push(Intent::Select(format!("tpl:{}:{}", sid, tpls[i].rref)));
+            out.push(Intent::Select(format!("tpl:{}:{}", tpls[i].0, tpls[i].2.rref)));
+        }
+    }
+
+    /// All servers' Networks tab (the toolbar's Networks): every pool's networks, each with how it
+    /// reaches outside (a VLAN on a card, a card, or none: private), its bridge, MTU and
+    /// description. New Network is next to the tabs.
+    fn networks_page(&self, ui: &mut Ui, out: &mut Vec<Intent>) {
+        let pal = self.pal;
+        // (pool, its name, the network, why it can't be deleted now)
+        let mut nets: Vec<(u32, String, NetInfo, Option<String>)> = vec![];
+        for s in &self.servers {
+            let Some(d) = s.data.as_ref() else { continue };
+            for n in &d.networks {
+                let users: Vec<&str> = d.vms.iter().chain(&d.user_templates).filter(|v| v.nics.iter().any(|c| c.net == n.rref)).map(|v| v.name.as_str()).collect();
+                let why = if !n.device.is_empty() && n.vlan < 0 {
+                    Some(format!("It's {}'s own network: it goes only with the card", n.device))
+                } else if !users.is_empty() {
+                    let more = if users.len() > 3 { format!(" and {} more", users.len() - 3) } else { String::new() };
+                    Some(format!("Cards are on it ({}{}): move or remove them first", users.iter().take(3).map(|u| format!("'{}'", u)).collect::<Vec<_>>().join(", "), more))
+                } else {
+                    None
+                };
+                nets.push((s.id, s.name(), n.clone(), why));
+            }
+        }
+        nets.sort_by_key(|t| t.2.name.to_lowercase());
+        let pools = self.servers.iter().filter(|s| s.data.is_some()).count();
+        ui.add_space(10.0);
+        ui.label(egui::RichText::new(format!("{} network{}", nets.len(), if nets.len() == 1 { "" } else { "s" })).color(pal.ink_soft));
+        ui.label(egui::RichText::new("The networks your VMs' cards join: on a server's network card (or a VLAN of one), or private to each server.").size(12.0).color(pal.ink_faint));
+        let mut headers = vec!["Name"];
+        if pools > 1 {
+            headers.push("Pool");
+        }
+        headers.extend(["Connection", "Bridge", "MTU", "Description", ""]);
+        let rows: Vec<Vec<Cell>> = nets
+            .iter()
+            .map(|(_, pool, n, _)| {
+                let mut r = vec![Cell::Icon(IconKind::Net, n.name.clone())];
+                if pools > 1 {
+                    r.push(Cell::Text(pool.clone()));
+                }
+                r.extend([Cell::Text(n.connection()), Cell::Text(n.bridge.clone()), Cell::Text(n.mtu.to_string()), Cell::Text(or(&n.description, "—").into()), Cell::Custom(26.0)]);
+                r
+            })
+            .collect();
+        let mut delete = None;
+        self.table_with(ui, "all-nets", &headers, &rows, false, &mut |ui, row, _col, r, hot| {
+            // the bin: red under the mouse; off, saying why, for a card's own network or one in use
+            let (sid, _, n, why) = &nets[row];
+            let b = Rect::from_center_size(pos2(r.max.x - 13.0, r.center().y), vec2(26.0, 26.0));
+            let resp = ui.interact(b, ui.id().with(("ndel", &n.rref)), if why.is_none() { Sense::click() } else { Sense::hover() });
+            let resp = resp.on_hover_text(why.as_deref().unwrap_or("Delete this network…"));
+            if why.is_none() && resp.hovered() {
+                ui.painter().rect_filled(b, Rounding::same(5.0), pal.red.gamma_multiply(if pal.dark { 0.25 } else { 0.12 }));
+            }
+            let colour = if why.is_some() {
+                pal.ink_faint.gamma_multiply(0.45)
+            } else if resp.hovered() {
+                pal.red
+            } else if hot {
+                pal.ink_soft
+            } else {
+                pal.ink_faint
+            };
+            paint_glyph(ui.painter(), Rect::from_center_size(b.center(), vec2(16.0, 16.0)), "trash", colour);
+            if resp.clicked() {
+                delete = Some((*sid, n.rref.clone()));
+            }
+        });
+        if let Some((sid, net)) = delete {
+            out.push(Intent::AskDeleteNetwork(sid, net));
         }
     }
 
@@ -5853,6 +6178,8 @@ impl App {
         // from New VM Storage: make it (pool, settings), or ask a server for its folders
         let mut storage: Option<(u32, NfsStorage)> = None;
         let mut browse: Option<(u32, String)> = None;
+        let mut network: Option<(u32, NewNetwork)> = None;
+        let mut delete_net: Option<(u32, String, String)> = None;
         // the pool's own VM that the server typed in New VM Storage is, if it's one
         let guest: Option<Guest> = match &self.dialog {
             Dialog::NewStorage(d) => self.server(d.sid).and_then(|s| s.data.as_ref()).and_then(|pd| {
@@ -6063,6 +6390,11 @@ impl App {
                     });
                 });
             }
+            Dialog::NewNetwork(d) => match d.ui(ctx, &pal) {
+                NetworkAction::Close => close = true,
+                NetworkAction::Create(sid, nw) => network = Some((sid, nw)),
+                NetworkAction::None => {}
+            },
             Dialog::NewStorage(d) => match d.ui(ctx, &pal, guest.as_ref()) {
                 StorageAction::Close => close = true,
                 StorageAction::Create(sid, st) => storage = Some((sid, st)),
@@ -6239,11 +6571,45 @@ impl App {
                     });
                 });
             }
-            Dialog::MakeTemplate { sid, vm, source, from, name, description, power_cut, focus } => {
-                dialog_window(ctx, "Make Template").show(ctx, |ui| {
+            Dialog::MakeTemplate { sid, vm, source, from, name, description, power_cut, focus, pick } => {
+                dialog_window(ctx, if pick.is_empty() { "Make Template" } else { "New Template" }).show(ctx, |ui| {
                     ui.set_width(460.0);
                     ui.spacing_mut().item_spacing.y = 8.0;
-                    ui.add(egui::Label::new(egui::RichText::new(format!("A template from {}, to make new VMs from. Its disks are copied in an instant on their own storage.", from)).color(pal.ink_soft)).wrap());
+                    // why the VM chosen can't be made a template now, if it can't
+                    let mut blocked: Option<(String, String)> = None;
+                    if pick.is_empty() {
+                        ui.add(egui::Label::new(egui::RichText::new(format!("A template from {}, to make new VMs from. Its disks are copied in an instant on their own storage.", from)).color(pal.ink_soft)).wrap());
+                    } else {
+                        let intro = "A template is a shut-down VM's copy that new VMs are made from; the VM stays as it is. Its disks are copied in an instant on their own storage.";
+                        ui.add(egui::Label::new(egui::RichText::new(intro).color(pal.ink_soft)).wrap());
+                        ui.add_space(2.0);
+                        ui.horizontal(|ui| {
+                            field_label(ui, "VM:", LABEL_WIDTH);
+                            crate::newvm::combo_style(ui, &pal);
+                            let now = pick.iter().position(|p| p.sid == *sid && p.vm == *vm).unwrap_or(0);
+                            let mut chosen = now;
+                            crate::newvm::combo("tpl-vm", pick[now].label.clone(), ui.available_width()).show_ui(ui, |ui| {
+                                for (i, p) in pick.iter().enumerate() {
+                                    let text = egui::RichText::new(p.label.as_str()).color(if p.why.is_some() { pal.ink_soft } else { pal.ink });
+                                    ui.selectable_value(&mut chosen, i, text);
+                                }
+                            });
+                            if chosen != now {
+                                // its name and description follow, unless they were changed
+                                let (old, new) = (&pick[now], &pick[chosen]);
+                                if *name == format!("{} template", old.name) {
+                                    *name = format!("{} template", new.name);
+                                }
+                                let was = format!("From '{}', ", old.name);
+                                if description.starts_with(&was) {
+                                    *description = format!("From '{}', {}", new.name, &description[was.len()..]);
+                                }
+                                (*sid, *vm, *source) = (new.sid, new.vm.clone(), new.vm.clone());
+                                *from = format!("'{}' (it stays as it is)", new.name);
+                            }
+                        });
+                        blocked = pick.iter().find(|p| p.sid == *sid && p.vm == *vm).and_then(|p| p.why.clone());
+                    }
                     ui.add_space(2.0);
                     ui.horizontal(|ui| {
                         field_label(ui, "Name:", LABEL_WIDTH);
@@ -6258,17 +6624,21 @@ impl App {
                         text_field(ui, &pal, description, ui.available_width(), false);
                     });
                     ui.add_space(2.0);
-                    if *power_cut {
-                        crate::newvm::alert(ui, &pal, false, "Taken while the VM was running.", "VMs made from it start as after a power cut: they check their disks, and programs that were busy may need to recover.", None);
+                    if let Some((title, text)) = &blocked {
+                        crate::newvm::alert(ui, &pal, false, title, text, None);
+                    } else {
+                        if *power_cut {
+                            crate::newvm::alert(ui, &pal, false, "Taken while the VM was running.", "VMs made from it start as after a power cut: they check their disks, and programs that were busy may need to recover.", None);
+                        }
+                        let tip = "Windows: run  sysprep /generalize /oobe /shutdown  first.\nLinux: empty the machine ID (truncate -s 0 /etc/machine-id) and delete the SSH host keys (/etc/ssh/ssh_host_*), then shut it down; on Debian and Ubuntu, run  ssh-keygen -A  on each new VM.";
+                        crate::newvm::alert(ui, &pal, false, "Generalize it first, so its copies don't clash.", tip, None);
                     }
-                    let tip = "Windows: run  sysprep /generalize /oobe /shutdown  first.\nLinux: empty the machine ID (truncate -s 0 /etc/machine-id) and delete the SSH host keys (/etc/ssh/ssh_host_*), then shut it down; on Debian and Ubuntu, run  ssh-keygen -A  on each new VM.";
-                    crate::newvm::alert(ui, &pal, false, "Generalize it first, so its copies don't clash.", tip, None);
                     ui.add_space(4.0);
                     dialog_buttons(ui, |ui| {
                         if dialog_button(ui, &pal, "close", "Cancel", Look::Plain, true) || ui.input(|i| i.key_pressed(Key::Escape)) {
                             close = true;
                         }
-                        let ready = !name.trim().is_empty();
+                        let ready = !name.trim().is_empty() && blocked.is_none();
                         if dialog_button(ui, &pal, "template", "Make Template", Look::Primary, ready) || (ready && ui.input(|i| i.key_pressed(Key::Enter))) {
                             make_tpl = Some((*sid, vm.clone(), source.clone(), name.trim().to_string(), description.trim().to_string()));
                         }
@@ -6317,6 +6687,23 @@ impl App {
                         if dialog_button(ui, &pal, "copy", "Copy", Look::Primary, ready) || (ready && ui.input(|i| i.key_pressed(Key::Enter))) {
                             let sr = stores.get(*store).filter(|s| !s.2).map(|s| s.0.clone());
                             copy_to = Some((*sid, vm.clone(), name.trim().to_string(), sr));
+                        }
+                    });
+                });
+            }
+            Dialog::ConfirmDeleteNetwork { sid, net, name, text } => {
+                dialog_window(ctx, "Delete Network").show(ctx, |ui| {
+                    ui.set_width(420.0);
+                    ui.add(egui::Label::new(format!("Delete the network '{}'?", name)).wrap());
+                    ui.add_space(8.0);
+                    ui.add(egui::Label::new(egui::RichText::new(text.as_str()).color(pal.ink_soft)).wrap());
+                    ui.add_space(12.0);
+                    dialog_buttons(ui, |ui| {
+                        if dialog_button(ui, &pal, "close", "Cancel", Look::Plain, true) || ui.input(|i| i.key_pressed(Key::Escape)) {
+                            close = true;
+                        }
+                        if dialog_button(ui, &pal, "trash", "Delete", Look::Danger, true) {
+                            delete_net = Some((*sid, net.clone(), name.clone()));
                         }
                     });
                 });
@@ -6775,6 +7162,13 @@ impl App {
         if let Some((sid, st)) = storage {
             self.start_storage(sid, st, ctx);
         }
+        if let Some((sid, nw)) = network {
+            self.start_network(sid, nw, ctx);
+        }
+        if let Some((sid, net, name)) = delete_net {
+            self.dialog = Dialog::None;
+            self.delete_network(sid, net, name, ctx);
+        }
         if let Some((sid, server)) = browse {
             self.browse_exports(sid, server, ctx);
         }
@@ -7147,6 +7541,33 @@ impl eframe::App for App {
                 }
                 "iso" => out.push(Intent::NewIsoLibrary),
                 "iso-library" => out.push(Intent::IsoLibrary),
+                "templates" => out.push(Intent::Templates),
+                "networks" => out.push(Intent::Networks),
+                "delete-network" => {
+                    out.push(Intent::Networks);
+                    out.extend(sel.sid.or(self.servers.first().map(|s| s.id)).map(|sid| Intent::AskDeleteNetwork(sid, "net-2".into())));
+                }
+                "networks-sorted" => {
+                    // sorted by MTU, the largest first (as two clicks on its heading do)
+                    out.push(Intent::Networks);
+                    ctx.data_mut(|d| d.insert_temp(egui::Id::new(("table-sort", "all-nets")), Some((3usize, false))));
+                }
+                "new-template" => out.push(Intent::NewTemplate),
+                "new-network" | "new-network-error" => {
+                    out.push(Intent::Networks);
+                    let pools: Vec<(u32, String)> = self.servers.iter().filter(|s| s.data.is_some()).map(|s| (s.id, s.name())).collect();
+                    if let Some(&(sid, _)) = pools.first() {
+                        let error = self.shot_show == "new-network-error";
+                        // (VLAN 666 is taken in the demo)
+                        let mut d = NetworkDialog::new(sid, pools, self.network_cards()).filled("VNET-iot", if error { "666" } else { "30" }, "192.168.30.0/24");
+                        if error {
+                            if let NetworkAction::Create(sid, nw) = d.submit() {
+                                self.start_network(sid, nw, ctx);
+                            }
+                        }
+                        self.dialog = Dialog::NewNetwork(Box::new(d));
+                    }
+                }
                 "vm-storage" => out.push(Intent::VmStorage),
                 "new-storage" | "new-storage-inside" | "new-storage-error" => {
                     out.push(Intent::VmStorage);
@@ -7295,13 +7716,19 @@ impl eframe::App for App {
                 self.tab_actions(ui, free, &sel, current, actions, &mut out);
             } else if sel.kind == Kind::Root && current == Tab::IsoLibrary {
                 self.iso_library_actions(ui, free, &mut out);
-            } else if sel.kind == Kind::Root && current == Tab::VmStorage {
+            } else if sel.kind == Kind::Root && matches!(current, Tab::VmStorage | Tab::Templates | Tab::Networks) {
+                // the page's one action: adding to it
+                let (label, tip, intent) = match current {
+                    Tab::VmStorage => ("New VM Storage", "Add an NFS folder that every server of a pool shares, for VMs' disks", Intent::NewStorage),
+                    Tab::Templates => ("New Template", "Make a template from one of your VMs, to make new VMs from", Intent::NewTemplate),
+                    _ => ("New Network", "Add a network for VMs' cards: a VLAN on a network card, or a private one", Intent::NewNetwork),
+                };
                 let mut child = ui.new_child(egui::UiBuilder::new().max_rect(free).layout(egui::Layout::right_to_left(egui::Align::Center)));
                 child.spacing_mut().item_spacing.x = 4.0;
                 let has_pool = self.servers.iter().any(|s| s.data.is_some());
-                let compact = free.width() < flat_button_width(&child, "New VM Storage") + 16.0 + SEP_W;
-                if flat_button(&mut child, "plus", "New VM Storage", Some(pal.accent), has_pool, compact, &pal).on_hover_text("Add an NFS folder that every server of a pool shares, for VMs' disks").clicked() {
-                    out.push(Intent::NewStorage);
+                let compact = free.width() < flat_button_width(&child, label) + 16.0 + SEP_W;
+                if flat_button(&mut child, "plus", label, Some(pal.accent), has_pool, compact, &pal).on_hover_text(tip).clicked() {
+                    out.push(intent);
                 }
                 vsep(&mut child, &pal);
             } else if let Some((s, t)) = self.template_of(&sel) {
@@ -7379,6 +7806,7 @@ impl eframe::App for App {
                 Tab::IsoFiles => self.iso_files(ui, &sel, &mut out),
                 Tab::IsoLibrary => self.iso_library_page(ui, &mut out),
                 Tab::VmStorage => self.vm_storage_page(ui, &mut out),
+                Tab::Networks => self.networks_page(ui, &mut out),
                 Tab::Snapshots => self.snapshots_tab(ui, &sel, &mut out),
                 Tab::Templates => self.templates_tab(ui, &sel, &mut out),
                 Tab::Logs => self.logs(ui, &sel, &mut out),
@@ -7696,6 +8124,109 @@ enum Cell {
     Icon(IconKind, String),
     /// Drawn by the caller (see `table_with`), at least this wide.
     Custom(f32),
+    /// A cell sorted by this rather than by what it shows (a date, a size; a Custom cell's text).
+    By(SortKey, Box<Cell>),
+}
+
+/// What a column is sorted by: a number, or words (numbers in them as numbers: "VM 2" before
+/// "VM 10").
+#[derive(Clone, Debug, PartialEq)]
+enum SortKey {
+    Num(f64),
+    Text(String),
+}
+
+impl Cell {
+    /// Sorted by `n`.
+    fn by_num(n: f64, c: Cell) -> Cell {
+        Cell::By(SortKey::Num(n), Box::new(c))
+    }
+    /// Sorted by `t`.
+    fn by_text(t: &str, c: Cell) -> Cell {
+        Cell::By(SortKey::Text(t.to_lowercase()), Box::new(c))
+    }
+    /// The cell as drawn.
+    fn plain(&self) -> &Cell {
+        match self {
+            Cell::By(_, c) => c.plain(),
+            c => c,
+        }
+    }
+    /// What it's sorted by; None for nothing ("—", empty, or drawn by the caller with no key),
+    /// which goes last. A size ("4.8 GB") counts as its bytes, a plain number as a number.
+    fn key(&self) -> Option<SortKey> {
+        let t = match self {
+            Cell::By(k, _) => return Some(k.clone()),
+            Cell::Usage(f, _) => return Some(SortKey::Num(*f as f64)),
+            Cell::Custom(_) => return None,
+            Cell::Text(t) | Cell::Status(t) | Cell::Icon(_, t) => t.trim(),
+        };
+        if t.is_empty() || t == "—" {
+            return None;
+        }
+        if let Some((n, unit)) = t.split_once(' ') {
+            let mult = match unit {
+                "B" => 1.0,
+                "KB" => 1024.0,
+                "MB" => 1024f64.powi(2),
+                "GB" => 1024f64.powi(3),
+                "TB" => 1024f64.powi(4),
+                "PB" => 1024f64.powi(5),
+                _ => 0.0,
+            };
+            if let (Ok(n), true) = (n.parse::<f64>(), mult > 0.0) {
+                return Some(SortKey::Num(n * mult));
+            }
+        }
+        match t.parse::<f64>() {
+            Ok(n) => Some(SortKey::Num(n)),
+            Err(_) => Some(SortKey::Text(t.to_lowercase())),
+        }
+    }
+}
+
+/// Two keys in order: numbers as numbers, words with the numbers in them as numbers.
+fn key_order(a: &SortKey, b: &SortKey) -> std::cmp::Ordering {
+    match (a, b) {
+        (SortKey::Num(x), SortKey::Num(y)) => x.total_cmp(y),
+        (SortKey::Num(_), SortKey::Text(_)) => std::cmp::Ordering::Less,
+        (SortKey::Text(_), SortKey::Num(_)) => std::cmp::Ordering::Greater,
+        (SortKey::Text(x), SortKey::Text(y)) => natural_order(x, y),
+    }
+}
+
+/// Words in order, a run of digits counting as its number ("10.20.1.9" before "10.20.1.10").
+fn natural_order(a: &str, b: &str) -> std::cmp::Ordering {
+    let (mut a, mut b) = (a.chars().peekable(), b.chars().peekable());
+    loop {
+        match (a.peek().copied(), b.peek().copied()) {
+            (None, None) => return std::cmp::Ordering::Equal,
+            (None, Some(_)) => return std::cmp::Ordering::Less,
+            (Some(_), None) => return std::cmp::Ordering::Greater,
+            (Some(x), Some(y)) if x.is_ascii_digit() && y.is_ascii_digit() => {
+                let run = |it: &mut std::iter::Peekable<std::str::Chars>| {
+                    let mut s = String::new();
+                    while let Some(c) = it.peek().copied().filter(|c| c.is_ascii_digit()) {
+                        s.push(c);
+                        it.next();
+                    }
+                    s.trim_start_matches('0').to_string()
+                };
+                let (m, n) = (run(&mut a), run(&mut b));
+                let o = m.len().cmp(&n.len()).then_with(|| m.cmp(&n));
+                if o != std::cmp::Ordering::Equal {
+                    return o;
+                }
+            }
+            (Some(x), Some(y)) => {
+                if x != y {
+                    return x.cmp(&y);
+                }
+                a.next();
+                b.next();
+            }
+        }
+    }
 }
 
 fn text_rows(rows: Vec<Vec<String>>) -> Vec<Vec<Cell>> {
@@ -8253,6 +8784,23 @@ fn setup_fonts(ctx: &egui::Context) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn columns_sort_as_people_expect() {
+        use std::cmp::Ordering::*;
+        // numbers in words as numbers; addresses part by part
+        assert_eq!(natural_order("vm 2", "vm 10"), Less);
+        assert_eq!(natural_order("10.20.1.9", "10.20.1.10"), Less);
+        assert_eq!(natural_order("vnet-casa", "vnet-citrix"), Less);
+        assert_eq!(natural_order("disk 007", "disk 7"), Equal);
+        // sizes as bytes, plain numbers as numbers, nothing as nothing
+        let k = |t: &str| Cell::Text(t.into()).key();
+        assert_eq!(key_order(&k("661 MB").unwrap(), &k("1.8 GB").unwrap()), Less);
+        assert_eq!(key_order(&k("9000").unwrap(), &k("1500").unwrap()), Greater);
+        assert_eq!(k("—"), None);
+        assert_eq!(Cell::by_num(5.0, Cell::Custom(10.0)).key(), Some(SortKey::Num(5.0)));
+        assert_eq!(Cell::Custom(10.0).key(), None);
+    }
 
     #[test]
     fn unfinished_round_trip() {

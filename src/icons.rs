@@ -249,6 +249,8 @@ pub fn tool_color(op: &str, pal: &Pal) -> Color32 {
         "iso" => pal.orange,
         "updates" => Color32::from_rgb(150, 110, 230),
         "storage" => Color32::from_rgb(32, 165, 150),
+        "templates" => Color32::from_rgb(214, 102, 160),
+        "networks" => Color32::from_rgb(205, 160, 40),
         _ => pal.icon,
     }
 }
@@ -311,6 +313,23 @@ pub fn paint_tool_glyph(p: &Painter, rect: Rect, op: &str, enabled: bool, pal: &
             line(p, o, &[(17.5, 5.8), (17.5, 16.2)], s);
             p.add(Shape::line(half(11.0, 0.0, 180.0), Stroke::new(1.5_f32, col)));
             p.add(Shape::line(half(16.2, 0.0, 180.0), s));
+        }
+        "templates" => {
+            // a screen on its stand, a copy of it behind
+            let s = Stroke::new(1.8_f32, col);
+            line(p, o, &[(7.0, 4.0), (19.0, 4.0), (19.0, 12.5)], Stroke::new(1.5_f32, col.gamma_multiply(0.6)));
+            rrect(p, o, 3.0, 7.0, 13.0, 9.5, 2.0, s);
+            line(p, o, &[(6.5, 19.5), (12.5, 19.5)], s);
+            line(p, o, &[(9.5, 16.5), (9.5, 19.5)], s);
+        }
+        "networks" => {
+            // three points joined: one above, two below
+            let s = Stroke::new(1.7_f32, col);
+            p.circle_stroke(o + vec2(11.0, 5.0), 2.6, s);
+            p.circle_stroke(o + vec2(5.0, 17.0), 2.6, s);
+            p.circle_stroke(o + vec2(17.0, 17.0), 2.6, s);
+            line(p, o, &[(11.0, 7.6), (11.0, 11.0)], s);
+            line(p, o, &[(5.0, 14.4), (5.0, 11.0), (17.0, 11.0), (17.0, 14.4)], s);
         }
         "newvm" => {
             // a screen on its stand, a plus on it

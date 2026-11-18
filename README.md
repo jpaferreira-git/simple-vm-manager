@@ -20,6 +20,7 @@ affiliated with or endorsed by the makers of XenServer or XCP-ng.
 | ![A pool's updates](docs/screenshot-dark-updates.png) | ![Updating a pool](docs/screenshot-dark-updating.png) |
 | ![Every ISO file of every pool](docs/screenshot-dark-iso-library.png) | ![Where your VMs' disks are](docs/screenshot-dark-vm-storage.png) |
 | ![Adding NFS storage for VMs](docs/screenshot-dark-new-storage.png) | ![Moving a VM](docs/screenshot-dark-move-vm.png) |
+| ![Your networks](docs/screenshot-dark-networks.png) | ![Adding a network on a VLAN](docs/screenshot-dark-new-network.png) |
 
 ## Features
 
@@ -30,8 +31,9 @@ affiliated with or endorsed by the makers of XenServer or XCP-ng.
   each time it starts. Right-click a server to *Forget saved password*.
 - **Disconnect** — at the end of a pool's (or a lone server's) tabs, or on its right-click menu;
   the app doesn't reconnect to it at the next start.
-- **Resource tree** — *Infrastructure* view (pool → servers → their VMs and storage; shared storage and
-  virtual networks in folders) or *Objects* view (grouped by type), with a search box. The sidebar **folds** into a slim icon strip.
+- **Resource tree** — *Infrastructure* view (pool → servers → their VMs and storage; shared storage in
+  a folder; templates and networks have their own pages on the toolbar) or *Objects* view (grouped
+  by type), with a search box. The sidebar **folds** into a slim icon strip.
   A dot on each icon says how it's doing: VMs by power state (grey, unknown, while the server
   they run on is off or not answering: nothing can be done to them then); servers green when on,
   red when off or not answering; shared storage and ISO libraries green when mounted, red when their server is
@@ -148,11 +150,22 @@ affiliated with or endorsed by the makers of XenServer or XCP-ng.
   own storage. A snapshot's row has it too (from a snapshot of the disks only), so a VM that's on
   needn't stop; otherwise the VM has to be off, as a copy of a running one is like one after a power
   cut (said when a snapshot was taken while it ran). The dialog reminds you to generalize it first:
-  Windows' sysprep; on Linux an empty machine ID and new SSH host keys. Your templates (not the
-  built-in ones) are in a *Templates* folder in the pool, each with its page, New VM and Delete.
+  Windows' sysprep; on Linux an empty machine ID and new SSH host keys. *Templates* on the toolbar
+  lists your templates (not the built-in ones) of every pool, with when each was made, and New VM
+  and Delete (a click opens its page); *New Template* there picks the VM, and one that can't be made a template now (on,
+  or busy) gets a yellow note saying why and what to do.
   *New VM* then offers *Create from: An ISO | A template*: from a template, its size as it is or
   other CPUs and memory, its disks copied in an instant where it is or in full onto other storage,
   and its network cards as they are or one on another network.
+- **Networks** — *Networks* on the toolbar lists every pool's networks: how each reaches outside
+  (*VLAN 10 on eth0*, a card, or private: no card), its bridge, MTU and description. *New Network*
+  makes one: on a VLAN of a network card (every server of the pool gets it on its card of that
+  name; the tags already on the card are listed, and one that's taken is refused before anything's
+  asked) or private (each server's VMs among themselves), with a description (its addresses, say)
+  and the MTU under Advanced. A VLAN the server turns down takes the new network away again, and
+  the reason is said in plain words with the `xe` commands and the server's answer. The bin at a
+  row's end deletes a network (its VLAN off every server's card first); it's off, saying why, for a
+  card's own network, or while VMs' or templates' cards are on it.
 - **Copy VM** — in the same menu: a VM just like one that's off, with its own disks (an instant copy
   where they are, or in full onto other storage) and new network addresses.
 - **Delete VM** — the bin next to a VM's tabs, or on its right-click menu. It asks first, and its disks go too unless unticked (a disk another VM also uses stays);
@@ -198,8 +211,10 @@ affiliated with or endorsed by the makers of XenServer or XCP-ng.
   servers that don't answer included. Long lines take two. A click on one (or on a row of the Logs
   tab) shows it in full: the server, when, how it went, and every call made to the server with its
   answer or its error, as the server gave it (passwords hidden), ready to copy.
-- **Tables** — a column's edge in the header can be dragged to make it wider or narrower; a double
-  click gives it back its own width. Long jobs (copying
+- **Tables** — a click on a column's heading sorts by it (an arrow says which way; again for the
+  other way, a third time as it came): sizes by their bytes, dates by time, names with the numbers
+  in them as numbers ("VM 2" before "VM 10"), empty ones last. A column's edge in the header can be
+  dragged to make it wider or narrower; a double click gives it back its own width. Long jobs (copying
   disks, mounting a share, starting a VM…) run as tasks on the server that the app looks at every
   two seconds: if the server stops answering (a power cut), the job is given up as failed after
   100 seconds, instead of waited on for hours. What was being made then (a VM, a copy, a template)

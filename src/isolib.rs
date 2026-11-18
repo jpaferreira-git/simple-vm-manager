@@ -331,7 +331,8 @@ pub(crate) fn failure_panel(ui: &mut Ui, pal: &Pal, f: &mut Failure) {
         ui.set_width(ui.available_width());
         egui::ScrollArea::vertical().max_height(150.0).auto_shrink([false, true]).show(ui, |ui| {
             for (i, line) in f.transcript.lines().enumerate() {
-                let col = if i == 0 { Color32::from_rgb(126, 231, 135) } else if line.starts_with("Error code:") { Color32::from_rgb(255, 123, 114) } else { Color32::from_gray(210) };
+                // the commands green (the first line, and any that starts like one), the error red
+                let col = if i == 0 || line.starts_with("$ ") { Color32::from_rgb(126, 231, 135) } else if line.starts_with("Error code:") { Color32::from_rgb(255, 123, 114) } else { Color32::from_gray(210) };
                 ui.add(egui::Label::new(egui::RichText::new(line).monospace().size(12.0).color(col)).wrap());
             }
         });

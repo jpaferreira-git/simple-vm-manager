@@ -107,6 +107,9 @@ pub struct VmInfo {
     pub mem_actual: i64,
     /// When it last started, in seconds since 1970 (while running).
     pub started: Option<i64>,
+    /// When it was made: for a template this app made, exactly (kept in its other_config);
+    /// else when the server says it was installed (a copy keeps its source's).
+    pub created: Option<i64>,
     pub tools_installed: bool,
     /// The guest tools' version, like "9.4.0"; empty when not known.
     pub tools: String,
@@ -652,6 +655,53 @@ pub struct NetInfo {
     pub description: String,
     pub bridge: String,
     pub mtu: i64,
+    /// The network card it's on ("eth0", "bond0"), empty for a private one (no card: VMs on the
+    /// same server only); and its VLAN tag there, -1 for none.
+    pub device: String,
+    pub vlan: i64,
+}
+
+impl NetInfo {
+    /// How it reaches outside, in words: "VLAN 10 on eth0", "eth0", "Private (no card)".
+    pub fn connection(&self) -> String {
+        match (self.device.as_str(), self.vlan) {
+            ("", _) => "Private (no card)".into(),
+            (d, v) if v >= 0 => format!("VLAN {} on {}", v, d),
+            (d, _) => d.to_string(),
+        }
+    }
+}
+
+/// A new network: on a VLAN of a network card (the card's name, the same on every server, and
+/// the tag), or private (no card: it joins the VMs of each server among themselves).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct NewNetwork {
+    pub name: String,
+    pub description: String,
+    pub mtu: i64,
+    pub vlan: Option<(String, i64)>,
+}
+
+impl NewNetwork {
+    /// Why it can't be made as it is, if it can't: `taken` are the VLANs there already
+    /// (card, tag, the network's name).
+    pub fn problem(&self, taken: &[(String, i64, String)]) -> Option<String> {
+        if self.name.trim().is_empty() {
+            return Some("Give it a name.".into());
+        }
+        if !(68..=9216).contains(&self.mtu) {
+            return Some("The MTU goes from 68 to 9216 (1500 usually, 9000 for jumbo frames).".into());
+        }
+        if let Some((card, tag)) = &self.vlan {
+            if !(1..=4094).contains(tag) {
+                return Some("A VLAN tag goes from 1 to 4094.".into());
+            }
+            if let Some((_, _, name)) = taken.iter().find(|(c, t, _)| c == card && t == tag) {
+                return Some(format!("{} has VLAN {} already: '{}'.", card, tag, name));
+            }
+        }
+        None
+    }
 }
 
 #[derive(Clone, Debug, Default)]
