@@ -39,6 +39,6 @@ rm -f "${OLD[@]}"
 # point the launcher at the user copy, in case ~/.local/bin isn't on PATH
 sed -i "s|^Exec=.*|Exec=$BIN/simple-vm-manager|" "$APPS/simple-vm-manager.desktop"
 command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$APPS" || true
-command -v gtk-update-icon-cache >/dev/null 2>&1 && gtk-update-icon-cache -q "${ICONS%/scalable/apps}" || true
+command -v gtk-update-icon-cache >/dev/null 2>&1 && gtk-update-icon-cache -q -t "${ICONS%/scalable/apps}" || true
 
 echo "Installed. Start it from your app launcher (Super + Space on Omarchy) or run: simple-vm-manager"

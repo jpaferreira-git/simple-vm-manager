@@ -1104,7 +1104,7 @@ impl ConsoleView {
         ui.allocate_rect(area, Sense::hover());
         self.input(ui, &resp, img, s, focused, allow_keyboard);
         if focused {
-            ui.painter().rect_stroke(area, Rounding::same(4.0), Stroke::new(1.5, pal.accent));
+            ui.painter().rect_stroke(area, Rounding::same(4.0), Stroke::new(1.5_f32, pal.accent));
         }
         self.overlays(ui, area, &status);
     }

@@ -8,7 +8,6 @@ use eframe::egui::{pos2, vec2, Color32, Painter, Pos2, Rect, Rounding, Shape, St
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum IconKind {
     Home,
-    Globe,
     Pool,
     Host,
     HostOff,
@@ -120,23 +119,18 @@ fn rrect(p: &Painter, o: Pos2, x: f32, y: f32, w: f32, h: f32, r: f32, s: Stroke
 
 /// The little status dot in an icon's lower-right corner, ringed with the background colour.
 fn dot(p: &Painter, o: Pos2, c: Color32, ring: Color32) {
-    p.circle(o + vec2(12.5, 12.5), 3.3, c, Stroke::new(1.4, ring));
+    p.circle(o + vec2(12.5, 12.5), 3.3, c, Stroke::new(1.4_f32, ring));
 }
 
 /// A 16×16 outline icon for the tree, the header and lists. `bg` is what it sits on.
 pub fn paint_icon(p: &Painter, rect: Rect, kind: IconKind, pal: &Pal, bg: Color32) {
     let o = rect.min;
-    let s = Stroke::new(1.3, pal.icon);
+    let s = Stroke::new(1.3_f32, pal.icon);
     match kind {
         IconKind::Home => {
             line(p, o, &[(1.5, 8.0), (8.0, 2.0), (14.5, 8.0)], s);
             line(p, o, &[(3.5, 6.5), (3.5, 14.0), (12.5, 14.0), (12.5, 6.5)], s);
             rrect(p, o, 6.5, 9.5, 3.0, 4.5, 0.5, s);
-        }
-        IconKind::Globe => {
-            p.circle_stroke(o + vec2(8.0, 8.0), 6.3, s);
-            p.add(Shape::ellipse_stroke(o + vec2(8.0, 8.0), vec2(2.8, 6.3), s));
-            line(p, o, &[(1.8, 8.0), (14.2, 8.0)], s);
         }
         IconKind::Pool => {
             // stacked layers
@@ -153,8 +147,8 @@ pub fn paint_icon(p: &Painter, rect: Rect, kind: IconKind, pal: &Pal, bg: Color3
                 IconKind::Host => dot(p, o, pal.green, bg),
                 IconKind::HostOff => dot(p, o, pal.red, bg),
                 _ => {
-                    p.circle(o + vec2(12.5, 12.5), 3.6, pal.red, Stroke::new(1.4, bg));
-                    let w = Stroke::new(1.2, Color32::WHITE);
+                    p.circle(o + vec2(12.5, 12.5), 3.6, pal.red, Stroke::new(1.4_f32, bg));
+                    let w = Stroke::new(1.2_f32, Color32::WHITE);
                     p.line_segment([o + vec2(11.2, 11.2), o + vec2(13.8, 13.8)], w);
                     p.line_segment([o + vec2(13.8, 11.2), o + vec2(11.2, 13.8)], w);
                 }
@@ -164,8 +158,8 @@ pub fn paint_icon(p: &Painter, rect: Rect, kind: IconKind, pal: &Pal, bg: Color3
             // a faint ring, and an arc going round it
             let col = tone.color(pal);
             let turn = (p.ctx().input(|i| i.time) * 300.0 % 360.0) as f32;
-            p.circle_stroke(o + vec2(8.0, 8.0), 5.8, Stroke::new(1.8, col.gamma_multiply(0.22)));
-            arc(p, o + vec2(8.0, 8.0), 5.8, turn, turn + 110.0, Stroke::new(1.9, col));
+            p.circle_stroke(o + vec2(8.0, 8.0), 5.8, Stroke::new(1.8_f32, col.gamma_multiply(0.22)));
+            arc(p, o + vec2(8.0, 8.0), 5.8, turn, turn + 110.0, Stroke::new(1.9_f32, col));
             p.ctx().request_repaint();
         }
         IconKind::Sr => {
@@ -177,7 +171,7 @@ pub fn paint_icon(p: &Painter, rect: Rect, kind: IconKind, pal: &Pal, bg: Color3
                 let a = (i as f32 / 16.0 * 180.0).to_radians();
                 o + vec2(8.0 + 5.8 * a.cos(), 8.0 + 2.3 * a.sin())
             }).collect();
-            p.add(Shape::line(pts, Stroke::new(1.0, pal.icon.gamma_multiply(0.6))));
+            p.add(Shape::line(pts, Stroke::new(1.0_f32, pal.icon.gamma_multiply(0.6))));
         }
         IconKind::Net => {
             line(p, o, &[(8.0, 5.0), (8.0, 8.0)], s);
@@ -189,8 +183,8 @@ pub fn paint_icon(p: &Painter, rect: Rect, kind: IconKind, pal: &Pal, bg: Color3
         IconKind::IsoSr => {
             // a disc: its edge, the hole and a glint
             p.circle_stroke(o + vec2(8.0, 8.0), 6.3, s);
-            p.circle_stroke(o + vec2(8.0, 8.0), 1.7, Stroke::new(1.2, pal.icon));
-            arc(p, o + vec2(8.0, 8.0), 4.0, 200.0, 265.0, Stroke::new(1.0, pal.icon.gamma_multiply(0.7)));
+            p.circle_stroke(o + vec2(8.0, 8.0), 1.7, Stroke::new(1.2_f32, pal.icon));
+            arc(p, o + vec2(8.0, 8.0), 4.0, 200.0, 265.0, Stroke::new(1.0_f32, pal.icon.gamma_multiply(0.7)));
         }
         IconKind::Storage { iso, health } => {
             paint_icon(p, rect, if iso { IconKind::IsoSr } else { IconKind::Sr }, pal, bg);
@@ -199,15 +193,15 @@ pub fn paint_icon(p: &Painter, rect: Rect, kind: IconKind, pal: &Pal, bg: Color3
                 SrHealth::Off => dot(p, o, pal.red, bg),
                 SrHealth::Partly | SrHealth::Nowhere => {
                     let c = o + vec2(12.5, 12.5);
-                    p.circle(c, 3.9, if health == SrHealth::Nowhere { pal.red } else { pal.orange }, Stroke::new(1.4, bg));
-                    p.line_segment([c + vec2(0.0, -2.2), c + vec2(0.0, 0.6)], Stroke::new(1.3, Color32::WHITE));
+                    p.circle(c, 3.9, if health == SrHealth::Nowhere { pal.red } else { pal.orange }, Stroke::new(1.4_f32, bg));
+                    p.line_segment([c + vec2(0.0, -2.2), c + vec2(0.0, 0.6)], Stroke::new(1.3_f32, Color32::WHITE));
                     p.circle_filled(c + vec2(0.0, 2.0), 0.75, Color32::WHITE);
                 }
             }
         }
         IconKind::Snapshot => camera(p, o + vec2(8.0, 8.0), s),
         IconKind::Template => {
-            let faint = Stroke::new(1.1, pal.icon.gamma_multiply(0.55));
+            let faint = Stroke::new(1.1_f32, pal.icon.gamma_multiply(0.55));
             line(p, o, &[(4.5, 1.0), (15.0, 1.0), (15.0, 8.0)], faint);
             line(p, o, &[(3.0, 2.5), (13.5, 2.5), (13.5, 9.5)], faint);
             rrect(p, o, 1.0, 4.0, 11.0, 8.0, 1.4, s);
@@ -216,7 +210,7 @@ pub fn paint_icon(p: &Painter, rect: Rect, kind: IconKind, pal: &Pal, bg: Color3
         }
         IconKind::Folder => {
             line(p, o, &[(1.5, 13.0), (1.5, 3.5), (6.0, 3.5), (7.5, 5.0), (14.5, 5.0), (14.5, 13.0), (1.5, 13.0)], s);
-            line(p, o, &[(1.5, 7.0), (14.5, 7.0)], Stroke::new(1.0, pal.icon.gamma_multiply(0.6)));
+            line(p, o, &[(1.5, 7.0), (14.5, 7.0)], Stroke::new(1.0_f32, pal.icon.gamma_multiply(0.6)));
         }
         IconKind::Vm(state) => {
             rrect(p, o, 1.5, 2.0, 13.0, 9.0, 1.6, s);
@@ -254,6 +248,7 @@ pub fn tool_color(op: &str, pal: &Pal) -> Color32 {
         "newvm" => pal.blue,
         "iso" => pal.orange,
         "updates" => Color32::from_rgb(150, 110, 230),
+        "storage" => Color32::from_rgb(32, 165, 150),
         _ => pal.icon,
     }
 }
@@ -262,7 +257,7 @@ pub fn tool_color(op: &str, pal: &Pal) -> Color32 {
 pub fn paint_tool_glyph(p: &Painter, rect: Rect, op: &str, enabled: bool, pal: &Pal) {
     let c = rect.center();
     let col = if enabled { tool_color(op, pal) } else { pal.ink_faint };
-    let s = Stroke::new(2.0, col);
+    let s = Stroke::new(2.0_f32, col);
     let o = rect.min;
     match op {
         "power-running" | "power-halted" | "power-suspended" | "power-paused" => {
@@ -291,29 +286,44 @@ pub fn paint_tool_glyph(p: &Painter, rect: Rect, op: &str, enabled: bool, pal: &
         "start" => poly(p, c, &[(-3.5, -6.0), (6.0, 0.0), (-3.5, 6.0)], col),
         "iso" => {
             // a disc: its edge, the hole, and a glint
-            p.circle_stroke(c, 7.2, Stroke::new(1.8, col));
-            p.circle_stroke(c, 2.0, Stroke::new(1.5, col));
-            arc(p, c, 4.7, 200.0, 265.0, Stroke::new(1.3, col));
+            p.circle_stroke(c, 7.2, Stroke::new(1.8_f32, col));
+            p.circle_stroke(c, 2.0, Stroke::new(1.5_f32, col));
+            arc(p, c, 4.7, 200.0, 265.0, Stroke::new(1.3_f32, col));
         }
         "updates" => {
             // a box with an arrow coming down into it
-            let s = Stroke::new(1.8, col);
+            let s = Stroke::new(1.8_f32, col);
             line(p, o, &[(11.0, 3.0), (11.0, 12.5)], s);
             line(p, o, &[(7.2, 8.8), (11.0, 12.6), (14.8, 8.8)], s);
             line(p, o, &[(5.5, 11.0), (4.0, 11.0), (4.0, 18.5), (18.0, 18.5), (18.0, 11.0), (16.5, 11.0)], s);
         }
+        "storage" => {
+            // a cylinder of disks: its top, its sides, a band half way down and its bottom
+            let s = Stroke::new(1.8_f32, col);
+            let half = |cy: f32, from: f32, to: f32| -> Vec<Pos2> {
+                (0..=16).map(|i| {
+                    let a = (from + (to - from) * i as f32 / 16.0).to_radians();
+                    o + vec2(11.0 + 6.5 * a.cos(), cy + 2.4 * a.sin())
+                }).collect()
+            };
+            p.add(Shape::closed_line(half(5.8, 0.0, 360.0), s));
+            line(p, o, &[(4.5, 5.8), (4.5, 16.2)], s);
+            line(p, o, &[(17.5, 5.8), (17.5, 16.2)], s);
+            p.add(Shape::line(half(11.0, 0.0, 180.0), Stroke::new(1.5_f32, col)));
+            p.add(Shape::line(half(16.2, 0.0, 180.0), s));
+        }
         "newvm" => {
             // a screen on its stand, a plus on it
-            let s = Stroke::new(1.8, col);
+            let s = Stroke::new(1.8_f32, col);
             rrect(p, o, 3.5, 4.0, 15.0, 10.5, 2.0, s);
             line(p, o, &[(8.0, 18.0), (14.0, 18.0)], s);
             line(p, o, &[(11.0, 14.5), (11.0, 18.0)], s);
-            line(p, o, &[(11.0, 6.6), (11.0, 11.9)], Stroke::new(1.7, col));
-            line(p, o, &[(8.3, 9.25), (13.7, 9.25)], Stroke::new(1.7, col));
+            line(p, o, &[(11.0, 6.6), (11.0, 11.9)], Stroke::new(1.7_f32, col));
+            line(p, o, &[(8.3, 9.25), (13.7, 9.25)], Stroke::new(1.7_f32, col));
         }
         "connect" => {
             // a plug: two pins, a rounded body and its cord
-            let s = Stroke::new(1.8, col);
+            let s = Stroke::new(1.8_f32, col);
             line(p, o, &[(8.5, 3.5), (8.5, 7.5)], s);
             line(p, o, &[(13.5, 3.5), (13.5, 7.5)], s);
             line(p, o, &[(5.5, 7.5), (16.5, 7.5), (16.5, 10.5), (14.8, 13.6), (11.0, 15.0), (7.2, 13.6), (5.5, 10.5), (5.5, 7.5)], s);
@@ -324,17 +334,17 @@ pub fn paint_tool_glyph(p: &Painter, rect: Rect, op: &str, enabled: bool, pal: &
             for i in 0..8 {
                 let a = (i as f32 * 45.0 + 22.5).to_radians();
                 let d = vec2(a.cos(), a.sin());
-                p.line_segment([c + d * 5.4, c + d * 8.2], Stroke::new(2.6, col));
+                p.line_segment([c + d * 5.4, c + d * 8.2], Stroke::new(2.6_f32, col));
             }
-            p.circle_stroke(c, 5.6, Stroke::new(1.8, col));
-            p.circle_stroke(c, 2.1, Stroke::new(1.5, col));
+            p.circle_stroke(c, 5.6, Stroke::new(1.8_f32, col));
+            p.circle_stroke(c, 2.1, Stroke::new(1.5_f32, col));
         }
         "sidebar" => {
-            let s = Stroke::new(1.6, col);
+            let s = Stroke::new(1.6_f32, col);
             p.rect_stroke(Rect::from_center_size(c, vec2(16.0, 13.0)), Rounding::same(2.5), s);
             p.line_segment([c + vec2(-2.5, -6.5), c + vec2(-2.5, 6.5)], s);
             for y in [-3.0, 0.0, 3.0] {
-                p.line_segment([c + vec2(-6.0, y), c + vec2(-4.5, y)], Stroke::new(1.2, col));
+                p.line_segment([c + vec2(-6.0, y), c + vec2(-4.5, y)], Stroke::new(1.2_f32, col));
             }
         }
         "theme-dark" => {
@@ -344,11 +354,11 @@ pub fn paint_tool_glyph(p: &Painter, rect: Rect, op: &str, enabled: bool, pal: &
         }
         "theme-light" => {
             // a sun: switch to light
-            p.circle_stroke(c, 3.6, Stroke::new(1.8, col));
+            p.circle_stroke(c, 3.6, Stroke::new(1.8_f32, col));
             for i in 0..8 {
                 let a = (i as f32 * 45.0).to_radians();
                 let d = vec2(a.cos(), a.sin());
-                p.line_segment([c + d * 6.0, c + d * 8.3], Stroke::new(1.6, col));
+                p.line_segment([c + d * 6.0, c + d * 8.3], Stroke::new(1.6_f32, col));
             }
         }
         _ => {}
@@ -357,7 +367,7 @@ pub fn paint_tool_glyph(p: &Painter, rect: Rect, op: &str, enabled: bool, pal: &
 
 /// The search box's magnifier.
 pub fn paint_search(p: &Painter, rect: Rect, col: Color32) {
-    let s = Stroke::new(1.7, col);
+    let s = Stroke::new(1.7_f32, col);
     let c = rect.center();
     p.circle_stroke(c - vec2(1.5, 1.5), 4.6, s);
     p.line_segment([c + vec2(2.0, 2.0), c + vec2(6.0, 6.0)], s);
@@ -365,32 +375,32 @@ pub fn paint_search(p: &Painter, rect: Rect, col: Color32) {
 
 /// The Home page drawing: a cloud with two screens below it.
 pub fn paint_cloud(p: &Painter, o: Pos2, pal: &Pal) {
-    let s = Stroke::new(1.6, pal.art);
+    let s = Stroke::new(1.6_f32, pal.art);
     let fill = pal.art_fill;
     for (c, r) in [(vec2(35.0, 70.0), 32.0), (vec2(80.0, 50.0), 45.0), (vec2(135.0, 68.0), 33.0)] {
         p.circle(o + c, r, fill, s);
     }
     p.rect_filled(Rect::from_min_max(o + vec2(10.0, 62.0), o + vec2(160.0, 100.0)), 0.0, fill);
     p.line_segment([o + vec2(25.0, 100.5), o + vec2(150.0, 100.5)], s);
-    let dash = Stroke::new(1.2, pal.art);
+    let dash = Stroke::new(1.2_f32, pal.art);
     for (a, b) in [((85.0, 101.0), (85.0, 125.0)), ((45.0, 125.0), (125.0, 125.0)), ((45.0, 125.0), (45.0, 140.0)), ((125.0, 125.0), (125.0, 140.0))] {
         p.add(Shape::dashed_line(&[o + vec2(a.0, a.1), o + vec2(b.0, b.1)], dash, 2.0, 2.0));
     }
     paint_monitor(p, o + vec2(20.0, 140.0), 50.0, pal);
     paint_monitor(p, o + vec2(100.0, 140.0), 50.0, pal);
-    p.circle_stroke(o + vec2(128.0, 36.0), 10.0, Stroke::new(1.6, pal.red));
-    p.circle_stroke(o + vec2(128.0, 36.0), 4.0, Stroke::new(1.6, pal.red));
+    p.circle_stroke(o + vec2(128.0, 36.0), 10.0, Stroke::new(1.6_f32, pal.red));
+    p.circle_stroke(o + vec2(128.0, 36.0), 4.0, Stroke::new(1.6_f32, pal.red));
 }
 
 pub fn paint_monitor(p: &Painter, o: Pos2, w: f32, pal: &Pal) {
-    let s = Stroke::new(1.5, pal.art);
+    let s = Stroke::new(1.5_f32, pal.art);
     let h = w * 2.0 / 3.0;
     p.rect_stroke(Rect::from_min_size(o, vec2(w, h)), Rounding::same(3.0), s);
     let cell = (w - 12.0) / 3.0;
     for i in 0..3 {
         for j in 0..2 {
             let r = Rect::from_min_size(o + vec2(6.0 + i as f32 * cell, 7.0 + j as f32 * (h / 2.6)), vec2(cell - 3.0, h / 3.6));
-            p.rect_stroke(r, Rounding::same(1.0), Stroke::new(1.2, pal.red));
+            p.rect_stroke(r, Rounding::same(1.0), Stroke::new(1.2_f32, pal.red));
         }
     }
     p.line_segment([o + vec2(w / 2.0, h), o + vec2(w / 2.0, h + 8.0)], s);
@@ -407,14 +417,14 @@ pub fn paint_glyph(p: &Painter, rect: Rect, name: &str, col: Color32) {
 /// `paint_glyph` on a known background `bg`, which cuts a gap around a stroke-through (Disconnect).
 pub fn paint_glyph_on(p: &Painter, rect: Rect, name: &str, col: Color32, bg: Color32) {
     let c = rect.center();
-    let s = Stroke::new(1.5, col);
+    let s = Stroke::new(1.5_f32, col);
     match name {
         "camera" => camera(p, c, s),
         "activity" => line(p, c, &[(-7.0, 1.0), (-3.5, 1.0), (-1.5, -5.0), (1.5, 6.0), (3.5, -1.0), (7.0, -1.0)], s),
         "template" => {
             // a screen with copies of it behind (as the Template icon)
             let o = c - vec2(8.0, 8.0);
-            let faint = Stroke::new(1.1, col.gamma_multiply(0.6));
+            let faint = Stroke::new(1.1_f32, col.gamma_multiply(0.6));
             line(p, o, &[(4.5, 1.0), (15.0, 1.0), (15.0, 8.0)], faint);
             line(p, o, &[(3.0, 2.5), (13.5, 2.5), (13.5, 9.5)], faint);
             p.rect_stroke(Rect::from_min_size(o + vec2(1.0, 4.0), vec2(11.0, 8.0)), Rounding::same(1.4), s);
@@ -425,7 +435,7 @@ pub fn paint_glyph_on(p: &Painter, rect: Rect, name: &str, col: Color32, bg: Col
             // a processor: a square chip, its core, pins on every side
             p.rect_stroke(Rect::from_center_size(c, vec2(9.0, 9.0)), Rounding::same(1.5), s);
             p.rect_filled(Rect::from_center_size(c, vec2(3.4, 3.4)), Rounding::same(0.5), col);
-            let pin = Stroke::new(1.2, col);
+            let pin = Stroke::new(1.2_f32, col);
             for d in [-2.5f32, 0.0, 2.5] {
                 line(p, c, &[(d, -4.5), (d, -7.0)], pin);
                 line(p, c, &[(d, 4.5), (d, 7.0)], pin);
@@ -452,7 +462,7 @@ pub fn paint_glyph_on(p: &Painter, rect: Rect, name: &str, col: Color32, bg: Col
                 p.rect_filled(Rect::from_min_size(c + vec2(x, -2.2), vec2(2.4, 2.8)), Rounding::ZERO, col);
             }
             for x in [-5.0f32, -2.5, 0.0, 2.5, 5.0] {
-                line(p, c, &[(x, 2.5), (x, 4.8)], Stroke::new(1.1, col));
+                line(p, c, &[(x, 2.5), (x, 4.8)], Stroke::new(1.1_f32, col));
             }
         }
         "revert" => {
@@ -473,7 +483,7 @@ pub fn paint_glyph_on(p: &Painter, rect: Rect, name: &str, col: Color32, bg: Col
             line(p, o, &[(3.5, 4.5), (12.5, 4.5), (12.5, 7.0), (11.0, 9.6), (8.0, 10.8), (5.0, 9.6), (3.5, 7.0), (3.5, 4.5)], s);
             line(p, o, &[(8.0, 10.8), (8.0, 14.5)], s);
             if name == "disconnect" {
-                line(p, o, &[(1.5, 14.5), (14.5, 1.5)], Stroke::new(4.5, bg));
+                line(p, o, &[(1.5, 14.5), (14.5, 1.5)], Stroke::new(4.5_f32, bg));
                 line(p, o, &[(1.5, 14.5), (14.5, 1.5)], s);
             }
         }
@@ -482,11 +492,23 @@ pub fn paint_glyph_on(p: &Painter, rect: Rect, name: &str, col: Color32, bg: Col
             line(p, c, &[(-5.5, 5.5), (-4.8, 2.4), (2.6, -5.0), (5.0, -2.6), (-2.4, 4.8), (-5.5, 5.5)], s);
             line(p, c, &[(0.8, -3.2), (3.2, -0.8)], s);
         }
+        "folder" => {
+            // a folder: its tab on the upper left, a line where its flap closes
+            line(p, c, &[(-6.5, 5.0), (-6.5, -5.0), (-2.6, -5.0), (-1.0, -3.2), (6.5, -3.2), (6.5, 5.0), (-6.5, 5.0)], s);
+            line(p, c, &[(-6.5, -0.8), (6.5, -0.8)], s);
+        }
         "upload" => {
             // an arrow rising out of a tray
             line(p, c, &[(0.0, -6.0), (0.0, 2.5)], s);
             line(p, c, &[(-3.8, -2.4), (0.0, -6.2), (3.8, -2.4)], s);
             line(p, c, &[(-6.0, 1.5), (-6.0, 5.5), (6.0, 5.5), (6.0, 1.5)], s);
+        }
+        "move" => {
+            // a screen going right: its outline, an arrow out of it
+            p.rect_stroke(Rect::from_min_max(c + vec2(-7.0, -5.5), c + vec2(1.5, 2.5)), Rounding::same(1.5), s);
+            line(p, c, &[(-4.5, 5.5), (-1.0, 5.5)], s);
+            line(p, c, &[(0.0, -1.5), (7.0, -1.5)], s);
+            line(p, c, &[(4.2, -4.3), (7.0, -1.5), (4.2, 1.3)], s);
         }
         "download" => {
             // an arrow going down into a tray
@@ -511,31 +533,31 @@ pub fn paint_glyph_on(p: &Painter, rect: Rect, name: &str, col: Color32, bg: Col
                 let a = i as f32 / 32.0 * std::f32::consts::TAU;
                 c + vec2(2.8 * a.cos(), r * a.sin())
             }).collect();
-            p.add(Shape::line(meridian, Stroke::new(1.2, col)));
-            line(p, c, &[(-r, 0.0), (r, 0.0)], Stroke::new(1.2, col));
-            line(p, c, &[(-5.2, -3.4), (5.2, -3.4)], Stroke::new(1.0, col));
-            line(p, c, &[(-5.2, 3.4), (5.2, 3.4)], Stroke::new(1.0, col));
+            p.add(Shape::line(meridian, Stroke::new(1.2_f32, col)));
+            line(p, c, &[(-r, 0.0), (r, 0.0)], Stroke::new(1.2_f32, col));
+            line(p, c, &[(-5.2, -3.4), (5.2, -3.4)], Stroke::new(1.0_f32, col));
+            line(p, c, &[(-5.2, 3.4), (5.2, 3.4)], Stroke::new(1.0_f32, col));
         }
         "newvm" => {
             // a screen with a plus
             p.rect_stroke(Rect::from_min_max(c + vec2(-6.5, -5.5), c + vec2(6.5, 3.5)), Rounding::same(1.5), s);
             line(p, c, &[(-3.0, 6.3), (3.0, 6.3)], s);
-            line(p, c, &[(0.0, -3.5), (0.0, 1.5)], Stroke::new(1.4, col));
-            line(p, c, &[(-2.5, -1.0), (2.5, -1.0)], Stroke::new(1.4, col));
+            line(p, c, &[(0.0, -3.5), (0.0, 1.5)], Stroke::new(1.4_f32, col));
+            line(p, c, &[(-2.5, -1.0), (2.5, -1.0)], Stroke::new(1.4_f32, col));
         }
         "trash" => {
             // a bin: its lid and handle, the can, two grooves
             line(p, c, &[(-6.0, -4.0), (6.0, -4.0)], s);
-            line(p, c, &[(-2.2, -4.0), (-2.2, -6.2), (2.2, -6.2), (2.2, -4.0)], Stroke::new(1.3, col));
+            line(p, c, &[(-2.2, -4.0), (-2.2, -6.2), (2.2, -6.2), (2.2, -4.0)], Stroke::new(1.3_f32, col));
             line(p, c, &[(-4.6, -4.0), (-3.8, 6.2), (3.8, 6.2), (4.6, -4.0)], s);
-            line(p, c, &[(-1.4, -1.5), (-1.4, 3.6)], Stroke::new(1.1, col));
-            line(p, c, &[(1.4, -1.5), (1.4, 3.6)], Stroke::new(1.1, col));
+            line(p, c, &[(-1.4, -1.5), (-1.4, 3.6)], Stroke::new(1.1_f32, col));
+            line(p, c, &[(1.4, -1.5), (1.4, 3.6)], Stroke::new(1.1_f32, col));
         }
-        "check" => line(p, c, &[(-5.0, 0.3), (-1.6, 3.8), (5.0, -3.6)], Stroke::new(1.7, col)),
+        "check" => line(p, c, &[(-5.0, 0.3), (-1.6, 3.8), (5.0, -3.6)], Stroke::new(1.7_f32, col)),
         "warning" => {
             // a triangle with an exclamation mark
-            line(p, c, &[(0.0, -6.5), (7.0, 5.5), (-7.0, 5.5), (0.0, -6.5)], Stroke::new(1.4, col));
-            line(p, c, &[(0.0, -2.2), (0.0, 1.6)], Stroke::new(1.6, col));
+            line(p, c, &[(0.0, -6.5), (7.0, 5.5), (-7.0, 5.5), (0.0, -6.5)], Stroke::new(1.4_f32, col));
+            line(p, c, &[(0.0, -2.2), (0.0, 1.6)], Stroke::new(1.6_f32, col));
             p.circle_filled(c + vec2(0.0, 3.7), 0.95, col);
         }
         "power" => {
@@ -551,18 +573,18 @@ pub fn paint_glyph_on(p: &Painter, rect: Rect, name: &str, col: Color32, bg: Col
         }
         "error" => {
             // a cross in a circle
-            p.circle_stroke(c, 6.8, Stroke::new(1.4, col));
-            let s = Stroke::new(1.5, col);
+            p.circle_stroke(c, 6.8, Stroke::new(1.4_f32, col));
+            let s = Stroke::new(1.5_f32, col);
             line(p, c, &[(-2.6, -2.6), (2.6, 2.6)], s);
             line(p, c, &[(2.6, -2.6), (-2.6, 2.6)], s);
         }
         "close" => {
-            let s = Stroke::new(1.7, col);
+            let s = Stroke::new(1.7_f32, col);
             line(p, c, &[(-4.0, -4.0), (4.0, 4.0)], s);
             line(p, c, &[(4.0, -4.0), (-4.0, 4.0)], s);
         }
         "plus" => {
-            let s = Stroke::new(1.7, col);
+            let s = Stroke::new(1.7_f32, col);
             line(p, c, &[(-5.0, 0.0), (5.0, 0.0)], s);
             line(p, c, &[(0.0, -5.0), (0.0, 5.0)], s);
         }
@@ -586,24 +608,24 @@ pub fn paint_glyph_on(p: &Painter, rect: Rect, name: &str, col: Color32, bg: Col
         "keyboard" => {
             // an outline, two rows of keys and a space bar
             let k = Rect::from_center_size(c, vec2(17.0, 11.0));
-            p.rect_stroke(k, Rounding::same(2.0), Stroke::new(1.3, col));
+            p.rect_stroke(k, Rounding::same(2.0), Stroke::new(1.3_f32, col));
             for row in 0..2 {
                 for i in 0..5 {
                     let at = pos2(k.min.x + 3.0 + i as f32 * 2.75, k.min.y + 3.0 + row as f32 * 2.5);
                     p.rect_filled(Rect::from_center_size(at, vec2(1.4, 1.2)), 0.0, col);
                 }
             }
-            p.line_segment([pos2(k.min.x + 5.0, k.max.y - 2.5), pos2(k.max.x - 5.0, k.max.y - 2.5)], Stroke::new(1.2, col));
+            p.line_segment([pos2(k.min.x + 5.0, k.max.y - 2.5), pos2(k.max.x - 5.0, k.max.y - 2.5)], Stroke::new(1.2_f32, col));
         }
         "screen" | "fit" => {
             // a monitor on its stand; to fit, arrows pointing to its corners
             let m = Rect::from_center_size(c - vec2(0.0, 1.5), vec2(17.0, 11.0));
-            let s = Stroke::new(1.3, col);
+            let s = Stroke::new(1.3_f32, col);
             p.rect_stroke(m, Rounding::same(1.5), s);
             p.line_segment([pos2(m.center().x, m.max.y), pos2(m.center().x, m.max.y + 2.5)], s);
             p.line_segment([pos2(m.center().x - 3.5, m.max.y + 2.5), pos2(m.center().x + 3.5, m.max.y + 2.5)], s);
             if name == "fit" {
-                let s = Stroke::new(1.1, col);
+                let s = Stroke::new(1.1_f32, col);
                 let (a, b) = (m.shrink2(vec2(3.0, 2.5)).min, m.shrink2(vec2(3.0, 2.5)).max);
                 for (corner, dx, dy) in [(a, 2.5, 2.0), (pos2(b.x, a.y), -2.5, 2.0), (pos2(a.x, b.y), 2.5, -2.0), (b, -2.5, -2.0)] {
                     p.line_segment([corner, corner + vec2(dx, 0.0)], s);

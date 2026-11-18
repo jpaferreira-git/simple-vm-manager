@@ -7,6 +7,8 @@ mod console;
 mod icons;
 mod isolib;
 mod model;
+mod movevm;
+mod newsr;
 mod newvm;
 mod pool_update;
 mod secrets;
@@ -32,7 +34,7 @@ fn main() -> eframe::Result {
     // --screenshot <file.png>: start with the demo server, draw about 120 frames, save the window, exit.
     // --show home|welcome|objects|networks|storage|isos|search|logs|vm|console|add-server|confirm|about|iso|
     // iso-advanced|iso-error|iso-disconnect|iso-describe|iso-upload|
-    // iso-upload-choose|iso-upload-web|iso-upload-done|iso-delete|new-vm|new-vm-advanced|new-vm-custom|new-vm-no-start|new-vm-created|new-vm-offline|vm-delete|host-console|vm-busy|settings|update|update-progress|host-shutdown|host-restart|pool|pool-details|pool-updates|pool-updating|pool-update-stopped|host-details|
+    // iso-upload-choose|iso-upload-web|iso-upload-done|iso-delete|new-vm|new-vm-advanced|new-vm-custom|new-vm-no-start|new-vm-created|new-vm-offline|vm-delete|host-console|vm-busy|settings|update|update-progress|host-shutdown|host-restart|pool|pool-details|pool-updates|pool-updating|pool-update-stopped|move-vm|move-vm-off|move-vm-local|sr-shared|host-details|iso-library|vm-storage|activities-moving|close-asked|new-storage|new-storage-inside|new-storage-error|
     // sr-unmounted|sr-detached|sr-auto-repair|sr-repair-failed|host-down|snapshots|snapshot-take|
     // snapshot-revert|snapshot-delete|snapshot-taken|templates|template|new-vm-template|make-template|
     // make-template-snapshot|copy-vm|template-made|vm-off|vm-edited|vm-bios|vm-rename|host|details|activities|log-detail picks what the screenshot shows (default: a VM's

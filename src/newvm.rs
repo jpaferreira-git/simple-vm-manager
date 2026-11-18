@@ -817,7 +817,7 @@ impl NewVmDialog {
             _ => self.net.and_then(|i| self.nets.get(i)).map(|n| n.1.clone()).unwrap_or_else(|| "no network".into()),
         };
         parts.push(net);
-        egui::Frame::none().fill(pal.rail).stroke(Stroke::new(1.0, pal.border)).rounding(Rounding::same(8.0)).inner_margin(egui::Margin::symmetric(12.0, 10.0)).show(ui, |ui| {
+        egui::Frame::none().fill(pal.rail).stroke(Stroke::new(1.0_f32, pal.border)).rounding(Rounding::same(8.0)).inner_margin(egui::Margin::symmetric(12.0, 10.0)).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.spacing_mut().item_spacing.y = 3.0;
             ui.label(egui::RichText::new(spec.name.as_str()).font(FontId::new(14.0, FontFamily::Name("bold".into()))).color(pal.ink));
@@ -1023,7 +1023,7 @@ impl NewVmDialog {
         ui.horizontal(|ui| {
             ui.add_space(LABEL_WIDTH + ui.spacing().item_spacing.x);
             let w = ui.available_width();
-            let frame = egui::Frame::none().fill(pal.rail).stroke(Stroke::new(1.0, pal.border)).rounding(Rounding::same(8.0)).inner_margin(egui::Margin::symmetric(0.0, 11.0));
+            let frame = egui::Frame::none().fill(pal.rail).stroke(Stroke::new(1.0_f32, pal.border)).rounding(Rounding::same(8.0)).inner_margin(egui::Margin::symmetric(0.0, 11.0));
             frame.show(ui, |ui| {
                 ui.set_width(w);
                 // centred by the width the row took last time
@@ -1069,7 +1069,7 @@ impl NewVmDialog {
             }
             let c = pos2(r.min.x + 10.0, r.center().y);
             let chev = if self.advanced { vec![c + vec2(-3.5, -1.5), c + vec2(0.0, 2.0), c + vec2(3.5, -1.5)] } else { vec![c + vec2(-1.5, -3.5), c + vec2(2.0, 0.0), c + vec2(-1.5, 3.5)] };
-            ui.painter().add(egui::Shape::line(chev, Stroke::new(1.4, pal.ink_soft)));
+            ui.painter().add(egui::Shape::line(chev, Stroke::new(1.4_f32, pal.ink_soft)));
             ui.painter().text(pos2(r.min.x + 22.0, r.center().y), Align2::LEFT_CENTER, "Advanced", FontId::proportional(13.0), pal.ink);
             ui.painter().text(pos2(r.max.x - 8.0, r.center().y), Align2::RIGHT_CENTER, sockets_text(self.sockets, cpus), FontId::proportional(12.0), pal.ink_soft);
             if resp.clicked() {
@@ -1105,7 +1105,7 @@ impl NewVmDialog {
         }
         let c = pos2(r.min.x + 10.0, r.center().y);
         let chev = if self.advanced { vec![c + vec2(-3.5, -1.5), c + vec2(0.0, 2.0), c + vec2(3.5, -1.5)] } else { vec![c + vec2(-1.5, -3.5), c + vec2(2.0, 0.0), c + vec2(-1.5, 3.5)] };
-        ui.painter().add(egui::Shape::line(chev, Stroke::new(1.4, pal.ink_soft)));
+        ui.painter().add(egui::Shape::line(chev, Stroke::new(1.4_f32, pal.ink_soft)));
         ui.painter().text(pos2(r.min.x + 22.0, r.center().y), Align2::LEFT_CENTER, "Advanced", FontId::proportional(13.0), pal.ink);
         ui.painter().text(pos2(r.max.x - 8.0, r.center().y), Align2::RIGHT_CENTER, summary, FontId::proportional(12.0), pal.ink_soft);
         if resp.clicked() {
@@ -1146,7 +1146,7 @@ impl NewVmDialog {
                 let resp = ui.interact(pr, ui.id().with(("boot", i)), if allowed[i] { Sense::click() } else { Sense::hover() });
                 let on = boot == *m;
                 if on {
-                    ui.painter().rect(pr, Rounding::same(4.5), pal.surface, Stroke::new(1.0, pal.border));
+                    ui.painter().rect(pr, Rounding::same(4.5), pal.surface, Stroke::new(1.0_f32, pal.border));
                 }
                 let col = if !allowed[i] { pal.ink_faint } else if on || resp.hovered() { pal.ink } else { pal.ink_soft };
                 ui.painter().text(pr.center(), Align2::CENTER_CENTER, boot_name(*m), FontId::proportional(12.5), col);
@@ -1190,7 +1190,7 @@ pub(crate) fn combo_style(ui: &mut Ui, pal: &Pal) {
     for (w, line) in [(&mut v.widgets.inactive, pal.border_strong), (&mut v.widgets.hovered, pal.border_strong), (&mut v.widgets.open, pal.accent)] {
         w.weak_bg_fill = pal.input;
         w.bg_fill = pal.input;
-        w.bg_stroke = Stroke::new(1.0, line);
+        w.bg_stroke = Stroke::new(1.0_f32, line);
         w.rounding = Rounding::same(5.0);
         w.expansion = 0.0;
     }
@@ -1329,7 +1329,7 @@ fn size_card(ui: &mut Ui, pal: &Pal, size: egui::Vec2, title: &str, lines: &[Str
     let (r, resp) = ui.allocate_exact_size(size, Sense::click());
     let p = ui.painter();
     let fill = if on { pal.accent.gamma_multiply(if pal.dark { 0.18 } else { 0.08 }) } else if resp.hovered() { pal.hover } else { pal.surface };
-    let stroke = if on { Stroke::new(1.6, pal.accent) } else { Stroke::new(1.0, if resp.hovered() { pal.border_strong } else { pal.border }) };
+    let stroke = if on { Stroke::new(1.6_f32, pal.accent) } else { Stroke::new(1.0_f32, if resp.hovered() { pal.border_strong } else { pal.border }) };
     p.rect(r, Rounding::same(8.0), fill, stroke);
     let title_font = FontId::new(CARD_TITLE, FontFamily::Name("bold".into()));
     let (title_h, line_h) = ui.fonts(|f| (f.row_height(&title_font), f.row_height(&FontId::proportional(CARD_LINE))));

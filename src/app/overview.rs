@@ -74,7 +74,6 @@ struct Around {
     saving: Option<String>,
     /// Its server, when that's off or not answering (its name, and whether it's live).
     down: Option<(String, bool)>,
-    host: Option<String>,
     /// ISO files for its DVD drive (disc, its name, its library), storage for a new disk (with
     /// its room), and networks.
     isos: Vec<(String, String, String)>,
@@ -102,7 +101,6 @@ impl App {
             busy: s.busy.get(&v.rref).map(|b| b.0.clone()),
             saving: self.vm_saving.get(&v.rref).cloned(),
             down: d.host_down_for(&v).map(|h| (h.name.clone(), h.live)),
-            host: host_of.map(|h| h.name.clone()),
             isos,
             stores,
             nets: d.networks.iter().map(|n| (n.rref.clone(), n.name.clone())).collect(),
@@ -250,7 +248,7 @@ const PANEL_ROWS: &str = "overview-panel-rows";
 /// A panel of rows, rounded, a hair of a border.
 pub(super) fn panel(ui: &mut Ui, pal: &Pal, add: impl FnOnce(&mut Ui)) {
     let min = ui.data_mut(|d| d.remove_temp::<f32>(egui::Id::new(PANEL_MIN))).unwrap_or(0.0);
-    egui::Frame::none().fill(pal.surface).stroke(Stroke::new(1.0, pal.border.gamma_multiply(0.7))).rounding(Rounding::same(12.0)).inner_margin(egui::Margin::symmetric(0.0, 3.0)).show(ui, |ui| {
+    egui::Frame::none().fill(pal.surface).stroke(Stroke::new(1.0_f32, pal.border.gamma_multiply(0.7))).rounding(Rounding::same(12.0)).inner_margin(egui::Margin::symmetric(0.0, 3.0)).show(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.spacing_mut().item_spacing.y = 0.0;
         add(ui);
@@ -346,7 +344,7 @@ pub(super) fn row(ui: &mut Ui, pal: &Pal, lead: Option<Lead>, label: &str, value
     match &tail {
         Tail::Chevron => {
             let c = pos2(right - 3.0, cy);
-            p.add(egui::Shape::line(vec![c + vec2(-3.0, -5.0), c + vec2(2.0, 0.0), c + vec2(-3.0, 5.0)], Stroke::new(1.5, pal.ink_faint)));
+            p.add(egui::Shape::line(vec![c + vec2(-3.0, -5.0), c + vec2(2.0, 0.0), c + vec2(-3.0, 5.0)], Stroke::new(1.5_f32, pal.ink_faint)));
             right -= 20.0;
         }
         Tail::More => {
@@ -375,7 +373,7 @@ pub(super) fn row(ui: &mut Ui, pal: &Pal, lead: Option<Lead>, label: &str, value
     }
     let resp = if cut { resp.on_hover_text(value) } else { resp };
     if !last {
-        p.line_segment([pos2(x, r.max.y - 0.5), pos2(r.max.x, r.max.y - 0.5)], Stroke::new(1.0, pal.border.gamma_multiply(0.6)));
+        p.line_segment([pos2(x, r.max.y - 0.5), pos2(r.max.x, r.max.y - 0.5)], Stroke::new(1.0_f32, pal.border.gamma_multiply(0.6)));
     }
     let mut anchor = resp.clone();
     anchor.rect = r;
@@ -529,7 +527,7 @@ fn chip(ui: &mut Ui, pal: &Pal, text: &str, on: bool) -> bool {
     } else {
         pal.input
     };
-    ui.painter().rect(r, Rounding::same(14.0), fill, if on { Stroke::NONE } else { Stroke::new(1.0, pal.border) });
+    ui.painter().rect(r, Rounding::same(14.0), fill, if on { Stroke::NONE } else { Stroke::new(1.0_f32, pal.border) });
     ui.painter().text(r.center(), Align2::CENTER_CENTER, text, FontId::proportional(13.0), if on { pal.on_accent } else { pal.ink });
     resp.clicked()
 }
@@ -541,11 +539,11 @@ fn round_button(ui: &mut Ui, pal: &Pal, plus: bool, enabled: bool) -> bool {
     if enabled && resp.hovered() {
         ui.painter().circle_filled(r.center(), 15.0, pal.hover);
     }
-    ui.painter().circle_stroke(r.center(), 14.0, Stroke::new(1.0, pal.border_strong));
+    ui.painter().circle_stroke(r.center(), 14.0, Stroke::new(1.0_f32, pal.border_strong));
     let c = r.center();
-    ui.painter().line_segment([c - vec2(5.0, 0.0), c + vec2(5.0, 0.0)], Stroke::new(1.6, col));
+    ui.painter().line_segment([c - vec2(5.0, 0.0), c + vec2(5.0, 0.0)], Stroke::new(1.6_f32, col));
     if plus {
-        ui.painter().line_segment([c - vec2(0.0, 5.0), c + vec2(0.0, 5.0)], Stroke::new(1.6, col));
+        ui.painter().line_segment([c - vec2(0.0, 5.0), c + vec2(0.0, 5.0)], Stroke::new(1.6_f32, col));
     }
     enabled && resp.clicked()
 }
@@ -802,7 +800,7 @@ fn tiles(ui: &mut Ui, pal: &Pal, w: f32, v: &VmInfo, at: &Around, perf: Option<&
 /// Where the tiles go while there's nothing to draw: why, in a panel as wide as they are (a
 /// spinner when it's coming).
 pub(super) fn say(ui: &mut Ui, pal: &Pal, text: &str, spin: bool) {
-    egui::Frame::none().fill(pal.surface).stroke(Stroke::new(1.0, pal.border.gamma_multiply(0.7))).rounding(Rounding::same(14.0)).inner_margin(egui::Margin::symmetric(16.0, 16.0)).show(ui, |ui| {
+    egui::Frame::none().fill(pal.surface).stroke(Stroke::new(1.0_f32, pal.border.gamma_multiply(0.7))).rounding(Rounding::same(14.0)).inner_margin(egui::Margin::symmetric(16.0, 16.0)).show(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.horizontal(|ui| {
             if spin {
@@ -912,7 +910,7 @@ pub(super) fn tile(ui: &mut Ui, pal: &Pal, w: f32, t: &Tile) {
         resp.on_hover_text(tip);
     }
     let p = ui.painter();
-    let edge = t.tone.map_or(Stroke::new(1.0, pal.border.gamma_multiply(0.7)), |c| Stroke::new(1.5, c.gamma_multiply(0.8)));
+    let edge = t.tone.map_or(Stroke::new(1.0_f32, pal.border.gamma_multiply(0.7)), |c| Stroke::new(1.5_f32, c.gamma_multiply(0.8)));
     p.rect(r, Rounding::same(14.0), pal.surface, edge);
     p.text(r.min + vec2(16.0, 18.0), Align2::LEFT_CENTER, title.to_uppercase(), FontId::proportional(11.0), t.tone.unwrap_or(pal.ink_faint));
     // a key for two lines: a dot in each colour, its name
@@ -957,7 +955,7 @@ pub(super) fn tile(ui: &mut Ui, pal: &Pal, w: f32, t: &Tile) {
             }
             p.add(egui::Shape::mesh(mesh));
         }
-        p.add(egui::Shape::line(pts, Stroke::new(1.8, *col)));
+        p.add(egui::Shape::line(pts, Stroke::new(1.8_f32, *col)));
     }
 }
 

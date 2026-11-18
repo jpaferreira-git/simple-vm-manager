@@ -223,7 +223,7 @@ fn choice(ui: &mut Ui, pal: &Pal, glyph: &str, title: &str, text: &str) -> bool 
     let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 62.0), Sense::click());
     let p = ui.painter();
     let hot = resp.hovered();
-    p.rect(r, Rounding::same(8.0), if hot { pal.hover } else { pal.surface }, Stroke::new(1.0, if hot { pal.accent } else { pal.border }));
+    p.rect(r, Rounding::same(8.0), if hot { pal.hover } else { pal.surface }, Stroke::new(1.0_f32, if hot { pal.accent } else { pal.border }));
     let icon = Rect::from_center_size(pos2(r.min.x + 32.0, r.center().y), vec2(36.0, 36.0));
     p.rect_filled(icon, Rounding::same(8.0), pal.accent.gamma_multiply(if pal.dark { 0.22 } else { 0.12 }));
     paint_glyph(p, Rect::from_center_size(icon.center(), vec2(16.0, 16.0)), glyph, pal.accent);
@@ -232,6 +232,6 @@ fn choice(ui: &mut Ui, pal: &Pal, glyph: &str, title: &str, text: &str) -> bool 
     p.text(pos2(x, r.center().y + 10.0), Align2::LEFT_CENTER, text, FontId::proportional(12.5), pal.ink_soft);
     // a chevron: this leads somewhere
     let c = pos2(r.max.x - 18.0, r.center().y);
-    p.add(egui::Shape::line(vec![c + vec2(-2.0, -4.5), c + vec2(2.5, 0.0), c + vec2(-2.0, 4.5)], Stroke::new(1.5, pal.ink_soft)));
+    p.add(egui::Shape::line(vec![c + vec2(-2.0, -4.5), c + vec2(2.5, 0.0), c + vec2(-2.0, 4.5)], Stroke::new(1.5_f32, pal.ink_soft)));
     resp.clicked()
 }

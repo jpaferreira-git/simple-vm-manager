@@ -18,6 +18,8 @@ affiliated with or endorsed by the makers of XenServer or XCP-ng.
 | ![Your templates](docs/screenshot-dark-templates.png) | ![A new VM from a template](docs/screenshot-dark-new-vm-template.png) |
 | ![A server's Overview](docs/screenshot-dark-host.png) | ![A pool's Overview](docs/screenshot-dark-pool.png) |
 | ![A pool's updates](docs/screenshot-dark-updates.png) | ![Updating a pool](docs/screenshot-dark-updating.png) |
+| ![Every ISO file of every pool](docs/screenshot-dark-iso-library.png) | ![Where your VMs' disks are](docs/screenshot-dark-vm-storage.png) |
+| ![Adding NFS storage for VMs](docs/screenshot-dark-new-storage.png) | ![Moving a VM](docs/screenshot-dark-move-vm.png) |
 
 ## Features
 
@@ -71,8 +73,9 @@ affiliated with or endorsed by the makers of XenServer or XCP-ng.
   moved to the others, the updates installed, the server restarted when they need it (or only its
   toolstack) and back before the next. VMs that can't move (on a server's own storage, no room
   elsewhere…) are never shut down unless you choose so: the update then won't start, every server
-  checked first, saying which VMs and why; or, if you choose, they're shut down for their server's
-  restart and started again after. Each step shows as it goes (how long it's been), with every
+  checked first, saying which VMs and why; or, if you choose, they're moved with their disks to
+  another server and brought back after (slower: their disks are copied twice, but none stops), or
+  shut down for their server's restart and started again after. Each step shows as it goes (how long it's been), with every
   call to the servers and their answers below it, as in a terminal (with Copy); a server's restart
   is waited for quietly (going down, then starting up again), and the end says plainly anything
   left to do by hand.
@@ -85,7 +88,12 @@ affiliated with or endorsed by the makers of XenServer or XCP-ng.
   the tabs sends Ctrl+Alt+Del and the combinations your desktop keeps for itself (the Windows key,
   Alt+Tab…). It reconnects by itself after the VM reboots. A server has a Console tab too: its own text console
   (the control domain's, as in XenCenter), where you log in as root.
-- **ISO libraries** — *ISO Library* on the toolbar adds a Windows (SMB) or NFS share of installation
+- **ISO libraries** — *ISO Library* on the toolbar opens a page with every ISO file of every pool:
+  each library as a card (where it is, how many files it has, or that it isn't mounted; a click
+  opens it), then all the files by name, with their library when there's more than one, each with
+  its description, *New VM* and the bin, as on a library's own page. Next to its tabs are *Upload*
+  (asking into which library when there are several), *Rescan* (every library) and
+  *New ISO Library*, which adds a Windows (SMB) or NFS share of installation
   discs to a pool: just the address (and a login for SMB) up front, protocol versions under
   *Advanced* (SMB 3.0 and NFSv3 by default). The server mounts the share right away; if that fails
   you get the reason in plain words, the equivalent `xe` command and the server's answer, ready to copy.
@@ -107,6 +115,18 @@ affiliated with or endorsed by the makers of XenServer or XCP-ng.
   its settings for it altogether (XenCenter's *Detach*), *Repair* asks where it is and connects the
   same library again, its discs and their descriptions kept. The app also does this by itself,
   once, when it finds storage unmounted (Settings → Storage); Logs says how it went.
+- **VM storage** — *VM Storage* on the toolbar lists every pool's storage for VMs' disks: its kind
+  (NFS, local disk…), where it is (the NFS folder, or the server it's in), how full it is, and which
+  one is the pool's default, where new VMs' disks go and what suspending and moving VMs use
+  (*Make Default* on the others, under the mouse; the pool's Overview marks it too). A pool with no
+  shared storage is told what that costs: a VM moves to another server only by copying its disks.
+  *New VM Storage* adds a folder an NFS server shares: every server of the pool mounts it, so VMs
+  move between servers without their disks being copied, and a pool update can keep them running.
+  *Browse* asks the server which folders it shares; the new storage can be made the pool's default
+  as it's made. If the address is one of the pool's own VMs (a TrueNAS VM, say) a caution says what
+  that means: when its server restarts, every VM with a disk there stops. A failure is explained as
+  for an ISO library (an export that doesn't let the servers in as root, a folder that isn't there),
+  with the `xe` command and the server's answer.
 - **New VM** — on the toolbar, on a pool's or server's right-click menu, or from an ISO in an ISO
   library: pick the ISO, a size (Small, Medium, Large or your own numbers), the server it runs on
   (or any), where the disk goes (the storage that server sees) and the network (or none). The rest is worked out: the system's template from the ISO's name
@@ -147,6 +167,13 @@ affiliated with or endorsed by the makers of XenServer or XCP-ng.
   it's on, puts it back, and then leaves it as it was at the time: resumed, started again, or off.
   The bin deletes one, with its copies of the disks. In a narrow window the tab keeps Revert and
   Delete in view, dropping the other columns first.
+- **Move a VM** — the Move button next to a VM's tabs, *Move…* on its right-click menu, or drag it
+  onto a server in the tree: one dialog for the server it goes to (each with its free memory, or
+  why it can't take it) and the storage of each of its disks (where it is when that server sees
+  it, else that server's own, or the roomiest it sees). Running, it keeps running: moved live,
+  its disks copied as it runs when they change storage (also on the same server); off, its disks
+  are copied and swapped in, and it starts on that server from then on. Its DVD drive is emptied
+  first when its disc's library isn't seen where it goes. Progress in Activities.
 - **Shut down or restart a server** — the red power icon and the green restart icon at the end of a
   server's tabs. Each asks first, saying which VMs move to the pool's other servers and which are
   shut down (their disks on that server's own storage), and warns when it's the pool's coordinator.
@@ -163,7 +190,8 @@ affiliated with or endorsed by the makers of XenServer or XCP-ng.
 - **Keyboard shortcuts** — Ctrl+B start · Ctrl+E shut down · Ctrl+R reboot · Ctrl+Y suspend/resume ·
   F5 refresh.
 - **Activities** — next to the gear: what's under way (a ring turning, with how many), each with its
-  server, how long it's been and how far it is, and the last few that ended. Above them, what's
+  server, how long it's been and how far it is (for disks moved or copied, and uploads, how much
+  of how much and how fast: "11.7 GB of 20 GB · 110 MB/s"), and the last few that ended. Above them, what's
   wrong right now (a red dot on the button): a connection lost, a server off or not answering (and
   the VMs whose state that makes unknown), storage that isn't mounted; a click opens it. A server
   that stops answering or comes back is noted there too, and Refresh (F5) says how it went,
@@ -177,7 +205,11 @@ affiliated with or endorsed by the makers of XenServer or XCP-ng.
   100 seconds, instead of waited on for hours. What was being made then (a VM, a copy, a template)
   is noted, even across closing the app; once the server's back, anything left half made under its
   name is offered for deleting. A dialog whose job can't be cancelled says *Close*, not *Cancel*:
-  closing it leaves the job going, under Activities.
+  closing it leaves the job going, under Activities. Closing the app doesn't stop a job that's one
+  task on the server (copying a VM, a snapshot, moving a running VM): the server finishes it. Only
+  when something would be left half done (the app takes it through several steps: a new VM, a
+  shut-down VM's disks moved, a revert, a pool's update, a server shut down, a VM deleted, an
+  upload) it asks first, with a yellow note for each saying what would be left.
 - **Settings** — the gear at the far left of the toolbar: the theme (light, dark, or the same as
   your desktop), the size of everything (90–125%; Ctrl + and Ctrl - too), and the saved passwords,
   each with *Forget* (deleted from the keychain; the app stops connecting there as it starts), even

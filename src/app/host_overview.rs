@@ -834,6 +834,16 @@ fn spark(p: &egui::Painter, r: Rect, s: &[f64], col: Color32) {
     p.add(egui::Shape::line(pts, Stroke::new(1.4_f32, col)));
 }
 
+/// A small rounded tag in `col` (its text in it, on a wash of it) from `at` (its left middle);
+/// how wide it is.
+pub(super) fn pill(p: &egui::Painter, pal: &Pal, at: egui::Pos2, text: &str, col: Color32) -> f32 {
+    let g = p.layout_no_wrap(text.to_string(), FontId::new(11.0, egui::FontFamily::Name("bold".into())), col);
+    let r = Rect::from_min_size(pos2(at.x, at.y - 9.0), vec2(g.size().x + 14.0, 18.0));
+    p.rect_filled(r, Rounding::same(9.0), col.gamma_multiply(if pal.dark { 0.2 } else { 0.13 }));
+    p.galley(pos2(r.min.x + 7.0, r.center().y - g.size().y / 2.0), g, col);
+    r.width()
+}
+
 /// A storage: its icon and name (and its server's, in the pool's list), how full it is, and a bar;
 /// or, when it isn't mounted where it should be, that instead.
 fn store_row(ui: &mut Ui, pal: &Pal, d: &PoolData, x: &SrInfo, aside: &str, trouble: Option<&str>, last: bool) -> egui::Response {
@@ -856,9 +866,14 @@ fn store_row(ui: &mut Ui, pal: &Pal, d: &PoolData, x: &SrInfo, aside: &str, trou
         None => (format!("{} of {}", fmt_bytes(x.used), fmt_bytes(x.size)), tone.unwrap_or(pal.ink_soft)),
     };
     let v = p.text(pos2(right, top), Align2::RIGHT_CENTER, &value, FontId::proportional(13.0), col);
-    let (g, cut) = fit(&p, &x.name, FontId::proportional(14.0), pal.ink, (v.min.x - tx - 14.0).max(30.0));
-    let end = tx + g.size().x;
+    // the pool's default storage says so after its name
+    let default = d.default_sr.as_deref() == Some(x.rref.as_str());
+    let (g, cut) = fit(&p, &x.name, FontId::proportional(14.0), pal.ink, (v.min.x - tx - 14.0 - if default { 70.0 } else { 0.0 }).max(30.0));
+    let mut end = tx + g.size().x;
     p.galley(pos2(tx, top - g.size().y / 2.0), g, pal.ink);
+    if default {
+        end += 8.0 + pill(&p, pal, pos2(end + 8.0, top), "Default", pal.green);
+    }
     if !aside.is_empty() && v.min.x - end > 70.0 {
         let (g, _) = fit(&p, aside, FontId::proportional(12.5), pal.ink_faint, v.min.x - end - 24.0);
         p.galley(pos2(end + 10.0, top - g.size().y / 2.0), g, pal.ink_faint);
@@ -867,7 +882,13 @@ fn store_row(ui: &mut Ui, pal: &Pal, d: &PoolData, x: &SrInfo, aside: &str, trou
     if !last {
         p.line_segment([pos2(tx, r.max.y - 0.5), pos2(r.max.x, r.max.y - 0.5)], Stroke::new(1.0_f32, pal.border.gamma_multiply(0.6)));
     }
-    let tip = format!("{}: {} free{}", x.name, fmt_bytes((x.size - x.used).max(0)), if x.shared { ", shared by the pool's servers" } else { "" });
+    let tip = format!(
+        "{}: {} free{}{}",
+        x.name,
+        fmt_bytes((x.size - x.used).max(0)),
+        if x.shared { ", shared by the pool's servers" } else { "" },
+        if default { ". The pool's default storage: new VMs' disks go here" } else { "" }
+    );
     if cut || trouble.is_none() {
         resp.on_hover_text(tip)
     } else {

@@ -4,8 +4,10 @@
 use crate::conn::*;
 use crate::console::{self, ConsoleView};
 use crate::isolib::{mount_trouble, IsoAction, IsoDialog, MountTrouble};
+use crate::newsr::{Guest, StorageAction, StorageDialog};
 use crate::newvm::{NewVmAction, NewVmDialog};
-use crate::pool_update::{PoolUpdateAction, PoolUpdateDialog, PoolView, UpdateRun};
+use crate::movevm::{MoveAction, MoveDialog};
+use crate::pool_update::{PlanSr, PlanVm, PoolUpdateAction, PoolUpdateDialog, PoolView, UpdateRun};
 use crate::upload::{UploadAction, UploadDialog};
 use crate::secrets;
 use crate::update;
@@ -76,6 +78,10 @@ enum Msg {
     Keychain { available: bool, saved: Vec<(String, String, String)>, session: Vec<(String, String)> },
     KeychainError(String),
     IsoDone { sid: u32, lib: IsoLibrary, result: Result<(), ApiError> },
+    /// New VM storage was made (its reference), or not; `log`: its entry in Activities.
+    StorageDone { sid: u32, st: NfsStorage, log: usize, result: Result<String, ApiError> },
+    /// The folders an NFS server shares, asked for by the New VM Storage dialog.
+    Exports { server: String, result: Result<Vec<String>, ApiError> },
     /// A rescan (forget false) or disconnect (forget true) of a storage ended.
     SrDone { sid: u32, sr: String, name: String, forget: bool, result: Result<(), ApiError> },
     /// Mounting a storage again ended: each server tried and how it went; `auto`: the app did it
@@ -100,6 +106,10 @@ enum Msg {
     PoolUpdated { sid: u32, log: usize, result: Result<String, String> },
     /// A server is restarting for an update, or is back from it.
     UpdateRestarting { host: String, back: bool },
+    /// Making a storage the pool's default ended.
+    DefaultSrSet { sid: u32, log: usize, name: String, result: Result<(), ApiError> },
+    /// Moving a VM ended.
+    Moved { sid: u32, vm: String, name: String, log: usize, result: Result<(), ApiError> },
     /// Asking a server to take VMs again ended.
     HostEnabled { sid: u32, host: String, name: String, log: usize, result: Result<(), ApiError> },
     /// A look at a running VM's screen, for its Overview (width, height, RGBA), or why not.
@@ -164,6 +174,15 @@ impl Upload {
 /// How long a finished upload's card stays.
 const DONE_CARD: Duration = Duration::from_secs(8);
 
+/// A row of a list of ISO files: its pool, its library and the file; `lib`, in the list of every
+/// library, the library's name (and its pool's, with several pools).
+struct IsoRow {
+    sid: u32,
+    sr: String,
+    lib: Option<String>,
+    file: IsoFile,
+}
+
 /// An ISO file's description being edited in its row.
 struct IsoEdit {
     vdi: String,
@@ -200,6 +219,9 @@ struct LogEntry {
     progress: Option<Arc<Progress>>,
     /// Listed under Activities: something that ran a while, or a server going or coming back.
     activity: bool,
+    /// For a job the app takes through several steps: what closing the app now would leave
+    /// half done (the step under way finishes on the server, the rest doesn't happen).
+    if_closed: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -257,6 +279,10 @@ enum Tab {
     Networking,
     Console,
     IsoFiles,
+    /// Every pool's ISO files, by library (All servers).
+    IsoLibrary,
+    /// Every pool's storage for VMs' disks (All servers).
+    VmStorage,
     Snapshots,
     /// The Templates folder's list.
     Templates,
@@ -275,6 +301,8 @@ impl Tab {
             Tab::Networking => "Networking",
             Tab::Console => "Console",
             Tab::IsoFiles => "ISO Files",
+            Tab::IsoLibrary => "ISO Library",
+            Tab::VmStorage => "VM Storage",
             Tab::Snapshots => "Snapshots",
             Tab::Templates => "Templates",
             Tab::Logs => "Logs",
@@ -288,9 +316,12 @@ enum Dialog {
     Confirm { action: usize, sid: u32, vm: String, title: String, text: String },
     Message { title: String, text: String },
     Iso(Box<IsoDialog>),
+    NewStorage(Box<StorageDialog>),
     Upload(Box<UploadDialog>),
     /// A pool's updates: what's waiting, fetching, installing.
     PoolUpdate(Box<PoolUpdateDialog>),
+    /// Moving a VM to another server or storage.
+    MoveVm(Box<MoveDialog>),
     NewVm(Box<NewVmDialog>),
     /// Disconnect (forget) an ISO library?
     ConfirmSr { sid: u32, sr: String, text: String },
@@ -328,6 +359,9 @@ enum Dialog {
     /// A log entry in full (from Activities or Logs): what happened, and the calls made to the
     /// server with its answers; when the Copy button was last used.
     LogDetail { index: usize, copied: Option<Instant> },
+    /// Closing the app while jobs would be left half done: each one's line and what's left; the
+    /// dialog that was open, back if the app stays open.
+    ConfirmClose { items: Vec<(String, String)>, back: Box<Dialog> },
 }
 
 /// The Update dialog: the release, this copy's file when it can replace itself, the download under
@@ -347,7 +381,14 @@ enum Intent {
     Demo,
     Remove(u32),
     ForgetPassword(u32),
+    /// The ISO Library page: every ISO file of every pool (the toolbar's ISO Library).
     IsoLibrary,
+    /// The New ISO Library dialog.
+    NewIsoLibrary,
+    /// The VM Storage page: every storage for VMs' disks of every pool.
+    VmStorage,
+    /// The New VM Storage dialog.
+    NewStorage,
     /// A pool's updates (this pool's, else the first).
     PoolUpdates(Option<u32>),
     RescanSr(u32, String),
@@ -389,6 +430,10 @@ enum Intent {
     AskShutdownHost(u32, String, bool),
     /// A server that isn't taking VMs (disabled) takes them again.
     EnableHost(u32, String),
+    /// Move a VM (to this server, when it was dropped on one).
+    MoveVm(u32, String, Option<String>),
+    /// Make a storage the pool's default.
+    MakeDefaultSr(u32, String),
     /// Hide a finished upload's card.
     DismissUpload(String),
     /// Files dropped on the window.
@@ -518,6 +563,8 @@ pub struct App {
     shot_requested: bool,
     shot_dialog: bool,
     started: Instant,
+    /// Close anyway was chosen: the window goes without asking again.
+    closing: bool,
 }
 
 impl App {
@@ -589,6 +636,7 @@ impl App {
             host_enabling: HashSet::new(),
             pending_select: None,
             creating: 0,
+            closing: false,
             uploads: HashMap::new(),
             shot_path: start.shot_path,
             shot_show: start.shot_show,
@@ -835,6 +883,9 @@ impl App {
         self.creating += 1;
         let what = if spec.from_template { format!("Creating VM '{}' from a template", spec.name) } else { format!("Creating VM '{}'", spec.name) };
         let prog = self.job(format!("newvm:{}:{}", sid, spec.name), sid, &server, None, &spec.name, &what);
+        if let Some(&log) = self.jobs.get(&format!("newvm:{}:{}", sid, spec.name)) {
+            self.if_closed(log, format!("'{}' is left half made: when the app opens again, it asks whether to delete it.", spec.name));
+        }
         self.remember_unfinished(sid, &spec.name);
         std::thread::spawn(move || {
             crate::conn::watch(&prog);
@@ -899,6 +950,7 @@ impl App {
         let Some((conn, server)) = self.server(sid).map(|s| (s.conn.clone(), s.name())) else { return };
         let what = format!("{} server '{}'", if reboot { "Restarting" } else { "Shutting down" }, name);
         let log = self.add_log(sid, &server, None, &name, &what, "In progress");
+        self.if_closed(log, format!("'{}' may not be {}, and be left not taking VMs with only some of its VMs moved off.", name, if reboot { "restarted" } else { "shut down" }));
         let prog = self.progress(log);
         self.host_busy.insert(host.clone());
         let (tx, ctx) = (self.tx.clone(), ctx.clone());
@@ -906,6 +958,39 @@ impl App {
             crate::conn::watch(&prog);
             let result = if reboot { conn.reboot_host(&host) } else { conn.shutdown_host(&host) };
             let _ = tx.send(Msg::HostShutdown { sid, host, name, reboot, log, result });
+            ctx.request_repaint();
+        });
+    }
+
+    /// Moves a VM as `m` says, in the background: its progress in Activities, "Moving…" on it.
+    fn move_vm(&mut self, sid: u32, m: MoveVm, ctx: &egui::Context) {
+        let Some(s) = self.server(sid) else { return };
+        let Some(d) = s.data.as_ref() else { return };
+        let Some(v) = d.vm(&m.vm) else { return };
+        let name = v.name.clone();
+        let to = d.host(&m.host).map(|h| h.name.clone()).unwrap_or_default();
+        let here = v.home().map_or(true, |h| h == m.host);
+        let disks = m.disks.len();
+        let text = match (here, disks) {
+            (true, 1) => format!("Moving the disk of VM '{}' to other storage", name),
+            (true, _) => format!("Moving the disks of VM '{}' to other storage", name),
+            (false, 0) => format!("Moving VM '{}' to {}", name, to),
+            (false, _) => format!("Moving VM '{}' and its disks to {}", name, to),
+        };
+        let (conn, tx, ctx, server, vm) = (s.conn.clone(), self.tx.clone(), ctx.clone(), s.name(), m.vm.clone());
+        let log = self.add_log(sid, &server, Some(&vm), &name, &text, "In progress");
+        if !m.running && disks > 0 {
+            // a shut-down VM's disks are copied one by one and swapped in by the app
+            self.if_closed(log, format!("The disk being copied is left half copied on the new storage (delete it there); '{}' keeps working from where its disks are.", name));
+        }
+        let prog = self.progress(log);
+        if let Some(s) = self.server_mut(sid) {
+            s.busy.insert(vm.clone(), ("Moving…".into(), "move"));
+        }
+        std::thread::spawn(move || {
+            crate::conn::watch(&prog);
+            let result = conn.move_vm(&m);
+            let _ = tx.send(Msg::Moved { sid, vm, name, log, result });
             ctx.request_repaint();
         });
     }
@@ -980,6 +1065,25 @@ impl App {
             never_checked: d.map_or(false, |d| d.last_update_sync.is_none()),
             reading: self.pool_updates_busy.get(&sid).map(|t| t.elapsed()),
             vm_names: d.map(|d| d.vms.iter().map(|v| (v.rref.clone(), v.name.clone())).collect()).unwrap_or_default(),
+            vms: d
+                .map(|d| {
+                    d.vms
+                        .iter()
+                        .filter(|v| v.power == PowerState::Running)
+                        .map(|v| PlanVm { rref: v.rref.clone(), mem: if v.mem_actual > 0 { v.mem_actual } else { v.mem_dyn_max }, disks: v.disks.iter().filter(|k| k.kind == "Disk" && !k.vdi.is_empty()).map(|k| (k.device.clone(), k.size, k.sr.clone())).collect() })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            srs: d
+                .map(|d| {
+                    d.srs
+                        .iter()
+                        .filter(|x| !x.is_iso() && x.kind != "udev" && x.size > 0)
+                        .map(|x| PlanSr { rref: x.rref.clone(), free: (x.size - x.used).max(0), seen_by: match &x.host { Some(h) => vec![h.clone()], None => x.links.iter().filter(|l| l.1).map(|l| l.0.clone()).collect() }, live_out: x.live_out, live_in: x.live_in })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            room: d.map(|d| d.hosts.iter().filter(|h| h.is_up() && h.enabled).map(|h| (h.rref.clone(), h.mem_free)).collect()).unwrap_or_default(),
             stuck: d
                 .map(|d| {
                     d.vms
@@ -1022,6 +1126,10 @@ impl App {
             return;
         }
         let log = self.add_log(sid, &server, None, &server, &format!("Updating {}", server), "In progress");
+        self.if_closed(
+            log,
+            "It stops after the step under way: the servers after it aren't updated, one may be left not taking VMs, and VMs shut down for a restart aren't started again.".into(),
+        );
         let prog = self.progress(log);
         let run = Arc::new(UpdateRun::new(prog.trace.clone()));
         self.pool_runs.insert(sid, run.clone());
@@ -1044,6 +1152,9 @@ impl App {
         let (tx, ctx) = (self.tx.clone(), ctx.clone());
         self.vm_deleting.insert(vm.clone());
         let prog = self.job(format!("vmdel:{}", vm), sid, &server, Some(&vm), &name, &format!("Deleting VM '{}'", name));
+        if let Some(&log) = self.jobs.get(&format!("vmdel:{}", vm)) {
+            self.if_closed(log, format!("'{}' may be left shut down, with only some of its disks deleted.", name));
+        }
         std::thread::spawn(move || {
             crate::conn::watch(&prog);
             let result = conn.delete_vm(&vm, disks);
@@ -1081,6 +1192,7 @@ impl App {
         let text = format!("Reverting VM '{}' to snapshot '{}'", vm_name, snap_name);
         let (conn, tx, ctx, server) = (s.conn.clone(), self.tx.clone(), ctx.clone(), s.name());
         let log = self.add_log(sid, &server, Some(&vm), &vm_name, &text, "In progress");
+        self.if_closed(log, format!("'{}' may be left reverted but shut down: start it yourself.", vm_name));
         let prog = self.progress(log);
         if let Some(s) = self.server_mut(sid) {
             s.busy.insert(vm.clone(), ("Reverting…".into(), "revert"));
@@ -1246,6 +1358,48 @@ impl App {
         });
     }
 
+    /// Makes storage `sr` the pool's default in the background (`name`: its name, when the pool
+    /// hasn't been read since it was made).
+    fn make_default(&mut self, sid: u32, sr: String, name: Option<String>, ctx: &egui::Context) {
+        let Some((conn, server, name)) = self.server(sid).and_then(|s| Some((s.conn.clone(), s.name(), name.or_else(|| Some(s.data.as_ref()?.sr(&sr)?.name.clone()))?))) else { return };
+        let log = self.add_log(sid, &server, Some(&sr), &name, &format!("Making '{}' the pool's default storage", name), "In progress");
+        let prog = self.progress(log);
+        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            crate::conn::watch(&prog);
+            let result = conn.make_default_sr(&sr);
+            let _ = tx.send(Msg::DefaultSrSet { sid, log, name, result });
+            ctx.request_repaint();
+        });
+    }
+
+    /// Asks the pool to create NFS storage for VMs' disks (which mounts it everywhere) in the
+    /// background.
+    fn start_storage(&mut self, sid: u32, st: NfsStorage, ctx: &egui::Context) {
+        let Some(s) = self.server(sid) else { return };
+        let (conn, server) = (s.conn.clone(), s.name());
+        let log = self.add_log(sid, &server, None, &st.name, &format!("Creating storage '{}' from {}", st.name, st.location), "In progress");
+        let prog = self.progress(log);
+        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            crate::conn::watch(&prog);
+            let result = conn.create_nfs_storage(&st);
+            let _ = tx.send(Msg::StorageDone { sid, st, log, result });
+            ctx.request_repaint();
+        });
+    }
+
+    /// Asks pool `sid` which folders NFS server `server` shares, in the background.
+    fn browse_exports(&mut self, sid: u32, server: String, ctx: &egui::Context) {
+        let Some(conn) = self.server(sid).map(|s| s.conn.clone()) else { return };
+        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let result = conn.nfs_exports(&server);
+            let _ = tx.send(Msg::Exports { server, result });
+            ctx.request_repaint();
+        });
+    }
+
     /// Asks the server to create the ISO library (which mounts the share) in the background.
     fn start_iso_library(&mut self, sid: u32, lib: IsoLibrary, ctx: &egui::Context) {
         let Some(s) = self.server(sid) else { return };
@@ -1325,8 +1479,32 @@ impl App {
             started: Instant::now(),
             progress: (status == "In progress").then(Progress::new),
             activity: status == "In progress",
+            if_closed: None,
         });
         self.log.len() - 1
+    }
+
+    /// What job `log` would leave half done if the app closed now (see `LogEntry::if_closed`).
+    fn if_closed(&mut self, log: usize, text: String) {
+        if let Some(e) = self.log.get_mut(log) {
+            e.if_closed = Some(text);
+        }
+    }
+
+    /// What closing the app now would leave half done: each job's line and what's left, the
+    /// uploads too (their bytes come from here). Jobs that are one task on the server aren't
+    /// here: the server finishes them by itself.
+    fn halfway(&self) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = self
+            .log
+            .iter()
+            .filter(|e| e.status == "In progress")
+            .filter_map(|e| e.if_closed.as_ref().map(|t| (format!("{}.", e.text), t.clone())))
+            .collect();
+        for u in self.uploads.values().filter(|u| u.active()) {
+            out.push((format!("Uploading '{}' to '{}'.", u.name, u.lib), "The file is left unfinished in the library: delete it there.".into()));
+        }
+        out
     }
 
     /// Something worth seeing under Activities that wasn't a job (a server gone, or back).
@@ -1451,6 +1629,33 @@ impl App {
                         }
                     }
                     self.selected = selected;
+                }
+                Msg::StorageDone { sid, st, log, result } => {
+                    match result {
+                        Ok(sr) => {
+                            self.end_log(log, "Done", None);
+                            if matches!(self.dialog, Dialog::NewStorage(_)) {
+                                self.dialog = Dialog::None;
+                            }
+                            self.refresh_soon(sid);
+                            self.expanded.insert(format!("folder:{}:srs", sid));
+                            if st.make_default {
+                                // (it's in the pool once the pool's read again: its name said here)
+                                self.make_default(sid, sr, Some(st.name.clone()), ctx);
+                            }
+                        }
+                        Err(e) => {
+                            self.end_log(log, "Failed", Some(format!("Couldn't create storage '{}' from {}: {}", st.name, st.location, e.message())));
+                            if let Dialog::NewStorage(d) = &mut self.dialog {
+                                d.failed(&st, &e);
+                            }
+                        }
+                    }
+                }
+                Msg::Exports { server, result } => {
+                    if let Dialog::NewStorage(d) = &mut self.dialog {
+                        d.exports_found(&server, result);
+                    }
                 }
                 Msg::IsoDone { sid, lib, result } => {
                     let server = self.server(sid).map(|s| s.name()).unwrap_or_default();
@@ -1993,6 +2198,50 @@ impl App {
                         run.finish(result);
                     }
                 }
+                Msg::DefaultSrSet { sid, log, name, result } => {
+                    match result {
+                        Ok(()) => self.end_log(log, "Done", None),
+                        Err(e) => self.end_log(log, "Failed", Some(format!("Couldn't make '{}' the pool's default storage: {}", name, e.message()))),
+                    }
+                    self.refresh_soon(sid);
+                }
+                Msg::Moved { sid, vm, name, log, result } => {
+                    if let Some(s) = self.server_mut(sid) {
+                        s.busy.remove(&vm);
+                    }
+                    match result {
+                        Ok(()) => self.end_log(log, "Done", None),
+                        Err(e) => {
+                            let sr_name = |r: &str| self.server(sid).and_then(|s| s.data.as_ref()).and_then(|d| d.sr(r)).map_or("That storage".to_string(), |x| x.name.clone());
+                            let why = match e.code.as_str() {
+                                "SR_DOES_NOT_SUPPORT_MIGRATION" => {
+                                    let sr = sr_name(e.details.first().map_or("", |x| x.as_str()));
+                                    if e.details.iter().any(|d| d == "VDI_MIRROR_IN") {
+                                        format!("{} can't take a disk while its VM runs (its kind of storage doesn't support live storage migration). Choose other storage, or shut the VM down to move its disks there.", sr)
+                                    } else {
+                                        format!("{} can't send a disk away while its VM runs (its kind of storage doesn't support live storage migration). Shut the VM down to move its disks.", sr)
+                                    }
+                                }
+                                "STORAGE_GONE" => format!("{} is storage that no longer exists, and XenServer uses it when moving a VM's disks. Make another storage the pool's default (Make Default, on its page), then move it again.", e.details.first().cloned().unwrap_or_default()),
+                                // a setting pointing to storage that's gone (the pool's default storage…)
+                                "HANDLE_INVALID" if e.details.first().map_or(false, |c| c == "SR") => {
+                                    let r = e.details.get(1).cloned().unwrap_or_default();
+                                    let what = self.server(sid).and_then(|s| s.data.as_ref()).and_then(|d| d.gone_storage().into_iter().find(|g| g.1 == r)).map(|g| g.0);
+                                    match what {
+                                        Some(w) => format!("{} is storage that no longer exists, and XenServer uses it when moving a VM's disks (for its snapshots and saved memory). Set another in XenCenter (the pool's or the server's Properties), or with xe, then move it again.", w),
+                                        None => "XenServer was pointed to storage that no longer exists (the pool's default storage, a server's storage for suspended VMs, or one of the VM's snapshots). Check those in XenCenter, then move it again.".to_string(),
+                                    }
+                                }
+                                _ => e.message(),
+                            };
+                            self.end_log(log, "Failed", Some(format!("Couldn't move VM '{}': {}", name, why)));
+                            if matches!(self.dialog, Dialog::None) {
+                                self.dialog = Dialog::Message { title: "Move VM".into(), text: format!("Couldn't move '{}'; it stays where it was.\n\n{}", name, why) };
+                            }
+                        }
+                    }
+                    self.refresh_soon(sid);
+                }
                 Msg::HostEnabled { sid, host, name, log, result } => {
                     self.host_enabling.remove(&host);
                     match result {
@@ -2167,7 +2416,7 @@ impl App {
                     self.expanded.extend(host_keys);
                     if shot && is_demo {
                         match self.shot_show.as_str() {
-                            "home" => self.select("root".into()),
+                            "home" | "iso-library" | "vm-storage" | "new-storage" | "new-storage-inside" | "new-storage-error" => self.select("root".into()),
                             "storage" | "pool" | "pool-details" | "pool-updates" | "pool-updating" | "pool-update-stopped" => self.select(format!("srv:{}", id)),
                             "isos" | "iso-disconnect" | "iso-delete" | "iso-describe" | "iso-upload" | "iso-upload-choose" | "iso-upload-web" | "iso-upload-done" | "sr-unmounted" | "sr-detached" | "sr-auto-repair" | "sr-repair-failed" => {
                                 self.expanded.insert(format!("folder:{}:srs", id));
@@ -2184,7 +2433,12 @@ impl App {
                                 self.expanded.insert(format!("folder:{}:tpls", id));
                                 self.select(format!("tpl:{}:tpl-web", id));
                             }
-                            "make-template" | "copy-vm" | "template-made" | "vm-off" | "vm-edited" => self.select(format!("vm:{}:vm-desk", id)),
+                            "make-template" | "copy-vm" | "template-made" | "vm-off" | "vm-edited" | "move-vm-off" => self.select(format!("vm:{}:vm-desk", id)),
+                            "move-vm-local" => self.select(format!("vm:{}:vm-mail", id)),
+                            "sr-shared" => {
+                                self.expanded.insert(format!("folder:{}:srs", id));
+                                self.select(format!("sr:{}:sr-nfs", id));
+                            }
                             "vm-bios" => self.select(format!("vm:{}:vm-db", id)),
                             "networks" => {
                                 self.expanded.insert(format!("folder:{}:nets", id));
@@ -2559,10 +2813,19 @@ impl App {
                         self.dialog = Dialog::ConfirmDeleteIso { sid, sr, vdi, name: f.name.clone(), text };
                     }
                 }
+                Intent::MoveVm(sid, vm, to) => {
+                    let Some(s) = self.server(sid) else { continue };
+                    let busy = s.busy.contains_key(&vm) || self.vm_deleting.contains(&vm);
+                    let Some(d) = s.data.as_ref() else { continue };
+                    let Some(v) = d.vm(&vm) else { continue };
+                    self.dialog = Dialog::MoveVm(Box::new(MoveDialog::new(sid, d, v, to.as_deref(), busy)));
+                }
+                Intent::MakeDefaultSr(sid, sr) => self.make_default(sid, sr, None, ctx),
                 Intent::EnableHost(sid, host) => {
                     let Some((conn, server, name)) = self.server(sid).and_then(|s| Some((s.conn.clone(), s.name(), s.data.as_ref()?.host(&host)?.name.clone()))) else { continue };
                     if self.host_enabling.insert(host.clone()) {
                         let log = self.add_log(sid, &server, None, &name, &format!("Letting '{}' take VMs again", name), "In progress");
+                        self.if_closed(log, format!("'{}' may stay not taking VMs (it was still starting): use Take VMs again later.", name));
                         let prog = self.progress(log);
                         let (tx, ctx) = (self.tx.clone(), ctx.clone());
                         std::thread::spawn(move || {
@@ -2592,6 +2855,9 @@ impl App {
                     }
                 }
                 Intent::AskDeleteVm(sid, vm) => {
+                    if self.server(sid).map_or(false, |s| s.busy.contains_key(&vm)) {
+                        continue;
+                    }
                     if let Some(v) = self.server(sid).and_then(|s| s.data.as_ref()).and_then(|d| d.vm(&vm)) {
                         let disks: Vec<VmDisk> = v.disks.iter().filter(|k| k.kind == "Disk").cloned().collect();
                         let running = v.power != PowerState::Halted;
@@ -2687,7 +2953,7 @@ impl App {
                         u.t.cancel.store(true, Ordering::Relaxed);
                     }
                 }
-                Intent::Dropped(paths) => match self.sr_of(sel).filter(|(_, x)| x.is_iso()).map(|(s, x)| (s.id, x.rref.clone())) {
+                Intent::Dropped(paths) => match self.drop_library(sel).map(|(sid, sr, _)| (sid, sr)) {
                     Some((sid, sr)) => {
                         let mut isos = paths.into_iter().filter(|p| p.extension().map_or(false, |e| e.eq_ignore_ascii_case("iso")));
                         match isos.next() {
@@ -2695,12 +2961,12 @@ impl App {
                             None => self.dialog = Dialog::Message { title: "Upload".into(), text: "Only .iso files can go in an ISO library.".into() },
                         }
                     }
-                    None => self.dialog = Dialog::Message { title: "Upload".into(), text: "To upload a file, select an ISO library in the tree, then drop the file on the window.".into() },
+                    None => self.dialog = Dialog::Message { title: "Upload".into(), text: "To upload a file, select an ISO library in the tree (or its card on the ISO Library page), then drop the file on the window.".into() },
                 },
                 Intent::AskForgetSr(sid, sr) => {
                     if let Some(x) = self.server(sid).and_then(|s| s.data.as_ref()).and_then(|d| d.sr(&sr)) {
                         let place = if x.location.is_empty() { String::new() } else { format!(" {}", x.location) };
-                        let text = format!("Are you sure you want to disconnect the ISO library '{}'?\n\nThe pool stops using the share{}. The ISO files on it aren't deleted, and you can add it again with ISO Library.", x.name, place);
+                        let text = format!("Are you sure you want to disconnect the ISO library '{}'?\n\nThe pool stops using the share{}. The ISO files on it aren't deleted, and you can add it again with New ISO Library (on the ISO Library page).", x.name, place);
                         self.dialog = Dialog::ConfirmSr { sid, sr, text };
                     }
                 }
@@ -2714,11 +2980,32 @@ impl App {
                         self.dialog = Dialog::PoolUpdate(Box::new(PoolUpdateDialog::new(sid)));
                     }
                 }
+                // the toolbar's ISO Library and VM Storage: All servers' page of them
                 Intent::IsoLibrary => {
+                    self.select("root".into());
+                    self.tab = Tab::IsoLibrary;
+                }
+                Intent::VmStorage => {
+                    self.select("root".into());
+                    self.tab = Tab::VmStorage;
+                }
+                Intent::NewIsoLibrary => {
                     let pools: Vec<(u32, String)> = self.servers.iter().filter(|s| s.data.is_some()).map(|s| (s.id, s.name())).collect();
                     let sid = sel.sid.filter(|id| pools.iter().any(|p| p.0 == *id)).or(pools.first().map(|p| p.0));
                     if let Some(sid) = sid {
                         self.dialog = Dialog::Iso(Box::new(IsoDialog::new(sid, pools)));
+                    }
+                }
+                Intent::NewStorage => {
+                    // each pool, and whether its default storage is shared already
+                    let pools: Vec<(u32, String, bool)> = self
+                        .servers
+                        .iter()
+                        .filter_map(|s| s.data.as_ref().map(|d| (s.id, s.name(), d.default_sr.as_deref().and_then(|r| d.sr(r)).map_or(false, |x| x.shared))))
+                        .collect();
+                    let sid = sel.sid.filter(|id| pools.iter().any(|p| p.0 == *id)).or(pools.first().map(|p| p.0));
+                    if let Some(sid) = sid {
+                        self.dialog = Dialog::NewStorage(Box::new(StorageDialog::new(sid, pools)));
                     }
                 }
                 Intent::ForgetPassword(sid) => {
@@ -2796,10 +3083,11 @@ impl App {
         let pal = self.pal;
         // (A VM's power actions are next to its tabs: see tab_actions; the theme is in Settings.)
         // When the window is too narrow for every label, buttons show only their icons (the
-        // label becomes a tooltip): first New VM and ISO Library (rank 2), then all of them.
+        // label becomes a tooltip): first New VM, ISO Library, VM Storage and Updates (rank 2),
+        // then all of them.
         let fits = |level: u8| {
             let w = |l: &str, rank: u8| if level >= rank { 32.0 } else { tool_width(ui, l) } + 2.0;
-            let buttons: f32 = w("Connect", 3) + w("New VM", 2) + w("ISO Library", 2) + w("Updates", 2);
+            let buttons: f32 = w("Connect", 3) + w("New VM", 2) + w("ISO Library", 2) + w("VM Storage", 2) + w("Updates", 2);
             36.0 + 40.0 + 10.0 + 16.0 + buttons + 160.0 <= ui.available_width() // 160: the app's name
         };
         let level = (0..3).find(|&l| fits(l)).unwrap_or(3);
@@ -2821,8 +3109,11 @@ impl App {
             if tool_button(ui, "newvm", "New VM", has_pool, compact(2), &pal).on_hover_text("Create a virtual machine that installs from an ISO file").clicked() {
                 out.push(Intent::NewVm(sel.sid, None));
             }
-            if tool_button(ui, "iso", "ISO Library", has_pool, compact(2), &pal).on_hover_text("Add a library of installation discs (.iso files) from a Windows or NFS share").clicked() {
+            if tool_button(ui, "iso", "ISO Library", has_pool, compact(2), &pal).on_hover_text("Your installation discs (.iso files) in every library, and adding a library").clicked() {
                 out.push(Intent::IsoLibrary);
+            }
+            if tool_button(ui, "storage", "VM Storage", has_pool, compact(2), &pal).on_hover_text("Where your VMs' disks are, and adding shared storage for them").clicked() {
+                out.push(Intent::VmStorage);
             }
             // a pool's updates: a red dot when one has security updates waiting, a yellow one (the
             // network tiles' "out") when one has others, or a server to restart for them
@@ -2881,6 +3172,17 @@ impl App {
             if let Some(t) = d.sr_trouble(x) {
                 out.push((x.name.clone(), if t.nowhere { "Isn't mounted".to_string() } else { "Isn't mounted on every server".to_string() }));
             }
+        }
+        // settings pointing to storage that's gone: the pool's together when they're the same
+        let mut seen: Vec<String> = vec![];
+        for (what, r) in d.gone_storage() {
+            let pools = what.starts_with("The pool's");
+            if pools && seen.contains(&r) {
+                continue;
+            }
+            seen.push(r);
+            let what = if pools && what.contains("default") { "Default storage".to_string() } else { what };
+            out.push((what, "No longer exists: use Make Default on another storage".to_string()));
         }
         let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|t| t.as_secs() as i64).unwrap_or(0);
         if let Some((text, standing)) = d.license(now) {
@@ -2949,9 +3251,9 @@ impl App {
         let ended: Vec<usize> = (0..self.log.len()).rev().filter(|&i| self.log[i].status != "In progress" && self.log[i].activity).take(5).collect();
         let problems = self.problems();
         let slot = ui.painter().add(egui::Shape::Noop);
-        let body = |ui: &mut Ui, out: &mut Vec<Intent>| {
-            ui.set_min_width(380.0);
-            ui.set_max_width(380.0);
+        let inner = |ui: &mut Ui, out: &mut Vec<Intent>| {
+            ui.set_min_width(440.0);
+            ui.set_max_width(440.0);
             ui.spacing_mut().item_spacing.y = 2.0;
             ui.label(egui::RichText::new("Activities").font(FontId::new(13.5, FontFamily::Name("bold".into()))).color(pal.ink));
             ui.add_space(2.0);
@@ -2987,21 +3289,23 @@ impl App {
                 ui.add_space(4.0);
                 ui.separator();
             }
-            if running.is_empty() && ended.is_empty() && problems.is_empty() {
-                ui.label(egui::RichText::new("Nothing under way, and nothing wrong.").color(pal.ink_soft));
-            }
             // an entry, clickable for its details: its mark, its text (two lines at most), then
             // its server, how long, how far, and a warning while the server doesn't answer
             let entry = |ui: &mut Ui, i: usize, out: &mut Vec<Intent>| {
                 let e = &self.log[i];
                 let running = e.status == "In progress";
                 let p = e.progress.as_ref();
-                // an upload's own progress, else the server task's
-                let fraction = self.uploads.values().find(|u| u.log == i && u.active()).and_then(|u| {
-                    let (sent, total) = (u.t.sent.load(Ordering::Relaxed), u.t.total.load(Ordering::Relaxed));
-                    (total > 0).then(|| sent as f32 / total as f32)
+                // an upload's own progress (how much of how much, and how fast), else the server
+                // task's (with the bytes it copies, when known)
+                let upload = self.uploads.values().find(|u| u.log == i && u.active()).and_then(|u| {
+                    let (sent, total) = (u.t.sent.load(Ordering::Relaxed) as i64, u.t.total.load(Ordering::Relaxed) as i64);
+                    let secs = u.started.elapsed().as_secs_f64();
+                    (total > 0).then(|| (sent, total, (secs >= 2.0 && sent > 0).then(|| sent as f64 / secs)))
                 });
+                let fraction = upload.map(|(sent, total, _)| sent as f32 / total as f32);
                 let fraction = if running { fraction.or_else(|| p.and_then(|p| p.fraction())) } else { None };
+                let copied = if running { upload.map(|(s, t, _)| (s, t)).or_else(|| p.and_then(|p| p.copied())) } else { None };
+                let rate = if running { upload.and_then(|u| u.2).or_else(|| p.and_then(|p| p.rate())) } else { None };
                 let w = ui.available_width();
                 // an ended one's time at the right, on its first line
                 let time = (!running).then(|| ui.painter().layout_no_wrap(e.time.clone(), FontId::proportional(12.5), pal.ink_faint));
@@ -3018,9 +3322,16 @@ impl App {
                     if let Some(f) = fraction {
                         detail.push(format!("{}%", (f * 100.0).round()));
                     }
+                    if let Some((done, total)) = copied {
+                        detail.push(format!("{} of {}", fmt_bytes(done), fmt_bytes(total)));
+                    }
+                    if let Some(r) = rate {
+                        detail.push(format!("{}/s", fmt_bytes(r as i64)));
+                    }
                 }
                 let quiet = p.and_then(|p| p.silent_for()).filter(|d| running && d.as_secs() >= 5);
-                let h = 6.0 + g.size().y + if running { 18.0 } else { 0.0 } + if fraction.is_some() { 8.0 } else { 0.0 } + 4.0;
+                // the text, its details under it, then the bar with room above and below
+                let h = 4.0 + g.size().y + if running { 20.0 } else { 0.0 } + if fraction.is_some() { 10.0 } else { 0.0 } + 6.0;
                 let (r, resp) = ui.allocate_exact_size(vec2(w, h), Sense::click());
                 if resp.hovered() {
                     ui.painter().rect_filled(r, Rounding::same(5.0), pal.hover);
@@ -3038,14 +3349,14 @@ impl App {
                 if let Some(t) = time {
                     ui.painter().galley(pos2(r.max.x - 6.0 - t.size().x, top.y + (first - t.size().y) / 2.0), t, pal.ink_faint);
                 }
-                let mut y = top.y + gh + 2.0;
+                let mut y = top.y + gh + 3.0;
                 if running {
                     let d = ui.painter().text(pos2(top.x + 26.0, y), Align2::LEFT_TOP, detail.join("  ·  "), FontId::proportional(12.0), pal.ink_soft);
                     if let Some(q) = quiet {
                         let left = LOST_AFTER.saturating_sub(q).as_secs();
                         ui.painter().text(pos2(d.max.x + 10.0, y), Align2::LEFT_TOP, format!("no answer for {} s, gives up in {} s", q.as_secs(), left), FontId::proportional(12.0), pal.orange);
                     }
-                    y += 18.0;
+                    y += 23.0;
                 }
                 if let Some(f) = fraction {
                     let bar = Rect::from_min_size(pos2(top.x + 26.0, y), vec2(w - 34.0, 4.0));
@@ -3057,19 +3368,31 @@ impl App {
                     ui.close_menu();
                 }
             };
+            // always two parts: what's under way (or that nothing is), then what ended
+            let none = |ui: &mut Ui, text: &str| {
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(26.0);
+                    ui.label(egui::RichText::new(text).size(13.0).color(pal.ink_soft));
+                });
+                ui.add_space(4.0);
+            };
+            ui.label(egui::RichText::new("Under way").size(12.0).color(pal.ink_faint));
+            if running.is_empty() {
+                none(ui, "Nothing under way right now.");
+            }
             for &i in &running {
                 entry(ui, i, out);
                 ui.ctx().request_repaint_after(Duration::from_millis(500));
             }
-            if !ended.is_empty() {
-                if !running.is_empty() {
-                    ui.add_space(4.0);
-                    ui.separator();
-                }
-                ui.label(egui::RichText::new("Ended").size(12.0).color(pal.ink_faint));
-                for &i in &ended {
-                    entry(ui, i, out);
-                }
+            ui.add_space(4.0);
+            ui.separator();
+            ui.label(egui::RichText::new("Ended").size(12.0).color(pal.ink_faint));
+            if ended.is_empty() {
+                none(ui, "Nothing has ended yet.");
+            }
+            for &i in &ended {
+                entry(ui, i, out);
             }
             ui.add_space(4.0);
             ui.separator();
@@ -3079,12 +3402,16 @@ impl App {
                 ui.close_menu();
             }
         };
+        // with room around it
+        let body = |ui: &mut Ui, out: &mut Vec<Intent>| {
+            egui::Frame::none().inner_margin(egui::Margin::symmetric(6.0, 4.0)).show(ui, |ui| inner(ui, out));
+        };
         let m = egui::menu::menu_custom_button(ui, egui::Button::new("").frame(false).min_size(vec2(32.0, 30.0)), |ui| body(ui, out));
         let r = m.response.rect;
         if m.response.hovered() || m.inner.is_some() {
             ui.painter().set(slot, egui::epaint::RectShape::filled(r, Rounding::same(6.0), pal.hover));
         }
-        if self.shot_path.is_some() && self.shot_show == "activities" {
+        if self.shot_path.is_some() && (self.shot_show == "activities" || self.shot_show == "activities-moving") {
             // the check's screenshot shows it open
             egui::Area::new(egui::Id::new("activities-shot")).order(egui::Order::Foreground).fixed_pos(r.left_bottom() + vec2(0.0, 4.0)).show(ui.ctx(), |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| body(ui, &mut vec![]));
@@ -3095,7 +3422,7 @@ impl App {
             paint_glyph(ui.painter(), icon, "activity", pal.ink_soft);
             if !problems.is_empty() {
                 // something's wrong: a red dot
-                ui.painter().circle(pos2(r.max.x - 8.0, r.min.y + 8.0), 4.0, pal.red, Stroke::new(1.5, pal.toolbar));
+                ui.painter().circle(pos2(r.max.x - 8.0, r.min.y + 8.0), 4.0, pal.red, Stroke::new(1.5_f32, pal.toolbar));
             }
         } else {
             paint_icon(ui.painter(), icon, IconKind::Busy(Tone::Accent), &pal, pal.toolbar);
@@ -3124,7 +3451,7 @@ impl App {
                 let w = ui.available_width() - 30.0;
                 egui::Frame::none()
                     .fill(pal.input)
-                    .stroke(Stroke::new(1.0, pal.border_strong))
+                    .stroke(Stroke::new(1.0_f32, pal.border_strong))
                     .rounding(Rounding::same(6.0))
                     .inner_margin(egui::Margin::symmetric(6.0, 3.0))
                     .show(ui, |ui| {
@@ -3153,7 +3480,7 @@ impl App {
                 let resp = ui.interact(hr, ui.id().with(("view", label)), Sense::click());
                 let on = self.objects_view == objects;
                 if on {
-                    ui.painter().rect(hr, Rounding::same(5.0), pal.surface, Stroke::new(1.0, pal.border));
+                    ui.painter().rect(hr, Rounding::same(5.0), pal.surface, Stroke::new(1.0_f32, pal.border));
                 }
                 let col = if on || resp.hovered() { pal.ink } else { pal.ink_soft };
                 ui.painter().text(hr.center(), Align2::CENTER_CENTER, label, FontId::proportional(12.5), col);
@@ -3200,7 +3527,9 @@ impl App {
     fn tree_ui(&self, ui: &mut Ui, node: &Node, depth: usize, out: &mut Vec<Intent>) {
         let pal = self.pal;
         let row_h = 22.0;
-        let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width().max(200.0), row_h), Sense::click());
+        // a VM can be dragged onto a server of its pool, to move it there
+        let draggable = node.kind == Kind::Vm && node.sid.is_some() && node.rref.is_some();
+        let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width().max(200.0), row_h), if draggable { Sense::click_and_drag() } else { Sense::click() });
         let p = ui.painter();
         let x0 = rect.min.x + 6.0 + depth as f32 * 16.0;
         let selected = node.key == self.selected;
@@ -3225,7 +3554,7 @@ impl App {
         }
         if has_kids {
             let c = pos2(x0 + 5.0, rect.center().y);
-            let s = Stroke::new(1.4, pal.ink_soft);
+            let s = Stroke::new(1.4_f32, pal.ink_soft);
             let pts = if open {
                 vec![c + vec2(-3.5, -1.5), c + vec2(0.0, 2.0), c + vec2(3.5, -1.5)]
             } else {
@@ -3245,6 +3574,31 @@ impl App {
             job.wrap = egui::text::TextWrapping { max_width: note_room, max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
             let g = p.layout_job(job);
             p.galley(pos2(x0 + 40.0 + note_x, rect.center().y - g.size().y / 2.0), g, note_col);
+        }
+        if let (true, Some(sid), Some(vm)) = (draggable, node.sid, node.rref.clone()) {
+            resp.dnd_set_drag_payload(DragVm { sid, vm, name: node.text.clone() });
+        }
+        if draggable && resp.dragged() {
+            // what's held, by the pointer
+            if let Some(at) = ui.ctx().pointer_hover_pos() {
+                let painter = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("drag-vm")));
+                let g = painter.layout_no_wrap(format!("Move '{}' to a server…", node.text), FontId::proportional(12.5), pal.on_accent);
+                let r = Rect::from_min_size(at + vec2(14.0, 10.0), g.size() + vec2(16.0, 8.0));
+                painter.rect_filled(r, Rounding::same(6.0), pal.accent);
+                painter.galley(r.min + vec2(8.0, 4.0), g, pal.on_accent);
+            }
+        }
+        if node.kind == Kind::Host {
+            // a VM of its pool held over it: outlined; dropped: the Move dialog, to it
+            if resp.dnd_hover_payload::<DragVm>().map_or(false, |p| Some(p.sid) == node.sid) {
+                p.rect_stroke(row, Rounding::same(5.0), Stroke::new(1.5_f32, pal.accent));
+            }
+            if let Some(p) = resp.dnd_release_payload::<DragVm>() {
+                if Some(p.sid) == node.sid {
+                    out.push(Intent::Select(format!("vm:{}:{}", p.sid, p.vm)));
+                    out.push(Intent::MoveVm(p.sid, p.vm.clone(), node.rref.clone()));
+                }
+            }
         }
         if resp.clicked() {
             let on_chevron = has_kids && resp.interact_pointer_pos().map_or(false, |pp| pp.x < x0 + 13.0);
@@ -3330,10 +3684,18 @@ impl App {
                     ui.separator();
                     let pal = self.pal;
                     let deleting = self.vm_deleting.contains(&vm);
+                    // Delete waits while it's moving, copying, taking a snapshot, starting…
+                    let busy = self.server(sid).and_then(|s| s.busy.get(&vm)).map(|b| busy_tip(&b.0));
                     let snap_ok = self.vm_of(node).map_or(false, |(s, d, v)| v.can_snapshot() && !s.busy.contains_key(&v.rref) && d.host_down_for(v).is_none());
                     if ui.add_enabled(snap_ok && !deleting, egui::Button::new("Take Snapshot…")).clicked() {
                         out.push(Intent::Select(node.key.clone()));
                         out.push(Intent::TakeSnapshot(sid, vm.clone()));
+                        ui.close_menu();
+                    }
+                    let move_ok = self.vm_of(node).map_or(false, |(s, d, v)| matches!(v.power, PowerState::Running | PowerState::Halted) && !s.busy.contains_key(&v.rref) && d.host_down_for(v).is_none());
+                    if ui.add_enabled(move_ok && !deleting, egui::Button::new("Move…")).clicked() {
+                        out.push(Intent::Select(node.key.clone()));
+                        out.push(Intent::MoveVm(sid, vm.clone(), None));
                         ui.close_menu();
                     }
                     let off = self.vm_of(node).map_or(false, |(s, _, v)| v.power == PowerState::Halted && !s.busy.contains_key(&v.rref));
@@ -3344,7 +3706,8 @@ impl App {
                             ui.close_menu();
                         }
                     }
-                    if ui.add_enabled(!deleting, egui::Button::new(egui::RichText::new("Delete VM…").color(pal.red))).clicked() {
+                    let del = ui.add_enabled(!deleting && busy.is_none(), egui::Button::new(egui::RichText::new("Delete VM…").color(pal.red)));
+                    if del.on_disabled_hover_text(busy.as_deref().unwrap_or("")).clicked() {
                         out.push(Intent::Select(node.key.clone()));
                         out.push(Intent::AskDeleteVm(sid, vm));
                         ui.close_menu();
@@ -3417,7 +3780,7 @@ impl App {
         // buttons, each `TOOL_BTN` and a gap
         let mut n = 0;
         if self.vm_of(sel).is_some() {
-            n += 4; // power, Take Snapshot, Copy, Delete
+            n += 5; // power, Take Snapshot, Move, Copy, Delete
         }
         if self.host_of(sel).is_some() {
             n += 2; // Restart, Shut Down
@@ -3470,9 +3833,13 @@ impl App {
         entries.push(None);
         entries.extend(actions.iter().filter_map(|&(_, _, force)| force).map(Some));
         let deleting = vm.as_ref().map_or(false, |(_, r)| self.vm_deleting.contains(r));
+        // Delete waits while it's moving, copying, taking a snapshot, starting…
+        let busy = self.vm_of(sel).and_then(|(s, _, v)| s.busy.get(&v.rref)).map(|b| busy_tip(&b.0));
         let snap_ok = self.vm_of(sel).map_or(false, |(s, d, v)| v.can_snapshot() && !s.busy.contains_key(&v.rref) && d.host_down_for(v).is_none());
         // Copy VM and Make Template: only while it's off
         let off = self.vm_of(sel).map_or(false, |(s, _, v)| v.power == PowerState::Halted && !s.busy.contains_key(&v.rref));
+        // Move: running or off, nothing under way, its server there
+        let move_ok = self.vm_of(sel).map_or(false, |(s, d, v)| matches!(v.power, PowerState::Running | PowerState::Halted) && !s.busy.contains_key(&v.rref) && d.host_down_for(v).is_none());
         let root = self.root_of(sel).map(|(sid, connected)| (sid, if connected { "Disconnect" } else { "Remove" }, self.server(sid).map(|s| s.name()).unwrap_or_default()));
         // a server: Restart and Shut Down, while it's on and not already going off
         let host = self.host_of(sel).map(|(s, h)| (s.id, h.rref.clone(), h.is_up() && !self.host_busy.contains(&h.rref) && !self.host_rebooting.contains_key(&h.rref)));
@@ -3507,10 +3874,13 @@ impl App {
         if free.width() >= need {
             // right to left: Delete, Take Snapshot, the power actions, the keyboard
             if let Some((sid, vref)) = &vm {
-                if tool_btn(ui, Face::Glyph("trash", pal.red), "Delete VM…", !deleting, &pal).clicked() {
+                if tool_btn(ui, Face::Glyph("trash", pal.red), busy.as_deref().unwrap_or("Delete VM…"), !deleting && busy.is_none(), &pal).clicked() {
                     out.push(Intent::AskDeleteVm(*sid, vref.clone()));
                 }
                 copy_menu(ui, &pal, *sid, vref, off && !deleting, out);
+                if tool_btn(ui, Face::Glyph("move", pal.accent), "Move to another server or storage…", move_ok && !deleting, &pal).clicked() {
+                    out.push(Intent::MoveVm(*sid, vref.clone(), None));
+                }
                 if tool_btn(ui, Face::Glyph("camera", pal.accent), "Take Snapshot…", snap_ok && !deleting, &pal).clicked() {
                     out.push(Intent::TakeSnapshot(*sid, vref.clone()));
                 }
@@ -3545,6 +3915,10 @@ impl App {
             }
             if let Some((sid, vref)) = &vm {
                 ui.separator();
+                if ui.add_enabled(move_ok && !deleting, egui::Button::new("Move…")).clicked() {
+                    out.push(Intent::MoveVm(*sid, vref.clone(), None));
+                    ui.close_menu();
+                }
                 if ui.add_enabled(snap_ok && !deleting, egui::Button::new("Take Snapshot…")).clicked() {
                     out.push(Intent::TakeSnapshot(*sid, vref.clone()));
                     ui.close_menu();
@@ -3555,7 +3929,8 @@ impl App {
                         ui.close_menu();
                     }
                 }
-                if ui.add_enabled(!deleting, egui::Button::new(egui::RichText::new("Delete VM…").color(pal.red))).clicked() {
+                let del = ui.add_enabled(!deleting && busy.is_none(), egui::Button::new(egui::RichText::new("Delete VM…").color(pal.red)));
+                if del.on_disabled_hover_text(busy.as_deref().unwrap_or("")).clicked() {
                     out.push(Intent::AskDeleteVm(*sid, vref.clone()));
                     ui.close_menu();
                 }
@@ -3589,7 +3964,7 @@ impl App {
         let head_w = 36.0 + title_w + if sub.is_empty() { 0.0 } else { 10.0 + width(&sub, &sub_font) };
         let tabs_w: f32 = tabs.iter().map(|t| width(t.label(), &tab_font) + 20.0).sum();
         let avail = ui.available_width();
-        let hairline = |ui: &Ui, r: Rect| ui.painter().line_segment([r.left_bottom() - vec2(0.0, 0.5), r.right_bottom() - vec2(0.0, 0.5)], Stroke::new(1.0, pal.border));
+        let hairline = |ui: &Ui, r: Rect| ui.painter().line_segment([r.left_bottom() - vec2(0.0, 0.5), r.right_bottom() - vec2(0.0, 0.5)], Stroke::new(1.0_f32, pal.border));
         // everything on one line, the details beside the name giving way first if need be
         let bare_w = 36.0 + title_w;
         let one_line = if head_w + 28.0 + tabs_w + 24.0 + actions <= avail {
@@ -3746,7 +4121,8 @@ impl App {
     fn tabs_for(&self, sel: &Node) -> Vec<Tab> {
         let has_data = sel.sid.and_then(|id| self.server(id)).map_or(false, |s| s.data.is_some());
         match sel.kind {
-            Kind::Root | Kind::Category => vec![Tab::Home, Tab::Search, Tab::Logs],
+            Kind::Root => vec![Tab::Home, Tab::IsoLibrary, Tab::VmStorage, Tab::Search, Tab::Logs],
+            Kind::Category => vec![Tab::Home, Tab::Search, Tab::Logs],
             Kind::Sr if self.sr_of(sel).map_or(false, |(_, x)| x.is_iso()) => vec![Tab::General, Tab::IsoFiles, Tab::Logs],
             Kind::Folder if sel.rref.as_deref() == Some("nets") => vec![Tab::Networking],
             Kind::Folder if sel.rref.as_deref() == Some("tpls") => vec![Tab::Templates],
@@ -3831,7 +4207,7 @@ impl App {
             let p = ui.painter().clone();
             for (i, (title, value, note, bar)) in cards.iter().enumerate() {
                 let r = Rect::from_min_size(area.min + vec2(pad + (i % cols) as f32 * (card_w + gap), (i / cols) as f32 * (card_h + gap)), vec2(card_w, card_h));
-                p.rect(r, Rounding::same(10.0), pal.surface, Stroke::new(1.0, pal.border));
+                p.rect(r, Rounding::same(10.0), pal.surface, Stroke::new(1.0_f32, pal.border));
                 p.text(r.min + vec2(16.0, 16.0), Align2::LEFT_TOP, *title, FontId::proportional(12.5), pal.ink_soft);
                 p.text(r.min + vec2(16.0, 36.0), Align2::LEFT_TOP, value, FontId::new(24.0, FontFamily::Name("bold".into())), pal.ink);
                 let note_y = if bar.is_some() { r.max.y - 34.0 } else { r.max.y - 26.0 };
@@ -3850,7 +4226,7 @@ impl App {
             let listed = hosts.len() + not_connected;
             let (list, _) = ui.allocate_exact_size(vec2(full, listed as f32 * row_h), Sense::hover());
             let list = Rect::from_min_max(list.min + vec2(pad, 0.0), list.max - vec2(pad, 0.0));
-            ui.painter().rect(list, Rounding::same(10.0), pal.surface, Stroke::new(1.0, pal.border));
+            ui.painter().rect(list, Rounding::same(10.0), pal.surface, Stroke::new(1.0_f32, pal.border));
             let mut y = list.min.y;
             let mut divider = false;
             for (s, h) in &hosts {
@@ -3858,7 +4234,7 @@ impl App {
                 let resp = ui.interact(r, ui.id().with(("home-host", s.id, h.rref.as_str())), Sense::click());
                 let p = ui.painter();
                 if divider {
-                    p.line_segment([pos2(r.min.x + 14.0, r.min.y), pos2(r.max.x - 14.0, r.min.y)], Stroke::new(1.0, pal.border));
+                    p.line_segment([pos2(r.min.x + 14.0, r.min.y), pos2(r.max.x - 14.0, r.min.y)], Stroke::new(1.0_f32, pal.border));
                 }
                 divider = true;
                 if resp.hovered() {
@@ -3894,7 +4270,7 @@ impl App {
                 let r = Rect::from_min_size(pos2(list.min.x, y), vec2(list.width(), row_h));
                 let p = ui.painter();
                 if divider {
-                    p.line_segment([pos2(r.min.x + 14.0, r.min.y), pos2(r.max.x - 14.0, r.min.y)], Stroke::new(1.0, pal.border));
+                    p.line_segment([pos2(r.min.x + 14.0, r.min.y), pos2(r.max.x - 14.0, r.min.y)], Stroke::new(1.0_f32, pal.border));
                 }
                 divider = true;
                 paint_icon(p, Rect::from_center_size(pos2(r.min.x + 24.0, r.center().y), vec2(16.0, 16.0)), IconKind::ServerDown, &pal, pal.surface);
@@ -3911,14 +4287,14 @@ impl App {
             let (list, _) = ui.allocate_exact_size(vec2(full, recent.len().max(1) as f32 * 36.0), Sense::hover());
             let list = Rect::from_min_max(list.min + vec2(pad, 0.0), list.max - vec2(pad, 0.0));
             let p = ui.painter();
-            p.rect(list, Rounding::same(10.0), pal.surface, Stroke::new(1.0, pal.border));
+            p.rect(list, Rounding::same(10.0), pal.surface, Stroke::new(1.0_f32, pal.border));
             if recent.is_empty() {
                 p.text(pos2(list.min.x + 16.0, list.center().y), Align2::LEFT_CENTER, "Nothing yet", FontId::proportional(13.0), pal.ink_soft);
             }
             for (i, e) in recent.iter().enumerate() {
                 let r = Rect::from_min_size(pos2(list.min.x, list.min.y + i as f32 * 36.0), vec2(list.width(), 36.0));
                 if i > 0 {
-                    p.line_segment([pos2(r.min.x + 14.0, r.min.y), pos2(r.max.x - 14.0, r.min.y)], Stroke::new(1.0, pal.border));
+                    p.line_segment([pos2(r.min.x + 14.0, r.min.y), pos2(r.max.x - 14.0, r.min.y)], Stroke::new(1.0_f32, pal.border));
                 }
                 p.circle_filled(pos2(r.min.x + 20.0, r.center().y), 3.5, status_color(&e.status, &pal));
                 let tg = p.layout_no_wrap(e.time.clone(), FontId::proportional(12.0), pal.ink_soft);
@@ -4042,7 +4418,10 @@ impl App {
                         row("License", d.license(now).map_or("None needed".to_string(), |l| l.0)),
                         row("Servers", n.to_string()),
                         row("Virtual machines", format!("{} ({} running)", d.vms.len(), running)),
-                        row("Default storage", d.default_sr.as_deref().and_then(|r| d.sr(r)).map_or("None".to_string(), |x| x.name.clone())),
+                        row("Default storage", match d.default_sr.as_deref() {
+                            None => "None".to_string(),
+                            Some(r) => d.sr(r).map_or("Storage that no longer exists".to_string(), |x| x.name.clone()),
+                        }),
                         row("CPUs", format!("{} in all", d.hosts.iter().map(|h| h.cpu_count).sum::<i64>())),
                         row("Memory", format!("{} in all, {} free", fmt_bytes(d.hosts.iter().map(|h| h.mem_total).sum()), fmt_bytes(on.iter().map(|h| h.mem_free).sum()))),
                     ],
@@ -4194,6 +4573,9 @@ impl App {
                     if !x.location.is_empty() {
                         g.push(row("Location", x.location.clone()));
                     }
+                    if !x.device.is_empty() {
+                        g.push(row("Device", x.device.clone()));
+                    }
                     if !x.share.is_empty() {
                         g.push(row("Connection", x.share.clone()));
                     }
@@ -4285,7 +4667,7 @@ impl App {
         let title_font = FontId::new(13.5, FontFamily::Name("bold".into()));
             for (r, name, rows, open) in cards {
                 let p = ui.painter().clone();
-                p.rect(r, Rounding::same(8.0), pal.surface, Stroke::new(1.0, pal.border));
+                p.rect(r, Rounding::same(8.0), pal.surface, Stroke::new(1.0_f32, pal.border));
                 let head = Rect::from_min_size(r.min, vec2(r.width(), HEAD));
                 let hresp = ui.interact(head, ui.id().with(("sec", name.as_str())), Sense::click());
                 if hresp.hovered() {
@@ -4299,14 +4681,14 @@ impl App {
                 }
                 let c = pos2(head.max.x - 20.0, head.center().y);
                 let chev = if open { vec![c + vec2(-4.0, -2.0), c + vec2(0.0, 2.0), c + vec2(4.0, -2.0)] } else { vec![c + vec2(-2.0, -4.0), c + vec2(2.0, 0.0), c + vec2(-2.0, 4.0)] };
-                p.add(egui::Shape::line(chev, Stroke::new(1.4, pal.ink_soft)));
+                p.add(egui::Shape::line(chev, Stroke::new(1.4_f32, pal.ink_soft)));
                 if hresp.clicked() {
                     out.push(Intent::Section(name.clone()));
                 }
                 if !open {
                     continue;
                 }
-                p.line_segment([pos2(r.min.x + 16.0, head.max.y), pos2(r.max.x - 16.0, head.max.y)], Stroke::new(1.0, pal.border));
+                p.line_segment([pos2(r.min.x + 16.0, head.max.y), pos2(r.max.x - 16.0, head.max.y)], Stroke::new(1.0_f32, pal.border));
                 let mut y = head.max.y + 5.0;
                 for (k, v) in rows {
                     let rr = Rect::from_min_size(pos2(r.min.x, y), vec2(r.width(), ROW));
@@ -4432,9 +4814,9 @@ impl App {
                 let grip = Rect::from_min_max(pos2(x - 4.0, area.min.y + 4.0), pos2(x + 4.0, area.min.y + head_h - 4.0));
                 let resp = ui.interact(grip, ui.id().with((id, "grip", i)), Sense::click_and_drag()).on_hover_cursor(egui::CursorIcon::ResizeColumn);
                 if resp.hovered() || resp.dragged() {
-                    p.line_segment([pos2(x, grip.min.y), pos2(x, grip.max.y)], Stroke::new(2.0, pal.accent));
+                    p.line_segment([pos2(x, grip.min.y), pos2(x, grip.max.y)], Stroke::new(2.0_f32, pal.accent));
                 } else {
-                    p.line_segment([pos2(x, grip.min.y + 4.0), pos2(x, grip.max.y - 4.0)], Stroke::new(1.0, pal.border));
+                    p.line_segment([pos2(x, grip.min.y + 4.0), pos2(x, grip.max.y - 4.0)], Stroke::new(1.0_f32, pal.border));
                 }
                 // the width from where the drag began (the same however often a frame is laid out)
                 let from_id = ui.id().with((id, "grip-from", i));
@@ -4454,7 +4836,7 @@ impl App {
                     ui.data_mut(|d| d.insert_temp(set_id, set.clone()));
                 }
             }
-            p.line_segment([pos2(area.min.x, area.min.y + head_h - 0.5), pos2(area.max.x, area.min.y + head_h - 0.5)], Stroke::new(1.0, pal.border));
+            p.line_segment([pos2(area.min.x, area.min.y + head_h - 0.5), pos2(area.max.x, area.min.y + head_h - 0.5)], Stroke::new(1.0_f32, pal.border));
             if rows.is_empty() {
                 p.text(pos2(area.min.x + pad, area.min.y + head_h + row_h / 2.0), Align2::LEFT_CENTER, "Nothing to show", font.clone(), pal.ink_soft);
             }
@@ -4466,7 +4848,7 @@ impl App {
                 if hot {
                     p.rect_filled(rr.shrink2(vec2(2.0, 2.0)), Rounding::same(6.0), pal.hover);
                 } else if ri > 0 {
-                    p.line_segment([pos2(rr.min.x + pad, rr.min.y), pos2(rr.max.x - pad, rr.min.y)], Stroke::new(1.0, pal.border.gamma_multiply(0.6)));
+                    p.line_segment([pos2(rr.min.x + pad, rr.min.y), pos2(rr.max.x - pad, rr.min.y)], Stroke::new(1.0_f32, pal.border.gamma_multiply(0.6)));
                 }
                 if resp.clicked() {
                     clicked = Some(ri);
@@ -4578,23 +4960,53 @@ impl App {
             ui.add_space(8.0);
             self.upload_card(ui, &sr, u, out);
         }
+        let rows = files.into_iter().map(|file| IsoRow { sid, sr: sr.clone(), lib: None, file }).collect();
+        self.iso_table(ui, "isos", rows, out);
+    }
+
+    /// ISO files in a table: each one's name, (in the list of every library) its library, size,
+    /// description with a pencil to edit it there and then, and at the end New VM and the bin.
+    fn iso_table(&mut self, ui: &mut Ui, id: &str, files: Vec<IsoRow>, out: &mut Vec<Intent>) {
+        let pal = self.pal;
+        let with_lib = files.iter().any(|f| f.lib.is_some());
         let font = FontId::proportional(13.0);
         let measure = |t: &str| ui.painter().layout_no_wrap(t.to_string(), font.clone(), pal.ink).size().x;
         let rows: Vec<Vec<Cell>> = files
             .iter()
-            .map(|f| {
+            .map(|r| {
+                let f = &r.file;
                 let editing = self.iso_edit.as_ref().map_or(false, |e| e.vdi == f.vdi);
                 let desc_w = if editing { 240.0 } else { (measure(&f.description) + 34.0).min(380.0) };
-                vec![Cell::Icon(IconKind::IsoSr, f.name.clone()), Cell::Text(fmt_bytes(f.size)), Cell::Custom(desc_w), Cell::Custom(56.0)]
+                let mut cells = vec![Cell::Icon(IconKind::IsoSr, f.name.clone())];
+                if let Some(lib) = &r.lib {
+                    cells.push(Cell::Custom(measure(lib).min(260.0)));
+                }
+                cells.extend([Cell::Text(fmt_bytes(f.size)), Cell::Custom(desc_w), Cell::Custom(56.0)]);
+                cells
             })
             .collect();
+        let headers: &[&str] = if with_lib { &["Name", "Library", "Size", "Description", ""] } else { &["Name", "Size", "Description", ""] };
+        let (lib_col, end_col) = if with_lib { (Some(1), 4) } else { (None, 3) };
         let mut edit = self.iso_edit.take();
-        let (mut close, mut save, mut delete, mut new_from) = (false, None, None, None);
+        let (mut close, mut save, mut delete, mut new_from, mut go) = (false, None, None, None, None);
         let (saving, deleting) = (&self.iso_saving, &self.iso_deleting);
-        self.table_with(ui, "isos", &["Name", "Size", "Description", ""], &rows, false, &mut |ui, row, col, r, hot| {
-            let f = &files[row];
+        self.table_with(ui, id, headers, &rows, false, &mut |ui, row, col, r, hot| {
+            let IsoRow { sid, sr, lib, file: f } = &files[row];
             let gone = deleting.contains(&f.vdi);
-            if col == 3 {
+            if Some(col) == lib_col {
+                // the library, a link to its page
+                let resp = ui.interact(r, ui.id().with(("lib", row)), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Open this library");
+                let text = lib.clone().unwrap_or_default();
+                let mut job = egui::text::LayoutJob::simple_singleline(text, font.clone(), if resp.hovered() { pal.accent } else { pal.ink });
+                job.wrap = egui::text::TextWrapping { max_width: r.width().max(10.0), max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
+                let g = ui.painter().layout_job(job);
+                ui.painter().galley(pos2(r.min.x, r.center().y - g.size().y / 2.0), g, pal.ink);
+                if resp.clicked() {
+                    go = Some(format!("sr:{}:{}", sid, sr));
+                }
+                return;
+            }
+            if col == end_col {
                 // the bin, at the row's end: faint, red under the mouse; off while a running VM holds the disc
                 if gone {
                     return;
@@ -4607,7 +5019,7 @@ impl App {
                 }
                 paint_glyph(ui.painter(), Rect::from_center_size(nb.center(), vec2(16.0, 16.0)), "newvm", if nresp.hovered() { pal.accent } else if hot { pal.ink_soft } else { pal.ink_faint });
                 if nresp.clicked() {
-                    new_from = Some(f.vdi.clone());
+                    new_from = Some((*sid, f.vdi.clone()));
                 }
                 let held = f.held_by();
                 let can = f.can_delete && held.is_empty();
@@ -4635,7 +5047,7 @@ impl App {
                 };
                 paint_glyph(ui.painter(), Rect::from_center_size(b.center(), vec2(16.0, 16.0)), "trash", colour);
                 if resp.clicked() {
-                    delete = Some(f.vdi.clone());
+                    delete = Some((*sid, sr.clone(), f.vdi.clone()));
                 }
                 return;
             }
@@ -4658,7 +5070,7 @@ impl App {
                 if ok || enter {
                     let text = e.text.trim().to_string();
                     if text != f.description {
-                        save = Some((f.vdi.clone(), f.name.clone(), text));
+                        save = Some((*sid, sr.clone(), f.vdi.clone(), f.name.clone(), text));
                     }
                 }
                 close |= ok || enter || cancel;
@@ -4690,14 +5102,303 @@ impl App {
             }
         });
         self.iso_edit = if close { None } else { edit };
-        if let Some((vdi, name, text)) = save {
-            out.push(Intent::SaveDescription(sid, sr.clone(), vdi, name, text));
+        if let Some((sid, sr, vdi, name, text)) = save {
+            out.push(Intent::SaveDescription(sid, sr, vdi, name, text));
         }
-        if let Some(vdi) = delete {
+        if let Some((sid, sr, vdi)) = delete {
             out.push(Intent::AskDeleteIso(sid, sr, vdi));
         }
-        if let Some(vdi) = new_from {
+        if let Some((sid, vdi)) = new_from {
             out.push(Intent::NewVm(Some(sid), Some(vdi)));
+        }
+        if let Some(key) = go {
+            out.push(Intent::Select(key));
+        }
+    }
+
+    /// Where a file dropped on the window goes: the ISO library selected, or on the ISO Library
+    /// page the only library there is (pool id, library, its name).
+    fn drop_library(&self, sel: &Node) -> Option<(u32, String, String)> {
+        if let Some((s, x)) = self.sr_of(sel).filter(|(_, x)| x.is_iso()) {
+            return Some((s.id, x.rref.clone(), x.name.clone()));
+        }
+        if sel.kind != Kind::Root || self.tab != Tab::IsoLibrary {
+            return None;
+        }
+        match self.iso_libraries().as_slice() {
+            [(sid, _, x)] => Some((*sid, x.rref.clone(), x.name.clone())),
+            _ => None,
+        }
+    }
+
+    /// Every connected pool's ISO libraries: (pool id, pool name, library), the pools in their
+    /// order, each one's libraries by name.
+    fn iso_libraries(&self) -> Vec<(u32, String, SrInfo)> {
+        let mut out = vec![];
+        for s in &self.servers {
+            let Some(d) = &s.data else { continue };
+            let mut libs: Vec<&SrInfo> = d.srs.iter().filter(|x| x.is_iso()).collect();
+            libs.sort_by_key(|x| x.name.to_lowercase());
+            out.extend(libs.into_iter().map(|x| (s.id, s.name(), x.clone())));
+        }
+        out
+    }
+
+    /// All servers' ISO Library page: every pool's ISO libraries, where each one is and how it's
+    /// doing (a click opens it), then every ISO file in them, by name, with its library. New ISO
+    /// Library, Upload and Rescan are next to the tabs.
+    fn iso_library_page(&mut self, ui: &mut Ui, out: &mut Vec<Intent>) {
+        let pal = self.pal;
+        let libs = self.iso_libraries();
+        let pools = libs.iter().map(|l| l.0).collect::<HashSet<_>>().len();
+        ui.add_space(10.0);
+        if libs.is_empty() {
+            ui.label(egui::RichText::new("No ISO library yet").color(pal.ink_soft));
+            let text = "An ISO library is a shared folder with installation discs (.iso files), on a NAS or a Windows computer: your servers mount it to install new VMs from. Add one with New ISO Library.";
+            ui.add(egui::Label::new(egui::RichText::new(text).size(12.0).color(pal.ink_faint)).wrap());
+            return;
+        }
+        let count: usize = libs.iter().map(|l| l.2.files.len()).sum();
+        let total: i64 = libs.iter().flat_map(|l| l.2.files.iter()).map(|f| f.size).sum();
+        let head = format!(
+            "{} ISO file{}  ·  {}  ·  in {} librar{}",
+            count,
+            if count == 1 { "" } else { "s" },
+            fmt_bytes(total),
+            libs.len(),
+            if libs.len() == 1 { "y" } else { "ies" }
+        );
+        ui.label(egui::RichText::new(head).color(pal.ink_soft));
+        ui.label(egui::RichText::new("If your file isn't in the list below, rescan its library.").size(12.0).color(pal.ink_faint));
+        for (_, _, x) in &libs {
+            if let Some(u) = self.uploads.get(&x.rref) {
+                ui.add_space(8.0);
+                self.upload_card(ui, &x.rref, u, out);
+            }
+        }
+        ui.add_space(12.0);
+        self.library_cards(ui, &libs, pools > 1, out);
+        ui.add_space(8.0);
+        // each file's library, when there's more than the one on the card above
+        let several = libs.len() > 1;
+        let mut rows: Vec<IsoRow> = libs
+            .iter()
+            .flat_map(|(sid, pool, x)| {
+                let lib = if pools > 1 { format!("{}  ·  {}", x.name, pool) } else { x.name.clone() };
+                x.files.iter().map(move |f| IsoRow { sid: *sid, sr: x.rref.clone(), lib: several.then(|| lib.clone()), file: f.clone() })
+            })
+            .collect();
+        rows.sort_by_key(|r| r.file.name.to_lowercase());
+        self.iso_table(ui, "all-isos", rows, out);
+    }
+
+    /// Next to the ISO Library page's tabs: Upload (into which library, when there are several),
+    /// Rescan (every library) and New ISO Library.
+    fn iso_library_actions(&self, ui: &mut Ui, free: Rect, out: &mut Vec<Intent>) {
+        let pal = self.pal;
+        let libs = self.iso_libraries();
+        // the ones that can take a file now: mounted, nothing under way
+        let ready: Vec<&(u32, String, SrInfo)> = libs
+            .iter()
+            .filter(|(sid, _, x)| {
+                let mounted = self.server(*sid).and_then(|s| s.data.as_ref()).map_or(false, |d| d.sr_trouble(x).is_none());
+                mounted && !self.sr_busy.contains(&x.rref) && !self.uploads.get(&x.rref).map_or(false, Upload::active)
+            })
+            .collect();
+        let busy = libs.iter().any(|l| self.sr_busy.contains(&l.2.rref));
+        let pools = libs.iter().map(|l| l.0).collect::<HashSet<_>>().len();
+        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(free).layout(egui::Layout::right_to_left(egui::Align::Center)));
+        child.spacing_mut().item_spacing.x = 4.0;
+        let need = flat_button_width(&child, "New ISO Library") + flat_button_width(&child, "Working…") + flat_button_width(&child, "Upload") + 16.0 + SEP_W;
+        let compact = free.width() < need;
+        let has_pool = self.servers.iter().any(|s| s.data.is_some());
+        if flat_button(&mut child, "plus", "New ISO Library", Some(pal.accent), has_pool, compact, &pal).on_hover_text("Add a shared folder with .iso files, from a Windows or NFS share").clicked() {
+            out.push(Intent::NewIsoLibrary);
+        }
+        if !libs.is_empty() {
+            let tip = "Look for ISO files added to or removed from every library";
+            if flat_button(&mut child, "rescan", if busy { "Working…" } else { "Rescan" }, None, !busy && !ready.is_empty(), compact, &pal).on_hover_text(tip).clicked() {
+                out.extend(ready.iter().map(|(sid, _, x)| Intent::RescanSr(*sid, x.rref.clone())));
+            }
+            let tip = if ready.is_empty() { "No library can take a file now" } else { "Add an .iso file from this computer or from a link on the web" };
+            let up = flat_button(&mut child, "upload", "Upload", None, !ready.is_empty(), compact, &pal).on_hover_text(tip).on_disabled_hover_text(tip);
+            let menu = child.id().with("upload-to");
+            if up.clicked() {
+                match ready.as_slice() {
+                    [(sid, _, x)] => out.push(Intent::Upload(*sid, x.rref.clone())),
+                    _ => child.memory_mut(|m| m.toggle_popup(menu)),
+                }
+            }
+            // into which library
+            egui::popup::popup_below_widget(&child, menu, &up, egui::PopupCloseBehavior::CloseOnClick, |ui| {
+                ui.set_min_width(200.0);
+                ui.label(egui::RichText::new("Upload to").size(12.0).color(pal.ink_soft));
+                for (sid, pool, x) in &ready {
+                    let label = if pools > 1 { format!("{}  ·  {}", x.name, pool) } else { x.name.clone() };
+                    if ui.button(label).clicked() {
+                        out.push(Intent::Upload(*sid, x.rref.clone()));
+                    }
+                }
+            });
+        }
+        vsep(&mut child, &pal);
+    }
+
+    /// The libraries side by side, each a card: its icon (how it's doing), its name, where it is,
+    /// and how many files it has (or that it isn't mounted); a click opens it.
+    fn library_cards(&self, ui: &mut Ui, libs: &[(u32, String, SrInfo)], name_pool: bool, out: &mut Vec<Intent>) {
+        let pal = self.pal;
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = vec2(10.0, 10.0);
+            let w = ((ui.available_width() - 20.0) / 3.0).clamp(220.0, 300.0).min(ui.available_width());
+            for (sid, pool, x) in libs {
+                let Some(d) = self.server(*sid).and_then(|s| s.data.as_ref()) else { continue };
+                let (r, resp) = ui.allocate_exact_size(vec2(w, 58.0), Sense::click());
+                let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+                let p = ui.painter();
+                let bg = if resp.hovered() { pal.hover } else { pal.surface };
+                p.rect(r, Rounding::same(10.0), bg, Stroke::new(1.0_f32, pal.border.gamma_multiply(0.7)));
+                paint_icon(p, Rect::from_min_size(r.min + vec2(14.0, 13.0), vec2(16.0, 16.0)), sr_icon(d, x, self.sr_busy.contains(&x.rref)), &pal, bg);
+                let trouble = d.sr_trouble(x).map(|t| if t.nowhere { "Not mounted" } else { "Not mounted everywhere" });
+                let files = x.files.len();
+                let (state, col) = match trouble {
+                    Some(t) => (t.to_string(), pal.red),
+                    None => (format!("{} file{}", files, if files == 1 { "" } else { "s" }), pal.ink_soft),
+                };
+                let st = p.text(pos2(r.max.x - 14.0, r.min.y + 21.0), Align2::RIGHT_CENTER, &state, FontId::proportional(12.5), col);
+                let (g, _) = overview::fit(p, &x.name, FontId::new(14.0, FontFamily::Name("bold".into())), pal.ink, (st.min.x - r.min.x - 50.0).max(30.0));
+                p.galley(pos2(r.min.x + 38.0, r.min.y + 21.0 - g.size().y / 2.0), g, pal.ink);
+                let place = [x.location.as_str(), if name_pool { pool.as_str() } else { "" }].into_iter().filter(|t| !t.is_empty()).collect::<Vec<_>>().join("  ·  ");
+                let place = if place.is_empty() { x.share.clone() } else { place };
+                let (g, _) = overview::fit(p, &place, FontId::proportional(12.0), pal.ink_faint, r.width() - 52.0);
+                p.galley(pos2(r.min.x + 38.0, r.min.y + 40.0 - g.size().y / 2.0), g, pal.ink_faint);
+                let tip = [x.name.clone(), x.location.clone(), x.share.clone()].into_iter().filter(|t| !t.is_empty()).collect::<Vec<_>>().join("\n");
+                if resp.on_hover_text(tip).clicked() {
+                    out.push(Intent::Select(format!("sr:{}:{}", sid, x.rref)));
+                }
+            }
+        });
+    }
+
+    /// All servers' VM Storage page: every pool's storage for VMs' disks, where it is, its kind,
+    /// how full it is, which one is the pool's default (Make Default on the others); a click opens
+    /// one. A pool with no shared storage is told what that costs. New VM Storage is next to the
+    /// tabs.
+    fn vm_storage_page(&mut self, ui: &mut Ui, out: &mut Vec<Intent>) {
+        let pal = self.pal;
+        struct Store {
+            sid: u32,
+            pool: String,
+            x: SrInfo,
+            /// Where it is in words (its server and disk, or its share), and in full for its tooltip.
+            place: String,
+            full: String,
+            default: bool,
+            trouble: Option<&'static str>,
+        }
+        let mut stores: Vec<Store> = vec![];
+        let mut unshared: Vec<String> = vec![];
+        for s in &self.servers {
+            let Some(d) = &s.data else { continue };
+            let mut mine: Vec<Store> = d
+                .srs
+                .iter()
+                .filter(|x| !x.is_iso() && x.kind != "udev")
+                .map(|x| {
+                    let server = x.host.as_deref().and_then(|h| d.host(h)).map_or(String::new(), |h| h.name.clone());
+                    let (place, full) = if x.shared || x.host.is_none() {
+                        (or(&x.location, "Every server").to_string(), [x.location.as_str(), x.share.as_str()].into_iter().filter(|t| !t.is_empty()).collect::<Vec<_>>().join("\n"))
+                    } else {
+                        let disk = device_words(&x.device);
+                        let place = [server.as_str(), disk.as_str()].into_iter().filter(|t| !t.is_empty()).collect::<Vec<_>>().join("  ·  ");
+                        (place, [server.clone(), x.device.replace(',', "\n")].into_iter().filter(|t| !t.is_empty()).collect::<Vec<_>>().join("\n"))
+                    };
+                    Store {
+                        sid: s.id,
+                        pool: s.name(),
+                        place,
+                        full,
+                        default: d.default_sr.as_deref() == Some(x.rref.as_str()),
+                        trouble: d.sr_trouble(x).map(|t| if t.nowhere { "Not mounted" } else { "Not mounted everywhere" }),
+                        x: x.clone(),
+                    }
+                })
+                .collect();
+            // shared first, then each server's, by name
+            mine.sort_by_key(|t| (!t.x.shared, t.place.to_lowercase(), t.x.name.to_lowercase()));
+            if d.hosts.len() > 1 && !mine.iter().any(|t| t.x.shared) {
+                unshared.push(s.name());
+            }
+            stores.extend(mine);
+        }
+        let pools = stores.iter().map(|t| t.sid).collect::<HashSet<_>>().len();
+        ui.add_space(10.0);
+        let (used, size) = stores.iter().filter(|t| t.trouble.is_none()).fold((0i64, 0i64), |(u, z), t| (u + t.x.used, z + t.x.size));
+        let head = format!("{} storage{} for VMs' disks  ·  {} of {} used", stores.len(), if stores.len() == 1 { "" } else { "s" }, fmt_bytes(used), fmt_bytes(size));
+        ui.label(egui::RichText::new(head).color(pal.ink_soft));
+        let hint = match unshared.as_slice() {
+            [] => "The default storage is where new VMs' disks go, and what suspending and moving VMs use.".to_string(),
+            [one] if pools <= 1 => format!("'{}' has no shared storage: a VM moves to another server only by copying its disks. New VM Storage adds an NFS folder that all its servers share.", one),
+            names => format!("{} have no shared storage: a VM moves to another server only by copying its disks. New VM Storage adds an NFS folder that all of a pool's servers share.", names.iter().map(|n| format!("'{}'", n)).collect::<Vec<_>>().join(", ")),
+        };
+        ui.add(egui::Label::new(egui::RichText::new(hint).size(12.0).color(pal.ink_faint)).wrap());
+        ui.add_space(6.0);
+        let font = FontId::proportional(13.0);
+        let measure = |t: &str| ui.painter().layout_no_wrap(t.to_string(), font.clone(), pal.ink).size().x;
+        let rows: Vec<Vec<Cell>> = stores
+            .iter()
+            .map(|t| {
+                let usage = match t.trouble {
+                    Some(why) => Cell::Text(why.to_string()),
+                    None if t.x.size > 0 => Cell::Usage((t.x.used as f32 / t.x.size as f32).clamp(0.0, 1.0), format!("{} of {}", fmt_bytes(t.x.used), fmt_bytes(t.x.size))),
+                    None => Cell::Text("—".into()),
+                };
+                let mut cells = vec![Cell::Custom(24.0 + measure(&t.x.name))];
+                if pools > 1 {
+                    cells.push(Cell::Text(t.pool.clone()));
+                }
+                // the last: Default on the pool's default, Make Default on the others under the mouse
+                cells.extend([Cell::Text(sr_kind_words(&t.x)), Cell::Custom(measure(&t.place).min(300.0)), usage, Cell::Custom(104.0)]);
+                cells
+            })
+            .collect();
+        let headers: &[&str] = if pools > 1 { &["Name", "Pool", "Type", "Where", "Used", ""] } else { &["Name", "Type", "Where", "Used", ""] };
+        let end = headers.len() - 1;
+        let place_col = if pools > 1 { 3 } else { 2 };
+        let mut make: Option<(u32, String)> = None;
+        let clicked = self.table_with(ui, "all-srs", headers, &rows, true, &mut |ui, row, col, r, hot| {
+            let t = &stores[row];
+            let Some(d) = self.server(t.sid).and_then(|s| s.data.as_ref()) else { return };
+            if col == 0 {
+                // its icon and its name
+                paint_icon(ui.painter(), Rect::from_min_size(pos2(r.min.x, r.center().y - 8.0), vec2(16.0, 16.0)), sr_icon(d, &t.x, false), &pal, if hot { pal.hover } else { pal.window });
+                let (g, _) = overview::fit(ui.painter(), &t.x.name, font.clone(), pal.ink, (r.width() - 24.0).max(20.0));
+                ui.painter().galley(pos2(r.min.x + 24.0, r.center().y - g.size().y / 2.0), g, pal.ink);
+            } else if col == place_col {
+                // where it is, cut short to fit; all of it (the disk's whole path) under the mouse
+                let (g, _) = overview::fit(ui.painter(), &t.place, font.clone(), pal.ink, r.width().max(20.0));
+                let hit = Rect::from_min_size(pos2(r.min.x, r.center().y - g.size().y / 2.0), g.size());
+                ui.painter().galley(hit.min, g, pal.ink);
+                if !t.full.is_empty() {
+                    ui.interact(hit, ui.id().with(("place", row)), Sense::hover()).on_hover_text(&t.full);
+                }
+            } else if col == end && t.default {
+                let tip = "The pool's default storage: new VMs' disks, suspended VMs' memory and crash dumps go here";
+                let w = host_overview::pill(ui.painter(), &pal, pos2(r.min.x, r.center().y), "Default", pal.green);
+                ui.interact(Rect::from_min_size(pos2(r.min.x, r.center().y - 9.0), vec2(w, 18.0)), ui.id().with(("default", row)), Sense::hover()).on_hover_text(tip);
+            } else if col == end && t.trouble.is_none() && t.x.size > 0 {
+                // Make Default: faint till the row's under the mouse
+                let mut child = ui.new_child(egui::UiBuilder::new().max_rect(r.expand2(vec2(8.0, 0.0))).layout(egui::Layout::left_to_right(egui::Align::Center)));
+                let tip = "Make this the pool's default storage: for new VMs' disks, suspended VMs' memory and crash dumps (moving a running VM's disks uses it too)";
+                if hot && flat_button(&mut child, "check", "Make Default", Some(pal.green), true, false, &pal).on_hover_text(tip).clicked() {
+                    make = Some((t.sid, t.x.rref.clone()));
+                }
+            }
+        });
+        if let Some((sid, sr)) = make {
+            out.push(Intent::MakeDefaultSr(sid, sr));
+        } else if let Some(i) = clicked {
+            out.push(Intent::Select(format!("sr:{}:{}", stores[i].sid, stores[i].x.rref)));
         }
     }
 
@@ -5041,7 +5742,7 @@ impl App {
             (true, false) => format!("Uploaded {}", u.name),
             (true, true) => format!("Downloaded {}", u.name),
         };
-        egui::Frame::none().fill(pal.surface).stroke(Stroke::new(1.0, pal.border)).rounding(Rounding::same(8.0)).inner_margin(egui::Margin::symmetric(12.0, 10.0)).show(ui, |ui| {
+        egui::Frame::none().fill(pal.surface).stroke(Stroke::new(1.0_f32, pal.border)).rounding(Rounding::same(8.0)).inner_margin(egui::Margin::symmetric(12.0, 10.0)).show(ui, |ui| {
             ui.set_width(ui.available_width()); // as wide as the list under it
             ui.horizontal(|ui| {
                 let (r, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
@@ -5147,6 +5848,20 @@ impl App {
         let mut add: Option<(String, String, String, bool)> = None;
         let mut iso: Option<(u32, IsoLibrary)> = None;
         let mut reattach: Option<(u32, String, IsoLibrary)> = None;
+        // from the Close question: close anyway (true) or stay (false)
+        let mut close_app: Option<bool> = None;
+        // from New VM Storage: make it (pool, settings), or ask a server for its folders
+        let mut storage: Option<(u32, NfsStorage)> = None;
+        let mut browse: Option<(u32, String)> = None;
+        // the pool's own VM that the server typed in New VM Storage is, if it's one
+        let guest: Option<Guest> = match &self.dialog {
+            Dialog::NewStorage(d) => self.server(d.sid).and_then(|s| s.data.as_ref()).and_then(|pd| {
+                let (v, sure) = pd.vm_at(&d.server())?;
+                let host = v.host.as_deref().or(v.home()).and_then(|h| pd.host(h)).map_or("a server of the pool".to_string(), |h| h.name.clone());
+                Some(Guest { vm: v.name.clone(), host, sure })
+            }),
+            _ => None,
+        };
         let mut forget_sr: Option<(u32, String)> = None;
         let mut delete_iso: Option<(u32, String, String, String)> = None;
         // from the Delete VM question: server, VM, its name, whether its disks go too
@@ -5206,7 +5921,11 @@ impl App {
             _ => None,
         };
         let mut pool_action = PoolUpdateAction::None;
+        let mut move_action: Option<(u32, MoveAction)> = None;
         match &mut self.dialog {
+            Dialog::MoveVm(d) => {
+                move_action = Some((d.sid, d.ui(ctx, &pal)));
+            }
             Dialog::PoolUpdate(d) => {
                 if let Some(v) = &pool_view {
                     pool_action = d.ui(ctx, &pal, v);
@@ -5227,9 +5946,9 @@ impl App {
                         // Earlier servers: a small ▾ button opens the list under the box.
                         let (r, resp) = ui.allocate_exact_size(vec2(FIELD_HEIGHT, FIELD_HEIGHT), Sense::click());
                         let p = ui.painter();
-                        p.rect(r, Rounding::same(5.0), if resp.hovered() { pal.hover } else { pal.input }, Stroke::new(1.0, pal.border_strong));
+                        p.rect(r, Rounding::same(5.0), if resp.hovered() { pal.hover } else { pal.input }, Stroke::new(1.0_f32, pal.border_strong));
                         let c = r.center();
-                        p.add(egui::Shape::line(vec![pos2(c.x - 4.0, c.y - 2.0), pos2(c.x, c.y + 2.0), pos2(c.x + 4.0, c.y - 2.0)], Stroke::new(1.6, pal.ink_soft)));
+                        p.add(egui::Shape::line(vec![pos2(c.x - 4.0, c.y - 2.0), pos2(c.x, c.y + 2.0), pos2(c.x + 4.0, c.y - 2.0)], Stroke::new(1.6_f32, pal.ink_soft)));
                         let popup = ui.make_persistent_id("known-hosts");
                         if resp.on_hover_text("Earlier servers").clicked() {
                             ui.memory_mut(|m| m.toggle_popup(popup));
@@ -5320,6 +6039,36 @@ impl App {
                     });
                 });
             }
+            Dialog::ConfirmClose { items, .. } => {
+                dialog_window(ctx, "Close Simple VM Manager?").show(ctx, |ui| {
+                    ui.set_width(480.0);
+                    ui.spacing_mut().item_spacing.y = 8.0;
+                    let intro = if items.len() == 1 { "This stops halfway if the app closes now:" } else { "These stop halfway if the app closes now:" };
+                    ui.add(egui::Label::new(intro).wrap());
+                    egui::ScrollArea::vertical().max_height(320.0).auto_shrink([false, true]).show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 8.0;
+                        for (what, left) in items.iter() {
+                            crate::newvm::alert(ui, &pal, false, what, left, None);
+                        }
+                    });
+                    ui.add(egui::Label::new(egui::RichText::new("Anything else under way goes on on the servers by itself.").size(12.5).color(pal.ink_soft)).wrap());
+                    ui.add_space(4.0);
+                    dialog_buttons(ui, |ui| {
+                        if dialog_button(ui, &pal, "close", "Close anyway", Look::Danger, true) {
+                            close_app = Some(true);
+                        }
+                        if dialog_button(ui, &pal, "check", "Keep it open", Look::Primary, true) || ui.input(|i| i.key_pressed(Key::Escape)) {
+                            close_app = Some(false);
+                        }
+                    });
+                });
+            }
+            Dialog::NewStorage(d) => match d.ui(ctx, &pal, guest.as_ref()) {
+                StorageAction::Close => close = true,
+                StorageAction::Create(sid, st) => storage = Some((sid, st)),
+                StorageAction::Browse(sid, server) => browse = Some((sid, server)),
+                StorageAction::None => {}
+            },
             Dialog::Iso(d) => match d.ui(ctx, &pal) {
                 IsoAction::Close => close = true,
                 IsoAction::Create(sid, lib) => iso = Some((sid, lib)),
@@ -5775,13 +6524,13 @@ impl App {
                         Some(false) => note_left(ui, &pal, "This system has no keychain (Secret Service), so passwords can't be saved."),
                         Some(true) if rows.is_empty() => note_left(ui, &pal, "None yet. Tick Remember password when you connect to keep one."),
                         Some(true) => {
-                            egui::Frame::none().stroke(Stroke::new(1.0, pal.border)).rounding(Rounding::same(8.0)).show(ui, |ui| {
+                            egui::Frame::none().stroke(Stroke::new(1.0_f32, pal.border)).rounding(Rounding::same(8.0)).show(ui, |ui| {
                                 ui.set_width(ui.available_width());
                                 ui.spacing_mut().item_spacing.y = 0.0;
                                 for (n, (h, u)) in rows.iter().map(|k| (&k.0, &k.1)).enumerate() {
                                     if n > 0 {
                                         let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
-                                        ui.painter().line_segment([r.left_center(), r.right_center()], Stroke::new(1.0, pal.border));
+                                        ui.painter().line_segment([r.left_center(), r.right_center()], Stroke::new(1.0_f32, pal.border));
                                     }
                                     let w = ui.available_width();
                                     ui.allocate_ui_with_layout(vec2(w, 40.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
@@ -5957,10 +6706,18 @@ impl App {
         let shot_update = matches!(self.shot_show.as_str(), "pool-updating" | "pool-update-stopped");
         if self.shot_path.is_some() && shot_update && matches!(pool_action, PoolUpdateAction::None) {
             if let Some(v) = pool_view.as_ref().filter(|v| v.run.is_none()) {
-                if let Some(plan) = v.plan(true, self.shot_show == "pool-updating") {
+                if let Some(plan) = v.plan(true, if self.shot_show == "pool-updating" { crate::pool_update::Stuck::Carry } else { crate::pool_update::Stuck::Keep }) {
                     pool_action = PoolUpdateAction::Install(plan);
                 }
             }
+        }
+        match move_action {
+            Some((_, MoveAction::Close)) => close = true,
+            Some((sid, MoveAction::Move(m))) => {
+                close = true;
+                self.move_vm(sid, m, ctx);
+            }
+            _ => {}
         }
         match pool_action {
             PoolUpdateAction::None => {}
@@ -5988,6 +6745,19 @@ impl App {
         if close {
             self.dialog = Dialog::None;
         }
+        // from the Close question: stay (the dialog that was open comes back), or go
+        match close_app {
+            Some(false) => {
+                if let Dialog::ConfirmClose { back, .. } = std::mem::replace(&mut self.dialog, Dialog::None) {
+                    self.dialog = *back;
+                }
+            }
+            Some(true) => {
+                self.closing = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            None => {}
+        }
         if let Some((h, u, p, remember)) = add {
             self.dialog = Dialog::None;
             if let Some(dup) = self.servers.iter().find(|s| !s.conn.is_demo() && s.conn.hostname().eq_ignore_ascii_case(&h)).map(|s| s.id) {
@@ -6001,6 +6771,12 @@ impl App {
         }
         if let Some((sid, lib)) = iso {
             self.start_iso_library(sid, lib, ctx);
+        }
+        if let Some((sid, st)) = storage {
+            self.start_storage(sid, st, ctx);
+        }
+        if let Some((sid, server)) = browse {
+            self.browse_exports(sid, server, ctx);
         }
         if let Some((sid, sr, lib)) = reattach {
             self.reattach_job(sid, sr, lib, ctx);
@@ -6140,7 +6916,7 @@ impl App {
             // nothing under way, and no look at the server due (one is right after a job)
             && self.vm_saving.is_empty()
             && self.edit_queue.is_empty()
-            && self.servers.iter().all(|s| s.busy.is_empty() && !s.fetching && s.next_refresh > Instant::now());
+            && self.servers.iter().all(|s| (s.busy.is_empty() || matches!(self.shot_show.as_str(), "activities-moving" | "close-asked")) && !s.fetching && s.next_refresh > Instant::now());
         if !self.shot_requested && ((self.shot_ready && self.frames >= 120 && settled && self.started.elapsed() >= Duration::from_secs(wait)) || timed_out) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot);
             self.shot_requested = true;
@@ -6221,13 +6997,17 @@ impl eframe::App for App {
         if !self.uploads.is_empty() {
             ctx.request_repaint_after(Duration::from_millis(250)); // the progress moves, a finished card goes
         }
-        if self.uploads.values().any(Upload::active) {
-            // closing now would leave an unfinished file in the library
-            if ctx.input(|i| i.viewport().close_requested()) {
+        // closing while a job would be left half done (an upload, a VM being made, a pool's
+        // update…): asked first; what's one task on the server goes on by itself, unasked
+        if !self.closing && self.shot_path.is_none() && ctx.input(|i| i.viewport().close_requested()) {
+            let items = self.halfway();
+            if !items.is_empty() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                let names: Vec<String> = self.uploads.values().filter(|u| u.active()).map(|u| format!("'{}' to '{}'", u.name, u.lib)).collect();
-                let text = format!("Still uploading {}.\n\nWait for it to finish, or cancel it, before closing the app; closing now would leave an unfinished file in the library.", names.join(", "));
-                self.dialog = Dialog::Message { title: "Upload in progress".into(), text };
+                let back = match std::mem::replace(&mut self.dialog, Dialog::None) {
+                    Dialog::ConfirmClose { back, .. } => back,
+                    other => Box::new(other),
+                };
+                self.dialog = Dialog::ConfirmClose { items, back };
             }
         }
         // --show add-server | confirm | about: a check's screenshot with that dialog open.
@@ -6241,6 +7021,9 @@ impl eframe::App for App {
                 "snapshots" => out.push(Intent::Tab(Tab::Snapshots)),
                 "details" | "host-details" | "pool-details" => out.push(Intent::Tab(Tab::Details)),
                 "pool-updates" | "pool-updating" | "pool-update-stopped" => out.push(Intent::PoolUpdates(sel.sid)),
+                "move-vm" => out.extend(sel.sid.map(|sid| Intent::MoveVm(sid, "vm-web".into(), Some("host-b".into())))),
+                "move-vm-local" => out.extend(sel.sid.map(|sid| Intent::MoveVm(sid, "vm-mail".into(), Some("host-a".into())))),
+                "move-vm-off" => out.extend(sel.sid.map(|sid| Intent::MoveVm(sid, "vm-desk".into(), Some("host-b".into())))),
                 "new-vm-template" => out.extend(sel.sid.map(|sid| Intent::NewVmFromTemplate(sid, "tpl-web".into()))),
                 "make-template" => out.extend(sel.sid.map(|sid| Intent::MakeTemplate(sid, "vm-desk".into()))),
                 "make-template-snapshot" => {
@@ -6275,6 +7058,28 @@ impl eframe::App for App {
                             VmChange::AutoPowerOn(true),
                         ] {
                             self.edit_vm(sid, vm.clone(), change, ctx);
+                        }
+                    }
+                }
+                "close-asked" => {
+                    // closing while a shut-down VM's disk is being copied and a snapshot reverted
+                    if let Some(sid) = sel.sid {
+                        let vdi = self.server(sid).and_then(|s| s.data.as_ref()).and_then(|d| d.vm("vm-desk")).and_then(|v| v.disks.iter().find(|k| k.kind == "Disk").map(|k| k.vdi.clone()));
+                        if let Some(vdi) = vdi {
+                            self.move_vm(sid, MoveVm { vm: "vm-desk".into(), host: "host-b".into(), disks: vec![(vdi, "sr-nfs".into())], eject: None, running: false }, ctx);
+                        }
+                        self.revert(sid, "vm-web-snap-2".into(), false, ctx);
+                        let items = self.halfway();
+                        self.dialog = Dialog::ConfirmClose { items, back: Box::new(Dialog::None) };
+                    }
+                }
+                "activities-moving" => {
+                    // a running VM going to the other server with its disk, still under way when
+                    // the screenshot's taken (with SVM_DEMO_SLOW and SVM_SHOT_WAIT)
+                    if let Some(sid) = sel.sid {
+                        let vdi = self.server(sid).and_then(|s| s.data.as_ref()).and_then(|d| d.vm("vm-mail")).and_then(|v| v.disks.iter().find(|k| k.kind == "Disk").map(|k| k.vdi.clone()));
+                        if let Some(vdi) = vdi {
+                            self.move_vm(sid, MoveVm { vm: "vm-mail".into(), host: "host-a".into(), disks: vec![(vdi, "sr-local1".into())], eject: None, running: true }, ctx);
                         }
                     }
                 }
@@ -6340,7 +7145,28 @@ impl eframe::App for App {
                         out.push(Intent::Tab(Tab::Console));
                     }
                 }
-                "iso" => out.push(Intent::IsoLibrary),
+                "iso" => out.push(Intent::NewIsoLibrary),
+                "iso-library" => out.push(Intent::IsoLibrary),
+                "vm-storage" => out.push(Intent::VmStorage),
+                "new-storage" | "new-storage-inside" | "new-storage-error" => {
+                    out.push(Intent::VmStorage);
+                    if let Some(sid) = self.servers.iter().find(|s| s.data.is_some()).map(|s| s.id) {
+                        let pools = vec![(sid, self.server(sid).map(|s| s.name()).unwrap_or_default(), false)];
+                        let found = vec!["/mnt/tank/backups".to_string(), "/mnt/tank/isos".into(), "/mnt/tank/vms".into()];
+                        let mut d = match self.shot_show.as_str() {
+                            "new-storage" => StorageDialog::new(sid, pools).filled("nas:/mnt/tank/vms", Some(found)),
+                            // the address of one of the demo's VMs
+                            "new-storage-inside" => StorageDialog::new(sid, pools).filled("10.20.1.22:/mnt/tank/vms", None),
+                            _ => StorageDialog::new(sid, pools).filled("unreachable:/mnt/tank/vms", None),
+                        };
+                        if self.shot_show == "new-storage-error" {
+                            if let StorageAction::Create(sid, st) = d.submit() {
+                                self.start_storage(sid, st, ctx);
+                            }
+                        }
+                        self.dialog = Dialog::NewStorage(Box::new(d));
+                    }
+                }
                 "iso-advanced" | "iso-error" => {
                     let pools: Vec<(u32, String)> = self.servers.iter().filter(|s| s.data.is_some()).map(|s| (s.id, s.name())).collect();
                     if let Some(&(sid, _)) = pools.first() {
@@ -6444,12 +7270,12 @@ impl eframe::App for App {
             }
         }
 
-        let tools_frame = egui::Frame::none().fill(pal.toolbar).inner_margin(egui::Margin::symmetric(6.0, 4.0)).stroke(Stroke::new(1.0, pal.border));
+        let tools_frame = egui::Frame::none().fill(pal.toolbar).inner_margin(egui::Margin::symmetric(6.0, 4.0)).stroke(Stroke::new(1.0_f32, pal.border));
         egui::TopBottomPanel::top("tools").frame(tools_frame).show(ctx, |ui| self.toolbar(ui, &sel, &mut out));
 
         // The sidebar folds to a narrow strip of icons, with a short animation.
-        let rail = egui::SidePanel::left("rail").resizable(false).exact_width(RAIL_WIDTH).frame(egui::Frame::none().fill(pal.rail).stroke(Stroke::new(1.0, pal.border)));
-        let full = egui::SidePanel::left("tree").resizable(true).default_width(290.0).width_range(200.0..=560.0).frame(egui::Frame::none().fill(pal.sidebar).stroke(Stroke::new(1.0, pal.border)));
+        let rail = egui::SidePanel::left("rail").resizable(false).exact_width(RAIL_WIDTH).frame(egui::Frame::none().fill(pal.rail).stroke(Stroke::new(1.0_f32, pal.border)));
+        let full = egui::SidePanel::left("tree").resizable(true).default_width(290.0).width_range(200.0..=560.0).frame(egui::Frame::none().fill(pal.sidebar).stroke(Stroke::new(1.0_f32, pal.border)));
         let open = self.sidebar_open;
         egui::SidePanel::show_animated_between(ctx, open, rail, full, |ui, how_expanded| {
             if how_expanded < 0.5 {
@@ -6467,6 +7293,17 @@ impl eframe::App for App {
             let free = self.header_and_tabs(ui, &sel, &tabs, current, actions, &mut out);
             if actions > 0.0 {
                 self.tab_actions(ui, free, &sel, current, actions, &mut out);
+            } else if sel.kind == Kind::Root && current == Tab::IsoLibrary {
+                self.iso_library_actions(ui, free, &mut out);
+            } else if sel.kind == Kind::Root && current == Tab::VmStorage {
+                let mut child = ui.new_child(egui::UiBuilder::new().max_rect(free).layout(egui::Layout::right_to_left(egui::Align::Center)));
+                child.spacing_mut().item_spacing.x = 4.0;
+                let has_pool = self.servers.iter().any(|s| s.data.is_some());
+                let compact = free.width() < flat_button_width(&child, "New VM Storage") + 16.0 + SEP_W;
+                if flat_button(&mut child, "plus", "New VM Storage", Some(pal.accent), has_pool, compact, &pal).on_hover_text("Add an NFS folder that every server of a pool shares, for VMs' disks").clicked() {
+                    out.push(Intent::NewStorage);
+                }
+                vsep(&mut child, &pal);
             } else if let Some((s, t)) = self.template_of(&sel) {
                 // a template's: New VM from it, and Delete
                 let (sid, tref, busy) = (s.id, t.rref.clone(), s.busy.contains_key(&t.rref));
@@ -6509,6 +7346,23 @@ impl eframe::App for App {
                     out.push(Intent::Upload(sid, sr));
                 }
                 vsep(&mut child, &pal);
+            } else if let Some((s, x)) = self.sr_of(&sel).filter(|(_, x)| !x.is_iso() && x.kind != "udev" && x.size > 0) {
+                // storage for disks: made the pool's default (where new disks, suspended VMs'
+                // memory and crash dumps go)
+                let (sid, sr) = (s.id, x.rref.clone());
+                let default = s.data.as_ref().map_or(false, |d| d.default_sr.as_deref() == Some(sr.as_str()) && d.suspend_sr.as_deref().map_or(true, |r| r == sr));
+                let mut child = ui.new_child(egui::UiBuilder::new().max_rect(free).layout(egui::Layout::right_to_left(egui::Align::Center)));
+                child.spacing_mut().item_spacing.x = 4.0;
+                let compact = free.width() < flat_button_width(&child, "Make Default") + 16.0 + SEP_W;
+                let (label, tip) = if default {
+                    ("Default", "This is the pool's default storage")
+                } else {
+                    ("Make Default", "Make this the pool's default storage: for new VMs' disks, suspended VMs' memory and crash dumps (moving a running VM's disks uses it too)")
+                };
+                if flat_button(&mut child, "check", label, Some(pal.green), !default, compact, &pal).on_hover_text(tip).on_disabled_hover_text(tip).clicked() {
+                    out.push(Intent::MakeDefaultSr(sid, sr));
+                }
+                vsep(&mut child, &pal);
             }
             ui.spacing_mut().item_spacing.y = 4.0;
             let margin = if current == Tab::General || current == Tab::Home { 0.0 } else { 10.0 };
@@ -6523,6 +7377,8 @@ impl eframe::App for App {
                 Tab::Networking => self.networking(ui, &sel),
                 Tab::Console => self.console_tab(ui, &sel, &mut out),
                 Tab::IsoFiles => self.iso_files(ui, &sel, &mut out),
+                Tab::IsoLibrary => self.iso_library_page(ui, &mut out),
+                Tab::VmStorage => self.vm_storage_page(ui, &mut out),
                 Tab::Snapshots => self.snapshots_tab(ui, &sel, &mut out),
                 Tab::Templates => self.templates_tab(ui, &sel, &mut out),
                 Tab::Logs => self.logs(ui, &sel, &mut out),
@@ -6533,14 +7389,14 @@ impl eframe::App for App {
         self.apply(out, &sel, ctx);
         // files dragged over the window: say where they'd go
         if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
-            let text = match self.sr_of(&sel).filter(|(_, x)| x.is_iso()) {
-                Some((_, x)) => format!("Drop to upload to {}", x.name),
+            let text = match self.drop_library(&sel) {
+                Some((_, _, name)) => format!("Drop to upload to {}", name),
                 None => "Select an ISO library first, then drop the file on it".to_string(),
             };
             let p = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("drop-files")));
             let r = ctx.screen_rect();
             p.rect_filled(r, 0.0, Color32::from_black_alpha(150));
-            p.rect_stroke(r.shrink(14.0), Rounding::same(12.0), Stroke::new(2.0, pal.accent));
+            p.rect_stroke(r.shrink(14.0), Rounding::same(12.0), Stroke::new(2.0_f32, pal.accent));
             p.text(r.center(), Align2::CENTER_CENTER, text, FontId::proportional(18.0), Color32::WHITE);
         }
         self.screenshot(ctx);
@@ -6577,7 +7433,7 @@ pub(crate) fn text_field(ui: &mut Ui, pal: &Pal, text: &mut String, width: f32, 
     let pad = egui::Margin::symmetric(7.0, ((FIELD_HEIGHT - row) / 2.0).max(0.0));
     let mut edit = ui.add_sized([width, FIELD_HEIGHT], egui::TextEdit::singleline(text).password(password).frame(false).margin(pad));
     edit.rect = edit.rect + pad; // egui reports the box without its margin
-    let stroke = Stroke::new(1.0, if edit.has_focus() { pal.accent } else { pal.border_strong });
+    let stroke = Stroke::new(1.0_f32, if edit.has_focus() { pal.accent } else { pal.border_strong });
     ui.painter().set(bg, egui::epaint::RectShape::new(edit.rect, Rounding::same(5.0), pal.input, stroke));
     edit
 }
@@ -6606,7 +7462,7 @@ pub(crate) fn dialog_button(ui: &mut Ui, pal: &Pal, glyph: &str, label: &str, lo
     let content = 22.0 + ui.painter().layout_no_wrap(label.to_string(), font.clone(), pal.ink).size().x;
     let filled = enabled && look != Look::Plain;
     let b = match look {
-        _ if !filled => egui::Button::new("").stroke(Stroke::new(1.0, pal.border_strong)),
+        _ if !filled => egui::Button::new("").stroke(Stroke::new(1.0_f32, pal.border_strong)),
         Look::Danger => egui::Button::new("").fill(pal.red),
         _ => egui::Button::new("").fill(pal.accent),
     };
@@ -6724,6 +7580,14 @@ fn upload_problem(e: &ApiError) -> String {
     }
 }
 
+/// A VM being dragged in the tree (onto a server, to move it there).
+struct DragVm {
+    sid: u32,
+    vm: String,
+    #[allow(dead_code)]
+    name: String,
+}
+
 /// Storage's tree icon: a disc for ISO libraries, a drum for the rest.
 /// A user's template in the tree (a ring turning while a VM is made from it or it's deleted).
 fn template_node(sid: u32, s: &ServerEntry, t: &VmInfo) -> Node {
@@ -6735,6 +7599,32 @@ fn template_node(sid: u32, s: &ServerEntry, t: &VmInfo) -> Node {
 /// green dot when it's mounted on a server that's up, a red one when its server is off or not
 /// answering, a "!" when it isn't mounted where it should be. A server's own storage (local
 /// disks, DVD drives, USB) has none.
+/// Why Delete waits, from what the VM is busy with ("Moving…" → "It's moving: delete it once
+/// that's done").
+fn busy_tip(doing: &str) -> String {
+    format!("It's {}: delete it once that's done", doing.trim_end_matches('…').to_lowercase())
+}
+
+/// A storage's kind in a word or two: "NFS (v3)", "LVM", "iSCSI"… (a server's own storage says
+/// it's local where it says which server it's in)
+fn sr_kind_words(x: &SrInfo) -> String {
+    match x.kind.as_str() {
+        "nfs" if !x.share.is_empty() => x.share.clone(),
+        "nfs" => "NFS".into(),
+        "lvm" => "LVM".into(),
+        "ext" => "EXT".into(),
+        "xfs" => "XFS".into(),
+        "largeblock" => "LVM (4K)".into(),
+        "file" => "Folder".into(),
+        "lvmoiscsi" => "iSCSI".into(),
+        "lvmohba" => "Fibre Channel".into(),
+        "gfs2" => "GFS2 (shared disk)".into(),
+        "smb" => "SMB".into(),
+        "zfs" => "ZFS".into(),
+        k => k.to_string(),
+    }
+}
+
 fn sr_icon(d: &PoolData, x: &SrInfo, busy: bool) -> IconKind {
     if busy {
         return IconKind::Busy(Tone::Accent);
@@ -6786,7 +7676,7 @@ fn sr_status(d: &PoolData, x: &SrInfo) -> String {
 fn mount_problem(e: &ApiError, nfs: bool) -> String {
     let plain = match mount_trouble(e) {
         Some(MountTrouble::Refused) if nfs => "The NFS server refused the XenServer hosts: check that its export still allows their addresses.",
-        Some(MountTrouble::Refused) => "The share refused the user name and password the pool has for it. If they changed, disconnect the library and add it again with ISO Library.",
+        Some(MountTrouble::Refused) => "The share refused the user name and password the pool has for it. If they changed, disconnect the library and add it again with New ISO Library (on the ISO Library page).",
         Some(MountTrouble::NotFound) => "The share or its folder isn't there any more.",
         Some(MountTrouble::Unreachable) => "The XenServer hosts couldn't reach the share's address. It answering this computer isn't enough: the hosts have to reach it themselves.",
         Some(MountTrouble::Unsupported) => "The share no longer speaks the protocol version set for it.",
@@ -7003,7 +7893,7 @@ fn paint_tool_btn(p: &egui::Painter, r: Rect, face: &Face, enabled: bool, hot: b
     }
     if menu {
         let c = pos2(pill.max.x - 11.0, pill.center().y);
-        p.add(egui::Shape::line(vec![pos2(c.x - 3.5, c.y - 1.5), pos2(c.x, c.y + 2.0), pos2(c.x + 3.5, c.y - 1.5)], Stroke::new(1.4, if enabled { col } else { pal.ink_faint })));
+        p.add(egui::Shape::line(vec![pos2(c.x - 3.5, c.y - 1.5), pos2(c.x, c.y + 2.0), pos2(c.x + 3.5, c.y - 1.5)], Stroke::new(1.4_f32, if enabled { col } else { pal.ink_faint })));
     }
 }
 
@@ -7017,7 +7907,7 @@ fn tool_btn(ui: &mut Ui, face: Face, tip: &str, enabled: bool, pal: &Pal) -> egu
 /// A thin upright line before a group of buttons.
 fn vsep(ui: &mut Ui, pal: &Pal) {
     let (r, _) = ui.allocate_exact_size(vec2(SEP_W - 2.0, 18.0), Sense::hover());
-    ui.painter().line_segment([r.center_top(), r.center_bottom()], Stroke::new(1.0, pal.border));
+    ui.painter().line_segment([r.center_top(), r.center_bottom()], Stroke::new(1.0_f32, pal.border));
 }
 
 fn tool_button(ui: &mut Ui, op: &str, label: &str, enabled: bool, compact: bool, pal: &Pal) -> egui::Response {
@@ -7059,7 +7949,7 @@ fn chevron_button(ui: &mut Ui, pal: &Pal, left: bool) -> egui::Response {
         p.rect_filled(rect, Rounding::same(5.0), pal.hover);
     }
     let c = rect.center();
-    let s = Stroke::new(1.6, pal.ink_soft);
+    let s = Stroke::new(1.6_f32, pal.ink_soft);
     let d = if left { 1.0 } else { -1.0 };
     for off in [-2.5f32, 2.5] {
         let x = c.x + off;

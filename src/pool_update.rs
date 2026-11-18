@@ -57,6 +57,11 @@ impl UpdateRun {
         s.push((text, StepState::Doing, String::new(), Instant::now()));
         s.len() - 1
     }
+    fn rename(&self, i: usize, text: impl Into<String>) {
+        if let Some(s) = self.steps.lock().unwrap().get_mut(i) {
+            s.0 = text.into();
+        }
+    }
     fn end(&self, i: usize, state: StepState, more: impl Into<String>) {
         let more = more.into();
         if state == StepState::Failed {
@@ -78,15 +83,49 @@ impl UpdateRun {
     }
 }
 
+/// What becomes of the running VMs that can't move off a server that restarts (their disks on its
+/// own storage…): nothing (the update doesn't start), moved with their disks to another server
+/// and back after, or shut down and started again after.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Stuck {
+    Keep,
+    Carry,
+    ShutDown,
+}
+
+/// A running VM, for carrying it off with its disks: its memory, and each disk's position, size and
+/// storage.
+#[derive(Clone)]
+pub struct PlanVm {
+    pub rref: String,
+    pub mem: i64,
+    pub disks: Vec<(String, i64, String)>,
+}
+
+/// Storage a carried VM's disks could go to: its room, the servers that see it, and whether it
+/// can send or take a running VM's disk (live storage migration).
+#[derive(Clone)]
+pub struct PlanSr {
+    pub rref: String,
+    pub free: i64,
+    pub seen_by: Vec<String>,
+    pub live_out: bool,
+    pub live_in: bool,
+}
+
 /// What an update does: the hash of the updates to install, whether servers restart when they
-/// need to, whether the VMs that can't move off a server are shut down for its restart (else
-/// the update stops before it), each server (the coordinator first), and the VMs' names.
+/// need to, what becomes of the VMs that can't move off them, each server (the coordinator
+/// first), the VMs' names; and, for carrying VMs off, the running ones, the storage, and each
+/// server's free memory.
 pub struct Plan {
     pub hash: String,
     pub restart: bool,
-    pub stop_stuck: bool,
+    pub stuck: Stuck,
     pub hosts: Vec<PlanHost>,
     pub vm_names: Vec<(String, String)>,
+    pub vms: Vec<PlanVm>,
+    pub srs: Vec<PlanSr>,
+    pub room: Vec<(String, i64)>,
 }
 
 impl Plan {
@@ -104,6 +143,45 @@ impl Plan {
         }
         out
     }
+    fn host_name<'a>(&'a self, r: &'a str) -> &'a str {
+        self.hosts.iter().find(|h| h.rref == r).map_or(r, |h| h.name.as_str())
+    }
+
+    /// Where a VM stuck on server `h` can go with its disks: the other server with the most memory
+    /// free (beside what's been `used` there already), and storage it sees for each disk it doesn't
+    /// see already (its own first, then the roomiest): the server, and each disk's position and new
+    /// storage.
+    fn place(&self, h: &str, vm: &PlanVm, used: &[(String, i64)]) -> Option<(String, Vec<(String, String)>)> {
+        let used_of = |r: &str| used.iter().filter(|u| u.0 == r).map(|u| u.1).sum::<i64>();
+        let mut hosts: Vec<(&String, i64)> = self.room.iter().filter(|(r, _)| r != h).map(|(r, free)| (r, free - used_of(r))).filter(|(_, free)| *free >= vm.mem).collect();
+        hosts.sort_by_key(|(_, free)| -free);
+        'hosts: for (t, _) in hosts {
+            let mut moves: Vec<(String, String)> = vec![];
+            let mut taken: Vec<(String, i64)> = used.to_vec();
+            for (dev, size, sr) in &vm.disks {
+                let sees = |x: &PlanSr| x.seen_by.iter().any(|s| s == t);
+                if self.srs.iter().any(|x| x.rref == *sr && sees(x)) {
+                    continue;
+                }
+                // (it goes live: its storage must send it, the new one take it)
+                if self.srs.iter().any(|x| x.rref == *sr && !x.live_out) {
+                    return None;
+                }
+                let room = |x: &PlanSr| x.free - taken.iter().filter(|u| u.0 == x.rref).map(|u| u.1).sum::<i64>();
+                let best = self.srs.iter().filter(|x| sees(x) && x.live_in && room(x) >= *size).max_by_key(|x| (x.seen_by.len() == 1, room(x)));
+                match best {
+                    Some(x) => {
+                        moves.push((dev.clone(), x.rref.clone()));
+                        taken.push((x.rref.clone(), *size));
+                    }
+                    None => continue 'hosts,
+                }
+            }
+            return Some((t.clone(), moves));
+        }
+        None
+    }
+
     /// The servers it restarts.
     fn restarts(&self) -> impl Iterator<Item = &PlanHost> {
         self.hosts.iter().filter(move |h| self.restart && ((h.updates > 0 && h.restart) || h.pending_restart))
@@ -113,6 +191,12 @@ impl Plan {
     fn stuck_words(&self, host: &str, stuck: &[(String, String)]) -> String {
         stuck.iter().map(|(vm, why)| format!("{} on {} ({})", self.vm_name(vm), host, why_stuck(why))).collect::<Vec<_>>().join(", ")
     }
+}
+
+/// A VM that can't move off its server only because its disks are on that server's own storage:
+/// it can go with them.
+fn carryable(why: &str) -> bool {
+    matches!(why.split_whitespace().next().unwrap_or_default().to_uppercase().as_str(), "VM_REQUIRES_SR" | "VM_REQUIRES_VDI")
 }
 
 /// Why a VM can't move off its server (host.get_vms_which_prevent_evacuation's error code), in words.
@@ -126,6 +210,7 @@ fn why_stuck(reason: &str) -> String {
         "VM_LACKS_FEATURE" | "VM_LACKS_FEATURE_SUSPEND" | "VM_MISSING_PV_DRIVERS" | "VM_OLD_PV_DRIVERS" => "it hasn't the guest tools to move".into(),
         "VM_HAS_PCI_ATTACHED" | "VM_REQUIRES_GPU" | "VM_HAS_VGPU" | "VGPU_TYPE_NOT_SUPPORTED" | "VM_HAS_SRIOV_VIF" => "it uses a device of this server".into(),
         "" => "the server didn't say why".into(),
+        "NO_ROOM" => "no other server has the memory, and storage that takes running VMs' disks, for it".into(),
         c => c.to_lowercase().replace('_', " "),
     }
 }
@@ -175,12 +260,26 @@ pub fn run(conn: &dyn Connection, plan: &Plan, r: &UpdateRun, restarting: &dyn F
             return Err(e.message());
         }
     }
-    // no VM is shut down: every server that restarts must be able to empty, checked before anything
-    if !plan.stop_stuck && plan.restarts().next().is_some() {
+    // no VM is shut down: every server that restarts must be able to empty (those carried off with
+    // their disks must have somewhere to go), checked before anything
+    if plan.stuck != Stuck::ShutDown && plan.restarts().next().is_some() {
         let i = r.begin("Checking every VM can move while its server restarts");
         let mut cant: Vec<String> = vec![];
         for h in plan.restarts() {
             match conn.vms_blocking_evacuation(&h.rref) {
+                Ok(stuck) if plan.stuck == Stuck::Carry => {
+                    let left: Vec<(String, String)> = stuck
+                        .into_iter()
+                        .filter_map(|(vm, why)| match plan.vms.iter().find(|v| v.rref == vm) {
+                            Some(v) if carryable(&why) && plan.place(&h.rref, v, &[]).is_some() => None,
+                            _ if carryable(&why) => Some((vm, "NO_ROOM".to_string())),
+                            _ => Some((vm, why)),
+                        })
+                        .collect();
+                    if !left.is_empty() {
+                        cant.push(plan.stuck_words(&h.name, &left));
+                    }
+                }
                 Ok(stuck) if stuck.is_empty() => {}
                 Ok(stuck) => cant.push(plan.stuck_words(&h.name, &stuck)),
                 Err(e) => cant.push(format!("{} couldn't say ({})", h.name, e.message())),
@@ -199,12 +298,68 @@ pub fn run(conn: &dyn Connection, plan: &Plan, r: &UpdateRun, restarting: &dyn F
             r.end(i, StepState::Failed, e.clone());
             Err(format!("{}: {}", h.name, e))
         };
-        // its VMs leave first when it'll restart
+        // its VMs leave first when it'll restart: those that can't, carried off with their disks
+        // (when so chosen; back after), or shut down (started again after)
         let mut stopped: Vec<String> = vec![];
+        let mut carried: Vec<(String, Vec<(String, String)>)> = vec![];
         let mut emptied = false;
-        let empty = |stopped: &mut Vec<String>| -> Result<(), String> {
+        let carry = |carried: &mut Vec<(String, Vec<(String, String)>)>| -> Result<(), String> {
+            let stuck = conn.vms_blocking_evacuation(&h.rref).unwrap_or_default();
+            let mut used: Vec<(String, i64)> = vec![];
+            for (vm, why) in stuck {
+                let name = plan.vm_name(&vm).to_string();
+                let i = r.begin(format!("{}: moving {} with its disks to another server", h.name, name));
+                let Some(v) = plan.vms.iter().find(|v| v.rref == vm).filter(|_| carryable(&why)) else {
+                    return fail(i, format!("stopped here, nothing shut down: {} can't move ({})", name, why_stuck(&why))).map(|_| ());
+                };
+                let Some((t, moves)) = plan.place(&h.rref, v, &used) else {
+                    return fail(i, format!("stopped here, nothing shut down: no other server has the memory and storage for {}", name)).map(|_| ());
+                };
+                let size: i64 = moves.iter().filter_map(|(dev, _)| v.disks.iter().find(|d| d.0 == *dev)).map(|d| d.1).sum();
+                r.rename(i, format!("{}: moving {} with its disks ({}) to {}", h.name, name, fmt_bytes(size), plan.host_name(&t)));
+                let now = match conn.vm_disks(&vm) {
+                    Ok((_, now)) => now,
+                    Err(e) => return fail(i, e.message()).map(|_| ()),
+                };
+                let disks: Vec<(String, String)> = moves.iter().filter_map(|(dev, sr)| now.iter().find(|d| d.0 == *dev).map(|d| (d.1.clone(), sr.clone()))).collect();
+                if let Err(e) = conn.move_vm(&MoveVm { vm: vm.clone(), host: t.clone(), disks, eject: None, running: true }) {
+                    return fail(i, e.message()).map(|_| ());
+                }
+                r.end(i, StepState::Done, "Running all along; it comes back after the restart");
+                used.push((t.clone(), v.mem));
+                for (dev, sr) in &moves {
+                    used.push((sr.clone(), v.disks.iter().find(|d| d.0 == *dev).map_or(0, |d| d.1)));
+                }
+                carried.push((vm.clone(), v.disks.iter().map(|(dev, _, sr)| (dev.clone(), sr.clone())).collect()));
+            }
+            Ok(())
+        };
+        let bring_back = |carried: &[(String, Vec<(String, String)>)]| {
+            for (vm, home) in carried {
+                let name = plan.vm_name(vm).to_string();
+                let i = r.begin(format!("{}: bringing {} back with its disks", h.name, name));
+                let back = conn.vm_disks(vm).and_then(|(running, now)| {
+                    let disks = now.iter().filter_map(|(dev, vdi, sr)| home.iter().find(|d| d.0 == *dev && d.1 != *sr).map(|d| (vdi.clone(), d.1.clone()))).collect();
+                    conn.move_vm(&MoveVm { vm: vm.clone(), host: h.rref.clone(), disks, eject: None, running })
+                });
+                match back {
+                    Ok(()) => r.end(i, StepState::Done, ""),
+                    Err(e) => {
+                        r.end(i, StepState::Failed, plan.named(&e.message()));
+                        r.leave(format!("move {} back to {} (Move, on its page)", name, h.name));
+                    }
+                }
+            }
+        };
+        let empty = |stopped: &mut Vec<String>, carried: &mut Vec<(String, Vec<(String, String)>)>| -> Result<(), String> {
+            if plan.stuck == Stuck::Carry {
+                if let Err(e) = carry(carried) {
+                    bring_back(carried);
+                    return Err(e);
+                }
+            }
             let i = r.begin(format!("{}: emptying it for its restart", h.name));
-            match conn.empty_host(&h.rref, plan.stop_stuck) {
+            match conn.empty_host(&h.rref, plan.stuck == Stuck::ShutDown) {
                 Ok((s, moved)) => {
                     // what happened to each of its VMs: shut down (only those that can't move) or moved
                     let mut said = vec![];
@@ -227,13 +382,17 @@ pub fn run(conn: &dyn Connection, plan: &Plan, r: &UpdateRun, restarting: &dyn F
                 Err(e) if e.code == "VMS_CANT_MOVE" => {
                     let stuck = conn.vms_blocking_evacuation(&h.rref).unwrap_or_default();
                     let names = if stuck.is_empty() { e.details.iter().map(|v| plan.vm_name(v).to_string()).collect::<Vec<_>>().join(", ") } else { plan.stuck_words(&h.name, &stuck) };
+                    bring_back(carried);
                     fail(i, format!("stopped here, nothing shut down: {} can't move", names)).map(|_| ())
                 }
-                Err(e) => fail(i, e.message()).map(|_| ()),
+                Err(e) => {
+                    bring_back(carried);
+                    fail(i, e.message()).map(|_| ())
+                }
             }
         };
         if plan.restart && (h.restart || (h.updates == 0 && h.pending_restart)) {
-            empty(&mut stopped)?;
+            empty(&mut stopped, &mut carried)?;
             emptied = true;
         }
         let mut pending: Vec<String> = vec![];
@@ -245,6 +404,7 @@ pub fn run(conn: &dyn Connection, plan: &Plan, r: &UpdateRun, restarting: &dyn F
                     if emptied {
                         let _ = conn.enable_host(&h.rref);
                         start_again(conn, r, plan, h, &stopped);
+                        bring_back(&carried);
                     }
                     return fail(i, e.message());
                 }
@@ -258,11 +418,14 @@ pub fn run(conn: &dyn Connection, plan: &Plan, r: &UpdateRun, restarting: &dyn F
         let reboot = pending.iter().any(|g| g.starts_with("reboot_host"));
         if reboot && plan.restart {
             if !emptied {
-                empty(&mut stopped)?;
+                empty(&mut stopped, &mut carried)?;
             }
             restarting(&h.rref, false);
             let i = r.begin(format!("{}: restarting (back in a few minutes)", h.name));
             if let Err(e) = conn.restart_host_and_wait(&h.rref, BACK_WITHIN) {
+                for (vm, _) in &carried {
+                    r.leave(format!("move {} back to {} once it's back (Move, on its page)", plan.vm_name(vm), h.name));
+                }
                 return fail(i, e.message());
             }
             restarting(&h.rref, true);
@@ -292,6 +455,7 @@ pub fn run(conn: &dyn Connection, plan: &Plan, r: &UpdateRun, restarting: &dyn F
             }
         }
         start_again(conn, r, plan, h, &stopped);
+        bring_back(&carried);
     }
     let mut said = match (updated, restarted) {
         (0, 0) => "Nothing to install".to_string(),
@@ -366,6 +530,11 @@ pub struct PoolView {
     /// own storage): their server's reference and name, and theirs.
     pub vm_names: Vec<(String, String)>,
     pub stuck: Vec<(String, String, String)>,
+    /// For carrying VMs off with their disks: the running ones, the storage, each server's free
+    /// memory.
+    pub vms: Vec<PlanVm>,
+    pub srs: Vec<PlanSr>,
+    pub room: Vec<(String, i64)>,
     /// Its servers, the coordinator first: reference, name, whether it's on, whether it must
     /// restart for updates installed before.
     pub hosts: Vec<(String, String, bool, bool)>,
@@ -386,7 +555,7 @@ impl PoolView {
         self.stuck.iter().filter(|s| restarting(&s.0)).map(|s| format!("{} (on {})", s.2, s.1)).collect()
     }
 
-    pub fn plan(&self, restart: bool, stop_stuck: bool) -> Option<Plan> {
+    pub fn plan(&self, restart: bool, stuck: Stuck) -> Option<Plan> {
         let found = self.found.as_ref()?.as_ref().ok()?;
         let hosts: Vec<PlanHost> = self
             .hosts
@@ -397,7 +566,7 @@ impl PoolView {
             })
             .collect();
         let something = hosts.iter().any(|h| h.updates > 0 || (h.pending_restart && restart));
-        something.then(|| Plan { hash: found.hash.clone(), restart, stop_stuck, hosts, vm_names: self.vm_names.clone() })
+        something.then(|| Plan { hash: found.hash.clone(), restart, stuck, hosts, vm_names: self.vm_names.clone(), vms: self.vms.clone(), srs: self.srs.clone(), room: self.room.clone() })
     }
 }
 
@@ -417,14 +586,14 @@ pub struct PoolUpdateDialog {
     pub sid: u32,
     /// Restart the servers that need it; shut down the VMs that can't move off them (else stop).
     restart: bool,
-    stop_stuck: bool,
+    stuck: Stuck,
     /// When the update's calls were last copied.
     copied: Option<Instant>,
 }
 
 impl PoolUpdateDialog {
     pub fn new(sid: u32) -> PoolUpdateDialog {
-        PoolUpdateDialog { sid, restart: true, stop_stuck: false, copied: None }
+        PoolUpdateDialog { sid, restart: true, stuck: Stuck::Keep, copied: None }
     }
 
     pub fn ui(&mut self, ctx: &egui::Context, pal: &Pal, v: &PoolView) -> PoolUpdateAction {
@@ -484,7 +653,7 @@ impl PoolUpdateDialog {
             }
             ui.add_space(6.0);
             dialog_buttons(ui, |ui| {
-                let plan = v.plan(self.restart, self.stop_stuck);
+                let plan = v.plan(self.restart, self.stuck);
                 let off: Vec<&str> = v.hosts.iter().filter(|h| !h.2).map(|h| h.1.as_str()).collect();
                 if v.run.is_none() && v.channel.is_some() && !v.xcp {
                     let n = plan.as_ref().map_or(0, |p| p.hosts.iter().map(|h| h.updates).max().unwrap_or(0));
@@ -493,7 +662,7 @@ impl PoolUpdateDialog {
                         (Some(_), 0) => "Restart servers".to_string(),
                         (Some(_), n) => format!("Install {} update{}", n, if n == 1 { "" } else { "s" }),
                     };
-                    let blocked = self.restart && !self.stop_stuck && !v.stuck_now().is_empty();
+                    let blocked = self.restart && self.stuck == Stuck::Keep && !v.stuck_now().is_empty();
                     let can = plan.is_some() && off.is_empty() && !v.checking && !blocked;
                     let resp = ui.add_enabled_ui(can, |ui| dialog_button(ui, pal, "download", &what, Look::Primary, can));
                     if resp.inner {
@@ -592,12 +761,13 @@ impl PoolUpdateDialog {
                 ui.indent("stuck", |ui| {
                     ui.spacing_mut().item_spacing.y = 4.0;
                     ui.add(egui::Label::new(egui::RichText::new("Before a server restarts, its VMs move to the other servers and keep running. For any that can't move (disks on that server's own storage, no room on the others…):").size(12.5).color(pal.ink_soft)).wrap());
-                    ui.radio_value(&mut self.stop_stuck, false, "Keep them running: don't update if one can't move");
-                    ui.radio_value(&mut self.stop_stuck, true, "Shut only those down while their server restarts, and start them again after");
+                    ui.radio_value(&mut self.stuck, Stuck::Keep, "Keep them running: don't update if one can't move");
+                    ui.radio_value(&mut self.stuck, Stuck::Carry, "Move them with their disks to another server, and back after (slow: disks copied twice)");
+                    ui.radio_value(&mut self.stuck, Stuck::ShutDown, "Shut only those down while their server restarts, and start them again after");
                     // the ones the pool's data says can't (their disks on their server's own storage):
                     // said only when they stop the update
                     let stuck = v.stuck_now();
-                    if !stuck.is_empty() && !self.stop_stuck {
+                    if !stuck.is_empty() && self.stuck == Stuck::Keep {
                         let one = stuck.len() == 1;
                         ui.add_space(4.0);
                         let title = format!("{} can't move: {} on {} server's own storage.", if one { "A VM" } else { "Some VMs" }, if one { "its disks are" } else { "their disks are" }, if one { "its" } else { "their" });
@@ -754,10 +924,38 @@ mod tests {
     #[test]
     fn said_with_names() {
         let host = |r: &str, name: &str| PlanHost { rref: r.into(), name: name.into(), updates: 1, restart: true, pending_restart: false };
-        let plan = Plan { hash: String::new(), restart: true, stop_stuck: false, hosts: vec![host("OpaqueRef:h1", "tico")], vm_names: vec![("OpaqueRef:v1".into(), "TrueNAS".into())] };
+        let plan = Plan { hash: String::new(), restart: true, stuck: Stuck::Keep, hosts: vec![host("OpaqueRef:h1", "tico")], vm_names: vec![("OpaqueRef:v1".into(), "TrueNAS".into())], vms: vec![], srs: vec![], room: vec![] };
         assert_eq!(plan.named("The server said: HOST_DISABLED (OpaqueRef:h1) for OpaqueRef:v1"), "The server said: HOST_DISABLED (tico) for TrueNAS");
         assert_eq!(plan.stuck_words("tico", &[("OpaqueRef:v1".into(), "VM_REQUIRES_SR OpaqueRef:v1 OpaqueRef:sr".into())]), "TrueNAS on tico (its disks are on this server's own storage)");
         assert_eq!(in_words("HA_IS_ENABLED", &plan.hosts), "High availability is on: turn it off while the pool updates");
         assert_eq!(in_words("HOST_OFFLINE OpaqueRef:h1", &plan.hosts), "tico is off: every server must be on");
+    }
+
+    #[test]
+    fn where_a_carried_vm_goes() {
+        const GB: i64 = 1 << 30;
+        let sr = |r: &str, free: i64, seen: &[&str]| PlanSr { rref: r.into(), free: free * GB, seen_by: seen.iter().map(|s| s.to_string()).collect(), live_out: true, live_in: r != "local-x" };
+        let plan = Plan {
+            hash: String::new(),
+            restart: true,
+            stuck: Stuck::Carry,
+            hosts: vec![],
+            vm_names: vec![],
+            vms: vec![],
+            srs: vec![sr("local-a", 500, &["a"]), sr("local-b", 30, &["b"]), sr("local-c", 300, &["c"]), sr("nfs", 900, &["a", "b", "c"])],
+            room: vec![("a".into(), 8 * GB), ("b".into(), 64 * GB), ("c".into(), 32 * GB)],
+        };
+        let vm = PlanVm { rref: "v".into(), mem: 16 * GB, disks: vec![("0".into(), 100 * GB, "local-a".into()), ("1".into(), 50 * GB, "nfs".into())] };
+        // the roomiest other server (b), its own storage too small for the disk: the shared one;
+        // the disk already on shared storage stays
+        assert_eq!(plan.place("a", &vm, &[]), Some(("b".to_string(), vec![("0".to_string(), "nfs".to_string())])));
+        // b's memory taken already: c, its own storage
+        assert_eq!(plan.place("a", &vm, &[("b".into(), 60 * GB)]), Some(("c".to_string(), vec![("0".to_string(), "local-c".to_string())])));
+        // c's own storage can't take a running VM's disk: the shared one
+        let mut no_mirror = Plan { srs: plan.srs.clone(), room: plan.room.clone(), vms: vec![], hosts: vec![], vm_names: vec![], hash: String::new(), restart: true, stuck: Stuck::Carry };
+        no_mirror.srs.iter_mut().filter(|x| x.rref == "local-c").for_each(|x| x.live_in = false);
+        assert_eq!(no_mirror.place("a", &vm, &[("b".into(), 60 * GB)]), Some(("c".to_string(), vec![("0".to_string(), "nfs".to_string())])));
+        // nowhere with the memory
+        assert_eq!(plan.place("a", &PlanVm { mem: 100 * GB, ..vm }, &[]), None);
     }
 }

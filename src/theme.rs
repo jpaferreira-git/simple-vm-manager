@@ -135,14 +135,14 @@ pub fn visuals(p: &Pal) -> egui::Visuals {
     let mut v = if p.dark { egui::Visuals::dark() } else { egui::Visuals::light() };
     v.panel_fill = p.window;
     v.window_fill = p.surface;
-    v.window_stroke = egui::Stroke::new(1.0, p.border);
+    v.window_stroke = egui::Stroke::new(1.0_f32, p.border);
     v.extreme_bg_color = p.input;
     v.faint_bg_color = p.stripe;
     v.hyperlink_color = p.link;
     v.selection.bg_fill = p.accent;
-    v.selection.stroke = egui::Stroke::new(1.0, p.on_accent);
+    v.selection.stroke = egui::Stroke::new(1.0_f32, p.on_accent);
     v.override_text_color = Some(p.ink);
-    v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, p.border);
+    v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, p.border);
     v.widgets.hovered.weak_bg_fill = p.hover;
     v.widgets.hovered.bg_fill = p.hover;
     v.window_rounding = egui::Rounding::same(8.0);

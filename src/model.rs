@@ -114,6 +114,19 @@ pub struct VmInfo {
     pub ips: Vec<String>,
 }
 
+/// Where a VM moves: the server it runs (or, off, starts) on; the disks that change storage (each
+/// VDI and its new SR); and its DVD drive, emptied first when its disc's library isn't where it
+/// goes.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MoveVm {
+    pub vm: String,
+    pub host: String,
+    pub disks: Vec<(String, String)>,
+    pub eject: Option<String>,
+    /// It runs (moved live), else it's off.
+    pub running: bool,
+}
+
 /// A change to a VM, made on its Overview.
 #[derive(Clone, Debug, PartialEq)]
 pub enum VmChange {
@@ -489,6 +502,10 @@ pub struct HostInfo {
     pub edition: String,
     pub license_name: String,
     pub license_expiry: Option<i64>,
+    /// The storage it saves suspended VMs' memory to, and crash dumps to (as set, even if that
+    /// storage is gone).
+    pub suspend_sr: Option<String>,
+    pub crash_dump_sr: Option<String>,
     /// Whether it has every update its pool last fetched from its update channel: "yes", "no" or
     /// "unknown" (latest_synced_updates_applied); empty on servers without update channels.
     pub updates_applied: String,
@@ -578,11 +595,18 @@ pub struct SrInfo {
     pub location: String,
     /// How it's reached, in words: "Windows share (SMB 3.0)", "NFS (v3)"…
     pub share: String,
+    /// A server's own storage: the disk (or partition) it's on, as its connection names it:
+    /// "/dev/sda3", or "/dev/disk/by-id/ata-…-part3" (several, comma-separated, for one on many).
+    pub device: String,
     /// An ISO library's discs.
     pub files: Vec<IsoFile>,
     /// Its connections to the servers (PBDs): each one's server, and whether the storage is
     /// mounted there now. None at all: the pool has no settings for reaching it (detached).
     pub links: Vec<(String, bool)>,
+    /// Its kind of storage can send a running VM's disk away (VDI_MIRROR), and take one in
+    /// (VDI_MIRROR_IN, or VDI_MIRROR): live storage migration. (Taken as yes when not known.)
+    pub live_out: bool,
+    pub live_in: bool,
 }
 
 /// Storage that should be mounted somewhere it isn't.
@@ -651,6 +675,9 @@ pub struct PoolData {
     pub update_bundle: bool,
     /// When its updates were last fetched from the channel.
     pub last_update_sync: Option<i64>,
+    /// Its storage for suspended VMs and for crash dumps, when set (even if that storage is gone).
+    pub suspend_sr: Option<String>,
+    pub crash_dump_sr: Option<String>,
 }
 
 /// An update a pool's update channel has.
@@ -934,6 +961,27 @@ impl PoolData {
     pub fn net(&self, r: &str) -> Option<&NetInfo> {
         self.networks.iter().find(|n| n.rref == r)
     }
+
+    /// The pool's own VM at `address`, if one is: one that reports that IP address (true), or
+    /// whose name is the address's first part ("truenas.lan" and a VM called "TrueNAS": false,
+    /// only a guess).
+    pub fn vm_at(&self, address: &str) -> Option<(&VmInfo, bool)> {
+        let a = address.trim().trim_start_matches('[').trim_end_matches(']').to_lowercase();
+        if a.is_empty() {
+            return None;
+        }
+        let ips = |v: &VmInfo| std::iter::once(v.ip.clone()).chain(v.ips.iter().cloned()).chain(v.nics.iter().map(|n| n.ip.clone())).filter(|ip| !ip.is_empty()).collect::<Vec<_>>();
+        if let Some(v) = self.vms.iter().find(|v| ips(v).iter().any(|ip| ip.eq_ignore_ascii_case(&a))) {
+            return Some((v, true));
+        }
+        // a name, not an address: its first part against the VMs' names, letters and digits only
+        if a.parse::<std::net::IpAddr>().is_ok() {
+            return None;
+        }
+        let bare = |t: &str| t.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>().to_lowercase();
+        let first = bare(a.split('.').next().unwrap_or(""));
+        (first.len() >= 3).then(|| self.vms.iter().find(|v| bare(&v.name) == first).map(|v| (v, false))).flatten()
+    }
     /// For a VM the pool says is running (or paused) on a server that's off or not answering, that
     /// server: what the VM is really doing can't be known, and nothing can be done to it there.
     pub fn host_down_for(&self, v: &VmInfo) -> Option<&HostInfo> {
@@ -1045,6 +1093,27 @@ impl PoolData {
         for v in hosts.iter().map(|h| h.version_text()).filter(|v| !v.is_empty()) {
             if !out.contains(&v) {
                 out.push(v);
+            }
+        }
+        out
+    }
+
+    /// Settings that point to storage that's gone (deleted, forgotten): what each is, and the
+    /// reference. XenServer uses them when moving a VM's disks (its snapshots, its saved memory).
+    pub fn gone_storage(&self) -> Vec<(String, String)> {
+        let gone = |r: &str| self.sr(r).is_none();
+        let mut out = vec![];
+        for (r, what) in [(&self.default_sr, "The pool's default storage"), (&self.suspend_sr, "The pool's storage for suspended VMs"), (&self.crash_dump_sr, "The pool's storage for crash dumps")] {
+            if let Some(r) = r.as_deref().filter(|r| gone(r)) {
+                out.push((what.to_string(), r.to_string()));
+            }
+        }
+        for h in &self.hosts {
+            if let Some(r) = h.suspend_sr.as_deref().filter(|r| gone(r)) {
+                out.push((format!("{}'s storage for suspended VMs", h.name), r.to_string()));
+            }
+            if let Some(r) = h.crash_dump_sr.as_deref().filter(|r| gone(r)) {
+                out.push((format!("{}'s storage for crash dumps", h.name), r.to_string()));
             }
         }
         out
@@ -1490,14 +1559,14 @@ impl IsoLibrary {
         if self.nfs {
             match self.location.split_once(':') {
                 Some((host, path)) if !host.is_empty() && path.starts_with('/') => None,
-                _ => Some("Type the NFS share as server:/path, for example nas:/mnt/tank/isos."),
+                _ => Some("Type the NFS share as address:/folder, for example 192.168.1.50:/mnt/tank/isos or nas.home.lan:/mnt/tank/isos."),
             }
         } else {
             let parts: Vec<&str> = self.location.trim_start_matches('/').split('/').filter(|p| !p.is_empty()).collect();
             if parts.len() >= 2 {
                 None
             } else {
-                Some("Type the share as \\\\server\\share, for example \\\\nas\\isos.")
+                Some("Type the share as \\\\address\\share, for example \\\\192.168.1.50\\isos or \\\\nas.home.lan\\isos.")
             }
         }
     }
@@ -1541,9 +1610,150 @@ impl IsoLibrary {
     }
 }
 
+/// New storage for VMs' disks: a folder an NFS server shares, which every server of the pool
+/// mounts (so a VM moves between them without its disks being copied).
+#[derive(Clone, Debug, Default)]
+pub struct NfsStorage {
+    pub name: String,
+    pub description: String,
+    /// "server:/path".
+    pub location: String,
+    /// "3", "4" or "4.1".
+    pub nfs_version: String,
+    /// Made the pool's default storage once it's there.
+    pub make_default: bool,
+}
+
+impl NfsStorage {
+    /// The server and the folder in "server:/path" (the folder from the first ":/", so an IPv6
+    /// address works too); the folder empty when there's none yet ("nas" or "nas:").
+    pub fn parts(location: &str) -> (String, String) {
+        let t = location.trim();
+        match t.find(":/") {
+            Some(i) => (t[..i].trim().to_string(), t[i + 1..].trim().to_string()),
+            None => (t.trim_end_matches(':').trim().to_string(), String::new()),
+        }
+    }
+
+    /// Why the location can't be right, if it can't.
+    pub fn location_problem(&self) -> Option<&'static str> {
+        let (server, path) = NfsStorage::parts(&self.location);
+        if server.is_empty() || !path.starts_with('/') {
+            Some("Type the NFS share as address:/folder, for example 192.168.1.50:/mnt/tank/vms or nas.home.lan:/mnt/tank/vms.")
+        } else {
+            None
+        }
+    }
+
+    /// The SR's device configuration, as the server's NFS driver expects it.
+    pub fn device_config(&self) -> Vec<(String, String)> {
+        let (server, path) = NfsStorage::parts(&self.location);
+        vec![("server".into(), server), ("serverpath".into(), path), ("nfsversion".into(), self.nfs_version.clone())]
+    }
+
+    /// The same request as an `xe` command for the server's console.
+    pub fn xe_command(&self) -> String {
+        let quote = |v: &str| if v.is_empty() || v.contains(|c: char| c.is_whitespace() || c == '"') { format!("\"{}\"", v.replace('"', "\\\"")) } else { v.to_string() };
+        let mut parts = vec!["xe sr-create".to_string(), "type=nfs".into(), "content-type=user".into(), "shared=true".into(), format!("name-label={}", quote(&self.name))];
+        for (k, v) in self.device_config() {
+            parts.push(format!("device-config:{}={}", k, quote(&v)));
+        }
+        parts.join(" ")
+    }
+}
+
+/// A storage's disk in a few words: "/dev/sda3" as it is; a "/dev/disk/by-id/" name as the
+/// disk's model and partition ("ata-Samsung_SSD_870_EVO_1TB_S6PTNX0T123456A-part3" → "Samsung SSD
+/// 870 EVO 1TB, part 3"), its bus and serial number left out; several joined with semicolons.
+pub fn device_words(device: &str) -> String {
+    let one = |d: &str| -> String {
+        let d = d.trim();
+        let Some(id) = d.strip_prefix("/dev/disk/by-id/") else { return d.to_string() };
+        let (id, part) = match id.rsplit_once("-part") {
+            Some((rest, n)) if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) => (rest, Some(n)),
+            _ => (id, None),
+        };
+        // the bus it's on, then the model, then (last) the serial number
+        let id = ["ata-", "nvme-", "scsi-SATA_", "scsi-", "usb-", "virtio-"].iter().find_map(|b| id.strip_prefix(b)).unwrap_or(id);
+        let mut words: Vec<&str> = id.split('_').filter(|w| !w.is_empty()).collect();
+        if words.len() > 1 && words.last().map_or(false, |w| w.len() >= 8 && w.chars().any(|c| c.is_ascii_digit())) {
+            words.pop();
+        }
+        let name = words.join(" ");
+        match part {
+            Some(n) => format!("{}, part {}", name, n),
+            None => name,
+        }
+    };
+    device.split(',').filter(|d| !d.trim().is_empty()).map(one).collect::<Vec<_>>().join("; ")
+}
+
+/// The folders in an NFS server's answer to a probe (`<Path>/mnt/tank/vms</Path>`, one per
+/// export), in order, each once.
+pub fn nfs_exports(answer: &str) -> Vec<String> {
+    let mut out: Vec<String> = vec![];
+    let mut rest = answer;
+    while let Some(i) = rest.find("<Path>") {
+        rest = &rest[i + 6..];
+        let Some(j) = rest.find("</Path>") else { break };
+        let path = rest[..j].trim().to_string();
+        if path.starts_with('/') && !out.contains(&path) {
+            out.push(path);
+        }
+        rest = &rest[j..];
+    }
+    out.sort();
+    out
+}
+
 #[cfg(test)]
 mod iso_tests {
     use super::*;
+
+    #[test]
+    fn nfs_storage_locations() {
+        assert_eq!(NfsStorage::parts("nas:/mnt/tank/vms"), ("nas".to_string(), "/mnt/tank/vms".to_string()));
+        assert_eq!(NfsStorage::parts(" 192.168.1.50:/srv/xen "), ("192.168.1.50".to_string(), "/srv/xen".to_string()));
+        assert_eq!(NfsStorage::parts("fd00::5:/srv/xen"), ("fd00::5".to_string(), "/srv/xen".to_string()));
+        assert_eq!(NfsStorage::parts("nas:"), ("nas".to_string(), String::new()));
+        assert_eq!(NfsStorage::parts("nas"), ("nas".to_string(), String::new()));
+        let st = |l: &str| NfsStorage { location: l.into(), ..Default::default() };
+        assert!(st("nas:/mnt/tank/vms").location_problem().is_none());
+        assert!(st("nas").location_problem().is_some());
+        assert!(st(":/mnt").location_problem().is_some());
+        assert!(st("nas:mnt").location_problem().is_some());
+    }
+
+    #[test]
+    fn disks_in_words() {
+        assert_eq!(device_words("/dev/sda3"), "/dev/sda3");
+        assert_eq!(device_words("/dev/disk/by-id/ata-Samsung_SSD_870_EVO_1TB_S6PTNX0T123456A-part3"), "Samsung SSD 870 EVO 1TB, part 3");
+        assert_eq!(device_words("/dev/disk/by-id/nvme-WD_BLACK_SN770_1TB_22123A456789"), "WD BLACK SN770 1TB");
+        assert_eq!(device_words("/dev/sdb,/dev/sdc"), "/dev/sdb; /dev/sdc");
+        assert_eq!(device_words(""), "");
+    }
+
+    #[test]
+    fn nfs_probe_answer_read() {
+        // as XenServer's NFS driver puts it in SR_BACKEND_FAILURE_101's details
+        let answer = "<?xml version=\"1.0\" ?>\n<nfs-exports>\n\t<Export>\n\t\t<Target>192.168.1.50</Target>\n\t\t<Path>/srv/xen</Path>\n\t\t<Accesslist>192.168.1.0/24</Accesslist>\n\t</Export>\n\t<Export>\n\t\t<Target>192.168.1.50</Target>\n\t\t<Path>/mnt/isos</Path>\n\t\t<Accesslist>*</Accesslist>\n\t</Export>\n</nfs-exports>";
+        assert_eq!(nfs_exports(answer), vec!["/mnt/isos".to_string(), "/srv/xen".to_string()]);
+        assert!(nfs_exports("The request is missing the serverpath parameter").is_empty());
+    }
+
+    #[test]
+    fn storage_inside_the_pool() {
+        let mut d = PoolData::default();
+        d.vms.push(VmInfo { rref: "v1".into(), name: "TrueNAS".into(), ip: "192.168.1.40".into(), ..Default::default() });
+        d.vms.push(VmInfo { rref: "v2".into(), name: "Web".into(), nics: vec![VmNic { ip: "192.168.1.41".into(), ..Default::default() }], ..Default::default() });
+        let at = |a: &str| d.vm_at(a).map(|(v, sure)| (v.name.clone(), sure));
+        assert_eq!(at("192.168.1.40"), Some(("TrueNAS".to_string(), true)));
+        assert_eq!(at("192.168.1.41"), Some(("Web".to_string(), true)));
+        assert_eq!(at("truenas.lan"), Some(("TrueNAS".to_string(), false)), "only the name: a guess");
+        assert_eq!(at("192.168.1.50"), None);
+        assert_eq!(at("nas.lan"), None);
+        assert_eq!(at("web"), Some(("Web".to_string(), false)));
+    }
 
     fn templates() -> Vec<TemplateInfo> {
         [

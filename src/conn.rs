@@ -38,23 +38,76 @@ pub const LOST_AFTER: Duration = Duration::from_secs(100);
 pub struct Progress {
     /// Every call the job made and the server's answers, for its details.
     pub trace: Arc<Trace>,
-    /// Per mille; u32::MAX while the server hasn't said.
+    /// The server task's progress, per mille; u64::MAX while the server hasn't said.
     permille: AtomicU64,
     /// Since when the server hasn't answered, while it doesn't.
     silent_since: Mutex<Option<Instant>>,
+    /// What the job copies, when that's known (disks moved or copied).
+    bytes: Mutex<Option<Bytes>>,
+    /// The bytes done as it went (when, how many), the last half minute of it: its speed.
+    done_at: Mutex<std::collections::VecDeque<(Instant, i64)>>,
+}
+
+/// A job that copies `total` bytes, its server task now on `part` of them after `before` (one
+/// task for it all, or one disk after another).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Bytes {
+    total: i64,
+    before: i64,
+    part: i64,
 }
 
 impl Progress {
     pub fn new() -> Arc<Progress> {
-        Arc::new(Progress { trace: Arc::new(Trace::default()), permille: AtomicU64::new(u64::MAX), silent_since: Mutex::new(None) })
+        Arc::new(Progress {
+            trace: Arc::new(Trace::default()),
+            permille: AtomicU64::new(u64::MAX),
+            silent_since: Mutex::new(None),
+            bytes: Mutex::new(None),
+            done_at: Mutex::new(Default::default()),
+        })
     }
-    /// How far it is (0 to 1), once the server says.
+    /// How far it is (0 to 1), once the server says: of all it copies, when that's known.
     pub fn fraction(&self) -> Option<f32> {
         let p = self.permille.load(Ordering::Relaxed);
-        (p != u64::MAX).then(|| p.min(1000) as f32 / 1000.0)
+        match *self.bytes.lock().unwrap() {
+            Some(b) if b.total > 0 => Some((self.done_of(b) as f64 / b.total as f64).clamp(0.0, 1.0) as f32),
+            _ => (p != u64::MAX).then(|| p.min(1000) as f32 / 1000.0),
+        }
     }
     pub fn set_fraction(&self, f: f64) {
         self.permille.store((f.clamp(0.0, 1.0) * 1000.0) as u64, Ordering::Relaxed);
+        if let Some(b) = *self.bytes.lock().unwrap() {
+            let now = Instant::now();
+            let mut at = self.done_at.lock().unwrap();
+            at.push_back((now, self.done_of(b)));
+            while at.front().map_or(false, |(t, _)| now.duration_since(*t) > Duration::from_secs(30)) {
+                at.pop_front();
+            }
+        }
+    }
+    /// From now on the server's task copies `part` bytes, `before` of `total` being done.
+    pub fn copying(&self, before: i64, part: i64, total: i64) {
+        *self.bytes.lock().unwrap() = Some(Bytes { total, before, part });
+        self.permille.store(0, Ordering::Relaxed);
+        self.done_at.lock().unwrap().push_back((Instant::now(), before));
+    }
+    fn done_of(&self, b: Bytes) -> i64 {
+        let p = self.permille.load(Ordering::Relaxed);
+        let f = if p == u64::MAX { 0.0 } else { p.min(1000) as f64 / 1000.0 };
+        (b.before + (b.part as f64 * f) as i64).min(b.total)
+    }
+    /// How much it has copied, and of how much (as the server's progress says, so near enough).
+    pub fn copied(&self) -> Option<(i64, i64)> {
+        self.bytes.lock().unwrap().filter(|b| b.total > 0).map(|b| (self.done_of(b), b.total))
+    }
+    /// How fast it copies, in bytes a second, over the last half minute (once there's enough of
+    /// it to say).
+    pub fn rate(&self) -> Option<f64> {
+        let at = self.done_at.lock().unwrap();
+        let (first, last) = (at.front()?, at.back()?);
+        let secs = last.0.duration_since(first.0).as_secs_f64();
+        (secs >= 4.0 && last.1 >= first.1).then(|| (last.1 - first.1) as f64 / secs)
     }
     /// How long the server hasn't answered, while it doesn't.
     pub fn silent_for(&self) -> Option<Duration> {
@@ -73,6 +126,13 @@ impl Progress {
 thread_local! {
     /// The progress of the job this thread is doing, if it's watched.
     static WATCHED: std::cell::RefCell<Option<Arc<Progress>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The watched job copies `part` bytes now, `before` of `total` done (see `Progress::copying`).
+fn copying(before: i64, part: i64, total: i64) {
+    if let Some(w) = watched() {
+        w.copying(before, part, total);
+    }
 }
 
 /// From now on this thread's long calls report to `p` (call first thing in a job's thread).
@@ -117,8 +177,10 @@ fn answered(r: &Result<Value, ApiError>, took: Duration) {
 fn args_text(args: &[Value]) -> String {
     fn hide(v: &Value) -> Value {
         match v {
-            Value::Object(m) => Value::Object(m.iter().map(|(k, v)| (k.clone(), if k.contains("password") { json!("********") } else { hide(v) })).collect()),
+            Value::Object(m) => Value::Object(m.iter().map(|(k, v)| (k.clone(), if k.contains("password") || k.contains("session") { json!("********") } else { hide(v) })).collect()),
             Value::Array(a) => Value::Array(a.iter().map(hide).collect()),
+            // (a session in a link: migrate_receive's answer)
+            Value::String(t) if t.contains("session_id=") => json!(hide_session(t)),
             other => other.clone(),
         }
     }
@@ -195,6 +257,11 @@ pub trait Connection: Send + Sync {
     /// Creates an ISO library; the server mounts the share right away, so a wrong address or
     /// password fails here, with the mount's own message in the error's details.
     fn create_iso_library(&self, lib: &IsoLibrary) -> Result<(), ApiError>;
+    /// Creates shared storage for VMs' disks from an NFS folder (mounted on every server of the
+    /// pool right away, so a wrong address fails here as for an ISO library); its reference.
+    fn create_nfs_storage(&self, st: &NfsStorage) -> Result<String, ApiError>;
+    /// The folders an NFS server shares, as the pool's coordinator sees them (SR.probe).
+    fn nfs_exports(&self, server: &str) -> Result<Vec<String>, ApiError>;
     /// Looks at the storage again for files added or removed (SR.scan).
     fn scan_sr(&self, sr_ref: &str) -> Result<(), ApiError>;
     /// Unplugs the storage from every server and forgets it; nothing on it is deleted.
@@ -294,6 +361,16 @@ pub trait Connection: Send + Sync {
     fn enable_host(&self, host_ref: &str) -> Result<(), ApiError>;
     /// Starts a VM on a server.
     fn start_vm_on(&self, vm_ref: &str, host_ref: &str) -> Result<(), ApiError>;
+    /// Moves a VM (see `MoveVm`). Running, it goes live: to the server (VM.pool_migrate), with its
+    /// disks when they change storage (VM.migrate_send), or only its disks (VDI.pool_migrate). Off,
+    /// its disks are copied to their new storage and swapped in, and its home set to the server.
+    fn move_vm(&self, m: &MoveVm) -> Result<(), ApiError>;
+    /// Makes a storage the pool's default: for new VMs' disks, suspended VMs' memory and crash
+    /// dumps (pool.set_default_SR, set_suspend_image_SR, set_crash_dump_SR, as XenCenter's Set as
+    /// Default).
+    fn make_default_sr(&self, sr_ref: &str) -> Result<(), ApiError>;
+    /// Whether a VM runs, and its disks: each one's position, VDI and storage.
+    fn vm_disks(&self, vm_ref: &str) -> Result<(bool, Vec<(String, String, String)>), ApiError>;
     /// Deletes a snapshot and its own copies of the disks (and its saved memory). The ones that
     /// couldn't be deleted (the snapshot is gone by then): each one's name and why.
     fn delete_snapshot(&self, snapshot_ref: &str) -> Result<Vec<String>, ApiError>;
@@ -995,6 +1072,57 @@ impl RealConnection {
         done
     }
 
+    /// What points to storage `sr` (gone): the VM's (or a snapshot's) storage for saved memory
+    /// (which, so it can be cleared), the pool's default storage, its or a server's storage for
+    /// suspended VMs or crash dumps. In words.
+    fn whose_storage(&self, vm: &str, sr: &str) -> Option<(String, Option<String>)> {
+        let t = 30_000;
+        let suspend_of = |v: &str| self.call_raw("VM.get_suspend_SR", vec![json!(v)], t).ok().map(|x| val_str(&x));
+        if suspend_of(vm).as_deref() == Some(sr) {
+            return Some(("Its storage for saved memory".into(), Some(vm.to_string())));
+        }
+        for snap in self.call_raw("VM.get_snapshots", vec![json!(vm)], t).ok().and_then(|x| x.as_array().cloned()).unwrap_or_default() {
+            let snap = val_str(&snap);
+            if suspend_of(&snap).as_deref() == Some(sr) {
+                return Some(("A snapshot's storage for saved memory".into(), Some(snap)));
+            }
+        }
+        for (_, p) in self.all("pool", t).unwrap_or_default() {
+            for (field, what) in [("default_SR", "The pool's default storage"), ("suspend_image_SR", "The pool's storage for suspended VMs"), ("crash_dump_SR", "The pool's storage for crash dumps")] {
+                if s(&p, field) == sr {
+                    return Some((what.into(), None));
+                }
+            }
+        }
+        for (_, h) in self.all("host", t).unwrap_or_default() {
+            for (field, what) in [("suspend_image_sr", "storage for suspended VMs"), ("crash_dump_sr", "storage for crash dumps")] {
+                if s(&h, field) == sr {
+                    return Some((format!("{}'s {}", s(&h, "name_label"), what), None));
+                }
+            }
+        }
+        None
+    }
+
+    /// What each disk takes on its storage (what a copy of it carries), else its size; 0 when
+    /// the server doesn't say. Not noted in the job's details.
+    fn disks_bytes<'a>(&self, vdis: impl Iterator<Item = &'a str>) -> Vec<i64> {
+        let number = |v: Value| match v {
+            Value::Number(x) => x.as_i64().unwrap_or(0),
+            Value::String(t) => t.trim().parse().unwrap_or(0),
+            _ => 0,
+        };
+        vdis.map(|vdi| {
+            let used = self.call_raw("VDI.get_physical_utilisation", vec![json!(vdi)], 30_000).map(number).unwrap_or(0);
+            if used > 0 {
+                used
+            } else {
+                self.call_raw("VDI.get_virtual_size", vec![json!(vdi)], 30_000).map(number).unwrap_or(0)
+            }
+        })
+        .collect()
+    }
+
     /// The pool's reference.
     fn pool_ref(&self) -> Result<Value, ApiError> {
         self.call("pool.get_all", vec![], 30_000)?.as_array().and_then(|a| a.first().cloned()).ok_or_else(|| ApiError::other("the server named no pool"))
@@ -1138,11 +1266,12 @@ impl RealConnection {
 /// The calls that can take long and that the server can run as a task (an Async form): only
 /// these go as tasks. A field's setter (set_*, add_to_*, remove_from_*) has no Async form: the
 /// server answers "No async mode for this operation".
-const TASKS: [&str; 34] = [
+const TASKS: [&str; 38] = [
     "VM.clone", "VM.copy", "VM.provision", "VM.snapshot", "VM.checkpoint", "VM.revert", "VM.start", "VM.start_on", "VM.resume", "VM.resume_on",
     "VM.suspend", "VM.clean_shutdown", "VM.hard_shutdown", "VM.clean_reboot", "VM.hard_reboot", "VM.destroy", "VDI.create", "VDI.destroy",
     "VDI.resize", "VBD.eject", "VBD.insert", "VBD.plug", "VIF.plug", "VIF.unplug", "VIF.move", "PBD.plug", "PBD.unplug", "SR.create", "SR.scan",
-    "SR.forget", "host.evacuate", "host.shutdown", "pool.sync_updates", "host.apply_updates",
+    "SR.forget", "host.evacuate", "host.shutdown", "pool.sync_updates", "host.apply_updates", "VM.pool_migrate", "VM.migrate_send",
+    "VDI.pool_migrate", "VDI.copy",
 ];
 
 /// Whether a call runs as a task on the server (see `call`): one allowed over a minute that can.
@@ -1340,6 +1469,8 @@ impl Connection for RealConnection {
             master = s(&r, "master");
             pd.default_sr = Some(s(&r, "default_SR")).filter(|x| !x.is_empty() && x != "OpaqueRef:NULL");
             repos = list(&r, "repositories");
+            pd.suspend_sr = Some(s(&r, "suspend_image_SR")).filter(|x| !x.is_empty() && x != "OpaqueRef:NULL");
+            pd.crash_dump_sr = Some(s(&r, "crash_dump_SR")).filter(|x| !x.is_empty() && x != "OpaqueRef:NULL");
             pd.last_update_sync = parse_xen_time(&s(&r, "last_update_sync"));
         }
         // its update channel: the enabled repository that has updates (not the base one)
@@ -1383,6 +1514,8 @@ impl Connection for RealConnection {
                 edition: s(&r, "edition"),
                 license_name: r.get("license_params").map(|l| s(l, "sku_marketing_name")).unwrap_or_default(),
                 license_expiry: r.get("license_params").and_then(|l| parse_xen_time(&s(l, "expiry"))),
+                suspend_sr: Some(s(&r, "suspend_image_sr")).filter(|x| !x.is_empty() && x != "OpaqueRef:NULL"),
+                crash_dump_sr: Some(s(&r, "crash_dump_sr")).filter(|x| !x.is_empty() && x != "OpaqueRef:NULL"),
                 updates_applied: s(&r, "latest_synced_updates_applied"),
                 pending_guidance: list(&r, "pending_guidances").into_iter().chain(list(&r, "pending_guidances_recommended")).collect(),
                 last_update: parse_xen_time(&s(&r, "last_software_update")),
@@ -1398,18 +1531,35 @@ impl Connection for RealConnection {
             plugged.entry(s(&r, "SR")).or_default().push((s(&r, "host"), b(&r, "currently_attached")));
             configs.entry(s(&r, "SR")).or_insert_with(|| r.get("device_config").cloned().unwrap_or(Value::Null));
         }
+        // what each kind of storage can do (its SM's features): moving a running VM's disks
+        let mut features: HashMap<String, Vec<String>> = HashMap::new();
+        for (_, r) in self.all("SM", t).unwrap_or_default() {
+            let mut f: Vec<String> = r.get("features").and_then(|v| v.as_object()).map(|o| o.keys().cloned().collect()).unwrap_or_default();
+            f.extend(list(&r, "capabilities"));
+            features.insert(s(&r, "type"), f);
+        }
         for (k, r) in self.all("SR", t)? {
             let shared = b(&r, "shared");
+            let can = |what: &[&str]| features.get(&s(&r, "type")).map_or(true, |f| f.iter().any(|x| what.contains(&x.as_str())));
             let links = plugged.get(&k).cloned().unwrap_or_default();
             let host = if !shared && links.len() == 1 { Some(links[0].0.clone()) } else { None };
             let config = configs.get(&k).cloned().unwrap_or(Value::Null);
             let share = match s(&config, "type").as_str() {
                 "cifs" => format!("Windows share (SMB {})", or_default(&s(&config, "vers"), "3.0")),
                 "nfs_iso" => format!("NFS (v{})", or_default(&s(&config, "nfsversion"), "3")),
+                _ if s(&r, "type") == "nfs" => format!("NFS (v{})", or_default(&s(&config, "nfsversion"), "3")),
                 _ => String::new(),
             };
+            // NFS storage for disks names its server and folder apart, iSCSI its target and IQN
+            let location = match (s(&r, "type").as_str(), s(&config, "server")) {
+                ("nfs", server) if !server.is_empty() => format!("{}:{}", server, s(&config, "serverpath")),
+                ("lvmoiscsi", _) => [s(&config, "target"), s(&config, "targetIQN")].into_iter().filter(|t| !t.is_empty()).collect::<Vec<_>>().join("  ·  "),
+                _ => s(&config, "location"),
+            };
             pd.srs.push(SrInfo {
-                location: s(&config, "location"),
+                location,
+                // a server's own disk (a DVD drive's "location" is its device, not this)
+                device: if s(&r, "type") == "udev" { String::new() } else { s(&config, "device") },
                 share,
                 rref: k,
                 uuid: s(&r, "uuid"),
@@ -1422,6 +1572,8 @@ impl Connection for RealConnection {
                 host,
                 files: vec![], // filled in from the VDIs below
                 links,
+                live_out: can(&["VDI_MIRROR"]),
+                live_in: can(&["VDI_MIRROR", "VDI_MIRROR_IN"]),
             });
         }
         // every network's name (a VM's card may be on one that isn't shown)
@@ -1649,6 +1801,36 @@ impl Connection for RealConnection {
         self.call("SR.create", args, 180_000).map(|_| ())
     }
 
+    /// SR.create on the pool coordinator, shared: the pool gives every server a connection to it
+    /// and plugs them all in.
+    fn create_nfs_storage(&self, st: &NfsStorage) -> Result<String, ApiError> {
+        let t = 30_000;
+        let coordinator = self.all("pool", t)?.values().map(|p| s(p, "master")).next().unwrap_or_default();
+        let config: Map<String, Value> = st.device_config().into_iter().map(|(k, v)| (k, json!(v))).collect();
+        let args = vec![json!(coordinator), Value::Object(config), json!(0), json!(st.name), json!(st.description), json!("nfs"), json!("user"), json!(true), json!({})];
+        let sr = self.call("SR.create", args, 300_000)?;
+        Ok(sr.as_str().unwrap_or_default().to_string())
+    }
+
+    /// SR.probe with only the server: the NFS driver answers with the list of its exports (as an
+    /// error, "the folder is missing", that carries the list), or with it as the result.
+    fn nfs_exports(&self, server: &str) -> Result<Vec<String>, ApiError> {
+        let t = 30_000;
+        let coordinator = self.all("pool", t)?.values().map(|p| s(p, "master")).next().unwrap_or_default();
+        let args = vec![json!(coordinator), json!({ "server": server }), json!("nfs"), json!({})];
+        match self.call_raw("SR.probe", args, 90_000) {
+            Ok(v) => Ok(nfs_exports(v.as_str().unwrap_or_default())),
+            Err(e) => {
+                let found = nfs_exports(&e.details.join("\n"));
+                if found.is_empty() {
+                    Err(e)
+                } else {
+                    Ok(found)
+                }
+            }
+        }
+    }
+
     fn scan_sr(&self, sr_ref: &str) -> Result<(), ApiError> {
         self.call("SR.scan", vec![json!(sr_ref)], 120_000).map(|_| ())
     }
@@ -1834,7 +2016,13 @@ impl Connection for RealConnection {
         let made = match sr {
             None => self.call("VM.clone", vec![json!(vm), json!(name)], 1_800_000)?,
             // a full copy takes as long as writing its disks out again
-            Some(sr) => self.call("VM.copy", vec![json!(vm), json!(name), json!(sr)], 6 * 3_600_000)?,
+            Some(sr) => {
+                // its disks' bytes go to the other storage
+                let (_, disks) = self.vm_disks(vm)?;
+                let total = self.disks_bytes(disks.iter().map(|d| d.1.as_str())).iter().sum();
+                copying(0, total, total);
+                self.call("VM.copy", vec![json!(vm), json!(name), json!(sr)], 6 * 3_600_000)?
+            }
         };
         Ok(made.as_str().unwrap_or_default().to_string())
     }
@@ -2124,6 +2312,140 @@ impl Connection for RealConnection {
 
     fn start_vm_on(&self, vm: &str, host: &str) -> Result<(), ApiError> {
         self.call("VM.start_on", vec![json!(vm), json!(host), json!(false), json!(false)], ACTION_TIMEOUT_MS).map(|_| ())
+    }
+
+    fn make_default_sr(&self, sr: &str) -> Result<(), ApiError> {
+        let pool = self.pool_ref()?;
+        for m in ["pool.set_default_SR", "pool.set_suspend_image_SR", "pool.set_crash_dump_SR"] {
+            self.call(m, vec![pool.clone(), json!(sr)], 60_000)?;
+        }
+        Ok(())
+    }
+
+    fn vm_disks(&self, vm: &str) -> Result<(bool, Vec<(String, String, String)>), ApiError> {
+        let t = 60_000;
+        let running = self.call("VM.get_power_state", vec![json!(vm)], t)?.as_str() == Some("Running");
+        let mut out = vec![];
+        for vbd in self.call("VM.get_VBDs", vec![json!(vm)], t)?.as_array().cloned().unwrap_or_default() {
+            let r = self.call("VBD.get_record", vec![vbd], t)?;
+            if s(&r, "type") == "Disk" && !b(&r, "empty") {
+                let vdi = s(&r, "VDI");
+                let sr = val_str(&self.call("VDI.get_SR", vec![json!(vdi)], t)?);
+                out.push((s(&r, "userdevice"), vdi, sr));
+            }
+        }
+        Ok((running, out))
+    }
+
+    fn move_vm(&self, m: &MoveVm) -> Result<(), ApiError> {
+        let (t, long) = (60_000, ACTION_TIMEOUT_MS);
+        let vm = json!(m.vm);
+        if let Some(vbd) = &m.eject {
+            note("its DVD drive emptied first: its disc's library isn't where it goes");
+            self.call("VBD.eject", vec![json!(vbd)], 120_000)?;
+        }
+        if m.running {
+            let now = val_str(&self.call("VM.get_resident_on", vec![vm.clone()], t)?);
+            if m.disks.is_empty() {
+                if now != m.host {
+                    self.call("VM.pool_migrate", vec![vm, json!(m.host), json!({ "live": "true" })], long)?;
+                }
+            } else if now == m.host {
+                // only its disks, as it runs, one after another
+                let sizes = self.disks_bytes(m.disks.iter().map(|d| d.0.as_str()));
+                let total = sizes.iter().sum();
+                let mut before = 0;
+                for ((vdi, sr), size) in m.disks.iter().zip(&sizes) {
+                    copying(before, *size, total);
+                    self.call("VDI.pool_migrate", vec![json!(vdi), json!(sr), json!({})], long)?;
+                    before += size;
+                }
+            } else {
+                // to the server with its disks: the server's management network carries them
+                let net = self
+                    .all("PIF", t)?
+                    .values()
+                    .find(|p| s(p, "host") == m.host && b(p, "management"))
+                    .map(|p| s(p, "network"))
+                    .ok_or_else(|| ApiError::other("the server has no management network to receive it on"))?;
+                let dest = self.call("host.migrate_receive", vec![json!(m.host), json!(net), json!({})], t)?;
+                // every disk in the map (xapi wants them all): those staying, to where they are
+                let (_, now) = self.vm_disks(&m.vm)?;
+                let vdi_map: Map<String, Value> = now.iter().map(|(_, vdi, sr)| (vdi.clone(), json!(m.disks.iter().find(|d| d.0 == *vdi).map_or(sr.as_str(), |d| d.1.as_str())))).collect();
+                let total: i64 = self.disks_bytes(m.disks.iter().map(|d| d.0.as_str())).iter().sum();
+                let send = || -> Result<(), ApiError> {
+                    copying(0, total, total);
+                    let args = vec![vm.clone(), dest.clone(), json!(true), Value::Object(vdi_map.clone()), json!({}), json!({ "force": "false" }), json!({})];
+                    match self.call("VM.migrate_send", args, long) {
+                        // (servers older than vGPUs: without its map)
+                        Err(e) if e.code == "MESSAGE_PARAMETER_COUNT_MISMATCH" => {
+                            self.call("VM.migrate_send", vec![vm.clone(), dest.clone(), json!(true), Value::Object(vdi_map.clone()), json!({}), json!({ "force": "false" })], long).map(|_| ())
+                        }
+                        r => r.map(|_| ()),
+                    }
+                };
+                match send() {
+                    // a setting pointing to storage that's gone: the VM's own (or a snapshot's)
+                    // storage for saved memory is cleared, as XenServer itself does after a move,
+                    // and it's tried again; another (the pool's, a server's) is said
+                    Err(e) if e.code == "HANDLE_INVALID" && e.details.first().map(String::as_str) == Some("SR") => {
+                        let gone = e.details.get(1).cloned().unwrap_or_default();
+                        match self.whose_storage(&m.vm, &gone) {
+                            Some((what, Some(holder))) => {
+                                note(format!("{} pointed to storage that no longer exists: cleared (as XenServer does after a move); trying again", what));
+                                self.call("VM.set_suspend_SR", vec![json!(holder), json!("OpaqueRef:NULL")], t)?;
+                                send()?;
+                            }
+                            Some((what, None)) => return Err(ApiError { code: "STORAGE_GONE".into(), details: vec![what, gone] }),
+                            None => return Err(e),
+                        }
+                    }
+                    r => r?,
+                }
+            }
+            return Ok(());
+        }
+        // off: each disk copied to its new storage and swapped in for the old one
+        let vbds = self.call("VM.get_VBDs", vec![vm.clone()], t)?.as_array().cloned().unwrap_or_default();
+        let sizes = self.disks_bytes(m.disks.iter().map(|d| d.0.as_str()));
+        let total = sizes.iter().sum();
+        let mut before = 0;
+        for ((vdi, sr), size) in m.disks.iter().zip(&sizes) {
+            copying(before, *size, total);
+            before += size;
+            let mut found = None;
+            for vbd in &vbds {
+                let r = self.call("VBD.get_record", vec![vbd.clone()], t)?;
+                if s(&r, "VDI") == *vdi {
+                    found = Some((vbd.clone(), r));
+                    break;
+                }
+            }
+            let (vbd, r) = found.ok_or_else(|| ApiError::other("one of its disks isn't attached to it any more"))?;
+            let copy = val_str(&self.call("VDI.copy", vec![json!(vdi), json!(sr)], long)?);
+            let drive = json!({
+                "VM": m.vm, "VDI": copy, "userdevice": s(&r, "userdevice"), "bootable": b(&r, "bootable"), "mode": s(&r, "mode"),
+                "type": s(&r, "type"), "unpluggable": b(&r, "unpluggable"), "empty": false, "other_config": r.get("other_config").cloned().unwrap_or(json!({})),
+                "qos_algorithm_type": s(&r, "qos_algorithm_type"), "qos_algorithm_params": r.get("qos_algorithm_params").cloned().unwrap_or(json!({})),
+                "device": "", "currently_attached": false,
+            });
+            // the old drive goes first (its position is the new one's); put back if the new fails
+            self.call("VBD.destroy", vec![vbd], t)?;
+            if let Err(e) = self.call("VBD.create", vec![drive], t) {
+                let _ = self.call("VDI.destroy", vec![json!(copy)], long);
+                let back = json!({
+                    "VM": m.vm, "VDI": vdi, "userdevice": s(&r, "userdevice"), "bootable": b(&r, "bootable"), "mode": s(&r, "mode"),
+                    "type": s(&r, "type"), "unpluggable": b(&r, "unpluggable"), "empty": false, "other_config": r.get("other_config").cloned().unwrap_or(json!({})),
+                    "qos_algorithm_type": "", "qos_algorithm_params": {}, "device": "", "currently_attached": false,
+                });
+                let _ = self.call("VBD.create", vec![back], t);
+                return Err(e);
+            }
+            if let Err(e) = self.call("VDI.destroy", vec![json!(vdi)], long) {
+                note(format!("the old copy of a disk couldn't be deleted ({}): delete it from its storage", e.message()));
+            }
+        }
+        self.call("VM.set_affinity", vec![vm, json!(m.host)], t).map(|_| ())
     }
 
     fn revert_vm(&self, snap: &str) -> Result<(), ApiError> {
@@ -2620,6 +2942,8 @@ impl DemoConnection {
             brand: "XenServer".into(),
             edition: "xenserver-premium".into(),
             license_name: String::new(),
+            suspend_sr: None,
+            crash_dump_sr: None,
             updates_applied: String::new(),
             pending_guidance: vec![],
             last_update: None,
@@ -2643,15 +2967,23 @@ impl DemoConnection {
             used,
             shared: host.is_none(),
             host: host.map(String::from),
+            live_out: true,
+            live_in: !std::env::var("SVM_DEMO_NO_MIRROR").map_or(false, |v| v.split(',').any(|x| x.trim() == r)),
             ..Default::default()
         };
-        d.srs.push(sr("sr-local1", "Local storage", "lvm", 900 * GB, 0, Some("host-a")));
+        d.srs.push(SrInfo { device: "/dev/disk/by-id/ata-Samsung_SSD_870_EVO_1TB_S6PTNX0T123456A-part3".into(), ..sr("sr-local1", "Local storage", "lvm", 900 * GB, 0, Some("host-a")) });
         d.srs.push(sr("sr-dvd1", "DVD drives", "udev", 4_700_000_000, 4_700_000_000, Some("host-a"))); // a disc in it
-        d.srs.push(sr("sr-local2", "Local storage", "lvm", 900 * GB, 0, Some("host-b")));
+        d.srs.push(SrInfo { device: "/dev/sda3".into(), ..sr("sr-local2", "Local storage", "lvm", 900 * GB, 0, Some("host-b")) });
         d.srs.push(sr("sr-dvd2", "DVD drives", "udev", 0, 0, Some("host-b"))); // empty: not listed
         d.srs.push(sr("sr-usb2", "Removable storage", "udev", 0, 0, Some("host-b"))); // empty: not listed
-        d.srs.push(sr("sr-nfs", "Shared NFS storage", "nfs", 4096 * GB, 0, None));
+        d.srs.push(SrInfo { location: "nas:/mnt/tank/vms".into(), share: "NFS (v3)".into(), ..sr("sr-nfs", "Shared NFS storage", "nfs", 4096 * GB, 0, None) });
         d.srs.push(SrInfo { location: "//nas/isos".into(), share: "Windows share (SMB 3.0)".into(), files: demo_isos("sr-iso"), ..sr("sr-iso", "ISO library", "iso", 250 * GB, 87 * GB, None) });
+        // the shared storage is the pool's default (where new disks, suspended VMs' memory and
+        // crash dumps go); SVM_DEMO_GONE_DEFAULT: it (and the rest) is storage that's gone
+        (d.default_sr, d.suspend_sr, d.crash_dump_sr) = (Some("sr-nfs".into()), Some("sr-nfs".into()), Some("sr-nfs".into()));
+        if std::env::var("SVM_DEMO_GONE_DEFAULT").is_ok() {
+            (d.default_sr, d.suspend_sr, d.crash_dump_sr) = (Some("sr-deleted".into()), Some("sr-deleted".into()), Some("sr-deleted".into()));
+        }
         // SVM_DEMO_LICENSE: the pool's license runs out soon, has run out, or is a trial
         if let Ok(how) = std::env::var("SVM_DEMO_LICENSE") {
             let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
@@ -2904,7 +3236,10 @@ fn demo_perf(v: &VmInfo) -> Perf {
     p
 }
 
+/// `ms` of work, its progress said every tenth of a second (five times as long with
+/// SVM_DEMO_SLOW, for a check's screenshot of it under way).
 fn demo_work(ms: u64) {
+    let ms = if std::env::var("SVM_DEMO_SLOW").is_ok() { ms * 5 } else { ms };
     let watch = watched();
     let steps = (ms / 100).max(1);
     for i in 1..=steps {
@@ -3156,6 +3491,55 @@ impl Connection for DemoConnection {
         Ok(())
     }
     /// Pretends to mount the share: see `demo_mount`.
+    /// Mounts it in about two seconds; an address with "unreachable" in it doesn't answer, and a
+    /// folder with "denied" in it doesn't let the servers in.
+    fn create_nfs_storage(&self, st: &NfsStorage) -> Result<String, ApiError> {
+        said("SR.create", &[json!("host-a"), json!(st.device_config().into_iter().collect::<HashMap<_, _>>()), json!(0), json!(st.name), json!(st.description), json!("nfs"), json!("user"), json!(true), json!({})]);
+        std::thread::sleep(Duration::from_millis(2000));
+        let (server, path) = NfsStorage::parts(&st.location);
+        let fail = |code: &str, text: String| {
+            let e = ApiError { code: code.into(), details: vec![String::new(), text, String::new()] };
+            answered(&Err(e.clone()), Duration::from_millis(2000));
+            Err(e)
+        };
+        if server.contains("unreachable") {
+            return fail("SR_BACKEND_FAILURE_108", "Unable to detect an NFS service on this target.".into());
+        }
+        if path.contains("denied") {
+            return fail("SR_BACKEND_FAILURE_73", format!("NFS mount error [opterr=mount failed with return code 32] mount.nfs: access denied by server while mounting {}:{}", server, path));
+        }
+        let mut d = self.data.lock().unwrap();
+        let rref = format!("sr-nfs-{}", d.srs.len());
+        let links = d.hosts.iter().map(|h| (h.rref.clone(), true)).collect();
+        d.srs.push(SrInfo {
+            rref: rref.clone(),
+            uuid: demo_uuid(),
+            name: st.name.clone(),
+            description: st.description.clone(),
+            kind: "nfs".into(),
+            size: 8192 * GB,
+            used: 0,
+            shared: true,
+            host: None,
+            location: format!("{}:{}", server, path),
+            device: String::new(),
+            share: format!("NFS (v{})", st.nfs_version),
+            files: vec![],
+            links,
+            live_out: true,
+            live_in: true,
+        });
+        answered(&Ok(json!(rref)), Duration::from_millis(2000));
+        Ok(rref)
+    }
+    fn nfs_exports(&self, server: &str) -> Result<Vec<String>, ApiError> {
+        std::thread::sleep(Duration::from_millis(1200));
+        if server.contains("unreachable") {
+            return Err(ApiError { code: "SR_BACKEND_FAILURE_108".into(), details: vec![String::new(), "Unable to detect an NFS service on this target.".into(), String::new()] });
+        }
+        let xml = "<?xml version=\"1.0\" ?>\n<nfs-exports>\n\t<Export>\n\t\t<Target>10.20.0.5</Target>\n\t\t<Path>/mnt/tank/vms</Path>\n\t\t<Accesslist>10.20.0.0/24</Accesslist>\n\t</Export>\n\t<Export>\n\t\t<Target>10.20.0.5</Target>\n\t\t<Path>/mnt/tank/isos</Path>\n\t\t<Accesslist>*</Accesslist>\n\t</Export>\n\t<Export>\n\t\t<Target>10.20.0.5</Target>\n\t\t<Path>/mnt/tank/backups</Path>\n\t\t<Accesslist>10.20.0.0/24</Accesslist>\n\t</Export>\n</nfs-exports>";
+        Ok(nfs_exports(xml))
+    }
     fn create_iso_library(&self, lib: &IsoLibrary) -> Result<(), ApiError> {
         std::thread::sleep(Duration::from_millis(900));
         demo_mount(lib)?;
@@ -3174,9 +3558,12 @@ impl Connection for DemoConnection {
             shared: lib.shared,
             host: None,
             location: lib.location.clone(),
+            device: String::new(),
             share: if lib.nfs { format!("NFS (v{})", lib.nfs_version) } else { format!("Windows share (SMB {})", lib.smb_version) },
             files,
             links,
+            live_out: false,
+            live_in: false,
         });
         Ok(())
     }
@@ -3681,6 +4068,51 @@ impl Connection for DemoConnection {
         }
         Ok(())
     }
+    fn make_default_sr(&self, sr: &str) -> Result<(), ApiError> {
+        said("pool.set_default_SR", &[json!("OpaqueRef:demo-pool"), json!(sr)]);
+        std::thread::sleep(Duration::from_millis(400));
+        let mut d = self.data.lock().unwrap();
+        (d.default_sr, d.suspend_sr, d.crash_dump_sr) = (Some(sr.into()), Some(sr.into()), Some(sr.into()));
+        Ok(())
+    }
+    fn vm_disks(&self, vm: &str) -> Result<(bool, Vec<(String, String, String)>), ApiError> {
+        let d = self.data.lock().unwrap();
+        let v = d.vm(vm).ok_or_else(|| ApiError { code: "HANDLE_INVALID".into(), details: vec!["VM".into(), vm.into()] })?;
+        Ok((v.power == PowerState::Running, v.disks.iter().filter(|k| k.kind == "Disk").map(|k| (k.device.clone(), k.vdi.clone(), k.sr.clone())).collect()))
+    }
+    /// A couple of seconds, more for disks; then it's there.
+    fn move_vm(&self, m: &MoveVm) -> Result<(), ApiError> {
+        said(if m.running { if m.disks.is_empty() { "VM.pool_migrate" } else { "VM.migrate_send" } } else { "VDI.copy" }, &[json!(m.vm), json!(m.host)]);
+        // the disks that go elsewhere, all at once
+        let total = self.data.lock().unwrap().vm(&m.vm).map_or(0, |v| v.disks.iter().filter(|k| m.disks.iter().any(|d| d.0 == k.vdi)).map(|k| k.size).sum());
+        if total > 0 {
+            copying(0, total, total);
+        }
+        demo_work(1500 + 1500 * m.disks.len() as u64);
+        let mut d = self.data.lock().unwrap();
+        let srs: Vec<(String, String, Option<String>)> = d.srs.iter().map(|x| (x.rref.clone(), x.name.clone(), x.host.clone())).collect();
+        let v = d.vms.iter_mut().find(|v| v.rref == m.vm).ok_or_else(|| ApiError { code: "HANDLE_INVALID".into(), details: vec!["VM".into(), m.vm.clone()] })?;
+        for k in v.disks.iter_mut() {
+            if let Some((_, sr)) = m.disks.iter().find(|(vdi, _)| *vdi == k.vdi) {
+                if let Some((r, name, _)) = srs.iter().find(|x| x.0 == *sr) {
+                    (k.sr, k.sr_name) = (r.clone(), name.clone());
+                }
+            }
+        }
+        if m.eject.is_some() {
+            if let Some(k) = v.disks.iter_mut().find(|k| k.kind == "DVD drive") {
+                (k.vdi, k.sr, k.sr_name, k.name) = (String::new(), String::new(), String::new(), "(empty)".into());
+            }
+        }
+        v.storage_host = v.disks.iter().filter(|k| k.kind == "Disk").find_map(|k| srs.iter().find(|x| x.0 == k.sr).and_then(|x| x.2.clone()));
+        if m.running {
+            v.host = Some(m.host.clone());
+        } else {
+            v.affinity = Some(m.host.clone());
+        }
+        recompute(&mut d);
+        Ok(())
+    }
     fn start_vm_on(&self, vm: &str, host: &str) -> Result<(), ApiError> {
         said("VM.start_on", &[json!(vm), json!(host)]);
         std::thread::sleep(Duration::from_millis(800));
@@ -3709,6 +4141,11 @@ impl Connection for DemoConnection {
     /// About a second on the same storage, four onto other storage; a VM has to be off.
     fn copy_vm(&self, vm: &str, name: &str, sr: Option<&str>) -> Result<String, ApiError> {
         match sr { Some(sr) => said("VM.copy", &[json!(vm), json!(name), json!(sr)]), None => said("VM.clone", &[json!(vm), json!(name)]) }
+        if sr.is_some() {
+            // its disks go to the other storage
+            let total = self.data.lock().unwrap().vm(vm).map_or(0, |v| v.disks.iter().filter(|k| k.kind == "Disk").map(|k| k.size).sum());
+            copying(0, total, total);
+        }
         demo_work(if sr.is_some() { 4000 } else { 1000 });
         let mut d = self.data.lock().unwrap();
         let from = match d.vm(vm) {
@@ -3769,6 +4206,38 @@ impl Connection for DemoConnection {
 mod tests {
 
     #[test]
+    fn demo_makes_nfs_storage() {
+        let c = DemoConnection::new();
+        assert_eq!(c.nfs_exports("nas").unwrap(), vec!["/mnt/tank/backups".to_string(), "/mnt/tank/isos".into(), "/mnt/tank/vms".into()]);
+        assert!(c.nfs_exports("unreachable").is_err());
+        let st = NfsStorage { name: "VMs".into(), location: "nas:/mnt/tank/vms".into(), nfs_version: "4.1".into(), ..Default::default() };
+        let sr = c.create_nfs_storage(&st).unwrap();
+        let d = c.data.lock().unwrap();
+        let x = d.sr(&sr).unwrap();
+        assert!(x.shared && x.links.len() == d.hosts.len() && x.links.iter().all(|l| l.1), "mounted on every server");
+        assert_eq!((x.kind.as_str(), x.location.as_str(), x.share.as_str()), ("nfs", "nas:/mnt/tank/vms", "NFS (v4.1)"));
+        drop(d);
+        let e = c.create_nfs_storage(&NfsStorage { location: "nas:/mnt/denied".into(), ..st }).unwrap_err();
+        assert_eq!(crate::isolib::mount_trouble(&e), Some(crate::isolib::MountTrouble::Refused));
+    }
+
+    #[test]
+    fn demo_moves_vms() {
+        let c = DemoConnection::new();
+        let get = |c: &DemoConnection, r: &str| c.data.lock().unwrap().vm(r).cloned().unwrap();
+        // running, live to the other server, its disk going along
+        let mail = get(&c, "vm-mail");
+        let vdi = mail.disks.iter().find(|k| k.kind == "Disk").unwrap().vdi.clone();
+        c.move_vm(&MoveVm { vm: "vm-mail".into(), host: "host-a".into(), disks: vec![(vdi, "sr-local1".into())], eject: None, running: true }).unwrap();
+        let mail = get(&c, "vm-mail");
+        assert_eq!((mail.host.as_deref(), mail.storage_host.as_deref(), mail.power), (Some("host-a"), Some("host-a"), PowerState::Running));
+        // off: its home is the server now
+        c.move_vm(&MoveVm { vm: "vm-backup".into(), host: "host-b".into(), disks: vec![], eject: None, running: false }).unwrap();
+        assert_eq!(get(&c, "vm-backup").home(), Some("host-b"));
+    }
+
+
+    #[test]
     fn demo_update_keeps_movable_vms_running() {
         let c = DemoConnection::new();
         let power = |c: &DemoConnection, vm: &str| c.data.lock().unwrap().vm(vm).map(|v| (v.power, v.host.clone()));
@@ -3781,6 +4250,14 @@ mod tests {
         assert_eq!(power(&c, "vm-web"), Some((PowerState::Running, Some("host-a".into()))));
     }
 
+
+    #[test]
+    fn sessions_never_noted() {
+        let dest = json!({"SM": "http://192.168.1.2/services/SM?session_id=OpaqueRef:7e54-aacb", "master": "http://192.168.1.2", "session_id": "OpaqueRef:7e54-aacb", "host": "OpaqueRef:6b2d"});
+        let text = args_text(&[json!("OpaqueRef:21ac"), dest]);
+        assert!(!text.contains("7e54"), "{}", text);
+        assert!(text.contains("OpaqueRef:6b2d") && text.contains("192.168.1.2"));
+    }
 
     #[test]
     fn session_ids_hidden() {

@@ -12,13 +12,13 @@ use eframe::egui::{self, pos2, vec2, Align2, Color32, FontId, Rect, Rounding, Se
 use std::time::{Duration, Instant};
 
 const SMB_VERSIONS: [&str; 2] = ["3.0", "1.0"];
-const NFS_VERSIONS: [(&str, &str); 3] = [("3", "NFSv3"), ("4", "NFSv4"), ("4.1", "NFSv4.1")];
+pub(crate) const NFS_VERSIONS: [(&str, &str); 3] = [("3", "NFSv3"), ("4", "NFSv4"), ("4.1", "NFSv4.1")];
 
-struct Failure {
-    title: String,
-    hint: String,
-    transcript: String,
-    copied: Option<Instant>,
+pub(crate) struct Failure {
+    pub title: String,
+    pub hint: String,
+    pub transcript: String,
+    pub copied: Option<Instant>,
 }
 
 pub enum IsoAction {
@@ -184,7 +184,7 @@ impl IsoDialog {
                     field_label(ui, "Location:", LABEL_WIDTH);
                     text_field(ui, pal, &mut self.location, ui.available_width(), false);
                 });
-                note(ui, pal, if self.nfs { "For example nas:/mnt/tank/isos" } else { "For example \\\\nas\\isos  (a folder inside the share works too)" });
+                note(ui, pal, if self.nfs { "For example 192.168.1.50:/mnt/tank/isos or nas.home.lan:/mnt/tank/isos" } else { "For example \\\\192.168.1.50\\isos or \\\\nas.home.lan\\isos (a folder inside the share works too)" });
                 if !self.nfs {
                     ui.horizontal(|ui| {
                         field_label(ui, "Username:", LABEL_WIDTH);
@@ -198,20 +198,8 @@ impl IsoDialog {
                 }
 
                 // Advanced: the less usual settings, already set to the common choices.
-                ui.add_space(2.0);
-                let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::click());
-                if resp.hovered() {
-                    ui.painter().rect_filled(r, Rounding::same(5.0), pal.hover);
-                }
-                let c = pos2(r.min.x + 10.0, r.center().y);
-                let chev = if self.advanced { vec![c + vec2(-3.5, -1.5), c + vec2(0.0, 2.0), c + vec2(3.5, -1.5)] } else { vec![c + vec2(-1.5, -3.5), c + vec2(2.0, 0.0), c + vec2(-1.5, 3.5)] };
-                ui.painter().add(egui::Shape::line(chev, Stroke::new(1.4, pal.ink_soft)));
-                ui.painter().text(pos2(r.min.x + 22.0, r.center().y), Align2::LEFT_CENTER, "Advanced", FontId::proportional(13.0), pal.ink);
                 let summary = if self.nfs { NFS_VERSIONS[self.nfs_version].1.to_string() } else { format!("SMB {}", SMB_VERSIONS[self.smb_version]) };
-                ui.painter().text(pos2(r.max.x - 8.0, r.center().y), Align2::RIGHT_CENTER, summary, FontId::proportional(12.0), pal.ink_soft);
-                if resp.clicked() {
-                    self.advanced = !self.advanced;
-                }
+                advanced(ui, pal, &mut self.advanced, &summary);
                 if self.advanced {
                     if self.nfs {
                         ui.horizontal(|ui| {
@@ -271,8 +259,26 @@ impl IsoDialog {
     }
 }
 
+/// The Advanced row that opens and folds the less usual settings, with what they're set to on
+/// its right.
+pub(crate) fn advanced(ui: &mut Ui, pal: &Pal, open: &mut bool, summary: &str) {
+    ui.add_space(2.0);
+    let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::click());
+    if resp.hovered() {
+        ui.painter().rect_filled(r, Rounding::same(5.0), pal.hover);
+    }
+    let c = pos2(r.min.x + 10.0, r.center().y);
+    let chev = if *open { vec![c + vec2(-3.5, -1.5), c + vec2(0.0, 2.0), c + vec2(3.5, -1.5)] } else { vec![c + vec2(-1.5, -3.5), c + vec2(2.0, 0.0), c + vec2(-1.5, 3.5)] };
+    ui.painter().add(egui::Shape::line(chev, Stroke::new(1.4_f32, pal.ink_soft)));
+    ui.painter().text(pos2(r.min.x + 22.0, r.center().y), Align2::LEFT_CENTER, "Advanced", FontId::proportional(13.0), pal.ink);
+    ui.painter().text(pos2(r.max.x - 8.0, r.center().y), Align2::RIGHT_CENTER, summary, FontId::proportional(12.0), pal.ink_soft);
+    if resp.clicked() {
+        *open = !*open;
+    }
+}
+
 /// A small grey line under a field.
-fn note(ui: &mut Ui, pal: &Pal, text: &str) {
+pub(crate) fn note(ui: &mut Ui, pal: &Pal, text: &str) {
     ui.horizontal(|ui| {
         ui.add_space(LABEL_WIDTH + ui.spacing().item_spacing.x + 2.0);
         ui.add(egui::Label::new(egui::RichText::new(text).size(12.0).color(pal.ink_soft)).wrap());
@@ -290,7 +296,7 @@ pub(crate) fn segmented(ui: &mut Ui, pal: &Pal, options: &[&str], chosen: &mut u
         let resp = ui.interact(pr, ui.id().with(("seg", *o)), Sense::click());
         let on = *chosen == i;
         if on {
-            ui.painter().rect(pr, Rounding::same(4.5), pal.surface, Stroke::new(1.0, pal.border));
+            ui.painter().rect(pr, Rounding::same(4.5), pal.surface, Stroke::new(1.0_f32, pal.border));
         }
         let col = if !ui.is_enabled() { pal.ink_faint } else if on || resp.hovered() { pal.ink } else { pal.ink_soft };
         ui.painter().text(pr.center(), Align2::CENTER_CENTER, *o, FontId::proportional(12.5), col);
@@ -303,7 +309,7 @@ pub(crate) fn segmented(ui: &mut Ui, pal: &Pal, options: &[&str], chosen: &mut u
 }
 
 /// What went wrong in plain words, then the request and the server's answer as in a terminal.
-fn failure_panel(ui: &mut Ui, pal: &Pal, f: &mut Failure) {
+pub(crate) fn failure_panel(ui: &mut Ui, pal: &Pal, f: &mut Failure) {
     ui.add_space(4.0);
     ui.label(egui::RichText::new(&f.title).font(FontId::new(14.0, egui::FontFamily::Name("bold".into()))).color(pal.red));
     ui.label(egui::RichText::new(&f.hint).color(pal.ink_soft));
@@ -353,7 +359,7 @@ pub(crate) fn mount_trouble(e: &ApiError) -> Option<MountTrouble> {
         Some(MountTrouble::Refused)
     } else if has(&["no such file", "error(2)", "not found", "does not exist", "bad network name", "error(6)"]) {
         Some(MountTrouble::NotFound)
-    } else if has(&["no route to host", "error(113)", "host is down", "error(112)", "timed out", "connection refused", "error(111)", "unreachable", "could not resolve", "name or service not known", "unable to find suitable address"]) {
+    } else if has(&["no route to host", "error(113)", "host is down", "error(112)", "timed out", "connection refused", "error(111)", "unreachable", "could not resolve", "name or service not known", "unable to find suitable address", "unable to detect an nfs service"]) {
         Some(MountTrouble::Unreachable)
     } else if has(&["operation not supported", "error(95)", "protocol not supported", "invalid argument", "error(22)", "requested nfs version"]) {
         Some(MountTrouble::Unsupported)
