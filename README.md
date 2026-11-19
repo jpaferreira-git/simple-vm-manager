@@ -15,6 +15,7 @@ affiliated with or endorsed by the makers of XenServer or XCP-ng.
 | ![An ISO library's files](docs/screenshot-dark-isos.png) | ![Uploading an ISO from a link](docs/screenshot-dark-upload.png) |
 | ![Creating a VM](docs/screenshot-dark-new-vm.png) | ![A new VM's advanced options](docs/screenshot-dark-new-vm-advanced.png) |
 | ![A VM's snapshots](docs/screenshot-dark-snapshots.png) | ![Taking a snapshot](docs/screenshot-dark-snapshot-take.png) |
+| ![Every VM's snapshots and schedules](docs/screenshot-dark-snapshots-page.png) | ![A snapshot schedule](docs/screenshot-dark-schedule.png) |
 | ![Your templates](docs/screenshot-dark-templates.png) | ![A new VM from a template](docs/screenshot-dark-new-vm-template.png) |
 | ![A server's Overview](docs/screenshot-dark-host.png) | ![A pool's Overview](docs/screenshot-dark-pool.png) |
 | ![A VM's week, in its Performance tab](docs/screenshot-dark-performance.png) | ![A server's Performance tab](docs/screenshot-dark-host-performance.png) |
@@ -94,7 +95,10 @@ affiliated with or endorsed by the makers of XenServer or XCP-ng.
   left to do by hand.
 - **Details** — a VM's tabs are Overview, Performance, Snapshots, Logs and Details: the less used
   things (tags, guest tools, virtualization, high availability, every disk and card with its
-  position and MAC), click a value to copy it. Pools and servers have Overview, Storage,
+  position and MAC), then *All fields*: every field the server keeps on it and on its metrics
+  (references shown by name, sizes in GB too), read again while the tab is open. A search finds
+  any of them (marked where found), a value's click copies it, and *Export* saves it all as a CSV
+  spreadsheet or a PDF. Pools and servers have Overview, Storage,
   Networking, Logs and Details, and servers Performance too. At the tab row's right end: the
   **Console** button, then the actions (power, snapshot, move, copy, delete; a server's
   maintenance mode, restart and shut down). In a window too narrow for them, they all fold into
@@ -206,6 +210,16 @@ affiliated with or endorsed by the makers of XenServer or XCP-ng.
   it's on, puts it back, and then leaves it as it was at the time: resumed, started again, or off.
   The bin deletes one, with its copies of the disks. In a narrow window the tab keeps Revert and
   Delete in view, dropping the other columns first.
+- **Snapshots page and schedules** — *Snapshots* on the toolbar lists every pool's VMs: how many
+  snapshots each has, its latest and its oldest (orange past 30 days: an old snapshot slows its
+  disks a little and holds on to everything changed since), and the schedule it's on; filters
+  (with snapshots, without, on a schedule), a search, and every column sorts. A click opens a VM's
+  Snapshots tab; tick several to take a snapshot of each at once, or to put them on a schedule.
+  *Schedules…* lists a pool's snapshot schedules (XenServer's VMSS): each takes its VMs' snapshots
+  by itself, every hour, day or chosen days of the week, keeps the last 1 to 10 it took (deleting
+  the oldest), with their memory or not; turn one on or off, edit it, pick its VMs, delete it. A
+  VM's Snapshots tab says which schedule it's on, with *Edit…* and *Remove* (off it), and marks
+  with a clock the snapshots a schedule took. A pool whose license doesn't include schedules says so.
 - **Move a VM** — the Move button next to a VM's tabs, *Move…* on its right-click menu, or drag it
   onto a server in the tree: one dialog for the server it goes to (each with its free memory, or
   why it can't take it) and the storage of each of its disks (where it is when that server sees

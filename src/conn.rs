@@ -372,6 +372,15 @@ pub trait Connection: Send + Sync {
     /// Changes a VM (see `VmChange`): what can be done while it runs is; a disk or card added to a
     /// running VM is plugged in when it can be (else at its next start).
     fn edit_vm(&self, vm_ref: &str, change: &VmChange) -> Result<(), ApiError>;
+    /// Makes a snapshot schedule (`x.rref` empty) or changes one, and puts exactly the VMs `x.vms`
+    /// on it (taking off those no longer listed). Its reference.
+    fn save_schedule(&self, x: &ScheduleInfo) -> Result<String, ApiError>;
+    /// Deletes a snapshot schedule, its VMs taken off it first (the snapshots it took stay).
+    fn delete_schedule(&self, vmss: &str) -> Result<(), ApiError>;
+    /// Puts VMs on a snapshot schedule, or (None) on none.
+    fn set_vm_schedule(&self, vms: &[String], vmss: Option<&str>) -> Result<(), ApiError>;
+    /// Turns a snapshot schedule on or off.
+    fn set_schedule_enabled(&self, vmss: &str, on: bool) -> Result<(), ApiError>;
     /// The last ten minutes of a running VM's load, from the server it runs on (its address).
     fn vm_perf(&self, vm_uuid: &str, host_address: &str) -> Result<Perf, ApiError>;
     /// The last ten minutes of a server's load and its running VMs', from the server itself (its
@@ -449,6 +458,9 @@ pub trait Connection: Send + Sync {
     /// Deletes a snapshot and its own copies of the disks (and its saved memory). The ones that
     /// couldn't be deleted (the snapshot is gone by then): each one's name and why.
     fn delete_snapshot(&self, snapshot_ref: &str) -> Result<Vec<String>, ApiError>;
+    /// Every field the server keeps on a VM, a server or the pool (`kind`: "vm", "host" or
+    /// "pool"; `rref` isn't needed for the pool), then those of its metrics: (what, the record).
+    fn records(&self, kind: &str, rref: &str) -> Result<Vec<(String, Value)>, ApiError>;
     /// Copies a file into an ISO library as `name` (see `iso_file_name`): a new disc in the library,
     /// then the file's bytes sent to it, from this computer or as they arrive from the web.
     /// `address` is the server to send them to for a library that only one server sees; a shared
@@ -1626,6 +1638,28 @@ fn s(o: &Value, k: &str) -> String {
     o.get(k).map(val_str).unwrap_or_default()
 }
 
+/// A snapshot schedule (VMSS record `r`, known as `rref`).
+fn schedule_of(rref: &str, r: &Value) -> ScheduleInfo {
+    let when = r.get("schedule").cloned().unwrap_or(Value::Null);
+    let num = |k: &str| s(&when, k).trim().parse::<u32>().unwrap_or(0);
+    let kind = s(r, "type");
+    ScheduleInfo {
+        rref: rref.to_string(),
+        name: s(r, "name_label"),
+        description: s(r, "name_description"),
+        enabled: b(r, "enabled"),
+        memory: kind == "checkpoint",
+        kind,
+        keep: n(r, "retained_snapshots").clamp(1, 10),
+        every: Every::parse(&s(r, "frequency")),
+        hour: num("hour").min(23),
+        min: num("min").min(59),
+        days: s(&when, "days").split(',').map(|d| d.trim().to_string()).filter(|d| !d.is_empty()).collect(),
+        last_run: parse_xen_time(&s(r, "last_run_time")).filter(|t| *t > 0),
+        vms: list(r, "VMs").into_iter().filter(|v| v != "OpaqueRef:NULL").collect(),
+    }
+}
+
 /// What's written on a disk on thin storage: its own file and the ones it's built on (a
 /// snapshot's or a template's: sm_config's vhd-parent), which go with it when it's copied.
 fn written(vdi: &Value, by_uuid: &HashMap<String, &Value>) -> i64 {
@@ -1747,8 +1781,11 @@ impl Connection for RealConnection {
         let mut pd = PoolData::default();
         let mut master = String::new();
         let mut repos: Vec<String> = vec![];
+        let mut no_vmss = false;
         for (_, r) in self.all("pool", t)? {
             pd.name = s(&r, "name_label");
+            // a license without snapshot schedules says so here
+            no_vmss = s(r.get("restrictions").unwrap_or(&Value::Null), "restrict_vmss") == "true";
             master = s(&r, "master");
             pd.default_sr = Some(s(&r, "default_SR")).filter(|x| !x.is_empty() && x != "OpaqueRef:NULL");
             repos = list(&r, "repositories");
@@ -1993,6 +2030,7 @@ impl Connection for RealConnection {
                 // a checkpoint's record is suspended: its memory is saved with it
                 memory: s(r, "power_state") == "Suspended",
                 was_running: s(&info, "power-state-at-snapshot") == "Running",
+                scheduled: b(r, "is_vmss_snapshot"),
             });
         }
         for list in snapshots.values_mut() {
@@ -2034,6 +2072,7 @@ impl Connection for RealConnection {
             };
             vm_details(&mut vm, &r, &g, vm_metrics.get(&s(&r, "metrics")).unwrap_or(&Value::Null));
             vm.snapshots = snapshots.remove(&vm.rref).unwrap_or_default();
+            vm.schedule = Some(s(&r, "snapshot_schedule")).filter(|x| !x.is_empty() && x != "OpaqueRef:NULL");
             let parent = s(&r, "parent");
             vm.parent = vm.snapshots.iter().any(|x| x.rref == parent).then_some(parent);
             for vbd_ref in list(&r, "VBDs") {
@@ -2084,6 +2123,20 @@ impl Connection for RealConnection {
         self.state.lock().unwrap().members = pd.hosts.iter().map(|h| h.address.clone()).filter(|a| !a.is_empty()).collect();
         if pd.name.is_empty() && pd.hosts.len() > 1 {
             pd.name = "Pool".into();
+        }
+        // its snapshot schedules (XenServer 7.2 and later; a license may leave them out)
+        match self.all("VMSS", t) {
+            Ok(all) => {
+                pd.schedules = all.iter().map(|(k, r)| schedule_of(k, r)).collect();
+                pd.schedules.sort_by_key(|x| x.name.to_lowercase());
+            }
+            Err(e) if e.code == "MESSAGE_METHOD_UNKNOWN" || e.code == "UNKNOWN_CLASS" || e.code == "MESSAGE_DEPRECATED" => {
+                pd.schedules_off = Some("This pool's version has no snapshot schedules (XenServer 7.2 and later have them).".into());
+            }
+            Err(_) => {}
+        }
+        if no_vmss {
+            pd.schedules_off = Some("The pool's license doesn't include snapshot schedules.".into());
         }
         Ok(pd)
     }
@@ -2376,6 +2429,77 @@ impl Connection for RealConnection {
             }
         };
         Ok(made.as_str().unwrap_or_default().to_string())
+    }
+
+    fn save_schedule(&self, x: &ScheduleInfo) -> Result<String, ApiError> {
+        let t = 30_000;
+        let schedule: serde_json::Map<String, Value> = x.schedule_map().into_iter().map(|(k, v)| (k.to_string(), json!(v))).collect();
+        let make = || -> Result<String, ApiError> {
+            let rec = json!({
+                "name_label": x.name, "name_description": x.description, "enabled": x.enabled, "type": x.kind_to_save(),
+                "retained_snapshots": x.keep, "frequency": x.every.api(), "schedule": schedule,
+            });
+            Ok(val_str(&self.call("VMSS.create", vec![rec], t)?))
+        };
+        let refs = |v: Value| -> Vec<String> { v.as_array().map(|a| a.iter().map(val_str).filter(|r| r != "OpaqueRef:NULL").collect()).unwrap_or_default() };
+        // (its reference, and the VMs on it now)
+        let (vmss, on) = if x.rref.is_empty() {
+            (make()?, vec![])
+        } else {
+            let on = refs(self.call("VMSS.get_VMs", vec![json!(x.rref)], t)?);
+            if val_str(&self.call("VMSS.get_frequency", vec![json!(x.rref)], t)?) != x.every.api() {
+                // another frequency takes a schedule of its own: a new one made, its VMs moved
+                // onto it, the old one deleted
+                note("Another frequency: a new schedule takes its place, with its VMs");
+                let made = make()?;
+                for vm in &on {
+                    self.call("VM.set_snapshot_schedule", vec![json!(vm), json!(made)], t)?;
+                }
+                self.call("VMSS.destroy", vec![json!(x.rref)], t)?;
+                (made, on)
+            } else {
+                let sets = [
+                    ("VMSS.set_name_label", json!(x.name)),
+                    ("VMSS.set_name_description", json!(x.description)),
+                    ("VMSS.set_type", json!(x.kind_to_save())),
+                    ("VMSS.set_retained_snapshots", json!(x.keep)),
+                    ("VMSS.set_schedule", Value::Object(schedule.clone())),
+                    ("VMSS.set_enabled", json!(x.enabled)),
+                ];
+                for (method, value) in sets {
+                    self.call(method, vec![json!(x.rref), value], t)?;
+                }
+                (x.rref.clone(), on)
+            }
+        };
+        // its VMs: those listed on it, the others off
+        for vm in x.vms.iter().filter(|v| !on.contains(v)) {
+            self.call("VM.set_snapshot_schedule", vec![json!(vm), json!(vmss)], t)?;
+        }
+        for vm in on.iter().filter(|v| !x.vms.contains(v)) {
+            self.call("VM.set_snapshot_schedule", vec![json!(vm), json!("OpaqueRef:NULL")], t)?;
+        }
+        Ok(vmss)
+    }
+
+    fn delete_schedule(&self, vmss: &str) -> Result<(), ApiError> {
+        let t = 30_000;
+        let on = self.call("VMSS.get_VMs", vec![json!(vmss)], t)?;
+        for vm in on.as_array().into_iter().flatten().map(val_str).filter(|r| r != "OpaqueRef:NULL") {
+            self.call("VM.set_snapshot_schedule", vec![json!(vm), json!("OpaqueRef:NULL")], t)?;
+        }
+        self.call("VMSS.destroy", vec![json!(vmss)], t).map(|_| ())
+    }
+
+    fn set_vm_schedule(&self, vms: &[String], vmss: Option<&str>) -> Result<(), ApiError> {
+        for vm in vms {
+            self.call("VM.set_snapshot_schedule", vec![json!(vm), json!(vmss.unwrap_or("OpaqueRef:NULL"))], 30_000)?;
+        }
+        Ok(())
+    }
+
+    fn set_schedule_enabled(&self, vmss: &str, on: bool) -> Result<(), ApiError> {
+        self.call("VMSS.set_enabled", vec![json!(vmss), json!(on)], 30_000).map(|_| ())
     }
 
     fn edit_vm(&self, vm: &str, change: &VmChange) -> Result<(), ApiError> {
@@ -2971,6 +3095,29 @@ impl Connection for RealConnection {
             return Ok(());
         };
         again.map(|_| ()).map_err(|e| ApiError { code: NOT_RESTARTED.into(), details: vec![e.message()] })
+    }
+
+    fn records(&self, kind: &str, rref: &str) -> Result<Vec<(String, Value)>, ApiError> {
+        let t = 30_000;
+        let valid = |r: &str| !r.is_empty() && r != "OpaqueRef:NULL";
+        // the item's own record, then its metrics' (which a VM that's off may not have)
+        let (main, title, metrics): (&str, &str, &[(&str, &str, &str)]) = match kind {
+            "vm" => ("VM", "VM", &[("metrics", "VM_metrics", "VM metrics"), ("guest_metrics", "VM_guest_metrics", "Guest metrics")]),
+            "host" => ("host", "Server", &[("metrics", "host_metrics", "Server metrics")]),
+            _ => return Ok(self.all("pool", t)?.into_iter().map(|(_, r)| ("Pool".to_string(), r)).collect()),
+        };
+        let r = self.call(&format!("{}.get_record", main), vec![json!(rref)], t)?;
+        let mut out = vec![];
+        for (field, cls, what) in metrics {
+            let m = s(&r, field);
+            if valid(&m) {
+                if let Ok(x) = self.call(&format!("{}.get_record", cls), vec![json!(m)], t) {
+                    out.push((what.to_string(), x));
+                }
+            }
+        }
+        out.insert(0, (title.to_string(), r));
+        Ok(out)
     }
 
     fn delete_snapshot(&self, snap: &str) -> Result<Vec<String>, ApiError> {
@@ -3670,6 +3817,11 @@ impl DemoConnection {
             });
             demo_details(d.vms.last_mut().unwrap());
         }
+        d.schedules = demo_schedules();
+        for v in d.vms.iter_mut() {
+            v.schedule = d.schedules.iter().find(|x| x.vms.contains(&v.rref)).map(|x| x.rref.clone());
+        }
+        link_schedules(&mut d);
         // the servers named in SVM_DEMO_OFF were shut down (their VMs moved to the other server
         // first, or shut down when their disks are on it), and those in SVM_DEMO_MAINTENANCE are in
         // maintenance mode (their VMs moved off, to come back later)
@@ -3900,6 +4052,39 @@ fn demo_perf(v: &VmInfo) -> Perf {
 
 /// `ms` of work, its progress said every tenth of a second (five times as long with
 /// SVM_DEMO_SLOW, for a check's screenshot of it under way).
+/// The demo's snapshot schedules: the Web Server and the Mail Relay every night (a week of them
+/// kept), the database every hour.
+fn demo_schedules() -> Vec<ScheduleInfo> {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|t| t.as_secs() as i64).unwrap_or(0);
+    let schedule = |rref: &str, name: &str, description: &str, every: Every, hour: u32, min: u32, keep: i64, vms: &[&str], ago: i64| ScheduleInfo {
+        rref: rref.into(),
+        name: name.into(),
+        description: description.into(),
+        enabled: true,
+        kind: "snapshot".into(),
+        keep,
+        every,
+        hour,
+        min,
+        last_run: Some(now - ago),
+        vms: vms.iter().map(|v| v.to_string()).collect(),
+        ..Default::default()
+    };
+    vec![
+        schedule("vmss-db", "Database hourly", "The shop's orders since the last one", Every::Hourly, 0, 30, 10, &["vm-db"], 20 * 60),
+        schedule("vmss-nightly", "Nightly", "A week of nights kept", Every::Daily, 3, 0, 7, &["vm-web", "vm-mail"], 6 * 3600 + 20 * 60),
+    ]
+}
+
+/// Each VM's schedule and each schedule's VMs agreeing (the schedules' lists as the VMs say),
+/// the schedules by name.
+fn link_schedules(d: &mut PoolData) {
+    for x in d.schedules.iter_mut() {
+        x.vms = d.vms.iter().filter(|v| v.schedule.as_deref() == Some(x.rref.as_str())).map(|v| v.rref.clone()).collect();
+    }
+    d.schedules.sort_by_key(|x| x.name.to_lowercase());
+}
+
 fn demo_work(ms: u64) {
     let ms = if std::env::var("SVM_DEMO_SLOW").is_ok() { ms * 5 } else { ms };
     let watch = watched();
@@ -4029,8 +4214,21 @@ fn demo_details(v: &mut VmInfo) {
             time: Some(now - hours * 3600 - 17 * 60),
             memory: *memory,
             was_running: *was_running,
+            scheduled: false,
         })
         .collect();
+    // what its snapshot schedule took (see demo_schedules): the Web Server's and the Mail Relay's
+    // every night, the database's every hour
+    let (auto_name, ago): (&str, &[i64]) = match v.rref.as_str() {
+        "vm-web" | "vm-mail" => ("Nightly snapshot", &[6, 30]),
+        "vm-db" => ("Hourly snapshot", &[0, 1, 2]),
+        _ => ("", &[]),
+    };
+    for (i, hours) in ago.iter().enumerate() {
+        let time = Some(now - hours * 3600 - 20 * 60);
+        v.snapshots.push(SnapshotInfo { rref: format!("{}-auto-{}", v.rref, i), name: auto_name.into(), time, was_running: true, scheduled: true, ..Default::default() });
+    }
+    v.snapshots.sort_by_key(|x| std::cmp::Reverse(x.time));
     v.parent = v.snapshots.first().map(|x| x.rref.clone());
     v.tags = tags.iter().map(|t| t.to_string()).collect();
     v.folder = folder.into();
@@ -4094,6 +4292,143 @@ fn recompute(d: &mut PoolData) {
 fn pick_host(d: &mut PoolData, need: i64) -> Option<String> {
     recompute(d);
     d.hosts.iter().filter(|h| h.mem_free >= need).max_by_key(|h| h.mem_free).map(|h| h.rref.clone())
+}
+
+/// A demo VM's, server's or pool's records as a server would send them: every field XenServer
+/// 8.4 has, made from what the demo knows.
+fn demo_records(d: &PoolData, kind: &str, rref: &str) -> Option<Vec<(String, Value)>> {
+    const NULL: &str = "OpaqueRef:NULL";
+    let xt = |t: Option<i64>| {
+        let t = t.unwrap_or(0);
+        let (days, secs) = (t.div_euclid(86_400), t.rem_euclid(86_400));
+        // the civil date from days since 1970 (Howard Hinnant's algorithm)
+        let z = days + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let day = doy - (153 * mp + 2) / 5 + 1;
+        let month = if mp < 10 { mp + 3 } else { mp - 9 };
+        let year = yoe + era * 400 + if month <= 2 { 1 } else { 0 };
+        format!("{:04}{:02}{:02}T{:02}:{:02}:{:02}Z", year, month, day, secs / 3600, secs % 3600 / 60, secs % 60)
+    };
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|t| t.as_secs() as i64).unwrap_or(0);
+    let master = d.hosts.iter().find(|h| h.is_master);
+    let opt = |r: &Option<String>| r.clone().unwrap_or_else(|| NULL.into());
+    match kind {
+        "vm" => {
+            let v = d.vm(rref)?;
+            let running = matches!(v.power, PowerState::Running | PowerState::Paused);
+            let uefi = v.firmware.to_lowercase().contains("uefi");
+            let order = if v.boot_order.to_lowercase().starts_with("dvd") { "dc" } else { "cd" };
+            let vm = json!({
+                "uuid": v.uuid, "name_label": v.name, "name_description": v.description, "power_state": match v.power { PowerState::Running => "Running", PowerState::Paused => "Paused", PowerState::Suspended => "Suspended", _ => "Halted" },
+                "allowed_operations": v.allowed, "current_operations": {}, "user_version": "1",
+                "is_a_template": false, "is_default_template": false, "is_a_snapshot": false, "is_control_domain": false,
+                "suspend_VDI": NULL, "resident_on": opt(&v.host), "scheduled_to_be_resident_on": NULL, "affinity": opt(&v.affinity),
+                "memory_overhead": "11534336", "memory_target": v.mem_dyn_max.to_string(), "memory_static_max": v.mem_static_max.to_string(),
+                "memory_dynamic_max": v.mem_dyn_max.to_string(), "memory_dynamic_min": v.mem_dyn_min.to_string(), "memory_static_min": v.mem_static_min.to_string(),
+                "VCPUs_params": {}, "VCPUs_max": v.vcpus_max.max(v.vcpus).to_string(), "VCPUs_at_startup": v.vcpus.to_string(),
+                "actions_after_softreboot": "soft_reboot", "actions_after_shutdown": "destroy", "actions_after_reboot": "restart", "actions_after_crash": "restart",
+                "consoles": if running { vec![format!("{}-console", v.rref)] } else { vec![] }, "VIFs": v.nics.iter().map(|n| n.vif.clone()).collect::<Vec<_>>(),
+                "VBDs": v.disks.iter().map(|k| k.vbd.clone()).collect::<Vec<_>>(), "VUSBs": [], "crash_dumps": [], "VTPMs": [], "VGPUs": [], "attached_PCIs": [],
+                "PV_bootloader": "", "PV_kernel": "", "PV_ramdisk": "", "PV_args": "", "PV_bootloader_args": "", "PV_legacy_args": "",
+                "HVM_boot_policy": "BIOS order", "HVM_boot_params": { "order": order, "firmware": if uefi { "uefi" } else { "bios" } }, "HVM_shadow_multiplier": 1.0,
+                "platform": { "timeoffset": "0", "device-model": "qemu-upstream-compat", "secureboot": if v.secure_boot.to_lowercase().starts_with("on") { "true" } else { "false" },
+                              "viridian": "false", "acpi": "1", "apic": "true", "pae": "true", "nx": "true", "hpet": "true", "vga": "std", "videoram": "8", "cores-per-socket": v.vcpus.max(1).to_string() },
+                "PCI_bus": "", "other_config": { "base_template_name": "Other install media", "folder": v.folder, "mac_seed": format!("{}-mac", v.uuid), "auto_poweron": v.auto_power_on.to_string(), "import_task": NULL },
+                "domid": if running { "3" } else { "-1" }, "domarch": if running { "x64" } else { "" },
+                "last_boot_CPU_flags": if running { json!({ "vendor": "GenuineIntel", "features": "1fcbfbff-f7fa3223-2c100800-00000121-0000000f-219c07ab-00000000-00000000-00001000-ac000400-00000000-00000000-00000000-00000000-00000000" }) } else { json!({}) },
+                "metrics": format!("{}-metrics", v.rref), "guest_metrics": if v.tools_installed { format!("{}-guest", v.rref) } else { NULL.into() },
+                "last_booted_record": "", "recommendations": "<restrictions><restriction field=\"memory-static-max\" max=\"1649267441664\"/><restriction field=\"vcpus-max\" max=\"32\"/></restrictions>",
+                "xenstore_data": { "vm-data": "", "vm-data/mmio-hole-size": "268435456" },
+                "ha_always_run": !v.ha.is_empty(), "ha_restart_priority": if v.ha.is_empty() { "" } else { "restart" },
+                "snapshot_of": NULL, "snapshots": v.snapshots.iter().map(|x| x.rref.clone()).collect::<Vec<_>>(), "snapshot_time": xt(None), "transportable_snapshot_id": "",
+                "blobs": {}, "tags": v.tags, "blocked_operations": {}, "snapshot_info": {}, "snapshot_metadata": "",
+                "parent": opt(&v.parent), "children": [], "bios_strings": { "bios-vendor": "Xen", "bios-version": "", "system-manufacturer": "Xen", "system-product-name": "HVM domU", "system-version": "", "system-serial-number": "", "baseboard-manufacturer": "", "hp-rombios": "", "oem-1": "Xen", "oem-2": "MS_VM_CERT/SHA1/bdbeb6e0a816d43fa6d3fe8aaef04c2bad9d3e3d" },
+                "protection_policy": NULL, "is_snapshot_from_vmpp": false, "snapshot_schedule": opt(&v.schedule), "is_vmss_snapshot": false,
+                "appliance": NULL, "start_delay": "0", "shutdown_delay": "0", "order": "0", "suspend_SR": NULL, "version": "0",
+                "generation_id": "0:0", "hardware_platform_version": "2", "has_vendor_device": false, "requires_reboot": false, "reference_label": "",
+                "domain_type": if v.virt_mode.to_lowercase().contains("pv") && !v.virt_mode.to_lowercase().contains("hvm") { "pv" } else { "hvm" },
+                "NVRAM": if uefi { json!({ "EFI-variables": "(1.4 KiB)" }) } else { json!({}) }, "pending_guidances": [], "pending_guidances_recommended": [], "pending_guidances_full": [],
+            });
+            let mut out = vec![("VM".to_string(), vm)];
+            if running || v.created.is_some() {
+                out.push((
+                    "VM metrics".into(),
+                    json!({
+                        "uuid": format!("{}-metrics", v.uuid), "memory_actual": v.mem_actual.max(if running { v.mem_dyn_max } else { 0 }).to_string(),
+                        "VCPUs_number": if running { v.vcpus } else { 0 }.to_string(), "VCPUs_utilisation": {}, "VCPUs_CPU": {}, "VCPUs_params": {}, "VCPUs_flags": {},
+                        "state": [], "start_time": xt(v.started), "install_time": xt(v.created), "last_updated": xt(None), "other_config": {},
+                        "hvm": true, "nested_virt": false, "nomigrate": false, "current_domain_type": if running { "hvm" } else { "unspecified" },
+                    }),
+                ));
+            }
+            if v.tools_installed {
+                let mut nets = serde_json::Map::new();
+                for (i, ip) in v.ips.iter().enumerate() {
+                    nets.insert(format!("{}/ip", i), json!(ip));
+                    nets.insert(format!("{}/ipv4/0", i), json!(ip));
+                }
+                let (major, minor) = v.tools.split_once('.').unwrap_or((v.tools.as_str(), "0"));
+                out.push((
+                    "Guest metrics".into(),
+                    json!({
+                        "uuid": format!("{}-guest", v.uuid), "os_version": { "name": v.os, "uname": v.kernel, "distro": v.os.split_whitespace().next().unwrap_or("").to_lowercase() },
+                        "netbios_name": {}, "PV_drivers_version": { "major": major, "minor": minor, "micro": "0", "build": "0" }, "PV_drivers_up_to_date": true,
+                        "memory": {}, "disks": {}, "networks": nets, "other": { "feature-balloon": "1", "has-vendor-device": "0", "platform-feature-multiprocessor-suspend": "1" },
+                        "last_updated": xt(Some(now - 40)), "other_config": {}, "live": running, "can_use_hotplug_vbd": "yes", "can_use_hotplug_vif": "yes", "PV_drivers_detected": true,
+                    }),
+                ));
+            }
+            Some(out)
+        }
+        "host" => {
+            let h = d.host(rref)?;
+            let resident: Vec<String> = d.vms.iter().filter(|v| v.host.as_deref() == Some(h.rref.as_str())).map(|v| v.rref.clone()).collect();
+            let host = json!({
+                "uuid": h.uuid, "name_label": h.name, "name_description": h.description, "memory_overhead": "4362076160",
+                "allowed_operations": ["vm_migrate", "provision", "vm_resume", "evacuate", "vm_start"], "current_operations": {},
+                "API_version_major": "2", "API_version_minor": "21", "API_version_vendor": "XenSource", "API_version_vendor_implementation": {},
+                "enabled": h.enabled, "software_version": { "product_version": h.version, "product_brand": or(&h.brand, "XenServer"), "platform_name": "XCP", "platform_version": "3.4.0",
+                    "build_number": "24.38.0", "hostname": h.name, "date": "2026-10-08", "xapi": "24.38", "xapi_build": "24.38.0", "xen": "4.17.5-6", "linux": "4.19.0+1", "xencenter_min": "2.21", "xencenter_max": "2.21", "network_backend": "openvswitch", "db_schema": "5.788" },
+                "other_config": { "iscsi_iqn": format!("iqn.2026-11.com.example:{}", &h.uuid[..8.min(h.uuid.len())]), "agent_start_time": format!("{}.", h.boot_time.unwrap_or(0) + 60), "boot_time": format!("{}.", h.boot_time.unwrap_or(0)), "MAINTENANCE_MODE": if h.maintenance { "true" } else { "false" } },
+                "capabilities": ["xen-3.0-x86_64", "hvm-3.0-x86_32", "hvm-3.0-x86_32p", "hvm-3.0-x86_64"], "cpu_configuration": {}, "sched_policy": "credit",
+                "supported_bootloaders": ["pygrub", "eliloader"], "resident_VMs": resident, "logging": {}, "PIFs": h.nics.iter().map(|n| format!("{}-pif-{}", h.rref, n.device)).collect::<Vec<_>>(),
+                "suspend_image_sr": opt(&h.suspend_sr), "crash_dump_sr": opt(&h.crash_dump_sr), "crashdumps": [], "patches": [], "updates": [], "PBDs": [], "host_CPUs": [],
+                "cpu_info": { "cpu_count": h.cpu_count.to_string(), "socket_count": "1", "threads_per_core": "2", "vendor": "GenuineIntel", "speed": "3600.000", "modelname": h.cpu_model, "family": "6", "model": "158", "stepping": "13",
+                              "flags": "fpu de tsc msr pae mce cx8 apic sep mca cmov pat clflush acpi mmx fxsr sse sse2 ht syscall nx rdtscp lm constant_tsc rep_good nopl nonstop_tsc cpuid pni pclmulqdq monitor est ssse3 fma cx16 sse4_1 sse4_2 movbe popcnt aes xsave avx f16c rdrand hypervisor lahf_lm abm 3dnowprefetch fsgsbase bmi1 avx2 bmi2 erms" },
+                "hostname": h.name, "address": h.address, "metrics": format!("{}-metrics", h.rref), "license_params": { "restrict_vmss": "false", "restrict_pool_size": "false", "sku_type": "free", "expiry": h.license_expiry.map(|t| xt(Some(t))).unwrap_or_default() },
+                "ha_statefiles": [], "ha_network_peers": [], "blobs": {}, "tags": [], "external_auth_type": "", "external_auth_service_name": "", "external_auth_configuration": {},
+                "edition": or(&h.edition, "free"), "license_server": { "address": "localhost", "port": "27000" }, "bios_strings": { "bios-vendor": "American Megatrends Inc.", "system-manufacturer": "Demo Computers", "system-product-name": "Demo Server 1U" },
+                "power_on_mode": h.power_on_mode, "power_on_config": {}, "local_cache_sr": NULL, "chipset_info": { "iommu": "true" }, "PCIs": [], "PGPUs": [], "PUSBs": [],
+                "ssl_legacy": false, "guest_VCPUs_params": {}, "display": "enabled", "virtual_hardware_platform_versions": ["0", "1", "2"], "control_domain": h.control_domain,
+                "updates_requiring_reboot": [], "features": [], "iscsi_iqn": format!("iqn.2026-11.com.example:{}", &h.uuid[..8.min(h.uuid.len())]), "multipathing": false, "uefi_certificates": "",
+                "certificates": [], "editions": [or(&h.edition, "free")], "pending_guidances": h.pending_guidance, "tls_verification_enabled": true, "last_software_update": xt(h.last_update),
+                "https_only": false, "latest_synced_updates_applied": or(&h.updates_applied, "unknown"), "numa_affinity_policy": "default_policy", "ssh_enabled": true, "ssh_enabled_timeout": "0", "console_idle_timeout": "0",
+            });
+            let metrics = json!({ "uuid": format!("{}-metrics", h.uuid), "memory_total": h.mem_total.to_string(), "memory_free": h.mem_free.to_string(), "live": h.live, "last_updated": xt(Some(now - 5)), "other_config": {} });
+            Some(vec![("Server".into(), host), ("Server metrics".into(), metrics)])
+        }
+        _ => {
+            let pool = json!({
+                "uuid": "8c1a4e2f-5b3d-4e6a-9f0c-2d7b1e8a6c4f", "name_label": d.name, "name_description": "", "master": master.map(|h| h.rref.clone()).unwrap_or_else(|| NULL.into()),
+                "default_SR": opt(&d.default_sr), "suspend_image_SR": opt(&d.suspend_sr), "crash_dump_SR": opt(&d.crash_dump_sr),
+                "other_config": { "auto_poweron": "true", "memory-ratio-hvm": "0.25", "memory-ratio-pv": "0.25" }, "ha_enabled": false, "ha_configuration": {}, "ha_statefiles": [],
+                "ha_host_failures_to_tolerate": "0", "ha_plan_exists_for": "0", "ha_allow_overcommit": false, "ha_overcommitted": false, "blobs": {}, "tags": [], "gui_config": {},
+                "health_check_config": {}, "wlb_url": "", "wlb_username": "", "wlb_enabled": false, "wlb_verify_cert": false, "redo_log_enabled": false, "redo_log_vdi": NULL,
+                "vswitch_controller": "", "restrictions": { "restrict_vmss": if d.schedules_off.is_some() { "true" } else { "false" }, "restrict_pool_size": "false", "restrict_ha": "false", "restrict_rbac": "false" },
+                "metadata_VDIs": [], "ha_cluster_stack": "xhad", "allowed_operations": ["ha_enable", "cluster_create", "designate_new_master"], "current_operations": {}, "guest_agent_config": {},
+                "cpu_info": { "cpu_count": d.hosts.iter().map(|h| h.cpu_count).sum::<i64>().to_string(), "socket_count": d.hosts.len().to_string(), "vendor": "GenuineIntel" },
+                "policy_no_vendor_device": false, "live_patching_disabled": false, "igmp_snooping_enabled": false, "uefi_certificates": "", "is_psr_pending": false, "tls_verification_enabled": true,
+                "repositories": [], "client_certificate_auth_enabled": false, "client_certificate_auth_name": "", "repository_proxy_url": "", "repository_proxy_username": "", "repository_proxy_password": NULL,
+                "migration_compression": false, "coordinator_bias": true, "telemetry_uuid": NULL, "telemetry_frequency": "weekly", "telemetry_next_collection": xt(Some(now + 5 * 86_400)),
+                "last_update_sync": xt(d.last_update_sync), "update_sync_frequency": "weekly", "update_sync_day": "0", "update_sync_enabled": false, "recommendations": {}, "license_server": {}, "ha_reboot_vm_on_internal_shutdown": true,
+            });
+            Some(vec![("Pool".into(), pool)])
+        }
+    }
 }
 
 impl Connection for DemoConnection {
@@ -4613,9 +4948,64 @@ impl Connection for DemoConnection {
         let rref = format!("snap-{}", demo_uuid());
         let time = SystemTime::now().duration_since(UNIX_EPOCH).map(|t| t.as_secs() as i64).ok();
         let was_running = v.power == PowerState::Running;
-        v.snapshots.insert(0, SnapshotInfo { rref: rref.clone(), name: name.into(), description: description.into(), time, memory, was_running });
+        v.snapshots.insert(0, SnapshotInfo { rref: rref.clone(), name: name.into(), description: description.into(), time, memory, was_running, scheduled: false });
         v.parent = Some(rref.clone());
         Ok(rref)
+    }
+    /// Half a second, as a real server would take it.
+    fn save_schedule(&self, x: &ScheduleInfo) -> Result<String, ApiError> {
+        said(if x.rref.is_empty() { "VMSS.create" } else { "VMSS.set_schedule" }, &[json!(x.name), json!(x.when())]);
+        demo_work(500);
+        let mut d = self.data.lock().unwrap();
+        let rref = if x.rref.is_empty() { format!("vmss-{}", demo_uuid()) } else { x.rref.clone() };
+        let mut y = ScheduleInfo { rref: rref.clone(), kind: x.kind_to_save(), ..x.clone() };
+        match d.schedules.iter_mut().find(|s| s.rref == rref) {
+            Some(old) => {
+                y.last_run = old.last_run;
+                *old = y;
+            }
+            None => d.schedules.push(y),
+        }
+        for v in d.vms.iter_mut() {
+            if x.vms.contains(&v.rref) {
+                v.schedule = Some(rref.clone());
+            } else if v.schedule.as_deref() == Some(rref.as_str()) {
+                v.schedule = None;
+            }
+        }
+        link_schedules(&mut d);
+        Ok(rref)
+    }
+    fn delete_schedule(&self, vmss: &str) -> Result<(), ApiError> {
+        said("VMSS.destroy", &[json!(vmss)]);
+        demo_work(400);
+        let mut d = self.data.lock().unwrap();
+        d.schedules.retain(|x| x.rref != vmss);
+        for v in d.vms.iter_mut().filter(|v| v.schedule.as_deref() == Some(vmss)) {
+            v.schedule = None;
+        }
+        Ok(())
+    }
+    fn set_vm_schedule(&self, vms: &[String], vmss: Option<&str>) -> Result<(), ApiError> {
+        demo_work(300);
+        let mut d = self.data.lock().unwrap();
+        for vm in vms {
+            said("VM.set_snapshot_schedule", &[json!(vm), json!(vmss.unwrap_or("OpaqueRef:NULL"))]);
+            if let Some(v) = d.vms.iter_mut().find(|v| v.rref == *vm) {
+                v.schedule = vmss.map(String::from);
+            }
+        }
+        link_schedules(&mut d);
+        Ok(())
+    }
+    fn set_schedule_enabled(&self, vmss: &str, on: bool) -> Result<(), ApiError> {
+        said("VMSS.set_enabled", &[json!(vmss), json!(on)]);
+        demo_work(200);
+        let mut d = self.data.lock().unwrap();
+        if let Some(x) = d.schedules.iter_mut().find(|x| x.rref == vmss) {
+            x.enabled = on;
+        }
+        Ok(())
     }
     /// Half a second (a disk a second and a half), as a real server would take it.
     fn edit_vm(&self, vm: &str, change: &VmChange) -> Result<(), ApiError> {
@@ -5089,6 +5479,12 @@ impl Connection for DemoConnection {
         recompute(&mut d);
         Ok(())
     }
+    fn records(&self, kind: &str, rref: &str) -> Result<Vec<(String, Value)>, ApiError> {
+        said(&format!("{}.get_record", kind), &[json!(rref)]);
+        std::thread::sleep(Duration::from_millis(120));
+        let d = self.data.lock().unwrap();
+        demo_records(&d, kind, rref).ok_or_else(|| ApiError { code: "HANDLE_INVALID".into(), details: vec![kind.into(), rref.into()] })
+    }
     fn delete_snapshot(&self, snap: &str) -> Result<Vec<String>, ApiError> {
         said("VM.destroy", &[json!(snap)]);
         std::thread::sleep(Duration::from_millis(900));
@@ -5384,15 +5780,62 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_schedules() {
+        let c = DemoConnection::new();
+        let d = c.fetch(0).unwrap();
+        let nightly = d.schedules.iter().find(|x| x.rref == "vmss-nightly").unwrap().clone();
+        assert_eq!((nightly.summary().as_str(), nightly.vms.len()), ("Daily at 03:00  ·  keeps 7", 2));
+        assert_eq!(d.vm("vm-web").unwrap().schedule.as_deref(), Some("vmss-nightly"));
+        // a new one: its VMs moved onto it (the database off its hourly one)
+        let x = ScheduleInfo { name: "Weekend".into(), enabled: true, keep: 4, every: Every::Weekly, hour: 22, days: vec!["Saturday".into()], vms: vec!["vm-db".into(), "vm-desk".into()], ..Default::default() };
+        let made = c.save_schedule(&x).unwrap();
+        let d = c.fetch(0).unwrap();
+        let y = d.schedules.iter().find(|x| x.rref == made).unwrap();
+        assert_eq!((y.when().as_str(), y.vms.len()), ("Sat at 22:00", 2));
+        assert!(d.schedules.iter().find(|x| x.rref == "vmss-db").unwrap().vms.is_empty());
+        // changed: one VM taken off; paused; then deleted, its VM on none
+        c.save_schedule(&ScheduleInfo { rref: made.clone(), vms: vec!["vm-db".into()], ..x.clone() }).unwrap();
+        assert_eq!(c.fetch(0).unwrap().vm("vm-desk").unwrap().schedule, None);
+        c.set_schedule_enabled(&made, false).unwrap();
+        assert!(!c.fetch(0).unwrap().schedules.iter().find(|x| x.rref == made).unwrap().enabled);
+        c.delete_schedule(&made).unwrap();
+        let d = c.fetch(0).unwrap();
+        assert!(d.schedules.iter().all(|x| x.rref != made) && d.vm("vm-db").unwrap().schedule.is_none());
+        // VMs put on one, and on none
+        c.set_vm_schedule(&["vm-db".into(), "vm-desk".into()], Some("vmss-nightly")).unwrap();
+        assert_eq!(c.fetch(0).unwrap().schedules.iter().find(|x| x.rref == "vmss-nightly").unwrap().vms.len(), 4);
+        c.set_vm_schedule(&["vm-web".into()], None).unwrap();
+        assert_eq!(c.fetch(0).unwrap().vm("vm-web").unwrap().schedule, None);
+    }
+
+    #[test]
+    fn schedules_read() {
+        let r = json!({
+            "name_label": "Nightly", "name_description": "", "enabled": true, "type": "checkpoint", "retained_snapshots": "7",
+            "frequency": "weekly", "schedule": { "hour": "3", "min": "30", "days": "Monday,Friday" },
+            "last_run_time": "20261118T03:30:02Z", "VMs": ["OpaqueRef:a", "OpaqueRef:b"],
+        });
+        let x = schedule_of("OpaqueRef:s", &r);
+        assert_eq!((x.every, x.hour, x.min, x.keep, x.memory), (Every::Weekly, 3, 30, 7, true));
+        assert_eq!((x.days.len(), x.vms.len(), x.when().as_str()), (2, 2, "Mon, Fri at 03:30"));
+        assert!(x.last_run.is_some());
+        // never run yet: the epoch, said as nothing
+        let never = schedule_of("x", &json!({ "last_run_time": "19700101T00:00:00Z", "frequency": "hourly", "schedule": { "min": "15" } }));
+        assert_eq!((never.last_run, never.when().as_str(), never.keep), (None, "Every hour at :15", 1));
+    }
+
+    #[test]
     fn snapshots_taken_reverted_and_deleted() {
         let c = DemoConnection::new();
         let vm = |c: &DemoConnection| c.fetch(0).unwrap().vm("vm-web").cloned().unwrap();
         assert_eq!(vm(&c).power, PowerState::Running);
-        assert_eq!(vm(&c).snapshots.len(), 3);
+        // three taken by hand, two by its nightly schedule
+        assert_eq!(vm(&c).snapshots.len(), 5);
+        assert_eq!(vm(&c).snapshots.iter().filter(|x| x.scheduled).count(), 2);
         // with its memory, the newest first, and now the current state comes from it
         let snap = c.snapshot_vm("vm-web", "Before upgrade", "nginx 1.24", true).unwrap();
         let v = vm(&c);
-        assert_eq!((v.snapshots.len(), v.snapshots[0].rref.as_str(), v.parent.as_deref()), (4, snap.as_str(), Some(snap.as_str())));
+        assert_eq!((v.snapshots.len(), v.snapshots[0].rref.as_str(), v.parent.as_deref()), (6, snap.as_str(), Some(snap.as_str())));
         assert!(v.snapshots[0].memory && v.snapshots[0].was_running && v.snapshots[0].description == "nginx 1.24");
         // a halted VM can't have its memory kept
         assert_eq!(c.snapshot_vm("vm-desk", "x", "", true).unwrap_err().code, "VM_BAD_POWER_STATE");

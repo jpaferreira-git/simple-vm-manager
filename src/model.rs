@@ -104,6 +104,8 @@ pub struct VmInfo {
     pub ha: String,
     /// Its snapshots, the newest first.
     pub snapshots: Vec<SnapshotInfo>,
+    /// The snapshot schedule it's on (XenServer's VMSS), if any.
+    pub schedule: Option<String>,
     /// The snapshot its current state comes from: the last one taken, or the one it was last
     /// put back to.
     pub parent: Option<String>,
@@ -491,6 +493,8 @@ pub struct SnapshotInfo {
     pub memory: bool,
     /// The VM was running when it was taken.
     pub was_running: bool,
+    /// Taken by a snapshot schedule (and deleted by it when it has more than it keeps).
+    pub scheduled: bool,
 }
 
 impl VmInfo {
@@ -835,6 +839,112 @@ pub struct PoolData {
     /// Its storage for suspended VMs and for crash dumps, when set (even if that storage is gone).
     pub suspend_sr: Option<String>,
     pub crash_dump_sr: Option<String>,
+    /// Its snapshot schedules (VMSS), by name.
+    pub schedules: Vec<ScheduleInfo>,
+    /// Why it can't have snapshot schedules, when it can't (its license, or a version without).
+    pub schedules_off: Option<String>,
+}
+
+/// How often a snapshot schedule takes its snapshots.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Every {
+    Hourly,
+    #[default]
+    Daily,
+    Weekly,
+}
+
+impl Every {
+    pub fn parse(t: &str) -> Every {
+        match t {
+            "hourly" => Every::Hourly,
+            "weekly" => Every::Weekly,
+            _ => Every::Daily,
+        }
+    }
+    /// As the server has it.
+    pub fn api(self) -> &'static str {
+        match self {
+            Every::Hourly => "hourly",
+            Every::Daily => "daily",
+            Every::Weekly => "weekly",
+        }
+    }
+}
+
+/// The days of the week as a snapshot schedule names them, Monday first.
+pub const WEEK_DAYS: [&str; 7] = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
+
+/// A pool's snapshot schedule (XenServer's VMSS): when it takes a snapshot of each of its VMs,
+/// and how many of them it keeps (deleting the oldest it took).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ScheduleInfo {
+    /// Empty for one not made yet.
+    pub rref: String,
+    pub name: String,
+    pub description: String,
+    pub enabled: bool,
+    /// Its snapshots hold the VMs' memory too (checkpoints); else their disks only.
+    pub memory: bool,
+    /// Its kind as the server has it ("snapshot", "checkpoint", "snapshot_with_quiesce"), kept
+    /// when what it holds isn't changed.
+    pub kind: String,
+    /// How many snapshots of each VM it keeps (1 to 10).
+    pub keep: i64,
+    pub every: Every,
+    /// When: the hour (daily, weekly) and the minute (0, 15, 30 or 45), on the pool's clock.
+    pub hour: u32,
+    pub min: u32,
+    /// Weekly: its days, as `WEEK_DAYS` names them, in the week's order.
+    pub days: Vec<String>,
+    /// When it last took its snapshots.
+    pub last_run: Option<i64>,
+    /// Its VMs (references).
+    pub vms: Vec<String>,
+}
+
+impl ScheduleInfo {
+    /// When it runs, in words: "Every hour at :15", "Daily at 03:00", "Mon, Wed, Fri at 03:00".
+    pub fn when(&self) -> String {
+        match self.every {
+            Every::Hourly => format!("Every hour at :{:02}", self.min),
+            Every::Daily => format!("Daily at {:02}:{:02}", self.hour, self.min),
+            Every::Weekly => {
+                let days: Vec<&str> = WEEK_DAYS.iter().filter(|d| self.days.iter().any(|x| x == *d)).map(|d| &d[..3]).collect();
+                let days = match days.len() {
+                    0 => "Weekly".to_string(),
+                    7 => "Every day".to_string(),
+                    _ => days.join(", "),
+                };
+                format!("{} at {:02}:{:02}", days, self.hour, self.min)
+            }
+        }
+    }
+    /// When it runs and how many it keeps: "Daily at 03:00 · keeps 7".
+    pub fn summary(&self) -> String {
+        format!("{}  ·  keeps {}", self.when(), self.keep)
+    }
+    /// What the server takes it as: its schedule's settings for its frequency.
+    pub fn schedule_map(&self) -> Vec<(&'static str, String)> {
+        let mut m = vec![("min", self.min.to_string())];
+        if self.every != Every::Hourly {
+            m.push(("hour", self.hour.to_string()));
+        }
+        if self.every == Every::Weekly {
+            let days: Vec<&str> = WEEK_DAYS.iter().copied().filter(|d| self.days.iter().any(|x| x == d)).collect();
+            m.push(("days", days.join(",")));
+        }
+        m
+    }
+    /// The kind to save it as: a checkpoint when it holds memory, else what it was (a quiesced
+    /// snapshot stays one) or a plain snapshot.
+    pub fn kind_to_save(&self) -> String {
+        match (self.memory, self.kind.as_str()) {
+            (true, _) => "checkpoint".into(),
+            (false, "snapshot_with_quiesce") => "snapshot_with_quiesce".into(),
+            _ => "snapshot".into(),
+        }
+    }
 }
 
 /// An update a pool's update channel has.

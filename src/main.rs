@@ -1,10 +1,12 @@
 // A simpler console for virtualization servers. Runs on Windows, Linux and macOS.
 #![windows_subsystem = "windows"]
+#![recursion_limit = "512"] // the demo's records (conn.rs): long json! objects
 
 mod alerts;
 mod app;
 mod conn;
 mod console;
+mod details;
 mod history;
 mod icons;
 mod isolib;
@@ -18,6 +20,7 @@ mod secrets;
 mod theme;
 mod update;
 mod upload;
+mod vmss;
 mod xva;
 
 use eframe::egui;
@@ -43,7 +46,8 @@ fn main() -> eframe::Result {
     // snapshot-revert|snapshot-delete|snapshot-taken|templates|template|new-vm-template|make-template|
     // make-template-snapshot|copy-vm|copy-vm-thin|template-made|vm-off|vm-edited|vm-bios|vm-rename|host|host-off|host-waking|
     // host-maintenance|host-in-maintenance|host-exit-maintenance|vm-performance|host-performance|alerts|alerts-all|alerts-dismissed|alert-rules|
-    // export|export-off|exporting|new-vm-import|importing|details|activities|log-detail picks what the screenshot shows (default: a VM's
+    // export|export-off|exporting|new-vm-import|importing|snapshots-page|snapshots-ticked|schedules|schedule-edit|schedule-new|
+    // schedule-pick|take-snapshots|details|details-search|activities|log-detail picks what the screenshot shows (default: a VM's
     // General tab; welcome is Home with no server; storage, search, logs, console and isos show that
     // tab; iso-describe an ISO's description being typed; iso-upload a demo upload under way, -done its
     // finished card; iso-upload-choose and -web the Upload dialog's two steps; sr-unmounted the ISO
@@ -58,7 +62,10 @@ fn main() -> eframe::Result {
     // opened; alerts-all with everything, alerts-dismissed with one dismissed as it starts),
     // alert-rules the Web Server's Alerts dialog; copy-vm-thin Copy VM onto the NFS share (thin); export the running Web Server's Export dialog,
     // export-off the Test Desktop's (off); exporting and importing one under way in Activities (with
-    // SVM_DEMO_SLOW and SVM_SHOT_WAIT); new-vm-import New VM from a demo .xva; the rest open a dialog).
+    // SVM_DEMO_SLOW and SVM_SHOT_WAIT); new-vm-import New VM from a demo .xva; snapshots-page the
+    // toolbar's Snapshots (-ticked with three VMs ticked), schedules its Schedules… list,
+    // schedule-edit the Nightly schedule, schedule-new a new one, schedule-pick the Web Server's
+    // Schedule… (its Snapshots tab), take-snapshots Take Snapshot for three VMs; the rest open a dialog).
     // --theme system|light|dark and --sidebar open|folded override the saved choices; --width 760…2560
     // sets the screenshot window's width (1180 by default; wider to check a wide layout), --height
     // 480…1600 its height (740 by default).

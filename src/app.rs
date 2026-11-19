@@ -13,6 +13,9 @@ use crate::movevm::{MoveAction, MoveDialog};
 use crate::pool_update::{PlanSr, PlanVm, PoolUpdateAction, PoolUpdateDialog, PoolView, UpdateRun};
 use crate::upload::{UploadAction, UploadDialog};
 use crate::xva::{ExportAction, ExportDialog, Exported};
+use crate::vmss::{EditAction, ListAction, PickAction, PickDialog, SchedPool, ScheduleDialog, SchedulesDialog};
+use details::FieldRecords;
+use snapshots::SnapView;
 use crate::secrets;
 use crate::update;
 use crate::icons::*;
@@ -26,9 +29,11 @@ use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod alerts;
+mod details;
 mod host_overview;
 mod overview;
 mod performance;
+mod snapshots;
 use alerts::{AlertsView, MessageCache, RulesAct, RulesDialog};
 use overview::{OverviewEdit, Thumb};
 
@@ -54,6 +59,9 @@ struct ServerEntry {
     error: Option<String>,
     next_refresh: Instant,
     fetching: bool,
+    /// When the fetch under way began: a re-read asked for since (next_refresh later than this)
+    /// is done right after it, as what it brings may be from before what was asked about.
+    fetch_started: Instant,
     ever: bool,
     failures: u32,
     /// VMs with a power action under way: what's being done ("Starting…") and the action.
@@ -97,6 +105,10 @@ impl ServerEntry {
 
 enum Msg {
     Fetched(u32, Result<PoolData, ApiError>),
+    /// A Details tab's every field, read (`key`: "vm:<ref>", "host:<ref>", "pool:").
+    Records { sid: u32, key: String, result: Result<Vec<(String, serde_json::Value)>, ApiError> },
+    /// A Details tab saved as a file (or not: why).
+    DetailsSaved { sid: u32, server: String, title: String, path: PathBuf, result: Result<(), String> },
     /// At startup: whether there's a keychain, the passwords saved in it for earlier servers, and
     /// the servers to reconnect to.
     Keychain { available: bool, saved: Vec<(String, String, String)>, session: Vec<(String, String)> },
@@ -153,6 +165,8 @@ enum Msg {
     Thumb { vm: String, result: Result<(usize, usize, Vec<u8>), String> },
     /// Saving a snapshot's description ended.
     SnapDescribed { sid: u32, vm: String, snap: String, name: String, text: String, result: Result<(), ApiError> },
+    /// Snapshot schedule work done (`key` as in `sched_busy`): what to log, done or not.
+    ScheduleDone { sid: u32, key: String, log: usize, done: String, failed: String, result: Result<String, ApiError> },
     /// Giving a detached library its settings back ended.
     Reattached { sid: u32, sr: String, lib: IsoLibrary, result: Result<(), ApiError> },
     /// Making a new VM ended: its name, and whether it was to start.
@@ -355,12 +369,20 @@ enum Tab {
     /// Every pool's networks (All servers).
     Networks,
     Snapshots,
+    /// Every pool's VMs with their snapshots and schedules (All servers; the toolbar's Snapshots).
+    AllSnapshots,
     /// The Templates folder's list.
     Templates,
     Logs,
 }
 
 impl Tab {
+    /// A page of All servers that a toolbar button opens: not a tab in its row too, the button
+    /// shown pressed instead.
+    fn on_toolbar(self) -> bool {
+        matches!(self, Tab::IsoLibrary | Tab::VmStorage | Tab::Templates | Tab::AllSnapshots | Tab::Networks | Tab::Alerts)
+    }
+
     fn label(self) -> &'static str {
         match self {
             Tab::Home => "Home",
@@ -377,7 +399,7 @@ impl Tab {
             Tab::IsoLibrary => "ISO Library",
             Tab::VmStorage => "VM Storage",
             Tab::Networks => "Networks",
-            Tab::Snapshots => "Snapshots",
+            Tab::Snapshots | Tab::AllSnapshots => "Snapshots",
             Tab::Templates => "Templates",
             Tab::Logs => "Logs",
         }
@@ -386,6 +408,13 @@ impl Tab {
 
 enum Dialog {
     None,
+    /// A pool's snapshot schedules; one of them (new or to change); the one some VMs are on.
+    Schedules(Box<SchedulesDialog>),
+    Schedule(Box<ScheduleDialog>),
+    PickSchedule(Box<PickDialog>),
+    /// A snapshot of each of several VMs: (pool, VM, its name, can hold its memory), the name,
+    /// description, and whether those that can hold their memory do.
+    TakeSnapshots { vms: Vec<(u32, String, String, bool)>, name: String, description: String, memory: bool, focus: bool },
     /// A VM's, a server's or a storage's alert limits, and its pool's email for alerts.
     AlertRules(Box<RulesDialog>),
     AddServer { server: String, user: String, password: String, error: String, remember: bool },
@@ -487,6 +516,22 @@ enum Intent {
     Templates,
     /// Make Template, choosing the VM.
     NewTemplate,
+    /// The Snapshots page: every pool's VMs with their snapshots (the toolbar's Snapshots).
+    Snapshots,
+    /// A VM's Snapshots tab: pool, VM.
+    OpenVmSnapshots(u32, String),
+    /// A pool's snapshot schedules (Schedules…; this pool's, else the first).
+    Schedules(Option<u32>),
+    /// A new snapshot schedule for these VMs of a pool (from the list of schedules: back to it after).
+    NewSchedule(u32, Vec<String>, bool),
+    /// Editing a pool's snapshot schedule (from the list of them: back to it after).
+    EditSchedule(u32, String, bool),
+    /// Choosing the snapshot schedule these VMs of a pool are on.
+    PickSchedule(u32, Vec<String>),
+    /// A VM of a pool taken off its snapshot schedule (its Snapshots tab's Remove).
+    Unschedule(u32, String),
+    /// A snapshot of each of these VMs (pool, VM), asked for first.
+    TakeSnapshots(Vec<(u32, String)>),
     /// The Networks page: every pool's networks (the toolbar's Networks).
     Networks,
     /// The New Network dialog.
@@ -637,6 +682,9 @@ pub struct App {
     /// back to that).
     before_console: Tab,
     closed_sections: HashSet<String>,
+    /// The Details tabs' every field, by pool and item (see `FieldRecords`), and their search.
+    field_records: HashMap<(u32, String), FieldRecords>,
+    details_search: String,
     dialog: Dialog,
     console: Option<ConsoleView>,
     /// Earlier servers and the account used on each, newest first.
@@ -660,6 +708,11 @@ pub struct App {
     snap_edit: Option<IsoEdit>,
     /// Snapshot descriptions being saved, by snapshot, shown until the server answers.
     snap_saving: HashMap<String, String>,
+    /// The Snapshots page: which VMs it shows, words in their names, the VMs ticked.
+    snap_view: SnapView,
+    /// Snapshot schedule work under way: a schedule's reference (turned on or off, deleted), or
+    /// "save:<pool>" (saved), or "pick:<pool>" (VMs put on one).
+    sched_busy: HashSet<String>,
     /// Snapshots being deleted.
     snap_deleting: HashSet<String>,
     /// ISO files being deleted, by disc.
@@ -765,6 +818,8 @@ impl App {
             tab: Tab::Home,
             before_console: Tab::Overview,
             closed_sections: HashSet::new(),
+            field_records: HashMap::new(),
+            details_search: String::new(),
             dialog: Dialog::None,
             console: None,
             known_hosts: load_history(),
@@ -779,6 +834,8 @@ impl App {
             iso_saving: HashMap::new(),
             snap_edit: None,
             snap_saving: HashMap::new(),
+            snap_view: SnapView::default(),
+            sched_busy: HashSet::new(),
             snap_deleting: HashSet::new(),
             iso_deleting: HashSet::new(),
             vm_deleting: HashSet::new(),
@@ -891,6 +948,7 @@ impl App {
             error: None,
             next_refresh: Instant::now(),
             fetching: false,
+            fetch_started: Instant::now(),
             ever: false,
             failures: 0,
             busy: HashMap::new(),
@@ -1441,6 +1499,62 @@ impl App {
             let _ = tx.send(Msg::SnapDone { sid, vm, snap: None, log, title: "Take Snapshot", text, result });
             ctx.request_repaint();
         });
+    }
+
+    /// Snapshot schedule work in the background (`key` as in `sched_busy`), logged as `doing`,
+    /// then `done` or `failed`.
+    fn schedule_job(&mut self, sid: u32, key: String, doing: String, done: String, failed: String, work: impl FnOnce(&dyn Connection) -> Result<String, ApiError> + Send + 'static, ctx: &egui::Context) {
+        let Some(s) = self.server(sid) else { return };
+        let (conn, tx, ctx, server) = (s.conn.clone(), self.tx.clone(), ctx.clone(), s.name());
+        let log = self.add_log(sid, &server, None, &server, &doing, "In progress");
+        let prog = self.progress(log);
+        self.sched_busy.insert(key.clone());
+        std::thread::spawn(move || {
+            crate::conn::watch(&prog);
+            let result = work(conn.as_ref());
+            let _ = tx.send(Msg::ScheduleDone { sid, key, log, done, failed, result });
+            ctx.request_repaint();
+        });
+    }
+
+    fn save_schedule(&mut self, sid: u32, x: ScheduleInfo, ctx: &egui::Context) {
+        let (doing, done, failed) = if x.rref.is_empty() {
+            (format!("Making snapshot schedule '{}'", x.name), format!("Made snapshot schedule '{}': {}", x.name, x.summary()), format!("Couldn't make snapshot schedule '{}'", x.name))
+        } else {
+            (format!("Saving snapshot schedule '{}'", x.name), format!("Saved snapshot schedule '{}': {}", x.name, x.summary()), format!("Couldn't save snapshot schedule '{}'", x.name))
+        };
+        self.schedule_job(sid, format!("save:{}", sid), doing, done, failed, move |c| c.save_schedule(&x), ctx);
+    }
+
+    fn delete_schedule(&mut self, sid: u32, vmss: String, ctx: &egui::Context) {
+        let name = self.server(sid).and_then(|s| s.data.as_ref()).and_then(|d| d.schedules.iter().find(|x| x.rref == vmss)).map(|x| x.name.clone()).unwrap_or_default();
+        let (doing, done, failed) = (format!("Deleting snapshot schedule '{}'", name), format!("Deleted snapshot schedule '{}'", name), format!("Couldn't delete snapshot schedule '{}'", name));
+        let r = vmss.clone();
+        self.schedule_job(sid, vmss, doing, done, failed, move |c| c.delete_schedule(&r).map(|_| String::new()), ctx);
+    }
+
+    fn enable_schedule(&mut self, sid: u32, vmss: String, on: bool, ctx: &egui::Context) {
+        let name = self.server(sid).and_then(|s| s.data.as_ref()).and_then(|d| d.schedules.iter().find(|x| x.rref == vmss)).map(|x| x.name.clone()).unwrap_or_default();
+        let (doing, done, failed) = if on {
+            (format!("Turning on snapshot schedule '{}'", name), format!("Turned on snapshot schedule '{}'", name), format!("Couldn't turn on snapshot schedule '{}'", name))
+        } else {
+            (format!("Pausing snapshot schedule '{}'", name), format!("Paused snapshot schedule '{}'", name), format!("Couldn't pause snapshot schedule '{}'", name))
+        };
+        let r = vmss.clone();
+        self.schedule_job(sid, vmss, doing, done, failed, move |c| c.set_schedule_enabled(&r, on).map(|_| String::new()), ctx);
+    }
+
+    /// Puts VMs of a pool on a snapshot schedule, or on none; `key` as in `sched_busy` (pick: the
+    /// Snapshot Schedule dialog's, off: a VM's Remove).
+    fn set_vm_schedule(&mut self, sid: u32, key: String, vms: Vec<String>, vmss: Option<String>, ctx: &egui::Context) {
+        let Some(d) = self.server(sid).and_then(|s| s.data.as_ref()) else { return };
+        let names: Vec<String> = vms.iter().filter_map(|r| d.vm(r).map(|v| v.name.clone())).collect();
+        let who = if names.len() == 1 { format!("VM '{}'", names[0]) } else { format!("{} VMs", names.len()) };
+        let (doing, done, failed) = match vmss.as_deref().and_then(|r| d.schedules.iter().find(|x| x.rref == r)) {
+            Some(x) => (format!("Putting {} on snapshot schedule '{}'", who, x.name), format!("Put {} on snapshot schedule '{}'", who, x.name), format!("Couldn't put {} on snapshot schedule '{}'", who, x.name)),
+            None => (format!("Taking {} off snapshot schedules", who), format!("Took {} off snapshot schedules", who), format!("Couldn't take {} off snapshot schedules", who)),
+        };
+        self.schedule_job(sid, key, doing, done, failed, move |c| c.set_vm_schedule(&vms, vmss.as_deref()).map(|_| String::new()), ctx);
     }
 
     /// Reverts a VM to a snapshot in the background (with `first`, after taking a snapshot of
@@ -2040,6 +2154,7 @@ impl App {
         for s in self.servers.iter_mut() {
             if !s.fetching && now >= s.next_refresh && s.state != ConnState::Disconnected {
                 s.fetching = true;
+                s.fetch_started = now;
                 let (conn, tx, ctx, id) = (s.conn.clone(), self.tx.clone(), ctx.clone(), s.id);
                 std::thread::spawn(move || {
                     let r = conn.fetch(FETCH_TIMEOUT_MS);
@@ -2051,6 +2166,24 @@ impl App {
         while let Ok(m) = self.rx.try_recv() {
             match m {
                 Msg::Fetched(id, r) => self.on_fetched(id, r),
+                Msg::Records { sid, key, result } => {
+                    let e = self.field_records.entry((sid, key)).or_default();
+                    e.loading = false;
+                    e.at = Some(Instant::now());
+                    match result {
+                        Ok(recs) => (e.recs, e.error) = (recs, None),
+                        Err(err) => e.error = Some(err.message()),
+                    }
+                }
+                Msg::DetailsSaved { sid, server, title, path, result } => match result {
+                    Ok(()) => {
+                        self.add_log(sid, &server, None, &title, &format!("Exported the details of '{}' to {}", title, path.display()), "Done");
+                    }
+                    Err(why) => {
+                        self.add_log(sid, &server, None, &title, &format!("Couldn't export the details of '{}': {}", title, why), "Failed");
+                        self.dialog = Dialog::Message { title: "Export Details".into(), text: format!("Couldn't save {}.\n\n{}", path.display(), why) };
+                    }
+                },
                 Msg::Keychain { available, saved, session } => {
                     self.keychain = Some(available);
                     self.saved = saved.into_iter().map(|(h, u, p)| ((h, u), p)).collect();
@@ -2629,6 +2762,15 @@ impl App {
                     }
                     if let Some(x) = &snap {
                         self.snap_deleting.remove(x);
+                        // gone: off its VM's list now, not at the next read
+                        if title == "Delete Snapshot" && result.is_ok() {
+                            if let Some(v) = self.server_mut(sid).and_then(|s| s.data.as_mut()).and_then(|d| d.vms.iter_mut().find(|v| v.rref == vm)) {
+                                v.snapshots.retain(|y| y.rref != *x);
+                                if v.parent.as_ref() == Some(x) {
+                                    v.parent = None;
+                                }
+                            }
+                        }
                     }
                     let shot = self.shot_path.is_some();
                     match result {
@@ -2899,6 +3041,49 @@ impl App {
                         Err(e) => t.error = Some(e),
                     }
                 }
+                Msg::ScheduleDone { sid, key, log, done, failed, result } => {
+                    self.sched_busy.remove(&key);
+                    if let Some(e) = self.log.get_mut(log) {
+                        match &result {
+                            Ok(_) => (e.text, e.status) = (done, "Done".into()),
+                            Err(err) => (e.text, e.status) = (format!("{}: {}", failed, err.message()), "Failed".into()),
+                        }
+                    }
+                    self.refresh_soon(sid);
+                    match &result {
+                        // its dialog is done with (back to the list it came from)
+                        Ok(_) if key.starts_with("save:") => {
+                            if let Dialog::Schedule(d) = &self.dialog {
+                                self.dialog = if d.from_list { Dialog::Schedules(Box::new(SchedulesDialog::new(sid))) } else { Dialog::None };
+                            }
+                        }
+                        Ok(_) if key.starts_with("off:") => {
+                            // off it now, not at the next read
+                            let vm = key.splitn(3, ':').nth(2).unwrap_or_default().to_string();
+                            if let Some(d) = self.server_mut(sid).and_then(|s| s.data.as_mut()) {
+                                for x in d.schedules.iter_mut() {
+                                    x.vms.retain(|r| *r != vm);
+                                }
+                                if let Some(v) = d.vms.iter_mut().find(|v| v.rref == vm) {
+                                    v.schedule = None;
+                                }
+                            }
+                        }
+                        Ok(_) if key.starts_with("pick:") => {
+                            if matches!(self.dialog, Dialog::PickSchedule(_)) {
+                                self.dialog = Dialog::None;
+                            }
+                            self.snap_view.picked.clear();
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            // said in a dialog, unless another one (not a schedule's) is open
+                            if matches!(self.dialog, Dialog::None | Dialog::Schedules(_) | Dialog::Schedule(_) | Dialog::PickSchedule(_)) {
+                                self.dialog = Dialog::Message { title: "Snapshot Schedules".into(), text: format!("{}.\n\n{}", failed, schedule_problem(e)) };
+                            }
+                        }
+                    }
+                }
                 Msg::SnapDescribed { sid, vm, snap, name, text, result } => {
                     self.snap_saving.remove(&snap);
                     let server = self.server(sid).map(|s| s.name()).unwrap_or_default();
@@ -3022,7 +3207,10 @@ impl App {
                 s.error = None;
                 s.failures = 0;
                 s.ever = true;
-                s.next_refresh = Instant::now() + Duration::from_millis(REFRESH_MS);
+                // a re-read asked for while this was being read (a snapshot deleted, say) is done
+                // now: this may be from before it
+                let asked = s.next_refresh > s.fetch_started;
+                s.next_refresh = if asked { Instant::now() } else { Instant::now() + Duration::from_millis(REFRESH_MS) };
                 let name = s.name();
                 let is_demo = s.conn.is_demo();
                 let (host, user) = (s.conn.hostname(), s.conn.username());
@@ -3670,6 +3858,51 @@ impl App {
                     self.select("root".into());
                     self.tab = Tab::Templates;
                 }
+                Intent::Snapshots => {
+                    self.select("root".into());
+                    self.tab = Tab::AllSnapshots;
+                }
+                Intent::OpenVmSnapshots(sid, vm) => {
+                    self.select(format!("vm:{}:{}", sid, vm));
+                    self.tab = Tab::Snapshots;
+                }
+                Intent::Schedules(sid) => {
+                    if let Some(sid) = sid.or_else(|| self.servers.iter().find(|s| s.data.is_some()).map(|s| s.id)) {
+                        self.dialog = Dialog::Schedules(Box::new(SchedulesDialog::new(sid)));
+                    }
+                }
+                Intent::NewSchedule(sid, vms, from_list) => {
+                    self.dialog = Dialog::Schedule(Box::new(ScheduleDialog::new(sid, None, vms, from_list)));
+                }
+                Intent::EditSchedule(sid, vmss, from_list) => {
+                    if let Some(x) = self.server(sid).and_then(|s| s.data.as_ref()).and_then(|d| d.schedules.iter().find(|x| x.rref == vmss)) {
+                        self.dialog = Dialog::Schedule(Box::new(ScheduleDialog::new(sid, Some(x), vec![], from_list)));
+                    }
+                }
+                Intent::PickSchedule(sid, vms) => {
+                    let Some(d) = self.server(sid).and_then(|s| s.data.as_ref()) else { continue };
+                    // the schedule they're all on, if they are
+                    let on: Vec<Option<String>> = vms.iter().map(|r| d.vm(r).and_then(|v| v.schedule.clone())).collect();
+                    let now = on.first().cloned().flatten().filter(|first| on.iter().all(|x| x.as_deref() == Some(first.as_str())));
+                    self.dialog = Dialog::PickSchedule(Box::new(PickDialog::new(sid, vms, now)));
+                }
+                Intent::Unschedule(sid, vm) => self.set_vm_schedule(sid, format!("off:{}:{}", sid, vm), vec![vm], None, ctx),
+                Intent::TakeSnapshots(list) => {
+                    let vms: Vec<(u32, String, String, bool)> = list
+                        .iter()
+                        .filter_map(|(sid, vm)| {
+                            let s = self.server(*sid)?;
+                            let v = s.data.as_ref()?.vm(vm)?;
+                            (v.can_snapshot() && !s.busy.contains_key(vm)).then(|| (*sid, vm.clone(), v.name.clone(), v.can("checkpoint")))
+                        })
+                        .collect();
+                    if vms.is_empty() {
+                        self.dialog = Dialog::Message { title: "Take Snapshot".into(), text: "None of them can have a snapshot taken now (busy, or their server isn't there).".into() };
+                    } else {
+                        let name = fmt_date_time(unix_now(), local_offset(unix_now()));
+                        self.dialog = Dialog::TakeSnapshots { vms, name, description: String::new(), memory: false, focus: true };
+                    }
+                }
                 Intent::Networks => {
                     self.select("root".into());
                     self.tab = Tab::Networks;
@@ -3837,16 +4070,19 @@ impl App {
     fn toolbar(&self, ui: &mut Ui, sel: &Node, out: &mut Vec<Intent>) {
         let pal = self.pal;
         // (A VM's power actions are next to its tabs: see tab_actions; the theme is in Settings.)
-        // When the window is too narrow for every label, buttons show only their icons (the
-        // label becomes a tooltip): first New VM, ISO Library, VM Storage and Updates (rank 2),
-        // then all of them.
-        let fits = |level: u8| {
+        // When the window is too narrow for every label, the app's name in the corner goes first;
+        // then buttons show only their icons (the label becomes a tooltip): New VM, ISO Library,
+        // VM Storage and the rest (rank 2), then Connect too.
+        let fits = |level: u8, name: bool| {
             let w = |l: &str, rank: u8| if level >= rank { 32.0 } else { tool_width(ui, l) } + 2.0;
-            let buttons: f32 = w("Connect", 3) + w("New VM", 2) + w("ISO Library", 2) + w("VM Storage", 2) + w("Templates", 2) + w("Networks", 2) + w("Updates", 2) + w("Alerts", 2);
-            36.0 + 40.0 + 10.0 + 16.0 + buttons + 160.0 <= ui.available_width() // 160: the app's name
+            let buttons: f32 = w("Connect", 3) + w("New VM", 2) + w("ISO Library", 2) + w("VM Storage", 2) + w("Templates", 2) + w("Snapshots", 2) + w("Networks", 2) + w("Updates", 2) + w("Alerts", 2);
+            36.0 + 40.0 + 10.0 + 16.0 + buttons + if name { 160.0 } else { 0.0 } <= ui.available_width() // 160: the app's name
         };
-        let level = (0..3).find(|&l| fits(l)).unwrap_or(3);
+        let (level, with_name) = [(0, true), (0, false), (2, true), (2, false), (3, true)].into_iter().find(|&(l, n)| fits(l, n)).unwrap_or((3, false));
         let compact = |rank: u8| level >= rank;
+        // the All servers page shown, its button pressed
+        let page = (sel.kind == Kind::Root && self.tab.on_toolbar()).then_some(self.tab);
+        let on = |t: Tab| page == Some(t);
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
             if icon_button(ui, "settings", &pal, true, false).on_hover_text("Settings").clicked() {
@@ -3857,29 +4093,32 @@ impl App {
             ui.add_space(2.0);
             vsep(ui, &pal);
             ui.add_space(2.0);
-            if tool_button(ui, "connect", "Connect", true, compact(3), &pal).clicked() {
+            if tool_button(ui, "connect", "Connect", true, false, compact(3), &pal).clicked() {
                 out.push(Intent::AddServer);
             }
             let has_pool = self.servers.iter().any(|s| s.data.is_some());
-            if tool_button(ui, "newvm", "New VM", has_pool, compact(2), &pal).on_hover_text("Create a virtual machine that installs from an ISO file").clicked() {
+            if tool_button(ui, "newvm", "New VM", has_pool, false, compact(2), &pal).on_hover_text("Create a virtual machine that installs from an ISO file").clicked() {
                 out.push(Intent::NewVm(sel.sid, None));
             }
-            if tool_button(ui, "iso", "ISO Library", has_pool, compact(2), &pal).on_hover_text("Your installation discs (.iso files) in every library, and adding a library").clicked() {
+            if tool_button(ui, "iso", "ISO Library", has_pool, on(Tab::IsoLibrary), compact(2), &pal).on_hover_text("Your installation discs (.iso files) in every library, and adding a library").clicked() {
                 out.push(Intent::IsoLibrary);
             }
-            if tool_button(ui, "storage", "VM Storage", has_pool, compact(2), &pal).on_hover_text("Where your VMs' disks are, and adding shared storage for them").clicked() {
+            if tool_button(ui, "storage", "VM Storage", has_pool, on(Tab::VmStorage), compact(2), &pal).on_hover_text("Where your VMs' disks are, and adding shared storage for them").clicked() {
                 out.push(Intent::VmStorage);
             }
-            if tool_button(ui, "templates", "Templates", has_pool, compact(2), &pal).on_hover_text("Your templates, and making one from a VM").clicked() {
+            if tool_button(ui, "templates", "Templates", has_pool, on(Tab::Templates), compact(2), &pal).on_hover_text("Your templates, and making one from a VM").clicked() {
                 out.push(Intent::Templates);
             }
-            if tool_button(ui, "networks", "Networks", has_pool, compact(2), &pal).on_hover_text("Your VMs' networks, and adding one").clicked() {
+            if tool_button(ui, "snapshots", "Snapshots", has_pool, on(Tab::AllSnapshots), compact(2), &pal).on_hover_text("Every VM's snapshots, and the schedules that take them").clicked() {
+                out.push(Intent::Snapshots);
+            }
+            if tool_button(ui, "networks", "Networks", has_pool, on(Tab::Networks), compact(2), &pal).on_hover_text("Your VMs' networks, and adding one").clicked() {
                 out.push(Intent::Networks);
             }
             // a pool's updates: a red dot when one has security updates waiting, a yellow one (the
             // network tiles' "out") when one has others, or a server to restart for them
             let worst = self.servers.iter().filter_map(|s| self.pool_update_status(s.id)).map(|st| st.1).filter(|st| matches!(st, Standing::Pending | Standing::Bad)).max();
-            let resp = tool_button(ui, "updates", "Updates", has_pool, compact(2), &pal);
+            let resp = tool_button(ui, "updates", "Updates", has_pool, false, compact(2), &pal);
             if let Some(st) = worst {
                 ui.painter().circle_filled(resp.rect.min + vec2(24.0, 6.0), 4.0, if st == Standing::Bad { pal.red } else { pal.orange });
             }
@@ -3893,7 +4132,7 @@ impl App {
             }
             // alerts: a bell, with how many need attention (red when one's critical)
             let need: Vec<Severity> = self.alert_rows().into_iter().map(|r| r.sev).filter(|s| s.needs_attention()).collect();
-            let resp = tool_button(ui, "alerts", "Alerts", true, compact(2), &pal);
+            let resp = tool_button(ui, "alerts", "Alerts", true, on(Tab::Alerts), compact(2), &pal);
             if !need.is_empty() {
                 let text = if need.len() > 99 { "99+".to_string() } else { need.len().to_string() };
                 let col = if need.contains(&Severity::Critical) { pal.red } else { pal.orange };
@@ -3911,7 +4150,10 @@ impl App {
             if resp.on_hover_text(tip).clicked() {
                 out.push(Intent::Alerts);
             }
-            // the app's name in the right corner; a click shows About
+            // the app's name in the right corner (when there's room); a click shows About
+            if !with_name {
+                return;
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add_space(8.0);
                 let font = FontId::new(15.5, FontFamily::Name("bold".into()));
@@ -4999,7 +5241,7 @@ impl App {
     fn tabs_for(&self, sel: &Node) -> Vec<Tab> {
         let has_data = sel.sid.and_then(|id| self.server(id)).map_or(false, |s| s.data.is_some());
         match sel.kind {
-            Kind::Root => vec![Tab::Home, Tab::IsoLibrary, Tab::VmStorage, Tab::Templates, Tab::Networks, Tab::Search, Tab::Logs, Tab::Alerts],
+            Kind::Root => vec![Tab::Home, Tab::IsoLibrary, Tab::VmStorage, Tab::Templates, Tab::AllSnapshots, Tab::Networks, Tab::Search, Tab::Logs, Tab::Alerts],
             Kind::Category => vec![Tab::Home, Tab::Search, Tab::Logs],
             Kind::Sr if self.sr_of(sel).map_or(false, |(_, x)| x.is_iso()) => vec![Tab::General, Tab::IsoFiles, Tab::Logs],
             Kind::Folder if sel.rref.as_deref() == Some("nets") => vec![Tab::Networking],
@@ -5530,20 +5772,26 @@ impl App {
     /// Its sections as cards, one under the other, in the middle 80% of the page (all of it in a
     /// narrow window).
     fn general(&self, ui: &mut Ui, sel: &Node, out: &mut Vec<Intent>) {
+        let secs = self.general_sections(sel);
+        self.cards(ui, &secs, "", out);
+    }
+
+    /// Sections as cards of label and value rows, each folding at its title; a value's click
+    /// copies it. With `q` (lower case) searched for, every card is open and what's found marked.
+    fn cards(&self, ui: &mut Ui, secs: &[(String, Vec<(String, String)>)], q: &str, out: &mut Vec<Intent>) {
         const HEAD: f32 = 38.0;
         const ROW: f32 = 25.0;
         let pal = self.pal;
-        let secs = self.general_sections(sel);
+        let mark = pal.accent.gamma_multiply(if pal.dark { 0.45 } else { 0.28 });
         egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
             let full = ui.available_width();
-            let (pad, gap) = (16.0, 12.0);
-            let room = full - 2.0 * pad;
-            let card_w = (full * 0.8).max(room.min(560.0)).min(room);
-            let origin = ui.cursor().min + vec2((full - card_w) / 2.0, 14.0);
+            let gap = 12.0;
+            let (x0, card_w) = details::card_span(full);
+            let origin = ui.cursor().min + vec2(x0, 14.0);
             let mut total = 0.0;
             let mut cards = vec![];
-            for (name, rows) in &secs {
-                let open = self.section_open(name);
+            for (name, rows) in secs {
+                let open = !q.is_empty() || self.section_open(name);
                 let h = HEAD + if open { rows.len() as f32 * ROW + 10.0 } else { 0.0 };
                 cards.push((Rect::from_min_size(origin + vec2(0.0, total), vec2(card_w, h)), name, rows, open));
                 total += h + gap;
@@ -5571,7 +5819,7 @@ impl App {
                 let c = pos2(head.max.x - 20.0, head.center().y);
                 let chev = if open { vec![c + vec2(-4.0, -2.0), c + vec2(0.0, 2.0), c + vec2(4.0, -2.0)] } else { vec![c + vec2(-2.0, -4.0), c + vec2(2.0, 0.0), c + vec2(-2.0, 4.0)] };
                 p.add(egui::Shape::line(chev, Stroke::new(1.4_f32, pal.ink_soft)));
-                if hresp.clicked() {
+                if hresp.clicked() && q.is_empty() {
                     out.push(Intent::Section(name.clone()));
                 }
                 if !open {
@@ -5579,18 +5827,24 @@ impl App {
                 }
                 p.line_segment([pos2(r.min.x + 16.0, head.max.y), pos2(r.max.x - 16.0, head.max.y)], Stroke::new(1.0_f32, pal.border));
                 let mut y = head.max.y + 5.0;
+                let clip = ui.clip_rect();
                 for (k, v) in rows {
                     let rr = Rect::from_min_size(pos2(r.min.x, y), vec2(r.width(), ROW));
-                    // (a long label, such as a VM's name, cut short)
-                    let mut kjob = egui::text::LayoutJob::simple_singleline(k.clone(), key_font.clone(), pal.ink_soft);
-                    kjob.wrap = egui::text::TextWrapping { max_width: label_w - 10.0, max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
-                    let kg = p.layout_job(kjob);
-                    p.galley(pos2(r.min.x + 16.0, rr.center().y - kg.size().y / 2.0), kg, pal.ink_soft);
+                    // (only the rows in view are drawn: a record has hundreds)
+                    if rr.max.y < clip.min.y || rr.min.y > clip.max.y {
+                        y += ROW;
+                        continue;
+                    }
+                    // (a long label, such as a VM's name, cut short: in full under the mouse)
+                    let kg = p.layout_job(details::marked(k, q, key_font.clone(), pal.ink_soft, mark, label_w - 10.0));
+                    let kr = Rect::from_min_size(pos2(r.min.x + 16.0, rr.center().y - kg.size().y / 2.0), kg.size());
+                    if kg.elided {
+                        ui.interact(kr, ui.id().with(("key", name.as_str(), k.as_str())), Sense::hover()).on_hover_text(k.as_str());
+                    }
+                    p.galley(kr.min, kg, pal.ink_soft);
                     let vx = r.min.x + 16.0 + label_w;
                     let room = r.max.x - 14.0 - vx;
-                    let mut job = egui::text::LayoutJob::simple_singleline(v.clone(), FontId::proportional(13.0), pal.ink);
-                    job.wrap = egui::text::TextWrapping { max_width: room.max(10.0), max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
-                    let g = p.layout_job(job);
+                    let g = p.layout_job(details::marked(v, q, FontId::proportional(13.0), pal.ink, mark, room));
                     let vr = Rect::from_min_size(pos2(vx, rr.center().y - g.size().y / 2.0), g.size());
                     p.galley(vr.min, g, pal.ink);
                     if !v.is_empty() {
@@ -6341,6 +6595,12 @@ impl App {
         let doing = s.busy.get(&v.rref).map(|b| b.0.clone());
         let gone = self.vm_of(sel).map_or(false, |(_, d, v)| d.host_down_for(v).is_some());
         let can_take = v.can_snapshot() && doing.is_none() && !gone;
+        // the snapshot schedule it's on (name, when and how many it keeps, on), and why the pool
+        // can't have them, if it can't
+        let (sched, sched_off) = self.vm_of(sel).map_or((None, None), |(_, d, v)| {
+            let x = v.schedule.as_deref().and_then(|r| d.schedules.iter().find(|x| x.rref == r));
+            (x.map(|x| (x.name.clone(), x.summary(), x.enabled, x.rref.clone())), d.schedules_off.clone())
+        });
         ui.add_space(10.0);
         if let Some(what) = &doing {
             ui.horizontal(|ui| {
@@ -6349,6 +6609,43 @@ impl App {
             });
             ui.add_space(4.0);
         }
+        ui.horizontal_wrapped(|ui| {
+            ui.set_min_height(28.0);
+            let (r, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
+            paint_glyph(ui.painter(), r, "clock", if sched.is_some() { pal.accent } else { pal.ink_faint });
+            match &sched {
+                Some((name, summary, on, _)) => {
+                    ui.label(egui::RichText::new(format!("On the schedule '{}'", name)).color(pal.ink));
+                    ui.label(egui::RichText::new(format!("{}{}", summary, if *on { "" } else { "  ·  paused" })).size(12.5).color(if *on { pal.ink_soft } else { pal.orange }));
+                }
+                None => {
+                    ui.label(egui::RichText::new("No snapshot schedule: only the snapshots you take").color(pal.ink_soft));
+                }
+            }
+            match &sched {
+                // its schedule's settings (when, how many it keeps, its VMs), or off it
+                Some((name, _, _, vmss)) => {
+                    let removing = self.sched_busy.contains(&format!("off:{}:{}", sid, vref));
+                    if flat_button(ui, "edit", "Edit…", Some(pal.accent), !removing, false, &pal).on_hover_text("Edit its schedule: when it runs, how many it keeps, its VMs").clicked() {
+                        out.push(Intent::EditSchedule(sid, vmss.clone(), false));
+                    }
+                    let tip = format!("Take it off '{}': no more snapshots taken by themselves. The snapshots it took stay, and so does the schedule, for its other VMs.", name);
+                    if flat_button(ui, "close", if removing { "Removing…" } else { "Remove" }, None, !removing, false, &pal).on_hover_text(tip).clicked() {
+                        out.push(Intent::Unschedule(sid, vref.clone()));
+                    }
+                    if removing {
+                        ui.add(egui::Spinner::new().size(13.0));
+                    }
+                }
+                None => {
+                    let tip = sched_off.as_deref().unwrap_or("Put it on a snapshot schedule: it takes snapshots by itself and keeps the last few");
+                    if flat_button(ui, "clock", "Schedule…", Some(pal.accent), sched_off.is_none(), false, &pal).on_hover_text(tip).on_disabled_hover_text(tip).clicked() {
+                        out.push(Intent::PickSchedule(sid, vec![vref.clone()]));
+                    }
+                }
+            }
+        });
+        ui.add_space(2.0);
         if snaps.is_empty() {
             ui.add_space(24.0);
             ui.vertical_centered(|ui| {
@@ -6434,9 +6731,15 @@ impl App {
             let p = ui.painter().clone();
             let current = parent.as_deref() == Some(x.rref.as_str());
             if cols[col] == Col::Name {
-                // the camera, the name (cut short if need be), and "Now" on the one the VM's
-                // current state comes from
-                paint_icon(&p, Rect::from_min_size(pos2(r.min.x, r.center().y - 8.0), vec2(16.0, 16.0)), IconKind::Snapshot, &pal, pal.window);
+                // the camera (a clock on one its schedule took), the name (cut short if need
+                // be), and "Now" on the one the VM's current state comes from
+                let icon = Rect::from_min_size(pos2(r.min.x, r.center().y - 8.0), vec2(16.0, 16.0));
+                if x.scheduled {
+                    paint_glyph(&p, icon, "clock", pal.accent);
+                    ui.interact(icon, ui.id().with(("auto", &x.rref)), Sense::hover()).on_hover_text("Taken by its snapshot schedule, which deletes it once it has more than it keeps");
+                } else {
+                    paint_icon(&p, icon, IconKind::Snapshot, &pal, pal.window);
+                }
                 let colour = if gone { pal.ink_faint } else { pal.ink };
                 let mut job = egui::text::LayoutJob::simple_singleline(x.name.clone(), font.clone(), colour);
                 job.wrap = egui::text::TextWrapping { max_width: (r.width() - 24.0 - if current { PILL + 8.0 } else { 0.0 }).max(20.0), max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
@@ -6920,6 +7223,9 @@ impl App {
         // from the snapshot dialogs: take one (server, VM, name, description, memory), revert to
         // one (server, snapshot, a snapshot of now first), delete one (server, snapshot)
         let mut take_snap: Option<(u32, String, String, String, bool)> = None;
+        // from the snapshot schedule dialogs, and Take Snapshot for several VMs
+        let (mut sched_list, mut sched_edit, mut sched_pick) = (None, None, None);
+        let mut take_many: Option<(Vec<(u32, String, String, bool)>, String, String, bool)> = None;
         let mut revert_to: Option<(u32, String, bool)> = None;
         let mut delete_snap: Option<(u32, String)> = None;
         // from the template and copy dialogs
@@ -7012,6 +7318,67 @@ impl App {
         match &mut self.dialog {
             Dialog::MoveVm(d) => {
                 move_action = Some((d.sid, d.ui(ctx, &pal)));
+            }
+            Dialog::Schedules(d) => {
+                let pools: Vec<SchedPool> = self.servers.iter().filter_map(|s| s.data.as_ref().map(|data| SchedPool { sid: s.id, name: s.name(), data })).collect();
+                sched_list = Some(d.ui(ctx, &pal, &pools, &self.sched_busy));
+            }
+            Dialog::Schedule(d) => {
+                let pool = self.servers.iter().find(|s| s.id == d.sid).and_then(|s| s.data.as_ref().map(|data| SchedPool { sid: s.id, name: s.name(), data }));
+                let saving = self.sched_busy.contains(&format!("save:{}", d.sid));
+                sched_edit = Some((d.sid, d.from_list, d.ui(ctx, &pal, pool.as_ref(), saving)));
+            }
+            Dialog::PickSchedule(d) => {
+                let pool = self.servers.iter().find(|s| s.id == d.sid).and_then(|s| s.data.as_ref().map(|data| SchedPool { sid: s.id, name: s.name(), data }));
+                let saving = self.sched_busy.contains(&format!("pick:{}", d.sid));
+                sched_pick = Some(d.ui(ctx, &pal, pool.as_ref(), saving));
+            }
+            Dialog::TakeSnapshots { vms, name, description, memory, focus } => {
+                dialog_window(ctx, "Take Snapshots").show(ctx, |ui| {
+                    ui.set_width(460.0);
+                    ui.spacing_mut().item_spacing.y = 8.0;
+                    let names: Vec<String> = vms.iter().map(|v| v.2.clone()).collect();
+                    let n = vms.len();
+                    let what = if *memory { "disks and memory" } else { "disks" };
+                    let who = if n == 1 { format!("'{}'", names[0]) } else { format!("{} VMs ({})", n, crate::vmss::names_of(&names)) };
+                    ui.add(egui::Label::new(egui::RichText::new(format!("Keeps the {} of {} as they are now, each in a snapshot of its own.", what, who)).color(pal.ink_soft)).wrap());
+                    ui.add_space(2.0);
+                    ui.horizontal(|ui| {
+                        field_label(ui, "Name:", LABEL_WIDTH);
+                        let r = text_field(ui, &pal, name, ui.available_width(), false);
+                        if *focus {
+                            r.request_focus();
+                            *focus = false;
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        field_label(ui, "Description:", LABEL_WIDTH);
+                        text_field(ui, &pal, description, ui.available_width(), false);
+                    });
+                    let running = vms.iter().filter(|v| v.3).count();
+                    if running > 0 {
+                        ui.horizontal(|ui| {
+                            ui.add_space(LABEL_WIDTH + ui.spacing().item_spacing.x);
+                            let label = if running == n { "Include their memory".to_string() } else { format!("Include the memory of the {} running", running) };
+                            ui.checkbox(memory, label);
+                        });
+                        ui.horizontal(|ui| {
+                            ui.add_space(LABEL_WIDTH + ui.spacing().item_spacing.x + 2.0);
+                            ui.add(egui::Label::new(egui::RichText::new("Reverting to one then resumes its VM right where it was. Each pauses while its memory is written to disk.").size(12.0).color(pal.ink_soft)).wrap());
+                        });
+                    }
+                    ui.add_space(4.0);
+                    dialog_buttons(ui, |ui| {
+                        if dialog_button(ui, &pal, "close", "Cancel", Look::Plain, true) || ui.input(|i| i.key_pressed(Key::Escape)) {
+                            close = true;
+                        }
+                        let ready = !name.trim().is_empty();
+                        let label = if n == 1 { "Take Snapshot".to_string() } else { format!("Take {} Snapshots", n) };
+                        if dialog_button(ui, &pal, "camera", &label, Look::Primary, ready) || (ready && ui.input(|i| i.key_pressed(Key::Enter))) {
+                            take_many = Some((vms.clone(), name.trim().to_string(), description.trim().to_string(), *memory));
+                        }
+                    });
+                });
             }
             Dialog::PoolUpdate(d) => {
                 if let Some(v) = &pool_view {
@@ -8120,6 +8487,41 @@ impl App {
             self.dialog = Dialog::None;
             self.take_snapshot(sid, vm, name, description, memory, ctx);
         }
+        if let Some((vms, name, description, memory)) = take_many {
+            self.dialog = Dialog::None;
+            for (sid, vm, _, can_memory) in vms {
+                self.take_snapshot(sid, vm, name.clone(), description.clone(), memory && can_memory, ctx);
+            }
+            self.snap_view.picked.clear();
+        }
+        match sched_list {
+            Some(ListAction::Close) => self.dialog = Dialog::None,
+            Some(ListAction::New(sid)) => self.dialog = Dialog::Schedule(Box::new(ScheduleDialog::new(sid, None, vec![], true))),
+            Some(ListAction::Edit(sid, vmss)) => {
+                if let Some(x) = self.server(sid).and_then(|s| s.data.as_ref()).and_then(|d| d.schedules.iter().find(|x| x.rref == vmss)) {
+                    self.dialog = Dialog::Schedule(Box::new(ScheduleDialog::new(sid, Some(x), vec![], true)));
+                }
+            }
+            Some(ListAction::Delete(sid, vmss)) => self.delete_schedule(sid, vmss, ctx),
+            Some(ListAction::Enable(sid, vmss, on)) => self.enable_schedule(sid, vmss, on, ctx),
+            Some(ListAction::None) | None => {}
+        }
+        match sched_edit {
+            Some((sid, from_list, EditAction::Close)) => self.dialog = if from_list { Dialog::Schedules(Box::new(SchedulesDialog::new(sid))) } else { Dialog::None },
+            Some((_, _, EditAction::Save(sid, x))) => self.save_schedule(sid, x, ctx),
+            Some((_, _, EditAction::None)) | None => {}
+        }
+        match sched_pick {
+            Some(PickAction::Close) => self.dialog = Dialog::None,
+            Some(PickAction::Set(sid, vms, vmss)) => self.set_vm_schedule(sid, format!("pick:{}", sid), vms, vmss, ctx),
+            Some(PickAction::New(sid, vms)) => self.dialog = Dialog::Schedule(Box::new(ScheduleDialog::new(sid, None, vms, false))),
+            Some(PickAction::Edit(sid, vmss)) => {
+                if let Some(x) = self.server(sid).and_then(|s| s.data.as_ref()).and_then(|d| d.schedules.iter().find(|x| x.rref == vmss)) {
+                    self.dialog = Dialog::Schedule(Box::new(ScheduleDialog::new(sid, Some(x), vec![], false)));
+                }
+            }
+            Some(PickAction::None) | None => {}
+        }
         if let Some((sid, snap, first)) = revert_to {
             self.dialog = Dialog::None;
             self.revert(sid, snap, first, ctx);
@@ -8197,6 +8599,7 @@ impl App {
             // nothing under way, and no look at the server due (one is right after a job)
             && self.vm_saving.is_empty()
             && self.edit_queue.is_empty()
+            && self.field_records.values().all(|e| !e.loading)
             && self.servers.iter().all(|s| (s.busy.is_empty() || matches!(self.shot_show.as_str(), "activities-moving" | "close-asked" | "exporting")) && !s.fetching && s.next_refresh > Instant::now());
         if !self.shot_requested && ((self.shot_ready && self.frames >= 120 && settled && self.started.elapsed() >= Duration::from_secs(wait)) || timed_out) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot);
@@ -8302,6 +8705,34 @@ impl eframe::App for App {
                 "about" => out.push(Intent::About),
                 "sr-detached" | "sr-repair-failed" => out.extend(sel.sid.map(|sid| Intent::RepairSr(sid, "sr-iso".into()))),
                 "snapshots" => out.push(Intent::Tab(Tab::Snapshots)),
+                // the Snapshots page, and snapshot schedules
+                "snapshots-page" => out.push(Intent::Snapshots),
+                "snapshots-ticked" => {
+                    out.push(Intent::Snapshots);
+                    if let Some(sid) = sel.sid {
+                        self.snap_view.picked.extend(["vm-web", "vm-db", "vm-desk"].map(|v| (sid, v.to_string())));
+                    }
+                }
+                "schedules" => {
+                    out.push(Intent::Snapshots);
+                    out.push(Intent::Schedules(sel.sid));
+                }
+                "schedule-edit" => {
+                    out.push(Intent::Snapshots);
+                    out.extend(sel.sid.map(|sid| Intent::EditSchedule(sid, "vmss-nightly".into(), true)));
+                }
+                "schedule-new" => {
+                    out.push(Intent::Snapshots);
+                    out.extend(sel.sid.map(|sid| Intent::NewSchedule(sid, vec!["vm-desk".into(), "vm-build".into()], false)));
+                }
+                "schedule-pick" => {
+                    out.push(Intent::Tab(Tab::Snapshots));
+                    out.extend(sel.sid.map(|sid| Intent::PickSchedule(sid, vec!["vm-web".into()])));
+                }
+                "take-snapshots" => {
+                    out.push(Intent::Snapshots);
+                    out.extend(sel.sid.map(|sid| Intent::TakeSnapshots(["vm-web", "vm-db", "vm-desk"].map(|v| (sid, v.to_string())).to_vec())));
+                }
                 "vm-performance" | "host-performance" => out.push(Intent::Tab(Tab::Performance)),
                 "alerts" | "alerts-all" => {
                     out.push(Intent::Alerts);
@@ -8315,6 +8746,10 @@ impl eframe::App for App {
                     out.extend(sel.sid.map(|sid| Intent::DismissAlerts(vec![(sid, "OpaqueRef:demo-message-1".into())])));
                 }
                 "details" | "host-details" | "pool-details" => out.push(Intent::Tab(Tab::Details)),
+                "details-search" => {
+                    out.push(Intent::Tab(Tab::Details));
+                    self.details_search = "memory".into();
+                }
                 "pool-updates" | "pool-updating" | "pool-update-stopped" => out.push(Intent::PoolUpdates(sel.sid)),
                 "move-vm" => out.extend(sel.sid.map(|sid| Intent::MoveVm(sid, "vm-web".into(), Some("host-b".into())))),
                 "move-vm-local" => out.extend(sel.sid.map(|sid| Intent::MoveVm(sid, "vm-mail".into(), Some("host-a".into())))),
@@ -8638,15 +9073,18 @@ impl eframe::App for App {
             let tabs = self.tabs_for(&sel);
             let current = if tabs.contains(&self.tab) { self.tab } else { tabs[0] };
             let actions = self.tab_actions_width(&sel, current);
-            // (a VM's or a server's console is a button at the row's end, not a tab among the others)
-            let shown: Vec<Tab> = tabs.iter().copied().filter(|t| *t != Tab::Console && *t != Tab::Alerts).collect();
+            // (a VM's or a server's console is a button at the row's end, not a tab among the others;
+            // All servers' pages that the toolbar opens are its buttons only)
+            let shown: Vec<Tab> = tabs.iter().copied().filter(|t| *t != Tab::Console && !(sel.kind == Kind::Root && t.on_toolbar())).collect();
             // the least room they take: all in one Actions menu (a connection's, its one button)
             let least = if self.root_of(&sel).is_some() { actions } else { (ACTIONS_BTN + TOOL_GAP + SEP_W + 8.0).min(actions) };
             // (the Alerts page's Dismiss all: room for it, its icon at least)
-            let page = if sel.kind == Kind::Root && current == Tab::Alerts { SQUARE.x + SEP_W + 12.0 } else { 0.0 };
+            let page = if sel.kind == Kind::Root && matches!(current, Tab::Alerts | Tab::AllSnapshots) { SQUARE.x + SEP_W + 12.0 } else { 0.0 };
             let free = self.header_and_tabs(ui, &sel, &shown, current, (actions.max(page), least.max(page)), &mut out);
             if sel.kind == Kind::Root && current == Tab::Alerts {
                 self.alerts_actions(ui, free, &mut out);
+            } else if sel.kind == Kind::Root && current == Tab::AllSnapshots {
+                self.snapshots_actions(ui, free, &mut out);
             } else if actions > 0.0 {
                 self.tab_actions(ui, free, &sel, current, actions, &mut out);
             } else if sel.kind == Kind::Root && current == Tab::IsoLibrary {
@@ -8735,6 +9173,7 @@ impl eframe::App for App {
             egui::Frame::none().inner_margin(egui::Margin::symmetric(margin, 0.0)).show(ui, |ui| match current {
                 Tab::Home => self.home(ui, &mut out),
                 Tab::Search => self.search_tab(ui, &mut out),
+                Tab::Details if matches!(sel.kind, Kind::Vm | Kind::Host | Kind::Pool) => self.details_tab(ui, &sel, &mut out),
                 Tab::General | Tab::Details => self.general(ui, &sel, &mut out),
                 Tab::Overview if sel.kind == Kind::Host => self.host_overview(ui, &sel, &mut out),
                 Tab::Overview if sel.kind == Kind::Pool => self.pool_overview(ui, &sel, &mut out),
@@ -8749,6 +9188,7 @@ impl eframe::App for App {
                 Tab::VmStorage => self.vm_storage_page(ui, &mut out),
                 Tab::Networks => self.networks_page(ui, &mut out),
                 Tab::Snapshots => self.snapshots_tab(ui, &sel, &mut out),
+                Tab::AllSnapshots => self.snapshots_page(ui, &mut out),
                 Tab::Templates => self.templates_tab(ui, &sel, &mut out),
                 Tab::Logs => self.logs(ui, &sel, &mut out),
             });
@@ -8865,6 +9305,15 @@ fn progress_bar(p: &egui::Painter, r: Rect, frac: f32, col: Color32, pal: &Pal) 
     p.rect_filled(r, round, pal.border);
     if frac > 0.0 {
         p.rect_filled(Rect::from_min_size(r.min, vec2((r.width() * frac.clamp(0.0, 1.0)).max(r.height()), r.height())), round, col);
+    }
+}
+
+/// Why snapshot schedule work failed, in plain words where it's a known reason.
+fn schedule_problem(e: &ApiError) -> String {
+    match e.code.as_str() {
+        "LICENCE_RESTRICTION" => "The pool's license doesn't include snapshot schedules.".into(),
+        "VMSS_SCHEDULE_FIELD_INVALID" | "INVALID_VALUE" => format!("The server didn't take its settings: {}", e.message()),
+        _ => e.message(),
     }
 }
 
@@ -9536,13 +9985,16 @@ fn vsep(ui: &mut Ui, pal: &Pal) {
     ui.painter().line_segment([r.center_top(), r.center_bottom()], Stroke::new(1.0_f32, pal.border));
 }
 
-fn tool_button(ui: &mut Ui, op: &str, label: &str, enabled: bool, compact: bool, pal: &Pal) -> egui::Response {
+/// `active`: the page it opens is the one shown (pressed: a soft background).
+fn tool_button(ui: &mut Ui, op: &str, label: &str, enabled: bool, active: bool, compact: bool, pal: &Pal) -> egui::Response {
     let w = if compact { SQUARE.x } else { tool_width(ui, label) };
     let sense = if enabled { Sense::click() } else { Sense::hover() };
     let (rect, mut resp) = ui.allocate_exact_size(vec2(w, SQUARE.y), sense);
     let p = ui.painter();
     if enabled && resp.hovered() {
         p.rect_filled(rect, Rounding::same(6.0), pal.hover);
+    } else if active {
+        p.rect_filled(rect, Rounding::same(6.0), pal.nav_on);
     }
     if compact {
         paint_tool(p, Rect::from_center_size(rect.center(), vec2(22.0, 22.0)), op, enabled, pal);

@@ -246,6 +246,7 @@ pub fn tool_color(op: &str, pal: &Pal) -> Color32 {
         "alerts" => Color32::from_rgb(232, 96, 86),
         "storage" => Color32::from_rgb(32, 165, 150),
         "templates" => Color32::from_rgb(214, 102, 160),
+        "snapshots" => Color32::from_rgb(98, 120, 238),
         "networks" => Color32::from_rgb(205, 160, 40),
         _ => pal.icon,
     }
@@ -317,6 +318,17 @@ pub fn paint_tool_glyph(p: &Painter, rect: Rect, op: &str, enabled: bool, pal: &
             line(p, o, &[(17.5, 5.8), (17.5, 16.2)], s);
             p.add(Shape::line(half(11.0, 0.0, 180.0), Stroke::new(1.5_f32, col)));
             p.add(Shape::line(half(16.2, 0.0, 180.0), s));
+        }
+        "snapshots" => {
+            // a camera, a small clock on its corner (taken by hand, or on a schedule)
+            let s = Stroke::new(1.8_f32, col);
+            rrect(p, o, 2.5, 7.0, 14.5, 10.5, 2.0, s);
+            line(p, o, &[(6.0, 7.0), (7.4, 4.5), (11.6, 4.5), (13.0, 7.0)], s);
+            p.circle_stroke(o + vec2(9.75, 12.25), 2.6, s);
+            let ring = Stroke::new(1.5_f32, col);
+            p.circle_filled(o + vec2(17.0, 16.5), 4.6, pal.window);
+            p.circle_stroke(o + vec2(17.0, 16.5), 3.9, ring);
+            line(p, o, &[(17.0, 14.4), (17.0, 16.6), (18.6, 17.6)], Stroke::new(1.2_f32, col));
         }
         "templates" => {
             // a screen on its stand, a copy of it behind
@@ -509,6 +521,11 @@ pub fn paint_glyph_on(p: &Painter, rect: Rect, name: &str, col: Color32, bg: Col
                 line(p, o, &[(1.5, 14.5), (14.5, 1.5)], Stroke::new(4.5_f32, bg));
                 line(p, o, &[(1.5, 14.5), (14.5, 1.5)], s);
             }
+        }
+        "clock" => {
+            // a clock face at ten past (a schedule)
+            p.circle_stroke(c, 6.2, s);
+            line(p, c, &[(0.0, -3.8), (0.0, 0.0), (2.9, 1.7)], s);
         }
         "edit" => {
             // a pencil, its point at the lower left
