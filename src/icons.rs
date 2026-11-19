@@ -221,14 +221,9 @@ pub fn paint_icon(p: &Painter, rect: Rect, kind: IconKind, pal: &Pal, bg: Color3
     }
 }
 
-/// A 22×22 toolbar glyph on a soft tinted square, in its action's colour (adapts to the theme).
+/// A 22×22 toolbar glyph: its lines alone, in its action's colour (adapts to the theme), on
+/// whatever is behind it.
 pub fn paint_tool(p: &Painter, rect: Rect, op: &str, enabled: bool, pal: &Pal) {
-    let col = if enabled { tool_color(op, pal) } else { pal.ink_faint };
-    let neutral = matches!(op, "sidebar" | "theme-dark" | "theme-light" | "settings");
-    if !neutral {
-        let tint = if enabled { col.gamma_multiply(if pal.dark { 0.22 } else { 0.14 }) } else { Color32::TRANSPARENT };
-        p.rect_filled(rect.shrink(0.5), Rounding::same(6.0), tint);
-    }
     paint_tool_glyph(p, rect, op, enabled, pal);
 }
 
@@ -239,7 +234,7 @@ pub fn tool_color(op: &str, pal: &Pal) -> Color32 {
         "clean_reboot" => pal.green,
         "hard_reboot" => pal.orange,
         "suspend" | "resume" => pal.blue,
-        "start" | "connect" => pal.green,
+        "start" | "connect" | "power_on" => pal.green,
         // the power menu's face: the VM's state, as its dot in the tree
         "power-running" => pal.green,
         "power-halted" => pal.red,
@@ -248,6 +243,7 @@ pub fn tool_color(op: &str, pal: &Pal) -> Color32 {
         "newvm" => pal.blue,
         "iso" => pal.orange,
         "updates" => Color32::from_rgb(150, 110, 230),
+        "alerts" => Color32::from_rgb(232, 96, 86),
         "storage" => Color32::from_rgb(32, 165, 150),
         "templates" => Color32::from_rgb(214, 102, 160),
         "networks" => Color32::from_rgb(205, 160, 40),
@@ -266,7 +262,7 @@ pub fn paint_tool_glyph(p: &Painter, rect: Rect, op: &str, enabled: bool, pal: &
             arc(p, c + vec2(0.0, 0.8), 5.6, -55.0, 235.0, s);
             p.line_segment([c + vec2(0.0, -6.5), c + vec2(0.0, -0.5)], s);
         }
-        "clean_shutdown" | "hard_shutdown" => {
+        "clean_shutdown" | "hard_shutdown" | "power_on" => {
             arc(p, c + vec2(0.0, 0.8), 5.6, -55.0, 235.0, s);
             p.line_segment([c + vec2(0.0, -6.5), c + vec2(0.0, -0.5)], s);
             if op == "hard_shutdown" {
@@ -291,6 +287,14 @@ pub fn paint_tool_glyph(p: &Painter, rect: Rect, op: &str, enabled: bool, pal: &
             p.circle_stroke(c, 7.2, Stroke::new(1.8_f32, col));
             p.circle_stroke(c, 2.0, Stroke::new(1.5_f32, col));
             arc(p, c, 4.7, 200.0, 265.0, Stroke::new(1.3_f32, col));
+        }
+        "alerts" => {
+            // a bell: its dome, its sides flaring to its rim, its knob and its clapper
+            let s = Stroke::new(1.8_f32, col);
+            arc(p, o + vec2(11.0, 9.0), 5.0, 180.0, 360.0, s);
+            line(p, o, &[(6.0, 9.0), (6.0, 14.0), (4.2, 16.0), (17.8, 16.0), (16.0, 14.0), (16.0, 9.0)], s);
+            line(p, o, &[(11.0, 2.6), (11.0, 4.0)], s);
+            arc(p, o + vec2(11.0, 17.6), 1.9, 0.0, 180.0, s);
         }
         "updates" => {
             // a box with an arrow coming down into it
@@ -579,10 +583,31 @@ pub fn paint_glyph_on(p: &Painter, rect: Rect, name: &str, col: Color32, bg: Col
             line(p, c, &[(0.0, -2.2), (0.0, 1.6)], Stroke::new(1.6_f32, col));
             p.circle_filled(c + vec2(0.0, 3.7), 0.95, col);
         }
+        "wrench" => {
+            // a spanner: its head an open ring (the jaw to the top right), its handle down to the left
+            let head = c + vec2(2.4, -2.4);
+            arc(p, head, 3.6, 5.0, 265.0, Stroke::new(1.8_f32, col));
+            let end = c + vec2(-5.4, 5.4);
+            p.line_segment([c + vec2(-0.1, 0.1), end], Stroke::new(2.4_f32, col));
+            p.circle_filled(end, 1.2, col);
+        }
         "power" => {
             // a power sign: a ring open at the top, a bar through the gap
             arc(p, c + vec2(0.0, 0.8), 5.4, -55.0, 235.0, s);
             p.line_segment([c + vec2(0.0, -6.2), c + vec2(0.0, -0.6)], s);
+        }
+        "bell" => {
+            // a bell, as the toolbar's Alerts
+            arc(p, c + vec2(0.0, -1.2), 4.2, 180.0, 360.0, s);
+            line(p, c, &[(-4.2, -1.2), (-4.2, 2.6), (-5.8, 4.4), (5.8, 4.4), (4.2, 2.6), (4.2, -1.2)], s);
+            line(p, c, &[(0.0, -6.8), (0.0, -5.6)], s);
+            arc(p, c + vec2(0.0, 5.6), 1.6, 0.0, 180.0, s);
+        }
+        "console" => {
+            // a screen with a prompt on it
+            p.rect_stroke(Rect::from_min_max(c + vec2(-7.0, -5.5), c + vec2(7.0, 5.5)), Rounding::same(1.8), s);
+            line(p, c, &[(-4.0, -2.2), (-1.6, 0.0), (-4.0, 2.2)], s);
+            line(p, c, &[(0.2, 2.4), (3.8, 2.4)], s);
         }
         "more" => {
             // three dots in a row

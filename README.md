@@ -17,6 +17,8 @@ affiliated with or endorsed by the makers of XenServer or XCP-ng.
 | ![A VM's snapshots](docs/screenshot-dark-snapshots.png) | ![Taking a snapshot](docs/screenshot-dark-snapshot-take.png) |
 | ![Your templates](docs/screenshot-dark-templates.png) | ![A new VM from a template](docs/screenshot-dark-new-vm-template.png) |
 | ![A server's Overview](docs/screenshot-dark-host.png) | ![A pool's Overview](docs/screenshot-dark-pool.png) |
+| ![A VM's week, in its Performance tab](docs/screenshot-dark-performance.png) | ![A server's Performance tab](docs/screenshot-dark-host-performance.png) |
+| ![Every pool's alerts](docs/screenshot-dark-alerts.png) | ![Alert limits for a VM](docs/screenshot-dark-alert-rules.png) |
 | ![A pool's updates](docs/screenshot-dark-updates.png) | ![Updating a pool](docs/screenshot-dark-updating.png) |
 | ![Every ISO file of every pool](docs/screenshot-dark-iso-library.png) | ![Where your VMs' disks are](docs/screenshot-dark-vm-storage.png) |
 | ![Adding NFS storage for VMs](docs/screenshot-dark-new-storage.png) | ![Moving a VM](docs/screenshot-dark-move-vm.png) |
@@ -59,6 +61,14 @@ affiliated with or endorsed by the makers of XenServer or XCP-ng.
   network, address and speed, the management card marked, an unplugged one said so). Near a limit
   (memory almost all taken, CPUs busy, more virtual CPUs than real ones, storage nearly full) the
   card turns amber, then red, saying what that means.
+- **Performance** — a VM's or a server's tab with its load over the last **10 minutes, 2 hours,
+  week or year**, as its server keeps it (a point every 5 seconds, every minute, every hour, every
+  day; nothing is stored on your computer): CPU, memory, disk and network as four charts, each with
+  its average and peak, and under the mouse each figure at that time. Below, **everything else it
+  measures**, each opened with a click: each CPU, each disk (read and write, requests, how long
+  they wait), each network card; on a server also its VMs' CPUs side by side, its load, and each
+  storage it uses. A VM made since shows a hatched stretch before its first records. *Performance ›*
+  above an Overview's load goes there.
 - **A pool's Overview** — one line with its version and its license (green; amber when it runs out
   within 30 days or is a trial; red once it has run out), then its servers' load added up, its
   capacity, its servers (each with its CPU and memory), all its VMs (the busiest first) and its
@@ -81,15 +91,19 @@ affiliated with or endorsed by the makers of XenServer or XCP-ng.
   call to the servers and their answers below it, as in a terminal (with Copy); a server's restart
   is waited for quietly (going down, then starting up again), and the end says plainly anything
   left to do by hand.
-- **Details** — a VM's tabs are Overview, Snapshots, Console, Logs and Details: the less used
+- **Details** — a VM's tabs are Overview, Performance, Snapshots, Logs and Details: the less used
   things (tags, guest tools, virtualization, high availability, every disk and card with its
   position and MAC), click a value to copy it. Pools and servers have Overview, Storage,
-  Networking, Logs and Details, and servers a Console.
-- **Console** — see a running VM's screen and use it with your keyboard and mouse (the keyboard goes
-  to the VM while the mouse is over its screen), always scaled to fit. A keyboard button next to
-  the tabs sends Ctrl+Alt+Del and the combinations your desktop keeps for itself (the Windows key,
-  Alt+Tab…). It reconnects by itself after the VM reboots. A server has a Console tab too: its own text console
-  (the control domain's, as in XenCenter), where you log in as root.
+  Networking, Logs and Details, and servers Performance too. At the tab row's right end: the
+  **Console** button, then the actions (power, snapshot, move, copy, delete; a server's
+  maintenance mode, restart and shut down). In a window too narrow for them, they all fold into
+  one **Actions** menu.
+- **Console** — the blue **Console** button by the tabs shows a running VM's screen, to use with
+  your keyboard and mouse (the keyboard goes to the VM while the mouse is over its screen), always
+  scaled to fit; clicked again, it goes back where you were. A keyboard button beside it sends
+  Ctrl+Alt+Del and the combinations your desktop keeps for itself (the Windows key, Alt+Tab…). It
+  reconnects by itself after the VM reboots. A server has a Console too: its own text console (the
+  control domain's, as in XenCenter), where you log in as root.
 - **ISO libraries** — *ISO Library* on the toolbar opens a page with every ISO file of every pool:
   each library as a card (where it is, how many files it has, or that it isn't mounted; a click
   opens it), then all the files by name, with their library when there's more than one, each with
@@ -192,8 +206,22 @@ affiliated with or endorsed by the makers of XenServer or XCP-ng.
   shut down (their disks on that server's own storage), and warns when it's the pool's coordinator.
   Then it goes the way the pool expects: no new VMs sent to it, those VMs shut down, the rest moved,
   then the server; if a step fails it takes VMs again. A restarting server turns green and ringed
-  in the tree, and Activities says when it's back. A server that's on but not taking VMs (as one
+  in the tree, and Activities says when it's back. One that takes more than ten minutes gets a
+  yellow note on its Overview (what may be wrong: stuck while starting, or off the network) and is
+  listed in Alerts. A server that's on but not taking VMs (as one
   left disabled) says so on its Overview, with *Take VMs again*, and in its pool's Details.
+- **Power On** — a server that's off gets a green power button at the end of its tabs (and
+  *Power On* by its state). The pool's coordinator sends it a Wake-on-LAN signal (set up for it the
+  first time), and so does this computer when it's on the same network: that also turns on the
+  coordinator itself, or a lone server, whose address the app remembers from the last time it
+  answered (even after the app restarts). Activities shows it till it answers; after ten minutes
+  its Overview says what may be wrong (Wake-on-LAN off in its firmware or for its network card).
+  The server's firmware and network card must have Wake-on-LAN on.
+- **Maintenance mode** — the orange spanner at the end of a server's tabs: it stops taking VMs
+  (and, on servers that allow it, stays so across restarts), its VMs move to the pool's other
+  servers (those that can't are shut down, said first), and it's marked as XenCenter marks it, so
+  both show the same. *Exit maintenance* (by its state, or the spanner) offers to bring its VMs
+  back: moved back live, and the ones shut down started on it again.
 - **VM power actions** — Start, Shut Down, Reboot, Suspend, Resume, Force Shut Down, Force Reboot,
   enabled only when the server allows them, with confirmations for the disruptive ones. They're
   all behind one button at the right end of a VM's tabs: the power symbol in the colour of the
@@ -202,11 +230,20 @@ affiliated with or endorsed by the makers of XenServer or XCP-ng.
   its right-click menu too.
 - **Keyboard shortcuts** — Ctrl+B start · Ctrl+E shut down · Ctrl+R reboot · Ctrl+Y suspend/resume ·
   F5 refresh.
+- **Alerts** — the bell on the toolbar, with how many need your attention (red when one is
+  critical), opens every pool's alerts, by day: what the servers say (a VM that crashed, a
+  certificate or license running out, a limit you set passed) and what the app finds itself (a
+  connection lost, a server off or not answering, storage not mounted). *Needs attention* or
+  *Everything*, by pool when there are several, and a search. A click opens one: what it says,
+  and a way to what it's about (or its Performance tab). Its X dismisses it on its server, so
+  XenCenter stops showing it too; *Dismiss all* does it for those shown. A VM's or a server's page
+  shows its own at the top. **Alerts…** in a VM's or a server's Performance tab, and on a
+  storage's page, sets limits the pool watches by itself, also while the app is closed (CPU,
+  network, disks, free memory, how full a storage is, each for so many minutes), and can have the
+  pool email its alerts.
 - **Activities** — next to the gear: what's under way (a ring turning, with how many), each with its
   server, how long it's been and how far it is (for disks moved or copied, and uploads, how much
-  of how much and how fast: "11.7 GB of 20 GB · 110 MB/s"), and the last few that ended. Above them, what's
-  wrong right now (a red dot on the button): a connection lost, a server off or not answering (and
-  the VMs whose state that makes unknown), storage that isn't mounted; a click opens it. A server
+  of how much and how fast: "11.7 GB of 20 GB · 110 MB/s"), and the last few that ended. A server
   that stops answering or comes back is noted there too, and Refresh (F5) says how it went,
   servers that don't answer included. Long lines take two. A click on one (or on a row of the Logs
   tab) shows it in full: the server, when, how it went, and every call made to the server with its
@@ -298,7 +335,7 @@ building anything. You can also just run `./simple-vm-manager` directly.
    address, your user name (usually `root`) and password, and press **Connect**.
 2. The server appears in the sidebar. Expand it to see its hosts and virtual machines.
 3. Select a VM and use the icons next to its tabs, or right-click it, to start, stop, reboot or suspend it.
-   Its **Console** tab shows the VM's screen.
+   Its **Console** button shows the VM's screen.
 4. Fold the sidebar with the « button next to the search box (the folded strip's top button opens
    it again); choose the theme under the gear (**Settings**).
 

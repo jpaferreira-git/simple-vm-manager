@@ -3,7 +3,7 @@
 //! what each one uses, and its storage and network cards. The pool's adds its servers up, and lists
 //! them, its VMs and its storage. The rest is in the Details tab.
 
-use super::overview::{fit, fmt_rate, pair, panel, row, say, section, tile_rows, Fig, Lead, Tail, Tile};
+use super::overview::{fit, fmt_rate, pair, panel, row, say, section, section_link, tile_rows, Fig, Lead, Tail, Tile};
 use super::*;
 
 /// How many lines a list shows before "Show all".
@@ -132,19 +132,36 @@ impl App {
     /// How a server is doing: its dot's colour, and in words.
     fn host_state(&self, h: &HostInfo) -> (Color32, String) {
         let pal = &self.pal;
-        if self.host_rebooting.contains_key(&h.rref) {
+        if let Some(m) = self.slow_restart(h) {
+            (pal.orange, format!("Restarting for {} min: longer than usual", m))
+        } else if self.host_rebooting.contains_key(&h.rref) {
             (pal.accent, "Restarting…".into())
         } else if self.host_busy.contains(&h.rref) {
             (pal.red, "Shutting down…".into())
+        } else if let Some(m) = self.slow_power_on(h) {
+            (pal.orange, format!("Turning on ({} min)…", m))
+        } else if self.host_waking.contains_key(&h.rref) {
+            (pal.accent, "Turning on…".into())
+        } else if let Some(&entering) = self.host_maint.get(&h.rref) {
+            (pal.accent, if entering { "Entering maintenance mode…" } else { "Leaving maintenance mode…" }.into())
         } else if h.unreachable {
             (pal.grey, "Not answering".into())
         } else if !h.live {
             (pal.grey, "Off".into())
+        } else if h.in_maintenance() {
+            (pal.orange, "Maintenance mode".into())
         } else if !h.enabled {
             (pal.orange, "On, not taking new VMs".into())
         } else {
             (pal.green, "On".into())
         }
+    }
+
+    /// How many minutes server `h` has been told to turn on without answering, when that's longer
+    /// than a server usually takes.
+    fn slow_power_on(&self, h: &HostInfo) -> Option<u64> {
+        let minutes = self.host_waking.get(&h.rref)?.since.elapsed().as_secs() / 60;
+        (minutes >= WAKE_SLOW_MIN).then_some(minutes)
     }
 
     /// The load read last for a server: its own, and its VMs'.
@@ -198,15 +215,33 @@ impl App {
         let Some((s, h)) = this.host_of(sel) else { return };
         let Some(d) = s.data.as_ref() else { return };
         let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|t| t.as_secs() as i64).unwrap_or(0);
+        // its own alerts, at the top
+        let strip = this.alerts_of(&sel.key);
 
         // who it is
         let (dot, state) = this.host_state(h);
         let here: Vec<&VmInfo> = d.vms.iter().filter(|v| v.home() == Some(h.rref.as_str())).collect();
         let running = here.iter().filter(|v| v.power == PowerState::Running).count();
-        // on, but not taking VMs (as left by a restart, or maintenance): a button to take them again
+        // after its state, a button: Power On while it's off; Exit maintenance while it's in
+        // maintenance mode; Take VMs again while it's on but not taking VMs (as left by a restart)
         let enabling = this.host_enabling.contains(&h.rref);
-        let disabled = h.is_up() && !h.enabled && !this.host_busy.contains(&h.rref) && !this.host_rebooting.contains_key(&h.rref);
-        let button = disabled.then(|| if enabling { ("Asking…", false) } else { ("Take VMs again", true) });
+        let maint_op = this.host_maint.get(&h.rref).copied();
+        let disabled = h.is_up() && !h.enabled && !h.in_maintenance() && maint_op.is_none() && !this.host_busy.contains(&h.rref) && !this.host_rebooting.contains_key(&h.rref);
+        let waking = this.host_waking.contains_key(&h.rref);
+        let (button, action) = if waking {
+            // (its state says so)
+            (None, None)
+        } else if let Some((sid, r, _, ok)) = this.power_on_of(sel) {
+            (Some(("Power On", ok)), Some(Intent::PowerOn(sid, r)))
+        } else if (h.in_maintenance() && h.is_up()) || maint_op == Some(false) {
+            (Some(if maint_op.is_some() { ("Leaving…", false) } else { ("Exit maintenance", true) }), Some(Intent::AskMaintenance(s.id, h.rref.clone())))
+        } else if disabled {
+            (Some(if enabling { ("Asking…", false) } else { ("Take VMs again", true) }), Some(Intent::EnableHost(s.id, h.rref.clone())))
+        } else {
+            (None, None)
+        };
+        // (taken once, inside the page's closure)
+        let action = std::cell::Cell::new(action);
         let mut left = vec![Fact { dot: Some(dot), button, ..Fact::new("State", state) }];
         if let (true, Some(t)) = (h.is_up(), h.boot_time) {
             left.push(Fact::new("Up for", fmt_duration(now - t)));
@@ -257,11 +292,40 @@ impl App {
         let up = h.is_up();
         egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
             page(ui, |ui, w| {
+                if !strip.is_empty() {
+                    super::alerts::alert_strip(ui, &pal, &strip, out);
+                    ui.add_space(16.0);
+                }
+                // a restart taking longer than a server usually does: what it may be, what to do
+                if let Some(m) = this.slow_restart(h) {
+                    let title = format!("{} is taking longer than usual to restart.", h.name);
+                    let text = format!(
+                        "It was told to restart {} minutes ago and hasn't answered since; a server usually takes 3 to 8 minutes. It may be stuck while starting (its firmware, a disk check, a message waiting for a key) or up but not on the network: look at its screen, or ping {}. The pool goes on without it.",
+                        m,
+                        if h.address.is_empty() { "it".to_string() } else { h.address.clone() }
+                    );
+                    crate::newvm::alert(ui, &pal, false, &title, &text, None);
+                    ui.add_space(16.0);
+                }
+                // told to turn on a while ago, no answer yet: what it may be
+                if let Some(m) = this.slow_power_on(h) {
+                    let title = format!("{} hasn't turned on yet.", h.name);
+                    let text = format!(
+                        "It was sent a Wake-on-LAN signal {} minutes ago; a server usually answers within 3 to 8. Wake-on-LAN may be off in its firmware (BIOS or UEFI) or for its network card, or it may have no power or no cable. The signal only reaches it on its own network.",
+                        m
+                    );
+                    crate::newvm::alert(ui, &pal, false, &title, &text, None);
+                    ui.add_space(16.0);
+                }
                 if facts(ui, &pal, w, &left, &right) {
-                    out.push(Intent::EnableHost(sid, h.rref.clone()));
+                    if let Some(a) = action.take() {
+                        out.push(a);
+                    }
                 }
                 ui.add_space(24.0);
-                section(ui, &pal, "Load  ·  the last ten minutes");
+                if section_link(ui, &pal, "Load  ·  the last ten minutes", "Performance") {
+                    out.push(Intent::Tab(Tab::Performance));
+                }
                 load_tiles(ui, &pal, w, cpus, load);
                 ui.add_space(24.0);
                 let cap: Card = &|ui, _, _| {

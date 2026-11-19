@@ -159,6 +159,8 @@ impl App {
             (true, Some(Thumb { error: Some(e), .. })) => Shot::Failed(e.clone()),
             (true, _) => Shot::Loading,
         };
+        // its own alerts, at the top
+        let strip = self.alerts_of(&sel.key);
         let ov = &mut self.ov;
         egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
             let pad = 20.0;
@@ -169,9 +171,15 @@ impl App {
                 ui.vertical(|ui| {
                     ui.set_width(w);
                     ui.spacing_mut().item_spacing.y = 0.0;
+                    if !strip.is_empty() {
+                        super::alerts::alert_strip(ui, &pal, &strip, out);
+                        ui.add_space(18.0);
+                    }
                     header(ui, &pal, w, &v, &at, &shot, ov, out);
                     ui.add_space(24.0);
-                    section(ui, &pal, "Load  ·  the last ten minutes");
+                    if section_link(ui, &pal, "Load  ·  the last ten minutes", "Performance") {
+                        out.push(Intent::Tab(Tab::Performance));
+                    }
                     tiles(ui, &pal, w, &v, &at, perf.as_ref(), running);
                     ui.add_space(24.0);
                     type Card<'c> = &'c dyn Fn(&mut Ui, &mut OverviewEdit, &mut Vec<Intent>);
@@ -240,6 +248,20 @@ pub(super) fn section(ui: &mut Ui, pal: &Pal, title: &str) {
     ui.add_space(8.0);
 }
 
+/// A section's title with a link at its right ("Performance ›"): whether that was clicked.
+pub(super) fn section_link(ui: &mut Ui, pal: &Pal, title: &str, link: &str) -> bool {
+    let mut clicked = false;
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(title.to_uppercase()).size(11.0).color(pal.ink_faint));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let text = egui::RichText::new(format!("{}  ›", link)).size(12.0).color(pal.link);
+            clicked = ui.add(egui::Label::new(text).sense(Sense::click())).on_hover_cursor(egui::CursorIcon::PointingHand).clicked();
+        });
+    });
+    ui.add_space(6.0);
+    clicked
+}
+
 /// The height the next panel is made at least (set by `pair`, used once), and the height its rows
 /// took (for `pair` to read back).
 const PANEL_MIN: &str = "overview-panel-min";
@@ -306,6 +328,8 @@ pub(super) enum Tail {
     Lock,
     /// An on/off switch, as it is.
     Switch(bool),
+    /// A click opens what's under it (a chevron pointing down while it's open).
+    Fold(bool),
     Nothing,
 }
 
@@ -354,6 +378,12 @@ pub(super) fn row(ui: &mut Ui, pal: &Pal, lead: Option<Lead>, label: &str, value
         Tail::Lock => {
             paint_glyph(&p, Rect::from_center_size(pos2(right - 7.0, cy), vec2(14.0, 14.0)), "lock", pal.ink_faint);
             right -= 24.0;
+        }
+        Tail::Fold(open) => {
+            let c = pos2(right - 3.0, cy);
+            let pts = if *open { vec![c + vec2(-5.0, -2.5), c + vec2(0.0, 2.5), c + vec2(5.0, -2.5)] } else { vec![c + vec2(-3.0, -5.0), c + vec2(2.0, 0.0), c + vec2(-3.0, 5.0)] };
+            p.add(egui::Shape::line(pts, Stroke::new(1.5_f32, pal.ink_faint)));
+            right -= 22.0;
         }
         Tail::Switch(on) => {
             let sw = Rect::from_min_size(pos2(right - 38.0, cy - 11.0), vec2(38.0, 22.0));
@@ -750,7 +780,8 @@ fn facts(ui: &mut Ui, pal: &Pal, v: &VmInfo, at: &Around, ov: &mut OverviewEdit,
 
 /// Bytes per second, shortly.
 pub(super) fn fmt_rate(b: f64) -> String {
-    match b {
+    // (nothing added up is -0.0 in Rust: shown as 0, as is anything below)
+    match if b > 0.0 { b } else { 0.0 } {
         b if b < 1024.0 => format!("{:.0} B/s", b),
         b if b < 1024.0 * 1024.0 => format!("{:.0} KB/s", b / 1024.0),
         b => format!("{:.1} MB/s", b / 1024.0 / 1024.0),
@@ -851,6 +882,11 @@ pub(super) enum Fig {
 
 /// A tile's figures in a row from `at`, smaller when they don't fit in `room`.
 pub(super) fn figures(p: &egui::Painter, pal: &Pal, at: egui::Pos2, figs: &[Fig], room: f32) {
+    figures_sized(p, pal, at, figs, room, &[22.0, 18.0, 15.0, 13.0]);
+}
+
+/// The same, the big figure at the first of `sizes` that fits (else the last).
+pub(super) fn figures_sized(p: &egui::Painter, pal: &Pal, at: egui::Pos2, figs: &[Fig], room: f32, sizes: &[f32]) {
     let lay = |big: f32| -> (Vec<(f32, Option<std::sync::Arc<egui::Galley>>, Option<Color32>)>, f32) {
         let mut x = 0.0;
         let mut out = vec![];
@@ -878,7 +914,7 @@ pub(super) fn figures(p: &egui::Painter, pal: &Pal, at: egui::Pos2, figs: &[Fig]
     };
     // the largest size that fits
     let mut parts = vec![];
-    for size in [22.0, 18.0, 15.0, 13.0] {
+    for &size in sizes {
         let (p, wide) = lay(size);
         parts = p;
         if wide <= room {

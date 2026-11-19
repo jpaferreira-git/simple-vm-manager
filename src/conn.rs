@@ -1,6 +1,8 @@
 //! Talking to servers: JSON-RPC 2.0 over HTTPS at /jsonrpc (as the original's XenAPI.JsonRpcClient),
 //! and an in-memory demo pool (the original has simulated connections too).
 
+use crate::alerts::{AlertSettings, XenMessage};
+use crate::history::{demo_host_records, demo_vm_records, read_records, Records, Span};
 use crate::model::*;
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
@@ -201,6 +203,44 @@ fn args_text(args: &[Value]) -> String {
 /// A login's error code when the pool's servers point to a coordinator that doesn't answer; its
 /// address is the detail.
 pub const COORDINATOR_DOWN: &str = "COORDINATOR_DOWN";
+/// A server's other_config keys for maintenance mode, as XenCenter writes them: the mark, and the
+/// VMs (uuids, with commas) it moved off, shut down, or suspended.
+const MAINT: &str = "MAINTENANCE_MODE";
+const MAINT_MOVED: &str = "MAINTENANCE_MODE_EVACUATED_VMS_MIGRATED";
+const MAINT_STOPPED: &str = "MAINTENANCE_MODE_EVACUATED_VMS_HALTED";
+const MAINT_SUSPENDED: &str = "MAINTENANCE_MODE_EVACUATED_VMS_SUSPENDED";
+
+/// Sends a server's Wake-on-LAN signal from this computer: its card's magic packet, to its
+/// network's broadcast address (when known) and to this computer's own network, on ports 9 and 7.
+/// It only reaches a server on the same network as this computer. Noted in the job's details.
+pub fn send_wake(target: &WakeTarget) -> Result<(), ApiError> {
+    let mac = parse_mac(&target.mac).ok_or_else(|| ApiError::other("its network card's address isn't known"))?;
+    let packet = magic_packet(mac);
+    let failed = |e: std::io::Error| ApiError::other(format!("couldn't send a Wake-on-LAN signal from this computer: {}", e));
+    let sock = std::net::UdpSocket::bind("0.0.0.0:0").map_err(failed)?;
+    sock.set_broadcast(true).map_err(failed)?;
+    let mut to: Vec<&str> = vec![];
+    if !target.broadcast.is_empty() {
+        to.push(&target.broadcast);
+    }
+    to.push("255.255.255.255");
+    let mut last = None;
+    let mut sent = vec![];
+    for addr in &to {
+        for port in [9u16, 7] {
+            match sock.send_to(&packet, (*addr, port)) {
+                Ok(_) if !sent.contains(addr) => sent.push(*addr),
+                Ok(_) => {}
+                Err(e) => last = Some(e),
+            }
+        }
+    }
+    if sent.is_empty() {
+        return Err(failed(last.unwrap_or_else(|| std::io::Error::other("nowhere to send it"))));
+    }
+    note(format!("sent a Wake-on-LAN signal for {} from this computer, to {}", target.mac, sent.join(" and ")));
+    Ok(())
+}
 /// How long a storage has to answer a check (a rescan takes a second or two).
 pub const CHECK_SECS: u64 = 15;
 
@@ -337,6 +377,21 @@ pub trait Connection: Send + Sync {
     /// The last ten minutes of a server's load and its running VMs', from the server itself (its
     /// uuid and address).
     fn host_perf(&self, host_uuid: &str, host_address: &str) -> Result<HostPerf, ApiError>;
+    /// A running VM's records over `span` (`vm_uuid`), or a server's own and its running VMs'
+    /// (None), as the server at `host_address` keeps them (the one the VM runs on).
+    fn history(&self, host_address: &str, vm_uuid: Option<&str>, span: Span) -> Result<Records, ApiError>;
+    /// The pool's messages for people (its alerts): all of them, or those since a time (seconds
+    /// since 1970).
+    fn messages(&self, since: Option<i64>) -> Result<Vec<XenMessage>, ApiError>;
+    /// Removes messages from the pool (dismissed: XenCenter no longer shows them either). One
+    /// already gone counts as done.
+    fn dismiss_messages(&self, refs: &[String]) -> Result<(), ApiError>;
+    /// A VM's, a server's or a storage's limits (its other_config's perfmon; `cls` "VM", "host"
+    /// or "SR"), and the pool's email for alerts.
+    fn alert_settings(&self, cls: &str, obj: &str) -> Result<AlertSettings, ApiError>;
+    /// Sets those (the pool's email too when `mail` is given: empty to stop it), then has every
+    /// server read its limits again.
+    fn set_alert_settings(&self, cls: &str, obj: &str, perfmon: &str, mail: Option<(String, String)>) -> Result<(), ApiError>;
     /// The updates the pool's servers lack, as last fetched from its update channel (its
     /// /updates answer).
     fn pool_updates(&self) -> Result<PoolUpdates, ApiError>;
@@ -365,6 +420,20 @@ pub trait Connection: Send + Sync {
     /// The server takes VMs again: asked till it does (one that's just restarted may not at
     /// once), for up to five minutes.
     fn enable_host(&self, host_ref: &str) -> Result<(), ApiError>;
+    /// Has the pool turn on a server that's off (host.power_on: its coordinator sends it a
+    /// Wake-on-LAN signal), set to Wake-on-LAN first when it has no way set. Done once the pool
+    /// has sent it; the server takes minutes to answer.
+    fn power_on_host(&self, host_ref: &str) -> Result<(), ApiError>;
+    /// Puts a server in maintenance mode: no new VMs sent to it (even after a restart, where the
+    /// server allows), its VMs moved to the pool's other servers and those that can't move shut
+    /// down (with `stop`; without, it fails first when there are any), then marked as XenCenter
+    /// marks it, with the VMs moved off and shut down, to bring back later. It takes VMs again if
+    /// a step fails. The VMs it shut down, and how many it moved.
+    fn enter_maintenance(&self, host_ref: &str, stop: bool) -> Result<(Vec<String>, usize), ApiError>;
+    /// Takes a server out of maintenance mode: it takes VMs again, its mark gone; with `back`, the
+    /// VMs maintenance moved off it come back (live) and those it shut down start on it again.
+    /// Those that couldn't, each with why.
+    fn exit_maintenance(&self, host_ref: &str, back: bool) -> Result<Vec<String>, ApiError>;
     /// Starts a VM on a server.
     fn start_vm_on(&self, vm_ref: &str, host_ref: &str) -> Result<(), ApiError>;
     /// Moves a VM (see `MoveVm`). Running, it goes live: to the server (VM.pool_migrate), with its
@@ -1003,11 +1072,14 @@ impl RealConnection {
     /// instead of being waited on for the whole time; the task's progress goes to the thread's
     /// watched `Progress`.
     /// `shutdown_host` and `reboot_host`: no new VMs sent to it, the VMs that can't leave stopped,
-    /// the rest moved, then it goes off or restarts; enabled again if a step fails.
+    /// the rest moved, then it goes off or restarts; enabled again if a step fails (unless it
+    /// wasn't taking VMs before). One in maintenance mode stays so once it's back.
     fn host_off(&self, host: &str, reboot: bool) -> Result<(), ApiError> {
-        self.emptied(host, true)?;
+        let maintenance = self.call_raw("host.get_other_config", vec![json!(host)], 30_000).map_or(false, |o| s(&o, MAINT).eq_ignore_ascii_case("true"));
+        let was_enabled = self.call_raw("host.get_enabled", vec![json!(host)], 30_000).ok().and_then(|v| v.as_bool()).unwrap_or(true);
+        self.emptied(host, true, maintenance)?;
         let done = self.call(if reboot { "host.reboot" } else { "host.shutdown" }, vec![json!(host)], ACTION_TIMEOUT_MS).map(|_| ());
-        if done.is_err() {
+        if done.is_err() && was_enabled {
             let _ = self.call("host.enable", vec![json!(host)], 60_000);
         }
         done
@@ -1027,19 +1099,34 @@ impl RealConnection {
         Ok(out)
     }
 
-    /// No new VMs sent to a server, the VMs that can't move elsewhere stopped (with `stop`;
-    /// without, it fails first when there are any), the rest moved: the VMs it stopped. Enabled
-    /// again if a step fails.
-    fn emptied(&self, host: &str, stop: bool) -> Result<(Vec<String>, usize), ApiError> {
+    /// No new VMs sent to a server; with `keep`, not even after it restarts (host.disable's
+    /// auto_enable, on servers that have it: older ones take VMs again once they've restarted).
+    fn disable(&self, host: &str, keep: bool) -> Result<(), ApiError> {
         let t = 60_000;
+        if keep {
+            match self.call("host.disable", vec![json!(host), json!(false)], t) {
+                Err(e) if e.code == "MESSAGE_PARAMETER_COUNT_MISMATCH" => note("an older server: it takes VMs again if it's restarted"),
+                r => return r.map(|_| ()),
+            }
+        }
+        self.call("host.disable", vec![json!(host)], t).map(|_| ())
+    }
+
+    /// No new VMs sent to a server (with `keep`, even after a restart), the VMs that can't move
+    /// elsewhere stopped (with `stop`; without, it fails first when there are any), the rest
+    /// moved: the VMs it stopped, and those it moved. Enabled again if a step fails (when it was
+    /// taking VMs before).
+    fn emptied(&self, host: &str, stop: bool, keep: bool) -> Result<(Vec<String>, Vec<String>), ApiError> {
+        let t = 60_000;
+        let was_enabled = self.call_raw("host.get_enabled", vec![json!(host)], 30_000).ok().and_then(|v| v.as_bool()).unwrap_or(true);
         if !stop {
             let stuck = self.blocking(host)?;
             if !stuck.is_empty() {
                 return Err(ApiError { code: "VMS_CANT_MOVE".into(), details: stuck.into_iter().map(|s| s.0).collect() });
             }
         }
-        self.call("host.disable", vec![json!(host)], t)?;
-        let done = (|| -> Result<(Vec<String>, usize), ApiError> {
+        self.disable(host, keep)?;
+        let done = (|| -> Result<(Vec<String>, Vec<String>), ApiError> {
             let mut stopped = vec![];
             let stuck = self.call("host.get_vms_which_prevent_evacuation", vec![json!(host)], t)?;
             for vm in stuck.as_object().map(|o| o.keys().cloned().collect::<Vec<_>>()).unwrap_or_default() {
@@ -1064,15 +1151,15 @@ impl RealConnection {
                 stopped.push(vm);
             }
             // what's left running there moves (its control domain stays)
-            let left = self
+            let left: Vec<String> = self
                 .call("host.get_resident_VMs", vec![json!(host)], t)?
                 .as_array()
-                .map(|a| a.iter().filter(|vm| !self.call("VM.get_is_control_domain", vec![(*vm).clone()], t).ok().and_then(|x| x.as_bool()).unwrap_or(true)).count())
-                .unwrap_or(0);
+                .map(|a| a.iter().filter(|vm| !self.call("VM.get_is_control_domain", vec![(*vm).clone()], t).ok().and_then(|x| x.as_bool()).unwrap_or(true)).map(val_str).collect())
+                .unwrap_or_default();
             self.call("host.evacuate", vec![json!(host)], ACTION_TIMEOUT_MS)?;
             Ok((stopped, left))
         })();
-        if done.is_err() {
+        if done.is_err() && was_enabled {
             let _ = self.call("host.enable", vec![json!(host)], t);
         }
         done
@@ -1239,15 +1326,8 @@ impl RealConnection {
     /// which says how many points it found. With none, the server's clock may be behind this
     /// computer's: asked again from its own time.
     fn rrd<T>(&self, address: &str, host: bool, read: impl Fn(&str) -> (T, usize)) -> Result<T, ApiError> {
-        let (coordinator, session) = self.session(20_000)?;
-        let at = if address.is_empty() { coordinator } else { address.to_string() };
-        let at = if at.contains(':') && !at.starts_with('[') { format!("[{}]", at) } else { at };
-        let port = if self.port == DEFAULT_PORT { String::new() } else { format!(":{}", self.port) };
-        let agent = ureq::AgentBuilder::new().tls_connector(self.tls.clone()).timeout_connect(Duration::from_secs(5)).timeout(Duration::from_secs(15)).build();
-        let get = |start: i64| -> Result<String, ApiError> {
-            let url = format!("https://{}{}/rrd_updates?session_id={}&start={}&cf=AVERAGE&interval=5&host={}", at, port, session, start, host);
-            agent.get(&url).call().map_err(web_error)?.into_string().map_err(|e| ApiError::other(e.to_string()))
-        };
+        let get = self.rrd_getter(address, 15)?;
+        let get = |start: i64| get(&format!("start={}&cf=AVERAGE&interval=5&host={}", start, host));
         let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
         let mut text = get(now - 600)?;
         let (mut got, mut n) = read(&text);
@@ -1264,6 +1344,20 @@ impl RealConnection {
         Ok(got)
     }
 
+    /// A way to ask the server at `address` (the coordinator when empty) for its records: an
+    /// rrd_updates query (without the session) to its answer, waited for up to `secs`.
+    fn rrd_getter(&self, address: &str, secs: u64) -> Result<impl Fn(&str) -> Result<String, ApiError>, ApiError> {
+        let (coordinator, session) = self.session(20_000)?;
+        let at = if address.is_empty() { coordinator } else { address.to_string() };
+        let at = if at.contains(':') && !at.starts_with('[') { format!("[{}]", at) } else { at };
+        let port = if self.port == DEFAULT_PORT { String::new() } else { format!(":{}", self.port) };
+        let agent = ureq::AgentBuilder::new().tls_connector(self.tls.clone()).timeout_connect(Duration::from_secs(5)).timeout(Duration::from_secs(secs)).build();
+        Ok(move |query: &str| -> Result<String, ApiError> {
+            let url = format!("https://{}{}/rrd_updates?session_id={}&{}", at, port, session, query);
+            agent.get(&url).call().map_err(web_error)?.into_string().map_err(|e| ApiError::other(e.to_string()))
+        })
+    }
+
     fn all(&self, cls: &str, timeout_ms: u64) -> Result<Map<String, Value>, ApiError> {
         Ok(self.call(&format!("{}.get_all_records", cls), vec![], timeout_ms)?.as_object().cloned().unwrap_or_default())
     }
@@ -1272,12 +1366,12 @@ impl RealConnection {
 /// The calls that can take long and that the server can run as a task (an Async form): only
 /// these go as tasks. A field's setter (set_*, add_to_*, remove_from_*) has no Async form: the
 /// server answers "No async mode for this operation".
-const TASKS: [&str; 38] = [
+const TASKS: [&str; 39] = [
     "VM.clone", "VM.copy", "VM.provision", "VM.snapshot", "VM.checkpoint", "VM.revert", "VM.start", "VM.start_on", "VM.resume", "VM.resume_on",
     "VM.suspend", "VM.clean_shutdown", "VM.hard_shutdown", "VM.clean_reboot", "VM.hard_reboot", "VM.destroy", "VDI.create", "VDI.destroy",
     "VDI.resize", "VBD.eject", "VBD.insert", "VBD.plug", "VIF.plug", "VIF.unplug", "VIF.move", "PBD.plug", "PBD.unplug", "SR.create", "SR.scan",
     "SR.forget", "host.evacuate", "host.shutdown", "pool.sync_updates", "host.apply_updates", "VM.pool_migrate", "VM.migrate_send",
-    "VDI.pool_migrate", "VDI.copy",
+    "VDI.pool_migrate", "VDI.copy", "host.power_on",
 ];
 
 /// Whether a call runs as a task on the server (see `call`): one allowed over a minute that can.
@@ -1505,6 +1599,8 @@ impl Connection for RealConnection {
             let cpu = r.get("cpu_info").cloned().unwrap_or(Value::Null);
             let m = metrics.get(&s(&r, "metrics")).cloned().unwrap_or(Value::Null);
             let version = s(&sw, "product_version");
+            let other = r.get("other_config").cloned().unwrap_or(Value::Null);
+            let uuids = |k: &str| s(&other, k).split(',').map(str::trim).filter(|u| !u.is_empty()).map(String::from).collect::<Vec<_>>();
             pd.hosts.push(HostInfo {
                 is_master: k == master,
                 rref: k,
@@ -1532,6 +1628,10 @@ impl Connection for RealConnection {
                 pending_guidance: list(&r, "pending_guidances").into_iter().chain(list(&r, "pending_guidances_recommended")).collect(),
                 last_update: parse_xen_time(&s(&r, "last_software_update")),
                 nics: vec![], // filled in from the PIFs below
+                power_on_mode: s(&r, "power_on_mode"),
+                maintenance: s(&other, MAINT).eq_ignore_ascii_case("true"),
+                maint_moved: uuids(MAINT_MOVED),
+                maint_stopped: uuids(MAINT_STOPPED),
             });
         }
         self.knock_hosts(&mut pd.hosts);
@@ -1627,6 +1727,8 @@ impl Connection for RealConnection {
                 management: b(&r, "management"),
                 carrier: b(&m, "carrier"),
                 speed: n(&m, "speed"),
+                mac: s(&r, "MAC"),
+                netmask: s(&r, "netmask"),
             };
             if let Some(h) = pd.hosts.iter_mut().find(|h| h.rref == s(&r, "host")) {
                 h.nics.push(nic);
@@ -1759,7 +1861,7 @@ impl Connection for RealConnection {
             for vbd_ref in list(&r, "VBDs") {
                 let Some(vbd) = vbds.get(&vbd_ref) else { continue };
                 let cd = s(vbd, "type") == "CD";
-                let mut d = VmDisk { device: s(vbd, "userdevice"), kind: if cd { "DVD drive".into() } else { "Disk".into() }, vbd: vbd_ref.clone(), ..Default::default() };
+                let mut d = VmDisk { device: s(vbd, "userdevice"), dev: s(vbd, "device"), kind: if cd { "DVD drive".into() } else { "Disk".into() }, vbd: vbd_ref.clone(), ..Default::default() };
                 if let Some(vdi) = vdis.get(&s(vbd, "VDI")) {
                     d.vdi = s(vbd, "VDI");
                     if vm.storage_host.is_none() {
@@ -2211,6 +2313,96 @@ impl Connection for RealConnection {
         })
     }
 
+    fn messages(&self, since: Option<i64>) -> Result<Vec<XenMessage>, ApiError> {
+        let v = match since {
+            None => self.call("message.get_all_records", vec![], 60_000)?,
+            Some(at) => self.call("message.get_since", vec![json!(xen_time_text(at))], 30_000)?,
+        };
+        let map = v.as_object().cloned().unwrap_or_default();
+        Ok(map
+            .into_iter()
+            .map(|(k, r)| XenMessage { rref: k, name: s(&r, "name"), priority: n(&r, "priority"), cls: s(&r, "cls"), obj_uuid: s(&r, "obj_uuid"), time: parse_xen_time(&s(&r, "timestamp")).unwrap_or(0), body: s(&r, "body") })
+            .collect())
+    }
+
+    fn dismiss_messages(&self, refs: &[String]) -> Result<(), ApiError> {
+        // all at once where the server can (newer ones), else one by one
+        if refs.len() > 1 {
+            match self.call("message.destroy_many", vec![json!(refs)], 60_000) {
+                Ok(_) => return Ok(()),
+                Err(e) if e.code == "MESSAGE_METHOD_UNKNOWN" || e.code == "HANDLE_INVALID" => {}
+                Err(e) => return Err(e),
+            }
+        }
+        for r in refs {
+            match self.call("message.destroy", vec![json!(r)], 20_000) {
+                Ok(_) => {}
+                Err(e) if e.code == "HANDLE_INVALID" => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    fn alert_settings(&self, cls: &str, obj: &str) -> Result<AlertSettings, ApiError> {
+        let t = 20_000;
+        let own = self.call(&format!("{}.get_other_config", cls), vec![json!(obj)], t)?;
+        let pool = self.call("pool.get_all", vec![], t)?.as_array().and_then(|a| a.first().cloned()).unwrap_or(Value::Null);
+        let pool = self.call("pool.get_other_config", vec![pool], t)?;
+        Ok(AlertSettings { perfmon: s(&own, "perfmon"), mail_to: s(&pool, "mail-destination"), mail_via: s(&pool, "ssmtp-mailhub") })
+    }
+
+    fn set_alert_settings(&self, cls: &str, obj: &str, perfmon: &str, mail: Option<(String, String)>) -> Result<(), ApiError> {
+        let t = 20_000;
+        // (taking out a key that isn't there is fine)
+        self.call(&format!("{}.remove_from_other_config", cls), vec![json!(obj), json!("perfmon")], t)?;
+        if !perfmon.is_empty() {
+            self.call(&format!("{}.add_to_other_config", cls), vec![json!(obj), json!("perfmon"), json!(perfmon)], t)?;
+        }
+        if let Some((to, via)) = mail {
+            let pool = self.call("pool.get_all", vec![], t)?.as_array().and_then(|a| a.first().cloned()).unwrap_or(Value::Null);
+            for (k, v) in [("mail-destination", to), ("ssmtp-mailhub", via)] {
+                self.call("pool.remove_from_other_config", vec![pool.clone(), json!(k)], t)?;
+                if !v.trim().is_empty() {
+                    self.call("pool.add_to_other_config", vec![pool.clone(), json!(k), json!(v.trim())], t)?;
+                }
+            }
+        }
+        // each server's perfmon reads its limits again now (else within minutes); one that
+        // doesn't answer reads them when it's back
+        let hosts = self.call("host.get_all", vec![], t)?;
+        for h in hosts.as_array().cloned().unwrap_or_default() {
+            let _ = self.call("host.call_plugin", vec![h, json!("perfmon"), json!("refresh"), json!({})], t);
+        }
+        Ok(())
+    }
+
+    fn history(&self, address: &str, vm_uuid: Option<&str>, span: Span) -> Result<Records, ApiError> {
+        // a year of a busy server's records is a few megabytes
+        let get = self.rrd_getter(address, 60)?;
+        let whose = match vm_uuid {
+            Some(u) => format!("vm_uuid={}", u),
+            None => "host=true".to_string(),
+        };
+        let ask = |start: i64| -> Result<(String, Records), ApiError> {
+            let text = get(&format!("start={}&cf=AVERAGE&interval={}&{}", start, span.step(), whose))?;
+            let r = read_records(&text);
+            Ok((text, r))
+        };
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+        let (mut text, mut r) = ask(span.start(now))?;
+        // asked by this computer's clock: when the server's differs, again by its own (the span
+        // it keeps ends at its own time)
+        if let Some(end) = rrd_end(&text).filter(|e| (*e - now).abs() > span.step().max(10)) {
+            (text, r) = ask(span.start(end))?;
+        }
+        if r.times.is_empty() || r.cols.is_empty() {
+            let head: String = text.trim().chars().take(160).collect();
+            return Err(ApiError::other(format!("the server sent no records for it ({} bytes): {}", text.len(), head)));
+        }
+        Ok(r)
+    }
+
     fn pool_updates(&self) -> Result<PoolUpdates, ApiError> {
         let (coordinator, session) = self.session(20_000)?;
         let at = if coordinator.contains(':') && !coordinator.starts_with('[') { format!("[{}]", coordinator) } else { coordinator };
@@ -2290,7 +2482,7 @@ impl Connection for RealConnection {
     }
 
     fn empty_host(&self, host: &str, stop: bool) -> Result<(Vec<String>, usize), ApiError> {
-        self.emptied(host, stop)
+        self.emptied(host, stop, false).map(|(stopped, moved)| (stopped, moved.len()))
     }
 
     fn restart_host_and_wait(&self, host: &str, limit: Duration) -> Result<(), ApiError> {
@@ -2376,6 +2568,69 @@ impl Connection for RealConnection {
             std::thread::sleep(Duration::from_secs(10));
             last = self.call_raw("host.enable", vec![json!(host)], 60_000).err();
         }
+    }
+
+    fn power_on_host(&self, host: &str) -> Result<(), ApiError> {
+        let t = 60_000;
+        if val_str(&self.call("host.get_power_on_mode", vec![json!(host)], t)?).is_empty() {
+            note("no way to turn it on was set: set to Wake-on-LAN");
+            self.call("host.set_power_on_mode", vec![json!(host), json!("wake-on-lan"), json!({})], t)?;
+        }
+        self.call("host.power_on", vec![json!(host)], 15 * 60_000).map(|_| ())
+    }
+
+    fn enter_maintenance(&self, host: &str, stop: bool) -> Result<(Vec<String>, usize), ApiError> {
+        let t = 60_000;
+        let (stopped, moved) = self.emptied(host, stop, true)?;
+        // marked as XenCenter marks it, with the VMs to bring back (by uuid)
+        let uuids = |refs: &[String]| refs.iter().filter_map(|r| self.call("VM.get_uuid", vec![json!(r)], t).ok().map(|u| val_str(&u))).collect::<Vec<_>>().join(",");
+        let marks = [(MAINT, "true".to_string()), (MAINT_MOVED, uuids(&moved)), (MAINT_STOPPED, uuids(&stopped))];
+        for (k, v) in &marks {
+            let _ = self.call_raw("host.remove_from_other_config", vec![json!(host), json!(k)], t);
+            self.call("host.add_to_other_config", vec![json!(host), json!(k), json!(v)], t)?;
+        }
+        Ok((stopped, moved.len()))
+    }
+
+    fn exit_maintenance(&self, host: &str, back: bool) -> Result<Vec<String>, ApiError> {
+        let t = 60_000;
+        let other = self.call("host.get_other_config", vec![json!(host)], t)?;
+        let uuids = |k: &str| s(&other, k).split(',').map(str::trim).filter(|u| !u.is_empty()).map(String::from).collect::<Vec<_>>();
+        let (moved, stopped) = (uuids(MAINT_MOVED), uuids(MAINT_STOPPED));
+        self.call("host.enable", vec![json!(host)], t)?;
+        for k in [MAINT, MAINT_MOVED, MAINT_STOPPED, MAINT_SUSPENDED] {
+            if !s(&other, k).is_empty() {
+                let _ = self.call("host.remove_from_other_config", vec![json!(host), json!(k)], t);
+            }
+        }
+        let mut failed = vec![];
+        if !back {
+            return Ok(failed);
+        }
+        for (uuid, start) in moved.iter().map(|u| (u, false)).chain(stopped.iter().map(|u| (u, true))) {
+            // (one deleted since is let go)
+            let Ok(vm) = self.call_raw("VM.get_by_uuid", vec![json!(uuid)], t).map(|v| val_str(&v)) else { continue };
+            let name = self.call_raw("VM.get_name_label", vec![json!(vm)], t).map(|v| val_str(&v)).unwrap_or_else(|_| uuid.clone());
+            let power = self.call("VM.get_power_state", vec![json!(vm)], t).map(|v| val_str(&v)).unwrap_or_default();
+            let done = if start {
+                // shut down by maintenance: started here again, if it's still off
+                if power != "Halted" {
+                    continue;
+                }
+                self.call("VM.start_on", vec![json!(vm), json!(host), json!(false), json!(false)], ACTION_TIMEOUT_MS)
+            } else {
+                // moved off: back here, if it still runs elsewhere
+                let on = self.call("VM.get_resident_on", vec![json!(vm)], t).map(|v| val_str(&v)).unwrap_or_default();
+                if power != "Running" || on == host {
+                    continue;
+                }
+                self.call("VM.pool_migrate", vec![json!(vm), json!(host), json!({"live": "true"})], ACTION_TIMEOUT_MS)
+            };
+            if let Err(e) = done {
+                failed.push(format!("{}: {}", name, e.message()));
+            }
+        }
+        Ok(failed)
     }
 
     fn start_vm_on(&self, vm: &str, host: &str) -> Result<(), ApiError> {
@@ -2966,6 +3221,9 @@ pub struct DemoConnection {
     data: Mutex<PoolData>,
     /// What its update channel has for its servers.
     updates: Mutex<PoolUpdates>,
+    /// Its messages for people, the limits set on its VMs, servers and storage (by reference),
+    /// and its email for alerts.
+    alerts: Mutex<(Vec<XenMessage>, HashMap<String, String>, (String, String))>,
 }
 
 impl DemoConnection {
@@ -3018,10 +3276,14 @@ impl DemoConnection {
             // till 31 July next year
             license_expiry: parse_xen_time(&format!("{}0731T00:00:00Z", 1971 + SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0) / 31_556_952)),
             nics: vec![
-                HostNic { device: "eth0".into(), network: "Pool-wide network 0".into(), ip: addr.into(), management: true, carrier: true, speed: 1000 },
-                HostNic { device: "eth1".into(), network: "Storage network".into(), ip: addr.replace("10.20.", "10.30."), management: false, carrier: true, speed: 10000 },
-                HostNic { device: "eth2".into(), network: "Pool-wide network 2".into(), ip: String::new(), management: false, carrier: false, speed: 0 },
+                HostNic { device: "eth0".into(), network: "Pool-wide network 0".into(), ip: addr.into(), management: true, carrier: true, speed: 1000, mac: format!("aa:16:3e:00:{}:01", &r[r.len() - 1..]), netmask: "255.255.0.0".into() },
+                HostNic { device: "eth1".into(), network: "Storage network".into(), ip: addr.replace("10.20.", "10.30."), management: false, carrier: true, speed: 10000, mac: format!("aa:16:3e:00:{}:02", &r[r.len() - 1..]), netmask: "255.255.0.0".into() },
+                HostNic { device: "eth2".into(), network: "Pool-wide network 2".into(), ip: String::new(), management: false, carrier: false, speed: 0, mac: format!("aa:16:3e:00:{}:03", &r[r.len() - 1..]), netmask: String::new() },
             ],
+            power_on_mode: if master { String::new() } else { "wake-on-lan".into() },
+            maintenance: false,
+            maint_moved: vec![],
+            maint_stopped: vec![],
         };
         d.hosts.push(host("host-a", "demo-host-01", "10.20.0.11", true));
         d.hosts.push(host("host-b", "demo-host-02", "10.20.0.12", false));
@@ -3133,13 +3395,43 @@ impl DemoConnection {
                 vcpus: *cpus,
                 allowed: vec![],
                 disks: vec![
-                    VmDisk { name: format!("{} disk 0", name), device: "0".into(), vbd: format!("{}-vbd-0", r), vdi: format!("{}-vdi-0", r), sr: srr.to_string(), sr_name, kind: "Disk".into(), size: disk * GB },
+                    VmDisk { name: format!("{} disk 0", name), device: "0".into(), vbd: format!("{}-vbd-0", r), vdi: format!("{}-vdi-0", r), sr: srr.to_string(), sr_name, kind: "Disk".into(), size: disk * GB, ..Default::default() },
                     VmDisk { name: "(empty)".into(), device: "3".into(), vbd: format!("{}-vbd-3", r), kind: "DVD drive".into(), ..Default::default() },
                 ],
                 nics: vec![VmNic { device: "0".into(), vif: format!("{}-vif-0", r), net: "net-0".into(), mac: format!("aa:16:3e:{:02x}:10:{:02x}", i + 1, 0x20 + i), network: "Pool-wide network 0".into(), ip: ip.to_string() }],
                 ..Default::default()
             });
             demo_details(d.vms.last_mut().unwrap());
+        }
+        // the servers named in SVM_DEMO_OFF were shut down (their VMs moved to the other server
+        // first, or shut down when their disks are on it), and those in SVM_DEMO_MAINTENANCE are in
+        // maintenance mode (their VMs moved off, to come back later)
+        for (var, maint) in [("SVM_DEMO_OFF", false), ("SVM_DEMO_MAINTENANCE", true)] {
+            let Ok(names) = std::env::var(var) else { continue };
+            for i in 0..d.hosts.len() {
+                let r = d.hosts[i].rref.clone();
+                if !names.split(',').any(|x| x.trim() == r) {
+                    continue;
+                }
+                let other = d.hosts.iter().find(|h| h.rref != r).map(|h| h.rref.clone());
+                let (mut moved, mut stopped) = (vec![], vec![]);
+                for v in d.vms.iter_mut().filter(|v| v.host.as_deref() == Some(r.as_str())) {
+                    if v.storage_host.as_deref() == Some(r.as_str()) || other.is_none() {
+                        (v.power, v.host) = (PowerState::Halted, None);
+                        stopped.push(v.uuid.clone());
+                    } else {
+                        v.host = other.clone();
+                        moved.push(v.uuid.clone());
+                    }
+                }
+                let h = &mut d.hosts[i];
+                h.enabled = false;
+                if maint {
+                    (h.maintenance, h.maint_moved, h.maint_stopped) = (true, moved, stopped);
+                } else {
+                    h.live = false;
+                }
+            }
         }
         recompute(&mut d);
         // two templates made from VMs like these, ready to copy
@@ -3169,7 +3461,7 @@ impl DemoConnection {
                 boot_order: "Disk, DVD drive, Network".into(),
                 ..Default::default()
             };
-            t.disks.push(VmDisk { name: format!("{} disk 0", name), device: "0".into(), vbd: format!("{}-vbd-0", r), vdi: format!("{}-vdi-0", r), sr: "sr-nfs".into(), sr_name: "Shared NFS storage".into(), kind: "Disk".into(), size: disk * GB });
+            t.disks.push(VmDisk { name: format!("{} disk 0", name), device: "0".into(), vbd: format!("{}-vbd-0", r), vdi: format!("{}-vdi-0", r), sr: "sr-nfs".into(), sr_name: "Shared NFS storage".into(), kind: "Disk".into(), size: disk * GB, ..Default::default() });
             t.nics.push(VmNic { device: "0".into(), vif: format!("{}-vif-0", r), net: "net-0".into(), mac: format!("aa:16:3e:7e:00:{:02x}", disk), network: "Pool-wide network 0".into(), ip: String::new() });
             d.user_templates.push(t);
         }
@@ -3216,7 +3508,8 @@ impl DemoConnection {
             ]
         };
         let found = PoolUpdates { hash: "6f1c0e9a".into(), updates, hosts };
-        DemoConnection { data: Mutex::new(d), updates: Mutex::new(found) }
+        let alerts = demo_alerts(&d);
+        DemoConnection { data: Mutex::new(d), updates: Mutex::new(found), alerts: Mutex::new(alerts) }
     }
 
     /// New VM from one of the user's templates: the calls a real server gets, with made-up answers.
@@ -3286,6 +3579,36 @@ fn demo_templates() -> Vec<TemplateInfo> {
 /// The discs in the demo's ISO library `sr`, two of them described.
 /// The demo's stand-in for a server task: `ms` of work, its progress reported to the thread's
 /// watched `Progress`.
+/// The demo pool's messages (a limit passed last night, a VM that crashed, a certificate
+/// running out, a snapshot taken…) and the limits set that raised them.
+fn demo_alerts(d: &PoolData) -> (Vec<XenMessage>, HashMap<String, String>, (String, String)) {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|t| t.as_secs() as i64).unwrap_or(0);
+    let uuid_of = |r: &str| -> String { d.vms.iter().find(|v| v.rref == r).map(|v| v.uuid.clone()).or_else(|| d.hosts.iter().find(|h| h.rref == r).map(|h| h.uuid.clone())).or_else(|| d.srs.iter().find(|x| x.rref == r).map(|x| x.uuid.clone())).unwrap_or_default() };
+    let cpu = "<variable>\n\t<name value=\"cpu_usage\"/>\n\t<alarm_trigger_level value=\"0.9\"/>\n\t<alarm_trigger_period value=\"300\"/>\n\t<alarm_auto_inhibit_period value=\"3600\"/>\n</variable>";
+    let full = "<variable>\n\t<name value=\"physical_utilisation\"/>\n\t<alarm_trigger_level value=\"0.9\"/>\n\t<alarm_trigger_period value=\"300\"/>\n</variable>";
+    let msg = |i: usize, name: &str, priority: i64, cls: &str, obj: &str, ago: i64, body: String| XenMessage {
+        rref: format!("OpaqueRef:demo-message-{}", i),
+        name: name.into(),
+        priority,
+        cls: cls.into(),
+        obj_uuid: uuid_of(obj),
+        time: now - ago,
+        body,
+    };
+    let list = vec![
+        msg(1, "ALARM", 3, "SR", "sr-local2", 40 * 60, format!("value: 0.962000\nconfig:\n{}", full)),
+        msg(2, "ALARM", 3, "VM", "vm-web", 9 * 3600, format!("value: 0.973000\nconfig:\n{}", cpu)),
+        msg(3, "VM_CRASHED", 2, "VM", "vm-mail", 26 * 3600, "The VM crashed and was restarted (actions_after_crash: restart)".into()),
+        msg(4, "HOST_SERVER_CERTIFICATE_EXPIRING_30", 3, "Host", "host-a", 2 * 86_400 + 3 * 3600, "The TLS server certificate is expiring soon. Refresh it before it expires.".into()),
+        msg(5, "VM_SNAPSHOTTED", 5, "VM", "vm-web", 2 * 86_400 + 7 * 3600, "Snapshot 'Before nginx 1.26' was taken".into()),
+        msg(6, "POOL_MASTER_TRANSITION", 4, "Host", "host-a", 5 * 86_400, "This host is now the pool coordinator".into()),
+    ];
+    let mut limits = HashMap::new();
+    limits.insert("vm-web".to_string(), format!("<config>{}</config>", cpu));
+    limits.insert("sr-local2".to_string(), format!("<config>{}</config>", full));
+    (list, limits, (String::new(), String::new()))
+}
+
 /// A VM's made-up ten minutes (see `DemoConnection::vm_perf`).
 fn demo_perf(v: &VmInfo) -> Perf {
     let seed = v.name.bytes().map(|b| b as f64).sum::<f64>();
@@ -3820,7 +4143,7 @@ impl Connection for DemoConnection {
             allowed: vec!["start".into(), "start_on".into()],
             ..Default::default()
         };
-        vm.disks.push(VmDisk { device: "0".into(), name: format!("{} disk", v.name), vbd: format!("{}-vbd-0", rref), vdi: format!("{}-vdi-0", rref), sr: v.sr.clone(), sr_name, kind: "Disk".into(), size: v.disk });
+        vm.disks.push(VmDisk { device: "0".into(), name: format!("{} disk", v.name), vbd: format!("{}-vbd-0", rref), vdi: format!("{}-vdi-0", rref), sr: v.sr.clone(), sr_name, kind: "Disk".into(), size: v.disk, ..Default::default() });
         if let Some((lib, file, size)) = iso {
             vm.disks.push(VmDisk { device: "3".into(), name: file, vbd: format!("{}-vbd-3", rref), vdi: v.iso.clone(), sr_name: lib, kind: "DVD drive".into(), size, ..Default::default() });
         }
@@ -3956,7 +4279,7 @@ impl Connection for DemoConnection {
             VmChange::AddDisk { name, size, sr } => {
                 let device = next(v.disks.iter().map(|k| k.device.as_str()).collect(), &["3"]);
                 let sr_name = srs.iter().find(|x| x.rref == *sr).map(|x| x.name.clone()).unwrap_or_default();
-                v.disks.push(VmDisk { name: name.clone(), device: device.clone(), vbd: format!("{}-vbd-{}", vm, device), vdi: format!("{}-vdi-{}", vm, device), sr: sr.clone(), sr_name, kind: "Disk".into(), size: *size });
+                v.disks.push(VmDisk { name: name.clone(), device: device.clone(), vbd: format!("{}-vbd-{}", vm, device), vdi: format!("{}-vdi-{}", vm, device), sr: sr.clone(), sr_name, kind: "Disk".into(), size: *size, ..Default::default() });
                 v.disks.sort_by(|a, b| a.device.cmp(&b.device));
             }
             VmChange::GrowDisk { vdi, size } => {
@@ -4003,6 +4326,52 @@ impl Connection for DemoConnection {
         let d = self.data.lock().unwrap();
         let v = d.vms.iter().find(|v| v.uuid == uuid).ok_or_else(|| ApiError { code: "HANDLE_INVALID".into(), details: vec!["VM".into(), uuid.into()] })?;
         Ok(demo_perf(v))
+    }
+    /// Made-up records over `span`: a VM's daily round with a backup at night, kept since it
+    /// was made; a server's likewise, with its VMs' CPUs.
+    fn history(&self, host_address: &str, vm_uuid: Option<&str>, span: Span) -> Result<Records, ApiError> {
+        std::thread::sleep(Duration::from_millis(200));
+        let d = self.data.lock().unwrap();
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|t| t.as_secs() as i64).unwrap_or(0);
+        match vm_uuid {
+            Some(u) => {
+                let v = d.vms.iter().find(|v| v.uuid == u).ok_or_else(|| ApiError { code: "HANDLE_INVALID".into(), details: vec!["VM".into(), u.into()] })?;
+                Ok(demo_vm_records(v, span, now, &local_offset))
+            }
+            None => {
+                // (the demo has one server per address; its first one when none is given)
+                let h = d.hosts.iter().find(|h| h.address == host_address).or(d.hosts.first()).ok_or_else(|| ApiError::other("no server"))?;
+                Ok(demo_host_records(h, &d, span, now, &local_offset))
+            }
+        }
+    }
+    fn messages(&self, since: Option<i64>) -> Result<Vec<XenMessage>, ApiError> {
+        std::thread::sleep(Duration::from_millis(120));
+        let a = self.alerts.lock().unwrap();
+        Ok(a.0.iter().filter(|m| since.map_or(true, |t| m.time > t)).cloned().collect())
+    }
+    fn dismiss_messages(&self, refs: &[String]) -> Result<(), ApiError> {
+        std::thread::sleep(Duration::from_millis(300));
+        self.alerts.lock().unwrap().0.retain(|m| !refs.contains(&m.rref));
+        Ok(())
+    }
+    fn alert_settings(&self, _cls: &str, obj: &str) -> Result<AlertSettings, ApiError> {
+        std::thread::sleep(Duration::from_millis(150));
+        let a = self.alerts.lock().unwrap();
+        Ok(AlertSettings { perfmon: a.1.get(obj).cloned().unwrap_or_default(), mail_to: a.2 .0.clone(), mail_via: a.2 .1.clone() })
+    }
+    fn set_alert_settings(&self, _cls: &str, obj: &str, perfmon: &str, mail: Option<(String, String)>) -> Result<(), ApiError> {
+        std::thread::sleep(Duration::from_millis(500));
+        let mut a = self.alerts.lock().unwrap();
+        if perfmon.is_empty() {
+            a.1.remove(obj);
+        } else {
+            a.1.insert(obj.to_string(), perfmon.to_string());
+        }
+        if let Some(m) = mail {
+            a.2 = m;
+        }
+        Ok(())
     }
     /// Its running VMs' made-up ten minutes, and the server's from theirs: their CPUs on its own
     /// and a little of its own, its memory as it stands give or take, their traffic on its first
@@ -4171,6 +4540,57 @@ impl Connection for DemoConnection {
             h.enabled = true;
         }
         Ok(())
+    }
+    /// The signal sent; the server answers a few seconds later.
+    fn power_on_host(&self, host: &str) -> Result<(), ApiError> {
+        if self.data.lock().unwrap().host(host).map_or(false, |h| h.power_on_mode.is_empty()) {
+            note("no way to turn it on was set: set to Wake-on-LAN");
+            said("host.set_power_on_mode", &[json!(host), json!("wake-on-lan"), json!({})]);
+        }
+        said("host.power_on", &[json!(host)]);
+        std::thread::sleep(Duration::from_millis(4000));
+        let mut d = self.data.lock().unwrap();
+        if let Some(h) = d.hosts.iter_mut().find(|h| h.rref == host) {
+            (h.live, h.enabled, h.power_on_mode) = (true, true, "wake-on-lan".into());
+            h.boot_time = Some(SystemTime::now().duration_since(UNIX_EPOCH).map(|t| t.as_secs() as i64).unwrap_or(0));
+        }
+        recompute(&mut d);
+        Ok(())
+    }
+    fn enter_maintenance(&self, host: &str, stop: bool) -> Result<(Vec<String>, usize), ApiError> {
+        let before: Vec<String> = self.data.lock().unwrap().vms.iter().filter(|v| v.host.as_deref() == Some(host) && matches!(v.power, PowerState::Running | PowerState::Paused)).map(|v| v.rref.clone()).collect();
+        let (stopped, moved) = self.empty_host(host, stop)?;
+        said("host.add_to_other_config", &[json!(host), json!(MAINT), json!("true")]);
+        let mut d = self.data.lock().unwrap();
+        let uuid = |d: &PoolData, r: &String| d.vm(r).map(|v| v.uuid.clone());
+        let moved_ids: Vec<String> = before.iter().filter(|r| !stopped.contains(r)).filter_map(|r| uuid(&d, r)).collect();
+        let stopped_ids: Vec<String> = stopped.iter().filter_map(|r| uuid(&d, r)).collect();
+        if let Some(h) = d.hosts.iter_mut().find(|h| h.rref == host) {
+            (h.maintenance, h.maint_moved, h.maint_stopped) = (true, moved_ids, stopped_ids);
+        }
+        Ok((stopped, moved))
+    }
+    fn exit_maintenance(&self, host: &str, back: bool) -> Result<Vec<String>, ApiError> {
+        said("host.enable", &[json!(host)]);
+        std::thread::sleep(Duration::from_millis(800));
+        let mut d = self.data.lock().unwrap();
+        let Some(h) = d.hosts.iter_mut().find(|h| h.rref == host) else { return Ok(vec![]) };
+        h.enabled = true;
+        h.maintenance = false;
+        let (moved, stopped) = (std::mem::take(&mut h.maint_moved), std::mem::take(&mut h.maint_stopped));
+        if back {
+            for v in d.vms.iter_mut() {
+                if moved.contains(&v.uuid) && v.power == PowerState::Running {
+                    said("VM.pool_migrate", &[json!(v.rref), json!(host), json!({"live": "true"})]);
+                    v.host = Some(host.to_string());
+                } else if stopped.contains(&v.uuid) && v.power == PowerState::Halted {
+                    said("VM.start_on", &[json!(v.rref), json!(host), json!(false), json!(false)]);
+                    (v.power, v.host) = (PowerState::Running, Some(host.to_string()));
+                }
+            }
+        }
+        recompute(&mut d);
+        Ok(vec![])
     }
     fn make_default_sr(&self, sr: &str) -> Result<(), ApiError> {
         said("pool.set_default_SR", &[json!("OpaqueRef:demo-pool"), json!(sr)]);

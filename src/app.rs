@@ -3,6 +3,8 @@
 
 use crate::conn::*;
 use crate::console::{self, ConsoleView};
+use crate::alerts::{AlertSettings, Severity, Watched, XenMessage};
+use crate::history::{Records, Span};
 use crate::isolib::{mount_trouble, IsoAction, IsoDialog, MountTrouble};
 use crate::newnet::{NetworkAction, NetworkDialog, PoolCards};
 use crate::newsr::{Guest, StorageAction, StorageDialog};
@@ -22,8 +24,11 @@ use std::sync::atomic::Ordering;
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+mod alerts;
 mod host_overview;
 mod overview;
+mod performance;
+use alerts::{AlertsView, MessageCache, RulesAct, RulesDialog};
 use overview::{OverviewEdit, Thumb};
 
 pub const REFRESH_MS: u64 = 15_000; // XenConnection.HEARTBEAT_INTERVAL
@@ -55,7 +60,24 @@ struct ServerEntry {
     /// Once the first login works: (true, password) keeps the password in the keychain and
     /// reconnects at startup; (false, _) forgets any saved one. None: leave things as they are.
     pending_save: Option<(bool, String)>,
+    /// Its pool's coordinator, as last seen (kept in a file): its name and where its Wake-on-LAN
+    /// signal goes, to turn it on when it's off and can't be asked.
+    wake: Option<(String, WakeTarget)>,
 }
+
+/// A server told to turn on, till it answers (see `check_waking`).
+struct Waking {
+    sid: u32,
+    /// Which (None: a connection's own server, known only from the last time it answered).
+    host: Option<String>,
+    name: String,
+    since: Instant,
+    log: usize,
+}
+
+/// How long a server told to turn on is waited for, and after how long that's longer than usual.
+const WAKE_LIMIT: Duration = Duration::from_secs(15 * 60);
+const WAKE_SLOW_MIN: u64 = 10;
 
 impl ServerEntry {
     /// "–  Logged in as root", after the connection's name in the tree.
@@ -105,6 +127,15 @@ enum Msg {
     Perf { vm: String, result: Result<Perf, ApiError> },
     /// A server's last ten minutes and its VMs', for its Overview and its pool's.
     HostPerf { host: String, result: Result<HostPerf, ApiError> },
+    /// A VM's or a server's records over a span, read for its Performance tab (by its reference).
+    History { key: String, span: Span, result: Result<Records, ApiError> },
+    /// A pool's messages (its alerts): all of them (`since` None), or the new ones.
+    Messages { sid: u32, since: Option<i64>, result: Result<Vec<XenMessage>, ApiError> },
+    /// Alerts dismissed on their pool, or why not.
+    Dismissed { sid: u32, refs: Vec<String>, result: Result<(), ApiError> },
+    /// What's set for the Alerts dialog's VM, server or storage (by its reference); and saved.
+    AlertSettingsRead { obj: String, result: Result<AlertSettings, ApiError> },
+    AlertSettingsSaved { obj: String, log: usize, result: Result<(), ApiError> },
     /// A pool's updates read; fetched from its channel; installed (or why not).
     PoolUpdatesRead { sid: u32, result: Result<PoolUpdates, ApiError> },
     PoolSynced { sid: u32, log: usize, result: Result<String, ApiError> },
@@ -134,6 +165,13 @@ enum Msg {
     IsoDeleted { sid: u32, sr: String, vdi: String, name: String, result: Result<(), ApiError> },
     /// Shutting a server down ended.
     HostShutdown { sid: u32, host: String, name: String, reboot: bool, log: usize, result: Result<(), ApiError> },
+    /// A server told to turn on (`key` as in `host_waking`): from this computer, and through the
+    /// pool, each when it could be.
+    PoweredOn { sid: u32, key: String, name: String, log: usize, here: Option<Result<(), ApiError>>, pool: Option<Result<(), ApiError>> },
+    /// In maintenance mode now (the VMs it shut down, how many it moved), or not.
+    MaintenanceIn { sid: u32, host: String, name: String, log: usize, result: Result<(Vec<String>, usize), ApiError> },
+    /// Out of maintenance mode (the VMs that couldn't come back, each with why), or not.
+    MaintenanceOut { sid: u32, host: String, name: String, log: usize, result: Result<Vec<String>, ApiError> },
     /// Deleting a VM ended: the disks left behind, or why it wasn't deleted.
     VmDeleted { sid: u32, vm: String, name: String, result: Result<Vec<String>, ApiError> },
     /// A link in the Upload dialog was checked.
@@ -290,6 +328,10 @@ enum Tab {
     /// A VM's, a server's or a pool's page: what matters most, its load, and (a VM's) its main
     /// settings to change.
     Overview,
+    /// A VM's or a server's load over ten minutes, two hours, a week or a year, in full.
+    Performance,
+    /// Every pool's alerts (All servers; the toolbar's bell, not a tab in the row).
+    Alerts,
     General,
     /// Their less used details (General, under another name).
     Details,
@@ -315,6 +357,8 @@ impl Tab {
             Tab::Home => "Home",
             Tab::Search => "Search",
             Tab::Overview => "Overview",
+            Tab::Performance => "Performance",
+            Tab::Alerts => "Alerts",
             Tab::General => "General",
             Tab::Details => "Details",
             Tab::Storage => "Storage",
@@ -333,6 +377,8 @@ impl Tab {
 
 enum Dialog {
     None,
+    /// A VM's, a server's or a storage's alert limits, and its pool's email for alerts.
+    AlertRules(Box<RulesDialog>),
     AddServer { server: String, user: String, password: String, error: String, remember: bool },
     Confirm { action: usize, sid: u32, vm: String, title: String, text: String },
     Message { title: String, text: String },
@@ -351,6 +397,12 @@ enum Dialog {
     /// Shutting a server down: which, its name, the VMs that move elsewhere and those that stop, and
     /// whether it's the pool's coordinator (with other servers) or the only server.
     ConfirmHostShutdown { sid: u32, host: String, name: String, moving: Vec<String>, stopping: Vec<String>, coordinator: bool, alone: bool, reboot: bool },
+    /// Putting a server in maintenance mode: which, its name, the VMs that move elsewhere and those
+    /// that stop, and whether it's the pool's coordinator (with other servers).
+    ConfirmMaintenance { sid: u32, host: String, name: String, moving: Vec<String>, stopping: Vec<String>, coordinator: bool },
+    /// Taking it out: the VMs maintenance moved off it (still running elsewhere) and shut down
+    /// (still off), and whether they come back.
+    ExitMaintenance { sid: u32, host: String, name: String, moved: Vec<String>, stopped: Vec<String>, back: bool },
     /// A newer version: offered, downloading, or why it couldn't.
     Update(Box<UpdateDialog>),
     /// The app's settings (the gear on the toolbar); `startup`: the servers it connects to as it
@@ -400,6 +452,12 @@ struct UpdateDialog {
 }
 
 enum Intent {
+    /// The Alerts page (the toolbar's bell).
+    Alerts,
+    /// Dismiss these alerts: each its pool and its message.
+    DismissAlerts(Vec<(u32, String)>),
+    /// The Alerts dialog for a VM, a server or a storage: its pool, XenAPI class, reference, name.
+    AlertRules(u32, &'static str, String, String, Watched),
     Select(String),
     Toggle(String),
     Action(usize),
@@ -466,6 +524,11 @@ enum Intent {
     AskShutdownHost(u32, String, bool),
     /// A server that isn't taking VMs (disabled) takes them again.
     EnableHost(u32, String),
+    /// Turn a server on (Wake-on-LAN): pool, server (None: the connection's own server, known
+    /// from the last time it answered).
+    PowerOn(u32, Option<String>),
+    /// Ask before putting a server in maintenance mode, or taking it out: pool, server.
+    AskMaintenance(u32, String),
     /// Move a VM (to this server, when it was dropped on one).
     MoveVm(u32, String, Option<String>),
     /// Make a storage the pool's default.
@@ -513,6 +576,23 @@ pub struct App {
     /// Servers' load and their VMs', by server: when it was read, and what came (or why not).
     host_perf: HashMap<String, (Instant, Result<HostPerf, String>)>,
     host_perf_busy: HashSet<String>,
+    /// The Performance tab: how far back it looks, which of its groups are open (by their keys,
+    /// for every VM or server alike), and the records read for it by VM or server and span (when,
+    /// and what came or why not), those being read.
+    perf_span: Span,
+    perf_open: HashSet<String>,
+    history: HashMap<(String, Span), (Instant, Result<Records, String>)>,
+    history_busy: HashSet<(String, Span)>,
+    /// The charts last made from those records (made again from a new reading).
+    perf_charts: Option<performance::PerfCharts>,
+    /// Each pool's messages for people (its alerts), and the pools whose are being read; the
+    /// messages being dismissed (hidden meanwhile); since when each problem this app finds has
+    /// been there; the Alerts page's choices.
+    messages: HashMap<u32, MessageCache>,
+    messages_busy: HashSet<u32>,
+    dismissing: HashSet<String>,
+    app_alerts_since: HashMap<String, i64>,
+    alerts_view: AlertsView,
     /// The last look at each running VM's screen shown in an Overview, and those being taken.
     thumbs: HashMap<String, Thumb>,
     thumb_busy: HashSet<String>,
@@ -541,6 +621,9 @@ pub struct App {
     pal: Pal,
     applied_dark: Option<bool>,
     tab: Tab,
+    /// The tab shown before the console was opened (the Console button opens it, and closes it
+    /// back to that).
+    before_console: Tab,
     closed_sections: HashSet<String>,
     dialog: Dialog,
     console: Option<ConsoleView>,
@@ -575,6 +658,11 @@ pub struct App {
     host_busy: HashSet<String>,
     /// Servers restarted from here that aren't back yet.
     host_rebooting: HashMap<String, i64>,
+    /// Servers told to turn on, by reference ("srv:<id>" for a connection's own server known
+    /// only from the last time).
+    host_waking: HashMap<String, Waking>,
+    /// Servers going into maintenance mode (true) or coming out of it (false).
+    host_maint: HashMap<String, bool>,
     /// Each pool's updates as last read (its /updates), and those being read; those fetching from
     /// their channel (and why the last fetch failed); updates under way.
     pool_updates: HashMap<u32, (Instant, Result<PoolUpdates, String>)>,
@@ -623,6 +711,22 @@ impl App {
             perf_busy: HashSet::new(),
             host_perf: HashMap::new(),
             host_perf_busy: HashSet::new(),
+            // (a check's screenshot may ask for another span: SVM_PERF_SPAN=minutes|hours|year)
+            perf_span: match std::env::var("SVM_PERF_SPAN").ok().filter(|_| shot).as_deref() {
+                Some("minutes") => Span::Minutes,
+                Some("hours") => Span::Hours,
+                Some("year") => Span::Year,
+                _ => Span::Week,
+            },
+            perf_open: ["vms", "disk:0"].map(String::from).into_iter().collect(),
+            history: HashMap::new(),
+            history_busy: HashSet::new(),
+            perf_charts: None,
+            messages: HashMap::new(),
+            messages_busy: HashSet::new(),
+            dismissing: HashSet::new(),
+            app_alerts_since: HashMap::new(),
+            alerts_view: AlertsView::default(),
             thumbs: HashMap::new(),
             thumb_busy: HashSet::new(),
             vm_saving: HashMap::new(),
@@ -644,6 +748,7 @@ impl App {
             pal: theme::LIGHT,
             applied_dark: None,
             tab: Tab::Home,
+            before_console: Tab::Overview,
             closed_sections: HashSet::new(),
             dialog: Dialog::None,
             console: None,
@@ -664,6 +769,8 @@ impl App {
             vm_deleting: HashSet::new(),
             host_busy: HashSet::new(),
             host_rebooting: HashMap::new(),
+            host_waking: HashMap::new(),
+            host_maint: HashMap::new(),
             pool_updates: HashMap::new(),
             pool_updates_busy: HashMap::new(),
             pool_syncing: HashSet::new(),
@@ -759,6 +866,7 @@ impl App {
         let id = self.next_id;
         self.next_id += 1;
         let host = conn.hostname();
+        let wake = if conn.is_demo() { None } else { load_wake(&host) };
         self.servers.push(ServerEntry {
             id,
             conn,
@@ -771,6 +879,7 @@ impl App {
             failures: 0,
             busy: HashMap::new(),
             pending_save: None,
+            wake,
         });
         self.add_log(id, &host, None, &host, &format!("Connecting to {}", host), "In progress");
         self.select(format!("srv:{}", id));
@@ -978,6 +1087,103 @@ impl App {
         } else {
             None
         }
+    }
+
+    /// Turns a server on in the background: a Wake-on-LAN signal from this computer (when its
+    /// card's address is known) and through the pool (when the pool answers and it isn't the
+    /// coordinator). Then, under Activities, it's waited for till it answers (`check_waking`).
+    fn power_on(&mut self, sid: u32, host: Option<String>, ctx: &egui::Context) {
+        let Some(s) = self.server(sid) else { return };
+        let key = host.clone().unwrap_or_else(|| format!("srv:{}", sid));
+        if self.host_waking.contains_key(&key) {
+            return;
+        }
+        let connected = s.state == ConnState::Connected;
+        let (name, target, through_pool) = match &host {
+            Some(r) => {
+                let Some(h) = s.data.as_ref().and_then(|d| d.host(r)) else { return };
+                // (a coordinator whose card isn't in the last look: its address kept from before)
+                let kept = s.wake.as_ref().filter(|w| h.is_master && w.0 == h.name).map(|w| w.1.clone());
+                (h.name.clone(), h.wake_target().or(kept), connected && !h.is_master)
+            }
+            None => match &s.wake {
+                Some((n, w)) => (n.clone(), Some(w.clone()), false),
+                None => return,
+            },
+        };
+        // (the demo's servers aren't on this network: nothing is sent from here)
+        let target = target.filter(|_| !s.conn.is_demo());
+        let (conn, server) = (s.conn.clone(), s.name());
+        let log = self.add_log(sid, &server, None, &name, &format!("Turning on server '{}'", name), "In progress");
+        self.log[log].activity = true;
+        let prog = self.progress(log);
+        self.host_waking.insert(key.clone(), Waking { sid, host: host.clone(), name: name.clone(), since: Instant::now(), log });
+        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            crate::conn::watch(&prog);
+            let here = target.map(|t| crate::conn::send_wake(&t));
+            let pool = match (&host, through_pool) {
+                (Some(r), true) => Some(conn.power_on_host(r)),
+                _ => None,
+            };
+            let _ = tx.send(Msg::PoweredOn { sid, key, name, log, here, pool });
+            ctx.request_repaint();
+        });
+    }
+
+    /// Servers told to turn on: done once they answer, failed when they haven't in `WAKE_LIMIT`.
+    fn check_waking(&mut self) {
+        let keys: Vec<String> = self.host_waking.keys().cloned().collect();
+        for key in keys {
+            let w = &self.host_waking[&key];
+            let up = self.server(w.sid).map_or(false, |s| {
+                s.state == ConnState::Connected
+                    && match &w.host {
+                        Some(r) => s.data.as_ref().and_then(|d| d.host(r)).map_or(false, |h| h.is_up()),
+                        None => true,
+                    }
+            });
+            if !up && w.since.elapsed() < WAKE_LIMIT {
+                continue;
+            }
+            let Some(w) = self.host_waking.remove(&key) else { continue };
+            if up {
+                self.end_log(w.log, "Done", Some(format!("Turned on server '{}'", w.name)));
+            } else {
+                let text = format!("'{}' didn't answer within {} minutes of being told to turn on: Wake-on-LAN may be off in its firmware (BIOS or UEFI) or for its network card, or it has no power", w.name, WAKE_LIMIT.as_secs() / 60);
+                self.end_log(w.log, "Failed", Some(text));
+            }
+        }
+    }
+
+    /// Puts a server in maintenance mode (`exit` None), or takes it out (Some: whether its VMs come
+    /// back), in the background.
+    fn maintenance(&mut self, sid: u32, host: String, name: String, exit: Option<bool>, ctx: &egui::Context) {
+        let Some((conn, server)) = self.server(sid).map(|s| (s.conn.clone(), s.name())) else { return };
+        if self.host_maint.contains_key(&host) {
+            return;
+        }
+        let what = match exit {
+            None => format!("Putting server '{}' in maintenance mode", name),
+            Some(_) => format!("Taking server '{}' out of maintenance mode", name),
+        };
+        let log = self.add_log(sid, &server, None, &name, &what, "In progress");
+        self.log[log].activity = true;
+        if exit.is_none() {
+            self.if_closed(log, format!("'{}' may be left not taking VMs with only some of its VMs moved off.", name));
+        }
+        let prog = self.progress(log);
+        self.host_maint.insert(host.clone(), exit.is_none());
+        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            crate::conn::watch(&prog);
+            let msg = match exit {
+                None => Msg::MaintenanceIn { result: conn.enter_maintenance(&host, true), sid, host, name, log },
+                Some(back) => Msg::MaintenanceOut { result: conn.exit_maintenance(&host, back), sid, host, name, log },
+            };
+            let _ = tx.send(msg);
+            ctx.request_repaint();
+        });
     }
 
     /// Shuts a server down, or (`reboot`) restarts it, in the background (its VMs moved or
@@ -1694,6 +1900,10 @@ impl App {
     }
 
     fn tick(&mut self, ctx: &egui::Context) {
+        if !self.host_waking.is_empty() {
+            self.check_waking();
+            ctx.request_repaint_after(Duration::from_secs(1));
+        }
         let now = Instant::now();
         for s in self.servers.iter_mut() {
             if !s.fetching && now >= s.next_refresh && s.state != ConnState::Disconnected {
@@ -2021,6 +2231,77 @@ impl App {
                         s.next_refresh = Instant::now();
                     }
                 }
+                Msg::PoweredOn { sid, key, name, log, here, pool } => {
+                    let sent = [&here, &pool].iter().any(|r| matches!(r, Some(Ok(()))));
+                    // (one that answered meanwhile is done already)
+                    let waiting = self.host_waking.get(&key).map_or(false, |w| w.log == log);
+                    if sent && waiting {
+                        self.end_log(log, "In progress", Some(format!("Turning on server '{}': waiting for it to answer", name)));
+                    } else if !sent && waiting {
+                        self.host_waking.remove(&key);
+                        let mut why = vec![];
+                        if let Some(Err(e)) = &pool {
+                            why.push(format!("The pool couldn't send it the signal: {}", host_problem(e)));
+                        }
+                        if let Some(Err(e)) = &here {
+                            why.push(format!("This computer couldn't send it either: {}", e.message()));
+                        }
+                        if why.is_empty() {
+                            why.push("Its network card's address isn't known here, and the pool can't be asked while it doesn't answer.".into());
+                        }
+                        self.end_log(log, "Failed", Some(format!("Couldn't turn on '{}'", name)));
+                        self.dialog = Dialog::Message { title: "Power On".into(), text: format!("Couldn't turn on '{}'.\n\n{}", name, why.join("\n\n")) };
+                    }
+                    self.refresh_soon(sid);
+                }
+                Msg::MaintenanceIn { sid, host, name, log, result } => {
+                    self.host_maint.remove(&host);
+                    match result {
+                        Ok((stopped, moved)) => {
+                            let mut parts = vec![];
+                            if moved > 0 {
+                                parts.push(format!("{} VM{} moved off", moved, if moved == 1 { "" } else { "s" }));
+                            }
+                            if !stopped.is_empty() {
+                                parts.push(format!("{} shut down", stopped.len()));
+                            }
+                            let more = if parts.is_empty() { String::new() } else { format!(" ({})", parts.join(", ")) };
+                            self.end_log(log, "Done", Some(format!("Server '{}' is in maintenance mode{}", name, more)));
+                            // so till the next look says it
+                            if let Some(h) = self.server_mut(sid).and_then(|s| s.data.as_mut()).and_then(|d| d.hosts.iter_mut().find(|h| h.rref == host)) {
+                                (h.enabled, h.maintenance) = (false, true);
+                            }
+                        }
+                        Err(e) => {
+                            let why = host_problem(&e);
+                            self.end_log(log, "Failed", Some(format!("Couldn't put '{}' in maintenance mode: {}", name, why)));
+                            self.dialog = Dialog::Message { title: "Maintenance Mode".into(), text: format!("Couldn't put '{}' in maintenance mode.\n\n{}", name, why) };
+                        }
+                    }
+                    self.refresh_soon(sid);
+                }
+                Msg::MaintenanceOut { sid, host, name, log, result } => {
+                    self.host_maint.remove(&host);
+                    match result {
+                        Ok(failed) => {
+                            if failed.is_empty() {
+                                self.end_log(log, "Done", Some(format!("Server '{}' is out of maintenance mode", name)));
+                            } else {
+                                self.end_log(log, "Done", Some(format!("Server '{}' is out of maintenance mode; not all its VMs came back", name)));
+                                self.dialog = Dialog::Message { title: "Exit Maintenance Mode".into(), text: format!("'{}' takes VMs again, but these didn't come back:\n\n{}", name, failed.join("\n")) };
+                            }
+                            if let Some(h) = self.server_mut(sid).and_then(|s| s.data.as_mut()).and_then(|d| d.hosts.iter_mut().find(|h| h.rref == host)) {
+                                (h.enabled, h.maintenance) = (true, false);
+                            }
+                        }
+                        Err(e) => {
+                            let why = host_problem(&e);
+                            self.end_log(log, "Failed", Some(format!("Couldn't take '{}' out of maintenance mode: {}", name, why)));
+                            self.dialog = Dialog::Message { title: "Exit Maintenance Mode".into(), text: format!("Couldn't take '{}' out of maintenance mode.\n\n{}", name, why) };
+                        }
+                    }
+                    self.refresh_soon(sid);
+                }
                 Msg::VmDeleted { sid, vm, name, result } => {
                     self.vm_deleting.remove(&vm);
                     let server = self.server(sid).map(|s| s.name()).unwrap_or_default();
@@ -2288,6 +2569,21 @@ impl App {
                     self.host_perf_busy.remove(&host);
                     self.host_perf.insert(host, (Instant::now(), result.map_err(|e| e.message())));
                 }
+                Msg::Messages { sid, since, result } => self.take_messages(sid, since, result),
+                Msg::Dismissed { sid, refs, result } => self.dismissed(sid, refs, result),
+                Msg::AlertSettingsRead { obj, result } => self.alert_rules_read(obj, result),
+                Msg::AlertSettingsSaved { obj, log, result } => self.alert_rules_saved(obj, log, result),
+                Msg::History { key, span, result } => {
+                    self.history_busy.remove(&(key.clone(), span));
+                    let result = result.map_err(|e| e.message());
+                    // a failed read again keeps what was read before (said once that's old)
+                    match (self.history.get_mut(&(key.clone(), span)), result) {
+                        (Some(old), Err(_)) if old.1.is_ok() => old.0 = Instant::now(),
+                        (_, result) => {
+                            self.history.insert((key, span), (Instant::now(), result));
+                        }
+                    }
+                }
                 Msg::PoolUpdatesRead { sid, result } => {
                     self.pool_updates_busy.remove(&sid);
                     let result = result.map_err(|e| if e.code == "NO_REPOSITORY_ENABLED" { "its update channel hasn't been fetched from yet".to_string() } else { e.message() });
@@ -2491,7 +2787,7 @@ impl App {
                         let expected = (self.host_busy.contains(&h.rref) || rebooting) && !h.live;
                         let what = if rebooting { "is restarting" } else if h.live { "isn't answering" } else { "is off" };
                         changes.push((h.rref.clone(), h.name.clone(), format!("{} {}", h.name, what), if expected { "Done" } else { "Failed" }));
-                    } else if !was && h.is_up() {
+                    } else if !was && h.is_up() && !self.host_waking.contains_key(&h.rref) {
                         let back = if self.host_rebooting.remove(&h.rref).is_some() { "is back" } else { "answers again" };
                         changes.push((h.rref.clone(), h.name.clone(), format!("{} {}", h.name, back), "Done"));
                     } else if h.is_up() && self.host_rebooting.get(&h.rref).map_or(false, |since| h.boot_time.map_or(false, |b| b >= since - 60)) {
@@ -2511,6 +2807,14 @@ impl App {
                 let members_changed = s.data.as_ref().map_or(true, |old| old.hosts.iter().map(|h| h.address.clone()).filter(|a| !a.is_empty()).collect::<Vec<_>>() != members);
                 if members_changed && !s.conn.is_demo() && !shot {
                     save_members(&s.conn.hostname(), &members);
+                }
+                // its coordinator's name and Wake-on-LAN address, kept for turning it on
+                let wake = d.hosts.iter().find(|h| h.is_master).and_then(|h| h.wake_target().map(|w| (h.name.clone(), w)));
+                if wake.is_some() && wake != s.wake {
+                    if !s.conn.is_demo() && !shot {
+                        save_wake(&s.conn.hostname(), wake.as_ref());
+                    }
+                    s.wake = wake;
                 }
                 s.data = Some(d);
                 s.state = ConnState::Connected;
@@ -2547,7 +2851,22 @@ impl App {
                             }
                             "search" | "logs" => self.select("root".into()),
                             "host-down" => self.select(format!("host:{}:host-b", id)),
-                            "host" | "host-details" | "host-shutdown" | "host-restart" => self.select(format!("host:{}:host-a", id)),
+                            "host-slow-restart" => {
+                                // told to restart fourteen minutes ago, not back since
+                                self.host_rebooting.insert("host-b".into(), crate::pool_update::now() - 14 * 60);
+                                self.select(format!("host:{}:host-b", id));
+                            }
+                            "host" | "host-details" | "host-shutdown" | "host-restart" | "host-maintenance" | "host-performance" => self.select(format!("host:{}:host-a", id)),
+                            // (with SVM_DEMO_OFF=host-b, or SVM_DEMO_MAINTENANCE=host-b)
+                            "host-off" | "host-in-maintenance" | "host-exit-maintenance" => self.select(format!("host:{}:host-b", id)),
+                            "host-waking" => {
+                                // told to turn on twelve minutes ago, no answer since
+                                let log = self.add_log(id, "Demo Pool", None, "demo-host-02", "Turning on server 'demo-host-02': waiting for it to answer", "In progress");
+                                self.log[log].activity = true;
+                                let since = Instant::now().checked_sub(Duration::from_secs(12 * 60)).unwrap_or_else(Instant::now);
+                                self.host_waking.insert("host-b".into(), Waking { sid: id, host: Some("host-b".into()), name: "demo-host-02".into(), since, log });
+                                self.select(format!("host:{}:host-b", id));
+                            }
                             "templates" | "networks" | "networks-sorted" | "delete-network" | "new-network" | "new-network-error" => self.select("root".into()),
                             "template" => self.select(format!("tpl:{}:tpl-web", id)),
                             // a running VM chosen: it can't be made a template now
@@ -2699,8 +3018,10 @@ impl App {
     /// A server's icon: off when disabled or shut down; a red ring turning while it shuts down, a
     /// green one while it restarts.
     fn host_icon(&self, h: &HostInfo) -> IconKind {
-        if self.host_rebooting.contains_key(&h.rref) {
+        if self.host_rebooting.contains_key(&h.rref) || self.host_waking.contains_key(&h.rref) {
             IconKind::Busy(Tone::Green)
+        } else if self.host_maint.contains_key(&h.rref) {
+            IconKind::Busy(Tone::Orange)
         } else if self.host_busy.contains(&h.rref) {
             IconKind::Busy(Tone::Red)
         } else if h.enabled && h.is_up() {
@@ -2956,20 +3277,27 @@ impl App {
                 Intent::AskShutdownHost(sid, host, reboot) => {
                     if let Some(d) = self.server(sid).and_then(|s| s.data.as_ref()) {
                         if let Some(h) = d.host(&host) {
-                            let others = d.hosts.iter().any(|o| o.rref != host && o.enabled && o.is_up());
-                            let mut moving = vec![];
-                            let mut stopping = vec![];
-                            for v in d.vms.iter().filter(|v| v.host.as_deref() == Some(host.as_str()) && matches!(v.power, PowerState::Running | PowerState::Paused)) {
-                                if others && v.storage_host.as_deref() != Some(host.as_str()) {
-                                    moving.push(v.name.clone());
-                                } else {
-                                    stopping.push(v.name.clone());
-                                }
-                            }
+                            let (moving, stopping) = leaving(d, &host);
                             let (coordinator, alone) = (h.is_master && d.hosts.len() > 1, d.hosts.len() == 1);
                             self.dialog = Dialog::ConfirmHostShutdown { sid, host, name: h.name.clone(), moving, stopping, coordinator, alone, reboot };
                         }
                     }
+                }
+                Intent::PowerOn(sid, host) => self.power_on(sid, host, ctx),
+                Intent::AskMaintenance(sid, host) => {
+                    let Some(d) = self.server(sid).and_then(|s| s.data.as_ref()) else { continue };
+                    let Some(h) = d.host(&host) else { continue };
+                    let dialog = if h.in_maintenance() {
+                        // what it moved off and still runs elsewhere, and what it shut down and is still off
+                        let vm = |u: &String| d.vms.iter().find(|v| &v.uuid == u);
+                        let moved = h.maint_moved.iter().filter_map(vm).filter(|v| v.power == PowerState::Running && v.host.as_deref() != Some(host.as_str())).map(|v| v.name.clone()).collect();
+                        let stopped = h.maint_stopped.iter().filter_map(vm).filter(|v| v.power == PowerState::Halted).map(|v| v.name.clone()).collect();
+                        Dialog::ExitMaintenance { sid, host: host.clone(), name: h.name.clone(), moved, stopped, back: true }
+                    } else {
+                        let (moving, stopping) = leaving(d, &host);
+                        Dialog::ConfirmMaintenance { sid, host: host.clone(), name: h.name.clone(), moving, stopping, coordinator: h.is_master && d.hosts.len() > 1 }
+                    };
+                    self.dialog = dialog;
                 }
                 Intent::AskDeleteVm(sid, vm) => {
                     if self.server(sid).map_or(false, |s| s.busy.contains_key(&vm)) {
@@ -3114,6 +3442,12 @@ impl App {
                     self.select("root".into());
                     self.tab = Tab::Networks;
                 }
+                Intent::Alerts => {
+                    self.select("root".into());
+                    self.tab = Tab::Alerts;
+                }
+                Intent::DismissAlerts(list) => self.dismiss_alerts(list, ctx),
+                Intent::AlertRules(sid, cls, obj, name, watched) => self.open_alert_rules(sid, cls, obj, name, watched, ctx),
                 Intent::NewTemplate => {
                     // every VM of every pool, the ones that can't be made a template now saying why
                     let mut pick: Vec<TemplateSource> = vec![];
@@ -3229,7 +3563,12 @@ impl App {
                     }
                 }
                 Intent::View(objects) => self.objects_view = objects,
-                Intent::Tab(t) => self.tab = t,
+                Intent::Tab(t) => {
+                    if t == Tab::Console && self.tab != Tab::Console {
+                        self.before_console = self.tab;
+                    }
+                    self.tab = t;
+                }
                 Intent::Section(name) => {
                     if !self.closed_sections.remove(&name) {
                         self.closed_sections.insert(name);
@@ -3271,7 +3610,7 @@ impl App {
         // then all of them.
         let fits = |level: u8| {
             let w = |l: &str, rank: u8| if level >= rank { 32.0 } else { tool_width(ui, l) } + 2.0;
-            let buttons: f32 = w("Connect", 3) + w("New VM", 2) + w("ISO Library", 2) + w("VM Storage", 2) + w("Templates", 2) + w("Networks", 2) + w("Updates", 2);
+            let buttons: f32 = w("Connect", 3) + w("New VM", 2) + w("ISO Library", 2) + w("VM Storage", 2) + w("Templates", 2) + w("Networks", 2) + w("Updates", 2) + w("Alerts", 2);
             36.0 + 40.0 + 10.0 + 16.0 + buttons + 160.0 <= ui.available_width() // 160: the app's name
         };
         let level = (0..3).find(|&l| fits(l)).unwrap_or(3);
@@ -3320,6 +3659,26 @@ impl App {
             if resp.on_hover_text(tip).clicked() {
                 out.push(Intent::PoolUpdates(sel.sid));
             }
+            // alerts: a bell, with how many need attention (red when one's critical)
+            let need: Vec<Severity> = self.alert_rows().into_iter().map(|r| r.sev).filter(|s| s.needs_attention()).collect();
+            let resp = tool_button(ui, "alerts", "Alerts", true, compact(2), &pal);
+            if !need.is_empty() {
+                let text = if need.len() > 99 { "99+".to_string() } else { need.len().to_string() };
+                let col = if need.contains(&Severity::Critical) { pal.red } else { pal.orange };
+                let g = ui.painter().layout_no_wrap(text, FontId::new(10.0, FontFamily::Name("bold".into())), Color32::WHITE);
+                let at = if compact(2) { resp.rect.center() + vec2(8.0, -8.0) } else { resp.rect.min + vec2(23.0, 8.0) };
+                let pill = Rect::from_center_size(at, vec2((g.size().x + 8.0).max(15.0), 15.0));
+                ui.painter().rect(pill, Rounding::same(7.5), col, Stroke::new(1.5_f32, pal.toolbar));
+                ui.painter().galley(pill.center() - g.size() / 2.0, g, Color32::WHITE);
+            }
+            let tip = match need.len() {
+                0 => "Alerts: nothing needs your attention".to_string(),
+                1 => "Alerts: 1 needs your attention".to_string(),
+                n => format!("Alerts: {} need your attention", n),
+            };
+            if resp.on_hover_text(tip).clicked() {
+                out.push(Intent::Alerts);
+            }
             // the app's name in the right corner; a click shows About
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add_space(8.0);
@@ -3331,6 +3690,14 @@ impl App {
                 }
             });
         });
+    }
+
+    /// How many minutes server `h` has been restarting, when that's longer than a server usually
+    /// takes (ten minutes).
+    fn slow_restart(&self, h: &HostInfo) -> Option<i64> {
+        let since = *self.host_rebooting.get(&h.rref)?;
+        let minutes = (crate::pool_update::now() - since) / 60;
+        (minutes >= 10).then_some(minutes)
     }
 
     /// What's wrong with a pool right now, for its Details (each what it's about, and what's
@@ -3345,10 +3712,15 @@ impl App {
         if s.state == ConnState::Reconnecting && !d.hosts.iter().any(|h| h.is_master && restarting(h)) {
             out.push(("Connection".to_string(), "Lost; reconnecting…".to_string()));
         }
-        for h in d.hosts.iter().filter(|h| h.is_up() && !h.enabled && !restarting(h) && !self.host_busy.contains(&h.rref)) {
+        for h in &d.hosts {
+            if let Some(m) = self.slow_restart(h) {
+                out.push((h.name.clone(), format!("Taking long to restart: {} minutes since it was told to (look at its screen)", m)));
+            }
+        }
+        for h in d.hosts.iter().filter(|h| h.is_up() && !h.enabled && !h.in_maintenance() && !restarting(h) && !self.host_busy.contains(&h.rref) && !self.host_maint.contains_key(&h.rref)) {
             out.push((h.name.clone(), "Is on but isn't taking new VMs (its Overview has Take VMs again)".to_string()));
         }
-        for h in d.hosts.iter().filter(|h| !h.is_up() && !restarting(h)) {
+        for h in d.hosts.iter().filter(|h| !h.is_up() && !restarting(h) && !self.host_waking.contains_key(&h.rref)) {
             let unknown = d.vms.iter().filter(|v| d.host_down_for(v).map_or(false, |x| x.rref == h.rref)).count();
             let what = if h.live { "Isn't answering" } else { "Is off" };
             let more = match unknown {
@@ -3400,13 +3772,19 @@ impl App {
                 }
                 continue;
             };
+            // a restart that's taking long
+            for h in &d.hosts {
+                if let Some(m) = self.slow_restart(h) {
+                    out.push((format!("host:{}:{}", s.id, h.rref), format!("{} is taking long to restart", h.name), format!("{} minutes since it was told to; look at its screen", m)));
+                }
+            }
             // (a server restarting, as asked, isn't a problem; nor the connection its coordinator's
             // restart takes with it)
             let restarting = |h: &HostInfo| self.host_rebooting.contains_key(&h.rref);
             if s.state == ConnState::Reconnecting && !d.hosts.iter().any(|h| h.is_master && restarting(h)) {
                 out.push((format!("srv:{}", s.id), format!("Lost the connection to {}", s.name()), "Reconnecting…".into()));
             }
-            for h in d.hosts.iter().filter(|h| !h.is_up() && !restarting(h)) {
+            for h in d.hosts.iter().filter(|h| !h.is_up() && !restarting(h) && !self.host_waking.contains_key(&h.rref)) {
                 let what = if h.live { "isn't answering" } else { "is off" };
                 let vms: Vec<&str> = d.vms.iter().filter(|v| d.host_down_for(v).map_or(false, |x| x.rref == h.rref)).map(|v| v.name.as_str()).collect();
                 let detail = match vms.len() {
@@ -3439,7 +3817,6 @@ impl App {
         let pal = self.pal;
         let running: Vec<usize> = (0..self.log.len()).filter(|&i| self.log[i].status == "In progress" && self.log[i].activity).collect();
         let ended: Vec<usize> = (0..self.log.len()).rev().filter(|&i| self.log[i].status != "In progress" && self.log[i].activity).take(5).collect();
-        let problems = self.problems();
         let slot = ui.painter().add(egui::Shape::Noop);
         let inner = |ui: &mut Ui, out: &mut Vec<Intent>| {
             ui.set_min_width(440.0);
@@ -3447,38 +3824,6 @@ impl App {
             ui.spacing_mut().item_spacing.y = 2.0;
             ui.label(egui::RichText::new("Activities").font(FontId::new(13.5, FontFamily::Name("bold".into()))).color(pal.ink));
             ui.add_space(2.0);
-            // what's wrong right now: a click opens it
-            if !problems.is_empty() {
-                ui.label(egui::RichText::new("Problems").size(12.0).color(pal.ink_faint));
-                for (key, text, detail) in &problems {
-                    // two lines at most for each
-                    let w = ui.available_width();
-                    let lay = |t: &str, size: f32, col: Color32| {
-                        let mut job = egui::text::LayoutJob::simple(t.to_string(), FontId::proportional(size), col, w - 30.0);
-                        job.wrap.max_rows = 2;
-                        job.wrap.overflow_character = Some('…');
-                        ui.painter().layout_job(job)
-                    };
-                    let (g, d) = (lay(text, 13.0, pal.ink), (!detail.is_empty()).then(|| lay(detail, 12.0, pal.ink_soft)));
-                    let h = 8.0 + g.size().y + d.as_ref().map_or(0.0, |d| d.size().y + 2.0);
-                    let (r, resp) = ui.allocate_exact_size(vec2(w, h), Sense::click());
-                    if resp.hovered() {
-                        ui.painter().rect_filled(r, Rounding::same(5.0), pal.hover);
-                    }
-                    paint_glyph(ui.painter(), Rect::from_min_size(r.min + vec2(4.0, 4.0), vec2(16.0, 16.0)), "warning", pal.red);
-                    let gh = g.size().y;
-                    ui.painter().galley(r.min + vec2(26.0, 4.0), g, pal.ink);
-                    if let Some(d) = d {
-                        ui.painter().galley(r.min + vec2(26.0, 6.0 + gh), d, pal.ink_soft);
-                    }
-                    if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-                        out.push(Intent::Select(key.clone()));
-                        ui.close_menu();
-                    }
-                }
-                ui.add_space(4.0);
-                ui.separator();
-            }
             // an entry, clickable for its details: its mark, its text (two lines at most), then
             // its server, how long, how far, and a warning while the server doesn't answer
             let entry = |ui: &mut Ui, i: usize, out: &mut Vec<Intent>| {
@@ -3610,10 +3955,6 @@ impl App {
         let icon = Rect::from_center_size(r.center(), vec2(16.0, 16.0));
         if running.is_empty() {
             paint_glyph(ui.painter(), icon, "activity", pal.ink_soft);
-            if !problems.is_empty() {
-                // something's wrong: a red dot
-                ui.painter().circle(pos2(r.max.x - 8.0, r.min.y + 8.0), 4.0, pal.red, Stroke::new(1.5_f32, pal.toolbar));
-            }
         } else {
             paint_icon(ui.painter(), icon, IconKind::Busy(Tone::Accent), &pal, pal.toolbar);
             // how many, in a small badge
@@ -3621,14 +3962,11 @@ impl App {
             ui.painter().circle_filled(b, 6.5, pal.accent);
             ui.painter().text(b, Align2::CENTER_CENTER, running.len().to_string(), FontId::proportional(9.5), Color32::WHITE);
         }
-        let mut tip = match running.len() {
+        let tip = match running.len() {
             0 => "Activities".to_string(),
             1 => "Activities: 1 under way".to_string(),
             n => format!("Activities: {} under way", n),
         };
-        if !problems.is_empty() {
-            tip = format!("{}{} problem{}", if running.is_empty() { "Activities: ".to_string() } else { format!("{}, ", tip) }, problems.len(), if problems.len() == 1 { "" } else { "s" });
-        }
         m.response.on_hover_text(tip);
     }
 
@@ -3964,6 +4302,36 @@ impl App {
         self.server(sid).map(|s| (sid, s.state != ConnState::Disconnected))
     }
 
+    /// Whether the selected server can be told to turn on from here: pool, server (None: the
+    /// connection's own, known only from the last time), its button's tip, and whether it can be
+    /// clicked now. A server that's off; or the coordinator while the pool doesn't answer through
+    /// it (it may be off).
+    fn power_on_of(&self, sel: &Node) -> Option<(u32, Option<String>, String, bool)> {
+        if let Some((s, h)) = self.host_of(sel) {
+            let lost = h.is_master && s.state != ConnState::Connected;
+            let off = !h.live && !h.unreachable && !self.host_busy.contains(&h.rref);
+            if !(off || lost) {
+                return None;
+            }
+            let waking = self.host_waking.contains_key(&h.rref);
+            let pool = s.state == ConnState::Connected && !h.is_master;
+            let known = h.wake_target().is_some() || (h.is_master && s.wake.is_some());
+            let tip = if waking {
+                "Turning on…".to_string()
+            } else if pool || known {
+                format!("Turn on {} (Wake-on-LAN)", h.name)
+            } else {
+                "Its network card's address isn't known here: turn it on at the server".to_string()
+            };
+            return Some((s.id, Some(h.rref.clone()), tip, !waking && (pool || known)));
+        }
+        let (sid, _) = self.root_of(sel)?;
+        let s = self.server(sid).filter(|s| s.data.is_none() && s.state != ConnState::Connected)?;
+        let (name, _) = s.wake.as_ref()?;
+        let waking = self.host_waking.contains_key(&format!("srv:{}", sid));
+        Some((sid, None, if waking { "Turning on…".into() } else { format!("Turn on {} (Wake-on-LAN from this computer)", name) }, !waking))
+    }
+
     /// How wide the buttons at the right end of the tab row are, as icons (0: none): a VM's power
     /// actions and Delete, a connection's Disconnect, and a console's keyboard.
     fn tab_actions_width(&self, sel: &Node, current: Tab) -> f32 {
@@ -3972,8 +4340,10 @@ impl App {
         if self.vm_of(sel).is_some() {
             n += 5; // power, Take Snapshot, Move, Copy, Delete
         }
-        if self.host_of(sel).is_some() {
-            n += 2; // Restart, Shut Down
+        if self.power_on_of(sel).is_some() {
+            n += 1; // Power On
+        } else if self.host_of(sel).is_some() {
+            n += 3; // Maintenance Mode, Restart, Shut Down
         }
         if current == Tab::Console && self.console.is_some() {
             n += 1; // the keyboard
@@ -3981,6 +4351,9 @@ impl App {
         let mut w = n as f32 * (TOOL_BTN.x + TOOL_GAP);
         if self.root_of(sel).is_some() {
             w += SQUARE.x + TOOL_GAP; // Disconnect (with its name when there's room)
+        }
+        if self.tabs_for(sel).contains(&Tab::Console) {
+            w += CONSOLE_BTN + TOOL_GAP; // Console, before the separator
         }
         if w > 0.0 {
             w + SEP_W + 8.0
@@ -3990,12 +4363,14 @@ impl App {
     }
 
     /// At the right end of the tab row, after a separator, as buttons all the same size (see
-    /// `paint_tool_btn`): a console's keyboard (its menu has Ctrl+Alt+Del and the other keys the desktop keeps), then a
-    /// VM's power menu, Take Snapshot, Copy (a menu) and Delete; a server's Restart and Shut Down.
-    /// When the row hasn't the `need`ed room, all of it is behind one "more" button instead, with
-    /// names.
+    /// `paint_tool_btn`): a console's keyboard (its menu has Ctrl+Alt+Del and the other keys the
+    /// desktop keeps), then a VM's power menu, Take Snapshot, Move, Copy (a menu) and Delete; a
+    /// server's Maintenance Mode, Restart and Shut Down, or Power On; before the separator, a VM's
+    /// or a server's Console, lit while it's shown (a click then goes back to the tab before).
+    /// When the row hasn't the `need`ed room, all of it is in one Actions menu instead.
     fn tab_actions(&mut self, ui: &mut Ui, free: Rect, sel: &Node, current: Tab, need: f32, out: &mut Vec<Intent>) {
         let pal = self.pal;
+        let console_to = self.tabs_for(sel).contains(&Tab::Console).then(|| if current == Tab::Console { self.before_console } else { Tab::Console });
         let vm = self.vm_of(sel).map(|(s, _, v)| (s.id, v.rref.clone()));
         // each power action shown: which, whether it can run, and its Force partner's
         let actions: Vec<(usize, bool, Option<(usize, bool)>)> = match self.vm_of(sel).map(|x| x.2) {
@@ -4031,38 +4406,52 @@ impl App {
         // Move: running or off, nothing under way, its server there
         let move_ok = self.vm_of(sel).map_or(false, |(s, d, v)| matches!(v.power, PowerState::Running | PowerState::Halted) && !s.busy.contains_key(&v.rref) && d.host_down_for(v).is_none());
         let root = self.root_of(sel).map(|(sid, connected)| (sid, if connected { "Disconnect" } else { "Remove" }, self.server(sid).map(|s| s.name()).unwrap_or_default()));
-        // a server: Restart and Shut Down, while it's on and not already going off
-        let host = self.host_of(sel).map(|(s, h)| (s.id, h.rref.clone(), h.is_up() && !self.host_busy.contains(&h.rref) && !self.host_rebooting.contains_key(&h.rref)));
+        // a server: Power On while it's off (or its pool, through it, doesn't answer); else
+        // Maintenance Mode, Restart and Shut Down, while it's on and nothing's under way on it
+        let wake = self.power_on_of(sel);
+        let host = self.host_of(sel).filter(|_| wake.is_none()).map(|(s, h)| {
+            let idle = !self.host_busy.contains(&h.rref) && !self.host_rebooting.contains_key(&h.rref) && !self.host_maint.contains_key(&h.rref);
+            (s.id, h.rref.clone(), h.is_up() && idle, h.in_maintenance())
+        });
+        let maint_tip = |on: bool, maint: bool| match (on, maint) {
+            (false, _) => "It's off",
+            (true, true) => "Take it out of maintenance mode…",
+            (true, false) => "Maintenance mode: move its VMs off, take no new ones…",
+        };
         let mut console = if current == Tab::Console { self.console.as_mut() } else { None };
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(free).layout(egui::Layout::right_to_left(egui::Align::Center)));
         let ui = &mut child;
         ui.spacing_mut().item_spacing.x = TOOL_GAP;
-        if root.is_some() || host.is_some() {
-            // right to left: a connection's Disconnect (its name too when there's room), a
-            // server's Shut Down and Restart, the keyboard
-            if let Some((sid, label, name)) = &root {
-                let wide = free.width() >= need - SQUARE.x + flat_button_width(ui, label) + 4.0;
-                let tip = format!("{} {}", if *label == "Remove" { "Remove" } else { "Disconnect from" }, name);
-                if flat_button(ui, "disconnect", label, Some(pal.red), true, !wide, &pal).on_hover_text(tip).clicked() {
-                    out.push(Intent::Remove(*sid));
+        // a connection's: Disconnect, with its name when there's room
+        if let Some((sid, label, name)) = &root {
+            let wide = free.width() >= need - SQUARE.x + flat_button_width(ui, label) + 4.0;
+            let tip = format!("{} {}", if *label == "Remove" { "Remove" } else { "Disconnect from" }, name);
+            if flat_button(ui, "disconnect", label, Some(pal.red), true, !wide, &pal).on_hover_text(tip).clicked() {
+                out.push(Intent::Remove(*sid));
+            }
+            vsep(ui, &pal);
+            return;
+        }
+        if free.width() >= need {
+            // right to left: a server's Power On, or its Shut Down, Restart and Maintenance Mode;
+            // a VM's Delete, Copy, Move, Take Snapshot and power menu; the keyboard; then the
+            // separator and Console
+            if let Some((sid, href, tip, ok)) = &wake {
+                if tool_btn(ui, Face::Tool("power_on"), tip, *ok, &pal).clicked() {
+                    out.push(Intent::PowerOn(*sid, href.clone()));
                 }
             }
-            if let Some((sid, href, on)) = &host {
+            if let Some((sid, href, on, maint)) = &host {
                 if tool_btn(ui, Face::Tool("clean_shutdown"), if *on { "Shut down this server…" } else { "It's off" }, *on, &pal).clicked() {
                     out.push(Intent::AskShutdownHost(*sid, href.clone(), false));
                 }
                 if tool_btn(ui, Face::Tool("clean_reboot"), if *on { "Restart this server…" } else { "It's off" }, *on, &pal).clicked() {
                     out.push(Intent::AskShutdownHost(*sid, href.clone(), true));
                 }
+                if tool_btn(ui, Face::Glyph("wrench", pal.orange), maint_tip(*on, *maint), *on, &pal).clicked() {
+                    out.push(Intent::AskMaintenance(*sid, href.clone()));
+                }
             }
-            if let Some(c) = console.as_deref_mut() {
-                keys_button(ui, &pal, c);
-            }
-            vsep(ui, &pal);
-            return;
-        }
-        if free.width() >= need {
-            // right to left: Delete, Take Snapshot, the power actions, the keyboard
             if let Some((sid, vref)) = &vm {
                 if tool_btn(ui, Face::Glyph("trash", pal.red), busy.as_deref().unwrap_or("Delete VM…"), !deleting && busy.is_none(), &pal).clicked() {
                     out.push(Intent::AskDeleteVm(*sid, vref.clone()));
@@ -4082,17 +4471,55 @@ impl App {
                 keys_button(ui, &pal, c);
             }
             vsep(ui, &pal);
+            if let Some(to) = console_to {
+                let on = current == Tab::Console;
+                if console_button(ui, &pal, on).on_hover_text(if on { "Back to where you were" } else { "Its screen, to work in it" }).clicked() {
+                    out.push(Intent::Tab(to));
+                }
+            }
             return;
         }
-        // no room: one button with all of it
-        let slot = ui.painter().add(egui::Shape::Noop);
-        let m = egui::menu::menu_custom_button(ui, egui::Button::new("").frame(false).min_size(SQUARE), |ui| {
-            ui.set_min_width(200.0);
+        // no room: one Actions menu with all of it, by name
+        actions_menu(ui, &pal, |ui| {
+            let mut line = false;
+            if let Some(to) = console_to {
+                let label = if current == Tab::Console { "Close Console" } else { "Console" };
+                if ui.button(label).clicked() {
+                    out.push(Intent::Tab(to));
+                    ui.close_menu();
+                }
+                line = true;
+            }
             if let Some(c) = console.as_deref_mut() {
                 ui.add_enabled_ui(c.connected(), |ui| ui.menu_button("Send keys", |ui| c.keys_menu(ui)));
-                if vm.is_some() {
+            }
+            if let Some((sid, href, tip, ok)) = &wake {
+                if line {
                     ui.separator();
                 }
+                if ui.add_enabled(*ok, egui::Button::new("Power On")).on_hover_text(tip.as_str()).clicked() {
+                    out.push(Intent::PowerOn(*sid, href.clone()));
+                    ui.close_menu();
+                }
+            }
+            if let Some((sid, href, on, maint)) = &host {
+                if line {
+                    ui.separator();
+                }
+                let label = if *maint { "Exit Maintenance Mode…" } else { "Maintenance Mode…" };
+                for (label, intent) in [
+                    (label, Intent::AskMaintenance(*sid, href.clone())),
+                    ("Restart…", Intent::AskShutdownHost(*sid, href.clone(), true)),
+                    ("Shut Down…", Intent::AskShutdownHost(*sid, href.clone(), false)),
+                ] {
+                    if ui.add_enabled(*on, egui::Button::new(label)).on_disabled_hover_text("It's off, or busy").clicked() {
+                        out.push(intent);
+                        ui.close_menu();
+                    }
+                }
+            }
+            if !actions.is_empty() && line {
+                ui.separator();
             }
             for &(i, ok, force) in &actions {
                 for (j, can) in std::iter::once((i, ok)).chain(force) {
@@ -4126,18 +4553,14 @@ impl App {
                 }
             }
         });
-        let r = m.response.rect;
-        if m.response.hovered() || m.inner.is_some() {
-            ui.painter().set(slot, egui::epaint::RectShape::filled(r, Rounding::same(6.0), pal.hover));
-        }
-        paint_glyph(ui.painter(), Rect::from_center_size(r.center(), vec2(16.0, 16.0)), "more", pal.ink_soft);
-        m.response.on_hover_text(if vm.is_some() { "Power, Delete and more" } else { "Send keys" });
         vsep(ui, &pal);
     }
 
-    /// The header and the tabs, on one line when they and `actions` (the width the buttons at
-    /// the row's right end want) fit, otherwise the tabs on a line of their own.
-    fn header_and_tabs(&mut self, ui: &mut Ui, sel: &Node, tabs: &[Tab], current: Tab, actions: f32, out: &mut Vec<Intent>) -> Rect {
+    /// The header and the tabs, on one line when they and the buttons at the row's right end fit
+    /// (`room`: the width those want, and the least they can take, as one Actions menu),
+    /// otherwise the tabs on a line of their own.
+    fn header_and_tabs(&mut self, ui: &mut Ui, sel: &Node, tabs: &[Tab], current: Tab, room: (f32, f32), out: &mut Vec<Intent>) -> Rect {
+        let (actions, least) = room;
         let pal = self.pal;
         let (title, sub) = self.header_text(sel);
         // a pool with something wrong: a dot on its Details, which says what
@@ -4173,15 +4596,22 @@ impl App {
             // the actions go after the tabs when there's room; otherwise on the name's line (whose
             // details beside the name give way if need be), still as icons; failing both, they
             // fold into one button after the tabs
+            // (all of them, or the one Actions menu they fold into, on the name's line when they
+            // don't fit after the tabs)
             let strip_room = avail - 2.0 - tabs_w - 16.0;
-            let on_head = actions > 0.0 && strip_room < actions && avail - bare_w - 14.0 >= actions;
-            let sub = if on_head && avail - head_w - 14.0 < actions { String::new() } else { sub };
+            let head_room = avail - bare_w - 14.0;
+            let on_head = actions > 0.0 && strip_room < actions && head_room >= least;
+            let takes = if head_room >= actions { actions } else { least };
+            let sub = if on_head && avail - head_w - 14.0 < takes { String::new() } else { sub };
             let used = if sub.is_empty() { bare_w } else { head_w };
             let (head, _) = ui.allocate_exact_size(vec2(avail, 38.0), Sense::hover());
             self.paint_header(ui, head, sel, &title, &sub, head.center().y + 2.0, rename, out);
             let (strip, _) = ui.allocate_exact_size(vec2(avail, 32.0), Sense::hover());
             hairline(ui, strip);
-            let after_tabs = self.paint_tabs(ui, strip, strip.min.x + 2.0, tabs, current, dot, out);
+            // the tabs closer together if need be, to leave the buttons the least they take
+            let keep = if on_head || actions <= 0.0 { 0.0 } else { least + 16.0 };
+            let mut after_tabs = self.paint_tabs(ui, Rect::from_min_max(strip.min, pos2(strip.max.x - keep, strip.max.y)), strip.min.x + 2.0, tabs, current, dot, out);
+            after_tabs.max.x = strip.max.x - 6.0;
             if on_head {
                 Rect::from_min_max(pos2(head.min.x + used + 8.0, head.min.y + 4.0), pos2(head.max.x - 6.0, head.max.y))
             } else {
@@ -4311,7 +4741,7 @@ impl App {
     fn tabs_for(&self, sel: &Node) -> Vec<Tab> {
         let has_data = sel.sid.and_then(|id| self.server(id)).map_or(false, |s| s.data.is_some());
         match sel.kind {
-            Kind::Root => vec![Tab::Home, Tab::IsoLibrary, Tab::VmStorage, Tab::Templates, Tab::Networks, Tab::Search, Tab::Logs],
+            Kind::Root => vec![Tab::Home, Tab::IsoLibrary, Tab::VmStorage, Tab::Templates, Tab::Networks, Tab::Search, Tab::Logs, Tab::Alerts],
             Kind::Category => vec![Tab::Home, Tab::Search, Tab::Logs],
             Kind::Sr if self.sr_of(sel).map_or(false, |(_, x)| x.is_iso()) => vec![Tab::General, Tab::IsoFiles, Tab::Logs],
             Kind::Folder if sel.rref.as_deref() == Some("nets") => vec![Tab::Networking],
@@ -4319,8 +4749,8 @@ impl App {
             Kind::Template => vec![Tab::General, Tab::Logs],
             Kind::Folder => vec![Tab::Storage],
             _ if !has_data => vec![Tab::General, Tab::Logs],
-            Kind::Vm => vec![Tab::Overview, Tab::Snapshots, Tab::Console, Tab::Logs, Tab::Details],
-            Kind::Host => vec![Tab::Overview, Tab::Storage, Tab::Networking, Tab::Console, Tab::Logs, Tab::Details],
+            Kind::Vm => vec![Tab::Overview, Tab::Performance, Tab::Snapshots, Tab::Console, Tab::Logs, Tab::Details],
+            Kind::Host => vec![Tab::Overview, Tab::Performance, Tab::Storage, Tab::Networking, Tab::Console, Tab::Logs, Tab::Details],
             Kind::Pool => vec![Tab::Overview, Tab::Storage, Tab::Networking, Tab::Logs, Tab::Details],
             _ => vec![Tab::General, Tab::Logs],
         }
@@ -4330,11 +4760,17 @@ impl App {
     /// returns the room left on their right.
     fn paint_tabs(&self, ui: &mut Ui, row: Rect, x: f32, tabs: &[Tab], current: Tab, dot: Option<Tab>, out: &mut Vec<Intent>) -> Rect {
         let pal = self.pal;
-        let font = FontId::proportional(13.5);
+        // closer together when they don't all fit (a narrow window), then smaller
+        let room = row.max.x - x - 4.0;
+        let n = tabs.len().max(1) as f32;
+        let words = |size: f32| -> f32 { tabs.iter().map(|t| ui.painter().layout_no_wrap(t.label().into(), FontId::proportional(size), pal.ink).size().x).sum() };
+        let size = if words(13.5) + 10.0 * n <= room { 13.5 } else { 12.5 };
+        let pad = ((room - words(size)) / n).clamp(8.0, 20.0);
+        let font = FontId::proportional(size);
         let mut x = x;
         for t in tabs {
             let tw = ui.painter().layout_no_wrap(t.label().into(), font.clone(), pal.ink).size().x;
-            let r = Rect::from_min_size(pos2(x, row.min.y), vec2(tw + 20.0, row.height()));
+            let r = Rect::from_min_size(pos2(x, row.min.y), vec2(tw + pad, row.height()));
             let resp = ui.interact(r, ui.id().with(t.label()), Sense::click());
             let on = *t == current;
             let col = if on || resp.hovered() { pal.ink } else { pal.ink_soft };
@@ -4640,7 +5076,12 @@ impl App {
                                     "On".into()
                                 },
                             ),
-                            row("Enabled", if h.enabled { "Yes".into() } else { "No (maintenance mode)".into() }),
+                            row("Enabled", if h.enabled { "Yes".into() } else if h.in_maintenance() { "No (maintenance mode)".into() } else { "No".into() }),
+                            row("Power on", match h.power_on_mode.as_str() {
+                                "" => "Not set up (Power On sets Wake-on-LAN)".into(),
+                                "wake-on-lan" => "Wake-on-LAN".into(),
+                                m => m.to_string(),
+                            }),
                             row("Version", h.version.clone()),
                             row("Running VMs", running.to_string()),
                             row("UUID", h.uuid.clone()),
@@ -6208,6 +6649,10 @@ impl App {
         let mut edit_now: Option<(u32, String, VmChange)> = None;
         // from the Shut Down Server question: pool, server, its name
         let mut shutdown_host: Option<(u32, String, String, bool)> = None;
+        // from Maintenance Mode's questions: pool, server, its name; and None to go in, or
+        // Some(whether its VMs come back) to come out
+        let mut maint: Option<(u32, String, String, Option<bool>)> = None;
+        let mut save_rules = false;
         // from Settings: the theme and size chosen, a saved password to forget
         let mut theme: Option<ThemeMode> = None;
         let mut zoom: Option<f32> = None;
@@ -6776,10 +7221,13 @@ impl App {
                         crate::newvm::alert(ui, &pal, false, "It's the only server.", &format!("This app loses its connection to it {}.", until), None);
                     }
                     ui.add_space(8.0);
-                    if *reboot {
+                    let in_maintenance = self.servers.iter().find(|s| s.id == *sid).and_then(|s| s.data.as_ref()).and_then(|d| d.host(host)).map_or(false, |h| h.in_maintenance());
+                    if *reboot && in_maintenance {
+                        soft(ui, "It's back in a few minutes, still in maintenance mode; Activities says when it answers.".into());
+                    } else if *reboot {
                         soft(ui, "It's back in a few minutes, taking new VMs again; Activities says when it answers.".into());
                     } else {
-                        soft(ui, "To turn it on again, use its power button (or its management board, such as iDRAC or iLO).".into());
+                        soft(ui, "To turn it on again: Power On here (Wake-on-LAN, when its firmware has it on), or its power button.".into());
                     }
                     ui.add_space(12.0);
                     dialog_buttons(ui, |ui| {
@@ -6790,6 +7238,87 @@ impl App {
                         let (glyph, label) = if *reboot { ("retry", "Restart") } else { ("power", "Shut Down") };
                         if dialog_button(ui, &pal, glyph, label, Look::Danger, true) {
                             shutdown_host = Some((*sid, host.clone(), name.clone(), *reboot));
+                        }
+                    });
+                });
+            }
+            Dialog::ConfirmMaintenance { sid, host, name, moving, stopping, coordinator } => {
+                dialog_window(ctx, "Maintenance Mode").show(ctx, |ui| {
+                    ui.set_width(440.0);
+                    ui.label(format!("Put {} in maintenance mode?", name));
+                    ui.add_space(8.0);
+                    let soft = |ui: &mut Ui, text: String| {
+                        ui.add(egui::Label::new(egui::RichText::new(text).color(pal.ink_soft)).wrap());
+                    };
+                    soft(ui, "It stops taking new VMs, and stays so till you take it out of maintenance mode.".into());
+                    ui.add_space(4.0);
+                    if moving.is_empty() && stopping.is_empty() {
+                        soft(ui, "No VMs are running on it.".into());
+                    }
+                    if !moving.is_empty() {
+                        soft(ui, format!("These move to the pool's other servers: {}.", moving.join(", ")));
+                    }
+                    if !stopping.is_empty() {
+                        let why = if moving.is_empty() && !leaving_somewhere(&self.servers, *sid, host) { "there's no other server to take them" } else { "their disks are on this server's own storage" };
+                        soft(ui, format!("These are shut down, as {}: {}. One without guest tools is turned off the hard way.", why, stopping.join(", ")));
+                    }
+                    if *coordinator {
+                        ui.add_space(4.0);
+                        soft(ui, "It stays the pool's coordinator: the pool is still managed through it.".into());
+                    }
+                    if !moving.is_empty() || !stopping.is_empty() {
+                        ui.add_space(4.0);
+                        soft(ui, "When it comes out, they can come back to it.".into());
+                    }
+                    ui.add_space(12.0);
+                    dialog_buttons(ui, |ui| {
+                        if dialog_button(ui, &pal, "close", "Cancel", Look::Plain, true) || ui.input(|i| i.key_pressed(Key::Escape)) {
+                            close = true;
+                        }
+                        let look = if stopping.is_empty() { Look::Primary } else { Look::Danger };
+                        if dialog_button(ui, &pal, "wrench", "Enter Maintenance Mode", look, true) {
+                            maint = Some((*sid, host.clone(), name.clone(), None));
+                        }
+                    });
+                });
+            }
+            Dialog::AlertRules(d) => match alerts::rules_window(ctx, &pal, d) {
+                RulesAct::Close => close = true,
+                RulesAct::Save => save_rules = true,
+                RulesAct::Nothing => {}
+            },
+            Dialog::ExitMaintenance { sid, host, name, moved, stopped, back } => {
+                dialog_window(ctx, "Exit Maintenance Mode").show(ctx, |ui| {
+                    ui.set_width(440.0);
+                    ui.label(format!("Take {} out of maintenance mode?", name));
+                    ui.add_space(8.0);
+                    let soft = |ui: &mut Ui, text: String| {
+                        ui.add(egui::Label::new(egui::RichText::new(text).color(pal.ink_soft)).wrap());
+                    };
+                    soft(ui, "It takes new VMs again.".into());
+                    if !moved.is_empty() || !stopped.is_empty() {
+                        ui.add_space(8.0);
+                        let n = moved.len() + stopped.len();
+                        ui.checkbox(back, if n == 1 { "Bring back the VM it had".to_string() } else { format!("Bring back the {} VMs it had", n) });
+                        ui.horizontal(|ui| {
+                            ui.add_space(24.0);
+                            ui.vertical(|ui| {
+                                if !moved.is_empty() {
+                                    soft(ui, format!("Moved back to it, without stopping: {}.", moved.join(", ")));
+                                }
+                                if !stopped.is_empty() {
+                                    soft(ui, format!("Started on it again: {}.", stopped.join(", ")));
+                                }
+                            });
+                        });
+                    }
+                    ui.add_space(12.0);
+                    dialog_buttons(ui, |ui| {
+                        if dialog_button(ui, &pal, "close", "Cancel", Look::Plain, true) || ui.input(|i| i.key_pressed(Key::Escape)) {
+                            close = true;
+                        }
+                        if dialog_button(ui, &pal, "wrench", "Exit Maintenance Mode", Look::Primary, true) {
+                            maint = Some((*sid, host.clone(), name.clone(), Some(*back && !(moved.is_empty() && stopped.is_empty()))));
                         }
                     });
                 });
@@ -7225,6 +7754,13 @@ impl App {
             self.dialog = Dialog::None;
             self.shutdown_host(sid, host, name, reboot, ctx);
         }
+        if let Some((sid, host, name, exit)) = maint {
+            self.dialog = Dialog::None;
+            self.maintenance(sid, host, name, exit, ctx);
+        }
+        if save_rules {
+            self.save_alert_rules(ctx);
+        }
         if let Some((sid, vm, name, disks)) = delete_vm {
             self.dialog = Dialog::None;
             self.delete_vm(sid, vm, name, disks, ctx);
@@ -7363,6 +7899,8 @@ impl eframe::App for App {
         let pal = self.pal;
         self.tick(ctx);
         self.poll_pool_updates(ctx);
+        self.poll_messages(ctx);
+        self.note_app_alerts();
         let tree = self.build_tree();
         if let Some((key, tab)) = self.pending_select.clone() {
             if tree.find(&key).is_some() {
@@ -7413,6 +7951,18 @@ impl eframe::App for App {
                 "about" => out.push(Intent::About),
                 "sr-detached" | "sr-repair-failed" => out.extend(sel.sid.map(|sid| Intent::RepairSr(sid, "sr-iso".into()))),
                 "snapshots" => out.push(Intent::Tab(Tab::Snapshots)),
+                "vm-performance" | "host-performance" => out.push(Intent::Tab(Tab::Performance)),
+                "alerts" | "alerts-all" => {
+                    out.push(Intent::Alerts);
+                    self.alerts_view.every = self.shot_show == "alerts-all";
+                    self.alerts_view.open = Some("msg:OpaqueRef:demo-message-2".into());
+                }
+                "alert-rules" => out.extend(sel.sid.map(|sid| Intent::AlertRules(sid, "VM", "vm-web".into(), "Web Server".into(), Watched::Vm))),
+                // (one dismissed as the window opens: it's gone from the page, the count and the server)
+                "alerts-dismissed" => {
+                    out.push(Intent::Alerts);
+                    out.extend(sel.sid.map(|sid| Intent::DismissAlerts(vec![(sid, "OpaqueRef:demo-message-1".into())])));
+                }
                 "details" | "host-details" | "pool-details" => out.push(Intent::Tab(Tab::Details)),
                 "pool-updates" | "pool-updating" | "pool-update-stopped" => out.push(Intent::PoolUpdates(sel.sid)),
                 "move-vm" => out.extend(sel.sid.map(|sid| Intent::MoveVm(sid, "vm-web".into(), Some("host-b".into())))),
@@ -7669,6 +8219,11 @@ impl eframe::App for App {
                         out.push(Intent::AskShutdownHost(sid, "host-a".into(), self.shot_show == "host-restart"));
                     }
                 }
+                "host-maintenance" | "host-exit-maintenance" => {
+                    if let Some(sid) = sel.sid {
+                        out.push(Intent::AskMaintenance(sid, if self.shot_show == "host-maintenance" { "host-a" } else { "host-b" }.into()));
+                    }
+                }
                 "vm-delete" => {
                     if let Some(sid) = sel.sid {
                         out.push(Intent::AskDeleteVm(sid, "vm-web".into()));
@@ -7711,8 +8266,16 @@ impl eframe::App for App {
             let tabs = self.tabs_for(&sel);
             let current = if tabs.contains(&self.tab) { self.tab } else { tabs[0] };
             let actions = self.tab_actions_width(&sel, current);
-            let free = self.header_and_tabs(ui, &sel, &tabs, current, actions, &mut out);
-            if actions > 0.0 {
+            // (a VM's or a server's console is a button at the row's end, not a tab among the others)
+            let shown: Vec<Tab> = tabs.iter().copied().filter(|t| *t != Tab::Console && *t != Tab::Alerts).collect();
+            // the least room they take: all in one Actions menu (a connection's, its one button)
+            let least = if self.root_of(&sel).is_some() { actions } else { (ACTIONS_BTN + TOOL_GAP + SEP_W + 8.0).min(actions) };
+            // (the Alerts page's Dismiss all: room for it, its icon at least)
+            let page = if sel.kind == Kind::Root && current == Tab::Alerts { SQUARE.x + SEP_W + 12.0 } else { 0.0 };
+            let free = self.header_and_tabs(ui, &sel, &shown, current, (actions.max(page), least.max(page)), &mut out);
+            if sel.kind == Kind::Root && current == Tab::Alerts {
+                self.alerts_actions(ui, free, &mut out);
+            } else if actions > 0.0 {
                 self.tab_actions(ui, free, &sel, current, actions, &mut out);
             } else if sel.kind == Kind::Root && current == Tab::IsoLibrary {
                 self.iso_library_actions(ui, free, &mut out);
@@ -7780,14 +8343,18 @@ impl eframe::App for App {
                 let default = s.data.as_ref().map_or(false, |d| d.default_sr.as_deref() == Some(sr.as_str()) && d.suspend_sr.as_deref().map_or(true, |r| r == sr));
                 let mut child = ui.new_child(egui::UiBuilder::new().max_rect(free).layout(egui::Layout::right_to_left(egui::Align::Center)));
                 child.spacing_mut().item_spacing.x = 4.0;
-                let compact = free.width() < flat_button_width(&child, "Make Default") + 16.0 + SEP_W;
+                let compact = free.width() < flat_button_width(&child, "Make Default") + flat_button_width(&child, "Alerts…") + 20.0 + SEP_W;
                 let (label, tip) = if default {
                     ("Default", "This is the pool's default storage")
                 } else {
                     ("Make Default", "Make this the pool's default storage: for new VMs' disks, suspended VMs' memory and crash dumps (moving a running VM's disks uses it too)")
                 };
                 if flat_button(&mut child, "check", label, Some(pal.green), !default, compact, &pal).on_hover_text(tip).on_disabled_hover_text(tip).clicked() {
-                    out.push(Intent::MakeDefaultSr(sid, sr));
+                    out.push(Intent::MakeDefaultSr(sid, sr.clone()));
+                }
+                let tip = "Get an alert when it's fuller than a limit you set (the pool watches, also while this app is closed)";
+                if flat_button(&mut child, "bell", "Alerts…", Some(pal.orange), true, compact, &pal).on_hover_text(tip).clicked() {
+                    out.push(Intent::AlertRules(sid, "SR", sr, x.name.clone(), Watched::Sr));
                 }
                 vsep(&mut child, &pal);
             }
@@ -7800,6 +8367,8 @@ impl eframe::App for App {
                 Tab::Overview if sel.kind == Kind::Host => self.host_overview(ui, &sel, &mut out),
                 Tab::Overview if sel.kind == Kind::Pool => self.pool_overview(ui, &sel, &mut out),
                 Tab::Overview => self.overview(ui, &sel, &mut out),
+                Tab::Performance => self.performance(ui, &sel, &mut out),
+                Tab::Alerts => self.alerts_page(ui, &mut out),
                 Tab::Storage => self.storage(ui, &sel),
                 Tab::Networking => self.networking(ui, &sel),
                 Tab::Console => self.console_tab(ui, &sel, &mut out),
@@ -7958,6 +8527,28 @@ fn create_problem(e: &ApiError) -> String {
 }
 
 /// Why shutting a server down failed, in plain words where the server's answer is a known one.
+/// The VMs running on server `host` that would leave it as it's emptied: those that move to the
+/// pool's other servers, and those shut down (their disks on its own storage, or no other server
+/// to take them). Their names.
+fn leaving(d: &PoolData, host: &str) -> (Vec<String>, Vec<String>) {
+    let others = d.hosts.iter().any(|o| o.rref != host && o.enabled && o.is_up());
+    let mut moving = vec![];
+    let mut stopping = vec![];
+    for v in d.vms.iter().filter(|v| v.host.as_deref() == Some(host) && matches!(v.power, PowerState::Running | PowerState::Paused)) {
+        if others && v.storage_host.as_deref() != Some(host) {
+            moving.push(v.name.clone());
+        } else {
+            stopping.push(v.name.clone());
+        }
+    }
+    (moving, stopping)
+}
+
+/// Whether pool `sid` has another server, on and taking VMs, for server `host`'s VMs to go to.
+fn leaving_somewhere(servers: &[ServerEntry], sid: u32, host: &str) -> bool {
+    servers.iter().find(|s| s.id == sid).and_then(|s| s.data.as_ref()).map_or(false, |d| d.hosts.iter().any(|o| o.rref != host && o.enabled && o.is_up()))
+}
+
 fn host_problem(e: &ApiError) -> String {
     match e.code.as_str() {
         "HOST_NOT_ENOUGH_FREE_MEMORY" | "NO_HOSTS_AVAILABLE" => "The pool's other servers haven't the memory free to take its VMs. Shut some VMs down, then try again.".into(),
@@ -8428,6 +9019,68 @@ fn paint_tool_btn(p: &egui::Painter, r: Rect, face: &Face, enabled: bool, hot: b
     }
 }
 
+/// How wide the Console button is.
+const CONSOLE_BTN: f32 = 104.0;
+
+/// The Console button before the tab row's separator: a screen and its name on a soft blue pill,
+/// filled blue while the console is shown (as the tab it stands for).
+fn console_button(ui: &mut Ui, pal: &Pal, on: bool) -> egui::Response {
+    let (r, resp) = ui.allocate_exact_size(vec2(CONSOLE_BTN, TOOL_BTN.y), Sense::click());
+    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+    let p = ui.painter();
+    let pill = Rect::from_center_size(r.center(), vec2(r.width() - 2.0, 26.0));
+    let hot = resp.hovered();
+    let (fill, ink) = if on {
+        (if hot { pal.accent.gamma_multiply(0.85) } else { pal.accent }, pal.on_accent)
+    } else {
+        (pal.accent.gamma_multiply(match (pal.dark, hot) {
+            (true, false) => 0.22,
+            (true, true) => 0.36,
+            (false, false) => 0.14,
+            (false, true) => 0.26,
+        }), if pal.dark { pal.ink } else { pal.accent })
+    };
+    p.rect_filled(pill, Rounding::same(7.0), fill);
+    let glyph = if on { pal.on_accent } else { pal.accent };
+    let font = FontId::new(13.0, FontFamily::Name("bold".into()));
+    let text = p.layout_no_wrap("Console".into(), font, ink);
+    let x = pill.center().x - (16.0 + 7.0 + text.size().x) / 2.0;
+    paint_glyph_on(p, Rect::from_center_size(pos2(x + 8.0, pill.center().y), vec2(16.0, 16.0)), "console", glyph, fill);
+    p.galley(pos2(x + 23.0, pill.center().y - text.size().y / 2.0), text, ink);
+    resp
+}
+
+/// How wide the Actions button is.
+const ACTIONS_BTN: f32 = 100.0;
+
+/// In a narrow window, the tab row's buttons all in one: "Actions" on a soft pill, a menu of them
+/// by name under it (`add`).
+fn actions_menu(ui: &mut Ui, pal: &Pal, add: impl FnOnce(&mut Ui)) {
+    let slot = ui.painter().add(egui::Shape::Noop);
+    let m = egui::menu::menu_custom_button(ui, egui::Button::new("").frame(false).min_size(vec2(ACTIONS_BTN, TOOL_BTN.y)), |ui| {
+        ui.set_min_width(210.0);
+        add(ui);
+    });
+    let r = m.response.rect;
+    let open = m.inner.is_some();
+    let pill = Rect::from_center_size(r.center(), vec2(r.width() - 2.0, 26.0));
+    let fill = pal.ink_soft.gamma_multiply(match (pal.dark, m.response.hovered() || open) {
+        (true, false) => 0.18,
+        (true, true) => 0.30,
+        (false, false) => 0.12,
+        (false, true) => 0.22,
+    });
+    ui.painter().set(slot, egui::epaint::RectShape::filled(pill, Rounding::same(7.0), fill));
+    let p = ui.painter();
+    let font = FontId::new(13.0, FontFamily::Name("bold".into()));
+    let text = p.layout_no_wrap("Actions".into(), font, pal.ink);
+    let x = pill.center().x - (text.size().x + 16.0) / 2.0;
+    p.galley(pos2(x, pill.center().y - text.size().y / 2.0), text.clone(), pal.ink);
+    let c = pos2(x + text.size().x + 10.0, pill.center().y);
+    p.add(egui::Shape::line(vec![pos2(c.x - 3.5, c.y - 1.5), pos2(c.x, c.y + 2.0), pos2(c.x + 3.5, c.y - 1.5)], Stroke::new(1.4_f32, pal.ink_soft)));
+    m.response.on_hover_text("Console, power, snapshots and more");
+}
+
 /// A button at the tab row's end (see `paint_tool_btn`); its name is its tip.
 fn tool_btn(ui: &mut Ui, face: Face, tip: &str, enabled: bool, pal: &Pal) -> egui::Response {
     let (r, resp) = ui.allocate_exact_size(TOOL_BTN, if enabled { Sense::click() } else { Sense::hover() });
@@ -8530,21 +9183,6 @@ fn prune(nodes: &mut Vec<Node>, f: &str) {
 
 fn unix_now() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
-}
-
-/// The local time zone's offset at `t`, in seconds east of UTC (0 where it can't be had).
-fn local_offset(t: i64) -> i64 {
-    #[cfg(unix)]
-    {
-        let tt = t as libc::time_t;
-        // SAFETY: localtime_r only writes the tm it's given; a zeroed tm is a valid one
-        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-        if !unsafe { libc::localtime_r(&tt, &mut tm) }.is_null() {
-            return tm.tm_gmtoff as i64;
-        }
-    }
-    let _ = t;
-    0
 }
 
 /// Why a change to a VM failed, in plain words where the server's answer is a known one.
@@ -8739,6 +9377,30 @@ fn save_members(host: &str, members: &[String]) {
     let _ = std::fs::create_dir_all(&dir);
     let f = dir.join("members.txt");
     let mut lines = vec![format!("{}\t{}", host, members.join(","))];
+    for line in std::fs::read_to_string(&f).unwrap_or_default().lines() {
+        if !line.split('\t').next().unwrap_or("").trim().eq_ignore_ascii_case(host) && lines.len() < 20 {
+            lines.push(line.to_string());
+        }
+    }
+    let _ = std::fs::write(f, lines.join("\n"));
+}
+
+/// The pool coordinator last seen through `host`, and where its Wake-on-LAN signal goes (wake.txt:
+/// the server, its coordinator's name, the card's address, the broadcast address; tabs between).
+fn load_wake(host: &str) -> Option<(String, WakeTarget)> {
+    let dir = config_dir()?;
+    std::fs::read_to_string(dir.join("wake.txt")).ok()?.lines().find_map(|l| {
+        let f: Vec<&str> = l.split('\t').collect();
+        (f.len() >= 4 && f[0].trim().eq_ignore_ascii_case(host) && parse_mac(f[2]).is_some()).then(|| (f[1].to_string(), WakeTarget { mac: f[2].trim().to_string(), broadcast: f[3].trim().to_string() }))
+    })
+}
+
+fn save_wake(host: &str, wake: Option<&(String, WakeTarget)>) {
+    let Some(dir) = config_dir() else { return };
+    let _ = std::fs::create_dir_all(&dir);
+    let f = dir.join("wake.txt");
+    let clean = |t: &str| t.replace(['\t', '\n'], " ");
+    let mut lines: Vec<String> = wake.map(|(n, w)| format!("{}\t{}\t{}\t{}", clean(host), clean(n), clean(&w.mac), clean(&w.broadcast))).into_iter().collect();
     for line in std::fs::read_to_string(&f).unwrap_or_default().lines() {
         if !line.split('\t').next().unwrap_or("").trim().eq_ignore_ascii_case(host) && lines.len() < 20 {
             lines.push(line.to_string());

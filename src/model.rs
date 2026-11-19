@@ -36,6 +36,9 @@ impl PowerState {
 pub struct VmDisk {
     pub name: String,
     pub device: String,
+    /// What its system calls it while the VM runs (its drive's device, like "xvda"; empty while
+    /// it's off): its server's records of it go by that name.
+    pub dev: String,
     /// Its drive (VBD) and disc (VDI; empty for an empty DVD drive), to change them.
     pub vbd: String,
     pub vdi: String,
@@ -339,6 +342,18 @@ pub fn parse_host_rrd(text: &str, uuid: &str) -> HostPerf {
 /// An rrd_updates answer's legend (its columns' names) and rows (a time and a value per column),
 /// from XML or JSON.
 fn rrd_table(text: &str) -> (Vec<String>, Vec<(i64, Vec<f64>)>) {
+    let (legend, mut rows) = rrd_table_raw(text);
+    for r in rows.iter_mut() {
+        for v in r.1.iter_mut().filter(|v| !v.is_finite()) {
+            *v = 0.0;
+        }
+    }
+    (legend, rows)
+}
+
+/// The same, gaps kept: NaN where the server has no figure (before it began keeping them, or
+/// while a VM was off).
+pub fn rrd_table_raw(text: &str) -> (Vec<String>, Vec<(i64, Vec<f64>)>) {
     if text.trim_start().starts_with('{') {
         return rrd_json(text);
     }
@@ -348,7 +363,7 @@ fn rrd_table(text: &str) -> (Vec<String>, Vec<(i64, Vec<f64>)>) {
 /// {"meta": {…, "legend": […]}, "data": [{"t": …, "values": […]}, …]}, read leniently: servers
 /// send its numbers in quotes or not, and NaN bare.
 fn rrd_json(text: &str) -> (Vec<String>, Vec<(i64, Vec<f64>)>) {
-    let number = |s: &str| s.trim().trim_matches('"').trim().parse::<f64>().ok().filter(|v| v.is_finite()).unwrap_or(0.0);
+    let number = |s: &str| s.trim().trim_matches('"').trim().parse::<f64>().ok().filter(|v| v.is_finite()).unwrap_or(f64::NAN);
     let Some(l) = text.find("legend") else { return (vec![], vec![]) };
     let (Some(a), Some(b)) = (text[l..].find('['), text[l..].find(']')) else { return (vec![], vec![]) };
     let legend: Vec<String> = text[l + a + 1..l + b].split(',').map(|s| s.trim().trim_matches('"').to_string()).filter(|s| !s.is_empty()).collect();
@@ -384,7 +399,7 @@ fn rrd_xml(xml: &str) -> (Vec<String>, Vec<(i64, Vec<f64>)>) {
     let mut rows: Vec<(i64, Vec<f64>)> = vec![];
     for row in tags("row") {
         let t = row.split("<t>").nth(1).and_then(|x| x.split("</t>").next()).and_then(|x| x.trim().parse::<i64>().ok());
-        let vals: Vec<f64> = row.split("<v>").skip(1).map(|x| x.split("</v>").next().unwrap_or("").trim().parse::<f64>().ok().filter(|v| v.is_finite()).unwrap_or(0.0)).collect();
+        let vals: Vec<f64> = row.split("<v>").skip(1).map(|x| x.split("</v>").next().unwrap_or("").trim().parse::<f64>().ok().filter(|v| v.is_finite()).unwrap_or(f64::NAN)).collect();
         if let Some(t) = t {
             rows.push((t, vals));
         }
@@ -519,6 +534,56 @@ pub struct HostInfo {
     pub last_update: Option<i64>,
     /// Its network cards: the physical ones and bonds (a bond's members and VLANs are in those).
     pub nics: Vec<HostNic>,
+    /// How the pool turns it on when it's off (host.power_on_mode): "wake-on-lan", "iLO",
+    /// "DRAC"…; empty when it can't.
+    pub power_on_mode: String,
+    /// Marked as in maintenance mode (its other_config's MAINTENANCE_MODE, as XenCenter marks
+    /// it), and the VMs (their uuids) that maintenance moved off it or shut down, to bring back
+    /// when it ends.
+    pub maintenance: bool,
+    pub maint_moved: Vec<String>,
+    pub maint_stopped: Vec<String>,
+}
+
+/// Where a server's Wake-on-LAN signal goes: its card's hardware address, and its network's
+/// broadcast address ("192.168.1.255"; empty when not known).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct WakeTarget {
+    pub mac: String,
+    pub broadcast: String,
+}
+
+/// "aa:bb:cc:dd:ee:ff" (or with dashes) as its six bytes.
+pub fn parse_mac(mac: &str) -> Option<[u8; 6]> {
+    let parts: Vec<&str> = mac.trim().split(|c| c == ':' || c == '-').collect();
+    if parts.len() != 6 {
+        return None;
+    }
+    let mut out = [0u8; 6];
+    for (o, p) in out.iter_mut().zip(&parts) {
+        if p.len() != 2 {
+            return None;
+        }
+        *o = u8::from_str_radix(p, 16).ok()?;
+    }
+    (out != [0; 6]).then_some(out)
+}
+
+/// Wake-on-LAN's "magic packet" for a card: six 0xFF bytes, then its address sixteen times.
+pub fn magic_packet(mac: [u8; 6]) -> Vec<u8> {
+    let mut p = vec![0xFF; 6];
+    for _ in 0..16 {
+        p.extend_from_slice(&mac);
+    }
+    p
+}
+
+/// The broadcast address of the network that `ip` with `netmask` is on.
+pub fn broadcast_of(ip: &str, netmask: &str) -> Option<std::net::Ipv4Addr> {
+    let ip: std::net::Ipv4Addr = ip.trim().parse().ok()?;
+    let mask: std::net::Ipv4Addr = netmask.trim().parse().ok()?;
+    let (ip, mask) = (u32::from(ip), u32::from(mask));
+    (mask != 0 && mask != u32::MAX).then(|| std::net::Ipv4Addr::from(ip | !mask))
 }
 
 /// A server's network card (a PIF).
@@ -535,12 +600,29 @@ pub struct HostNic {
     /// A cable is in and the link is up, at `speed` Mbit/s (0 when not known).
     pub carrier: bool,
     pub speed: i64,
+    /// Its hardware address ("aa:bb:cc:dd:ee:ff") and its address's netmask, when it has one.
+    pub mac: String,
+    pub netmask: String,
 }
 
 impl HostInfo {
     /// On and answering.
     pub fn is_up(&self) -> bool {
         self.live && !self.unreachable
+    }
+
+    /// In maintenance mode: marked so and not taking VMs (a mark left on a server that takes VMs
+    /// again, as after a restart on servers that re-enable themselves, doesn't count).
+    pub fn in_maintenance(&self) -> bool {
+        self.maintenance && !self.enabled
+    }
+
+    /// Where a Wake-on-LAN signal for it goes: the hardware address of the card it's managed
+    /// through, and the broadcast address of that card's network (when its address and netmask
+    /// say).
+    pub fn wake_target(&self) -> Option<WakeTarget> {
+        let n = self.nics.iter().find(|n| n.management && parse_mac(&n.mac).is_some())?;
+        Some(WakeTarget { mac: n.mac.clone(), broadcast: broadcast_of(&n.ip, &n.netmask).map(|b| b.to_string()).unwrap_or_default() })
     }
 
     /// Its license's name for people: the server's own, else its edition's words ("Premium
@@ -1316,7 +1398,7 @@ pub fn fmt_duration(secs: i64) -> String {
 /// XenAPI's times, like "20261114T13:22:01Z", in seconds since 1970.
 /// The civil date (year, month 1–12, day) of a day counted from 1970 (Howard Hinnant's algorithm,
 /// the inverse of the one in `parse_xen_time`).
-fn civil_from_days(z: i64) -> (i64, i64, i64) {
+pub fn civil_from_days(z: i64) -> (i64, i64, i64) {
     let z = z + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z - era * 146_097;
@@ -1326,6 +1408,21 @@ fn civil_from_days(z: i64) -> (i64, i64, i64) {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     (yoe + era * 400 + if m <= 2 { 1 } else { 0 }, m, d)
+}
+
+/// The local time zone's offset at `t`, in seconds east of UTC (0 where it can't be had).
+pub fn local_offset(t: i64) -> i64 {
+    #[cfg(unix)]
+    {
+        let tt = t as libc::time_t;
+        // SAFETY: localtime_r only writes the tm it's given; a zeroed tm is a valid one
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        if !unsafe { libc::localtime_r(&tt, &mut tm) }.is_null() {
+            return tm.tm_gmtoff as i64;
+        }
+    }
+    let _ = t;
+    0
 }
 
 /// When something happened, for people: "Today, 08:42", "Yesterday, 19:10", "3 Nov, 14:00", or
@@ -1368,6 +1465,13 @@ pub fn fmt_date(t: i64) -> String {
     const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
     let (y, m, d) = civil_from_days(t.div_euclid(86_400));
     format!("{} {} {}", d, MONTHS[(m - 1) as usize], y)
+}
+
+/// A time (seconds since 1970) as XenAPI writes them: "20261114T13:22:01Z".
+pub fn xen_time_text(t: i64) -> String {
+    let (y, m, d) = civil_from_days(t.div_euclid(86_400));
+    let s = t.rem_euclid(86_400);
+    format!("{:04}{:02}{:02}T{:02}:{:02}:{:02}Z", y, m, d, s / 3600, s / 60 % 60, s % 60)
 }
 
 pub fn parse_xen_time(t: &str) -> Option<i64> {
@@ -1759,6 +1863,33 @@ pub fn nfs_exports(answer: &str) -> Vec<String> {
 #[cfg(test)]
 mod iso_tests {
     use super::*;
+
+    #[test]
+    fn wake_on_lan_signal() {
+        assert_eq!(parse_mac("00:1A:2b:3c:4d:5e"), Some([0x00, 0x1a, 0x2b, 0x3c, 0x4d, 0x5e]));
+        assert_eq!(parse_mac("00-1a-2b-3c-4d-5e"), Some([0x00, 0x1a, 0x2b, 0x3c, 0x4d, 0x5e]));
+        assert_eq!(parse_mac("00:00:00:00:00:00"), None);
+        assert_eq!(parse_mac("00:1a:2b:3c:4d"), None);
+        assert_eq!(parse_mac(""), None);
+        let p = magic_packet([1, 2, 3, 4, 5, 6]);
+        assert_eq!(p.len(), 102);
+        assert_eq!(&p[..6], &[0xFF; 6]);
+        assert_eq!(&p[96..], &[1, 2, 3, 4, 5, 6]);
+        assert_eq!(broadcast_of("192.168.1.20", "255.255.255.0").map(|b| b.to_string()).as_deref(), Some("192.168.1.255"));
+        assert_eq!(broadcast_of("10.20.3.4", "255.255.0.0").map(|b| b.to_string()).as_deref(), Some("10.20.255.255"));
+        assert_eq!(broadcast_of("10.20.3.4", ""), None);
+        let mut h = HostInfo::default();
+        assert_eq!(h.wake_target(), None);
+        h.nics.push(HostNic { device: "eth1".into(), mac: "aa:bb:cc:00:00:02".into(), ..Default::default() });
+        h.nics.push(HostNic { device: "eth0".into(), management: true, ip: "192.168.1.20".into(), netmask: "255.255.255.0".into(), mac: "aa:bb:cc:00:00:01".into(), ..Default::default() });
+        assert_eq!(h.wake_target(), Some(WakeTarget { mac: "aa:bb:cc:00:00:01".into(), broadcast: "192.168.1.255".into() }));
+        // maintenance: marked, and not taking VMs
+        h.maintenance = true;
+        h.enabled = true;
+        assert!(!h.in_maintenance());
+        h.enabled = false;
+        assert!(h.in_maintenance());
+    }
 
     #[test]
     fn nfs_storage_locations() {
