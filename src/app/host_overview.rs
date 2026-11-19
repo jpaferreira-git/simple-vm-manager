@@ -113,8 +113,8 @@ struct LoadLine<'a> {
 
 impl App {
     /// Reads the load of the servers `hosts` (reference, uuid, address) every five seconds while
-    /// they're shown.
-    fn poll_hosts(&mut self, ctx: &egui::Context, conn: &Arc<dyn Connection>, hosts: Vec<(String, String, String)>) {
+    /// they're shown (on their Overview, or for the Move dialog's CPU bar).
+    pub(super) fn poll_hosts(&mut self, ctx: &egui::Context, conn: &Arc<dyn Connection>, hosts: Vec<(String, String, String)>) {
         for (host, uuid, address) in hosts {
             let due = self.host_perf.get(&host).map_or(true, |(t, _)| t.elapsed() >= Duration::from_secs(5));
             if due && self.host_perf_busy.insert(host.clone()) {

@@ -22,6 +22,7 @@ affiliated with or endorsed by the makers of XenServer or XCP-ng.
 | ![A pool's updates](docs/screenshot-dark-updates.png) | ![Updating a pool](docs/screenshot-dark-updating.png) |
 | ![Every ISO file of every pool](docs/screenshot-dark-iso-library.png) | ![Where your VMs' disks are](docs/screenshot-dark-vm-storage.png) |
 | ![Adding NFS storage for VMs](docs/screenshot-dark-new-storage.png) | ![Moving a VM](docs/screenshot-dark-move-vm.png) |
+| ![Exporting a running VM to a file](docs/screenshot-dark-export.png) | ![A new VM from a .xva file](docs/screenshot-dark-import.png) |
 | ![Your networks](docs/screenshot-dark-networks.png) | ![Adding a network on a VLAN](docs/screenshot-dark-new-network.png) |
 
 ## Features
@@ -181,7 +182,18 @@ affiliated with or endorsed by the makers of XenServer or XCP-ng.
   row's end deletes a network (its VLAN off every server's card first); it's off, saying why, for a
   card's own network, or while VMs' or templates' cards are on it.
 - **Copy VM** — in the same menu: a VM just like one that's off, with its own disks (an instant copy
-  where they are, or in full onto other storage) and new network addresses.
+  where they are, or in full onto other storage) and new network addresses. Each storage says
+  whether it's *thin* (a disk takes only what's written on it: EXT, NFS, SMB…) or *thick* (LVM,
+  iSCSI: its whole size), and the dialog says how much the copy takes there.
+- **Export and import (.xva)** — *Export to a File…*, in the same menu (and the right-click menu),
+  saves a VM in one file on this computer, as XenServer and XenCenter write it: its settings and its
+  disks, compressed on the server if you like. A running VM keeps running: the app takes a snapshot,
+  saves that and deletes it (its disks are then as after a power cut, which it says first). A
+  template's row and a snapshot's have it too. *New VM* brings one back with *Create from: A file*
+  (or drop a .xva on the window): what's in it is read first (its system, CPUs, memory, disks and
+  cards), then its name, server, storage and network are yours to choose, and it can start once
+  it's in; a template comes in as a template. Both go under Activities with how much and how fast,
+  and *Stop* in their details; a stopped one leaves nothing behind.
 - **Delete VM** — the bin next to a VM's tabs, or on its right-click menu. It asks first, and its disks go too unless unticked (a disk another VM also uses stays);
   its snapshots go with it, and ISO files in its DVD drive aren't touched. A VM that's on is
   turned off first, the button saying so ("Shut down and delete").
@@ -197,7 +209,9 @@ affiliated with or endorsed by the makers of XenServer or XCP-ng.
 - **Move a VM** — the Move button next to a VM's tabs, *Move…* on its right-click menu, or drag it
   onto a server in the tree: one dialog for the server it goes to (each with its free memory, or
   why it can't take it) and the storage of each of its disks (where it is when that server sees
-  it, else that server's own, or the roomiest it sees). Running, it keeps running: moved live,
+  it, else that server's own, or the roomiest it sees). Under *After the move*, bars show what's
+  in use there now and what the VM adds: the server's memory and CPUs, and the storage (on thin
+  storage only what's written on its disks counts). Running, it keeps running: moved live,
   its disks copied as it runs when they change storage (also on the same server); off, its disks
   are copied and swapped in, and it starts on that server from then on. Its DVD drive is emptied
   first when its disc's library isn't seen where it goes. Progress in Activities.

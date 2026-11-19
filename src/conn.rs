@@ -8,7 +8,7 @@ use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -454,6 +454,14 @@ pub trait Connection: Send + Sync {
     /// `address` is the server to send them to for a library that only one server sees; a shared
     /// one takes them on the pool coordinator. A failed or cancelled upload leaves nothing behind.
     fn upload_iso(&self, sr_ref: &str, address: Option<&str>, src: &Source, name: &str, t: &Arc<Transfer>) -> Result<(), ApiError>;
+    /// Saves a VM, a template or a snapshot (`obj`) in a .xva file on this computer, compressed on
+    /// the server (zstd) with `compress`. A running VM is saved from a snapshot taken for it
+    /// (`via_snapshot`), deleted afterwards. The bytes saved. One that fails or is stopped leaves
+    /// no file behind (it's written beside, then renamed).
+    fn export_vm(&self, obj: &str, to: &Path, compress: bool, via_snapshot: bool, t: &Arc<Transfer>) -> Result<u64, ApiError>;
+    /// Brings a .xva file into the pool (see `ImportVm`), then names it, sets its home server and
+    /// moves its network cards as asked. The VM (or template) made.
+    fn import_vm(&self, imp: &ImportVm, t: &Arc<Transfer>) -> Result<String, ApiError>;
     fn close(&self);
 }
 
@@ -650,6 +658,25 @@ pub struct Transfer {
     pub finishing: AtomicBool,
     /// Set by the window to stop it.
     pub cancel: AtomicBool,
+    /// How far the server's own task is, per mille plus one (0 while it hasn't said): an export,
+    /// whose size isn't known till it ends.
+    server_part: AtomicU64,
+}
+
+impl Transfer {
+    /// The server says its task is this far (0 to 1).
+    pub fn set_part(&self, f: f64) {
+        self.server_part.store((f.clamp(0.0, 1.0) * 1000.0) as u64 + 1, Ordering::Relaxed);
+    }
+    /// How far it is: of the bytes to send when that's known, else as the server's task says.
+    pub fn fraction(&self) -> Option<f32> {
+        let (sent, total) = (self.sent.load(Ordering::Relaxed), self.total.load(Ordering::Relaxed));
+        if total > 0 {
+            return Some((sent as f64 / total as f64).min(1.0) as f32);
+        }
+        let p = self.server_part.load(Ordering::Relaxed);
+        (p > 0).then(|| (p - 1) as f32 / 1000.0)
+    }
 }
 
 /// The code of the error an upload ends with when it's cancelled.
@@ -782,6 +809,133 @@ pub struct RealConnection {
 const SILENT_LOOKS: u32 = 2;
 
 impl RealConnection {
+    /// The address to reach a server over HTTPS (`address`, else the pool's coordinator), and
+    /// the session to send along.
+    fn http_base(&self, address: Option<&str>) -> (String, String) {
+        let (coordinator, session) = {
+            let st = self.state.lock().unwrap();
+            (st.host.clone(), st.session.clone().unwrap_or_default())
+        };
+        let host = address.filter(|a| !a.is_empty()).map(str::to_string).unwrap_or(coordinator);
+        let host = if host.contains(':') && !host.starts_with('[') { format!("[{}]", host) } else { host };
+        let port = if self.port == DEFAULT_PORT { String::new() } else { format!(":{}", self.port) };
+        (format!("https://{}{}", host, port), session)
+    }
+
+    /// One VM, template or snapshot into a .xva: an HTTP GET of /export (the coordinator sends it
+    /// on to the server that has its disks), written beside `to` and renamed once whole, the
+    /// server's task looked at meanwhile for how far it is.
+    fn export_one(&self, obj: &str, to: &Path, compress: bool, t: &Arc<Transfer>) -> Result<u64, ApiError> {
+        let uuid = self.call("VM.get_uuid", vec![json!(obj)], 30_000)?.as_str().unwrap_or_default().to_string();
+        let label = to.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        let task = self.call("task.create", vec![json!("Export"), json!(label)], 30_000)?.as_str().unwrap_or_default().to_string();
+        let (base, session) = self.http_base(None);
+        let how = if compress { "zstd" } else { "false" };
+        let url = format!("{}/export?session_id={}&uuid={}&task_id={}&use_compression={}", base, session, uuid, task, how);
+        if let Some(w) = watched() {
+            w.trace.push(Said::Asked, format!("GET /export  uuid={}  use_compression={}", uuid, how));
+            w.trace.push(Said::Note, format!("Saving it as {}", to.display()));
+        }
+        let part = to.with_file_name(format!("{}.part", label));
+        let finish = |r: Result<u64, ApiError>| -> Result<u64, ApiError> {
+            if r.is_err() {
+                let _ = std::fs::remove_file(&part);
+            }
+            r
+        };
+        let agent = ureq::AgentBuilder::new()
+            .tls_connector(self.tls.clone())
+            .timeout_connect(Duration::from_secs(30))
+            .timeout_read(Duration::from_secs(600))
+            .user_agent(concat!("SimpleVMManager/", env!("CARGO_PKG_VERSION")))
+            .build();
+        let resp = match agent.get(&url).call() {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = self.call("task.cancel", vec![json!(task)], 30_000);
+                let verdict = self.task_result(&task, Duration::from_secs(20));
+                let _ = self.call("task.destroy", vec![json!(task)], 30_000);
+                return Err(match (verdict, e) {
+                    (Err(e), _) if e.code != CANCELLED => e,
+                    (_, ureq::Error::Status(code, r)) => ApiError::other(format!("The server answered the export with HTTP {} {}.", code, r.status_text())),
+                    (_, e) => ApiError::other(e.to_string()),
+                });
+            }
+        };
+        let mut out = match std::fs::File::create(&part) {
+            Ok(f) => f,
+            Err(e) => {
+                let _ = self.call("task.cancel", vec![json!(task)], 30_000);
+                let _ = self.call("task.destroy", vec![json!(task)], 30_000);
+                return Err(ApiError::other(format!("Couldn't write {}: {}", part.display(), e)));
+            }
+        };
+        // the server's task says how far it is (the file's size isn't known till it ends)
+        let done = AtomicBool::new(false);
+        let written = std::thread::scope(|sc| {
+            sc.spawn(|| {
+                while !done.load(Ordering::Relaxed) {
+                    for _ in 0..20 {
+                        if done.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                    if let Ok(p) = self.call_raw("task.get_progress", vec![json!(task)], 20_000) {
+                        if let Some(f) = p.as_f64().or_else(|| p.as_str().and_then(|x| x.parse().ok())) {
+                            t.set_part(f);
+                        }
+                    }
+                }
+            });
+            let r = (|| -> Result<u64, String> {
+                let mut src = resp.into_reader();
+                let mut buf = vec![0u8; 1 << 20];
+                let mut total = 0u64;
+                loop {
+                    if t.cancel.load(Ordering::Relaxed) {
+                        return Err(String::new());
+                    }
+                    let n = src.read(&mut buf).map_err(|e| format!("The download broke off: {}", e))?;
+                    if n == 0 {
+                        break;
+                    }
+                    out.write_all(&buf[..n]).map_err(|e| format!("Couldn't write {}: {}", part.display(), e))?;
+                    total += n as u64;
+                    t.sent.fetch_add(n as u64, Ordering::Relaxed);
+                }
+                out.sync_all().map_err(|e| format!("Couldn't write {}: {}", part.display(), e))?;
+                Ok(total)
+            })();
+            done.store(true, Ordering::Relaxed);
+            r
+        });
+        t.finishing.store(true, Ordering::Relaxed);
+        drop(out);
+        let cancelled = t.cancel.load(Ordering::Relaxed);
+        if cancelled || written.is_err() {
+            let _ = self.call("task.cancel", vec![json!(task)], 30_000);
+        }
+        let verdict = self.task_result(&task, Duration::from_secs(if written.is_ok() && !cancelled { 300 } else { 30 }));
+        let _ = self.call("task.destroy", vec![json!(task)], 30_000);
+        if cancelled {
+            return finish(Err(ApiError { code: CANCELLED.into(), details: vec![] }));
+        }
+        let bytes = match (verdict, written) {
+            (Err(e), _) if e.code != CANCELLED => return finish(Err(e)),
+            (_, Err(why)) => return finish(Err(ApiError::other(why))),
+            (Ok(true), Ok(n)) => n,
+            (_, Ok(_)) => return finish(Err(ApiError::other("The server didn't say the export was whole."))),
+        };
+        if let Err(e) = std::fs::rename(&part, to) {
+            return finish(Err(ApiError::other(format!("Couldn't name it {}: {}", to.display(), e))));
+        }
+        if let Some(w) = watched() {
+            w.trace.push(Said::Answer, format!("{} saved", fmt_bytes(bytes as i64)));
+        }
+        Ok(bytes)
+    }
+
     pub fn new(host_and_port: &str, user: &str, password: &str) -> RealConnection {
         let mut host = host_and_port.trim().to_string();
         let mut port = DEFAULT_PORT;
@@ -1387,6 +1541,15 @@ fn hidden_network(other_config: &Value) -> bool {
 }
 
 /// A task's result: the reference (or value) inside its <value>…</value>, or nothing.
+/// The references in a task's result ("<value><array><data><value>OpaqueRef:…"), in order.
+fn task_refs(result: &str) -> Vec<String> {
+    result
+        .match_indices("OpaqueRef:")
+        .map(|(i, _)| result[i..].chars().take_while(|c| c.is_ascii_alphanumeric() || *c == ':' || *c == '-').collect::<String>())
+        .filter(|r| r != "OpaqueRef:NULL")
+        .collect()
+}
+
 fn task_value(result: &str) -> Value {
     let inner = result.trim().trim_start_matches("<value>").trim_end_matches("</value>").trim();
     if inner.is_empty() {
@@ -1461,6 +1624,20 @@ fn val_str(v: &Value) -> String {
 }
 fn s(o: &Value, k: &str) -> String {
     o.get(k).map(val_str).unwrap_or_default()
+}
+
+/// What's written on a disk on thin storage: its own file and the ones it's built on (a
+/// snapshot's or a template's: sm_config's vhd-parent), which go with it when it's copied.
+fn written(vdi: &Value, by_uuid: &HashMap<String, &Value>) -> i64 {
+    let mut sum = n(vdi, "physical_utilisation");
+    let mut at = vdi;
+    for _ in 0..64 {
+        let parent = s(at.get("sm_config").unwrap_or(&Value::Null), "vhd-parent");
+        let Some(p) = by_uuid.get(&parent) else { break };
+        sum += n(p, "physical_utilisation");
+        at = p;
+    }
+    sum
 }
 fn n(o: &Value, k: &str) -> i64 {
     match o.get(k) {
@@ -1744,6 +1921,7 @@ impl Connection for RealConnection {
         }
         let vbds = self.all("VBD", t)?;
         let vdis = self.all("VDI", t)?;
+        let vdi_by_uuid: HashMap<String, &Value> = vdis.values().map(|v| (s(v, "uuid"), v)).collect();
         let vm_records = self.all("VM", t)?;
         // the built-in templates (a copy made by someone has no default_template mark)
         for (k, r) in vm_records.iter().filter(|(_, r)| b(r, "is_a_template") && !b(r, "is_a_snapshot")) {
@@ -1871,6 +2049,9 @@ impl Connection for RealConnection {
                     d.size = n(vdi, "virtual_size");
                     d.sr = s(vdi, "SR");
                     d.sr_name = sr_names.get(&d.sr).cloned().unwrap_or_default();
+                    if pd.srs.iter().any(|x| x.rref == d.sr && x.is_thin()) {
+                        d.used = written(vdi, &vdi_by_uuid);
+                    }
                 } else if cd {
                     d.name = "(empty)".into();
                 }
@@ -3137,6 +3318,89 @@ impl Connection for RealConnection {
         result
     }
 
+    fn export_vm(&self, obj: &str, to: &Path, compress: bool, via_snapshot: bool, t: &Arc<Transfer>) -> Result<u64, ApiError> {
+        if !via_snapshot {
+            return self.export_one(obj, to, compress, t);
+        }
+        let name = self.call("VM.get_name_label", vec![json!(obj)], 30_000)?.as_str().unwrap_or_default().to_string();
+        let snap = self.call("VM.snapshot", vec![json!(obj), json!(format!("{} (for an export)", name))], 1_800_000)?.as_str().unwrap_or_default().to_string();
+        let result = self.export_one(&snap, to, compress, t);
+        note("The snapshot was only for the export: deleting it.");
+        match self.delete_snapshot(&snap) {
+            Ok(left) if !left.is_empty() => note(format!("Not deleted: {}", left.join("; "))),
+            Err(e) => note(format!("The snapshot couldn't be deleted ({}): delete it on the Snapshots tab.", e.message())),
+            Ok(_) => {}
+        }
+        result
+    }
+
+    fn import_vm(&self, imp: &ImportVm, t: &Arc<Transfer>) -> Result<String, ApiError> {
+        let file = &imp.file;
+        let size = std::fs::metadata(file).map_err(|e| ApiError::other(format!("Couldn't read {}: {}", file.display(), e)))?.len();
+        let f = std::fs::File::open(file).map_err(|e| ApiError::other(format!("Couldn't open {}: {}", file.display(), e)))?;
+        t.total.store(size, Ordering::Relaxed);
+        let label = file.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        let task = self.call("task.create", vec![json!("Import"), json!(label)], 30_000)?.as_str().unwrap_or_default().to_string();
+        let (base, session) = self.http_base(imp.address.as_deref());
+        let url = format!("{}/import?session_id={}&task_id={}&sr_id={}&restore=false&force=false", base, session, task, imp.sr);
+        if let Some(w) = watched() {
+            w.trace.push(Said::Asked, format!("PUT /import  sr={}  file=\"{}\"  ({})", named(&imp.names, &imp.sr), label, fmt_bytes(size as i64)));
+        }
+        let agent = ureq::AgentBuilder::new()
+            .tls_connector(self.tls.clone())
+            .timeout_connect(Duration::from_secs(30))
+            .timeout_write(Duration::from_secs(600))
+            .timeout_read(Duration::from_secs(3600))
+            .redirects(0)
+            .user_agent(concat!("SimpleVMManager/", env!("CARGO_PKG_VERSION")))
+            .build();
+        let body = Counting { inner: Box::new(std::io::BufReader::with_capacity(1 << 20, f)), t: t.clone() };
+        let sent = agent.put(&url).set("Content-Length", &size.to_string()).send(body);
+        t.finishing.store(true, Ordering::Relaxed);
+        let cancelled = t.cancel.load(Ordering::Relaxed);
+        let put_error = match sent {
+            Ok(_) => None,
+            Err(ureq::Error::Status(code, _)) => Some(ApiError::other(format!("The server answered the import with HTTP {}.", code))),
+            Err(e) => Some(ApiError::other(e.to_string())),
+        };
+        if cancelled || put_error.is_some() {
+            let _ = self.call("task.cancel", vec![json!(task)], 30_000);
+        }
+        // the server writes the disks as they come; what's left is short
+        let wait = if cancelled || put_error.is_some() { 60 } else { 1800 };
+        let verdict = self.task_result(&task, Duration::from_secs(wait));
+        let made = self.call_raw("task.get_result", vec![json!(task)], 30_000).ok().map(|v| v.as_str().unwrap_or_default().to_string()).unwrap_or_default();
+        let _ = self.call("task.destroy", vec![json!(task)], 30_000);
+        if cancelled {
+            return Err(ApiError { code: CANCELLED.into(), details: vec![] });
+        }
+        match verdict {
+            Ok(true) => {}
+            Err(e) if e.code != CANCELLED => return Err(e),
+            _ => return Err(put_error.unwrap_or_else(|| ApiError::other("The server didn't finish the import in time."))),
+        }
+        // the task's result: the VMs made, as XML ("<value><array>…OpaqueRef:…")
+        let vms = task_refs(&made);
+        let vm = vms.first().cloned().ok_or_else(|| ApiError::other("The server imported it but didn't say what it made."))?;
+        if let Some(w) = watched() {
+            w.trace.push(Said::Answer, format!("{}  (imported)", vm));
+        }
+        let t30 = 30_000;
+        self.call("VM.set_name_label", vec![json!(vm), json!(imp.name)], t30)?;
+        if let Some(h) = &imp.host {
+            self.call("VM.set_affinity", vec![json!(vm), json!(h)], t30)?;
+        }
+        if let Some(net) = &imp.network {
+            let vifs: Vec<String> = self.call("VM.get_VIFs", vec![json!(vm)], t30)?.as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
+            for vif in vifs {
+                if self.call("VIF.get_network", vec![json!(vif)], t30)?.as_str() != Some(net.as_str()) {
+                    self.call("VIF.move", vec![json!(vif), json!(net)], 120_000)?;
+                }
+            }
+        }
+        Ok(vm)
+    }
+
     /// The VM's VNC console through an HTTP CONNECT tunnel on the server's HTTPS port, as the
     /// original's console: CONNECT <console location>&session_id=<session> HTTP/1.0.
     fn open_console(&self, vm_ref: &str) -> Result<ConsoleStream, ApiError> {
@@ -3303,7 +3567,8 @@ impl DemoConnection {
         };
         d.srs.push(SrInfo { device: "/dev/disk/by-id/ata-Samsung_SSD_870_EVO_1TB_S6PTNX0T123456A-part3".into(), ..sr("sr-local1", "Local storage", "lvm", 900 * GB, 0, Some("host-a")) });
         d.srs.push(sr("sr-dvd1", "DVD drives", "udev", 4_700_000_000, 4_700_000_000, Some("host-a"))); // a disc in it
-        d.srs.push(SrInfo { device: "/dev/sda3".into(), ..sr("sr-local2", "Local storage", "lvm", 900 * GB, 0, Some("host-b")) });
+        // (demo-host-02's installed with thin provisioning: EXT, not LVM)
+        d.srs.push(SrInfo { device: "/dev/sda3".into(), ..sr("sr-local2", "Local storage", "ext", 900 * GB, 0, Some("host-b")) });
         d.srs.push(sr("sr-dvd2", "DVD drives", "udev", 0, 0, Some("host-b"))); // empty: not listed
         d.srs.push(sr("sr-usb2", "Removable storage", "udev", 0, 0, Some("host-b"))); // empty: not listed
         d.srs.push(SrInfo { location: "nas:/mnt/tank/vms".into(), share: "NFS (v3)".into(), ..sr("sr-nfs", "Shared NFS storage", "nfs", 4096 * GB, 0, None) });
@@ -3375,6 +3640,7 @@ impl DemoConnection {
         for (i, (r, name, desc, p, host, os, ip, cpus, mem, srr, disk)) in vms.iter().enumerate() {
             let sr_name = d.sr(srr).map(|x| x.name.clone()).unwrap_or_default();
             let storage_host = d.sr(srr).and_then(|x| x.host.clone());
+            let thin = d.sr(srr).is_some_and(|x| x.is_thin());
             if let Some(x) = d.srs.iter_mut().find(|x| x.rref == *srr) {
                 x.used += disk * GB;
             }
@@ -3395,7 +3661,8 @@ impl DemoConnection {
                 vcpus: *cpus,
                 allowed: vec![],
                 disks: vec![
-                    VmDisk { name: format!("{} disk 0", name), device: "0".into(), vbd: format!("{}-vbd-0", r), vdi: format!("{}-vdi-0", r), sr: srr.to_string(), sr_name, kind: "Disk".into(), size: disk * GB, ..Default::default() },
+                    // on thin storage about a third of it written; on LVM not known
+                    VmDisk { name: format!("{} disk 0", name), device: "0".into(), vbd: format!("{}-vbd-0", r), vdi: format!("{}-vdi-0", r), sr: srr.to_string(), sr_name, kind: "Disk".into(), size: disk * GB, used: if thin { disk * GB * 7 / 20 } else { 0 }, ..Default::default() },
                     VmDisk { name: "(empty)".into(), device: "3".into(), vbd: format!("{}-vbd-3", r), kind: "DVD drive".into(), ..Default::default() },
                 ],
                 nics: vec![VmNic { device: "0".into(), vif: format!("{}-vif-0", r), net: "net-0".into(), mac: format!("aa:16:3e:{:02x}:10:{:02x}", i + 1, 0x20 + i), network: "Pool-wide network 0".into(), ip: ip.to_string() }],
@@ -4093,6 +4360,116 @@ impl Connection for DemoConnection {
         x.files.sort_by_key(|f| f.name.to_lowercase());
         Ok(())
     }
+    /// Pretends to save it in about four seconds (a running VM's snapshot first), the server's
+    /// progress said as it goes; the file written is a real .xva of the VM's settings, without
+    /// its disks, so the demo can import it again.
+    fn export_vm(&self, obj: &str, to: &Path, compress: bool, via_snapshot: bool, t: &Arc<Transfer>) -> Result<u64, ApiError> {
+        let info = {
+            let d = self.data.lock().unwrap();
+            let v = d.vm(obj).or_else(|| d.user_template(obj)).or_else(|| d.vms.iter().find(|v| v.snapshot(obj).is_some()));
+            let v = v.ok_or_else(|| ApiError { code: "HANDLE_INVALID".into(), details: vec!["VM".into(), obj.into()] })?;
+            if !via_snapshot && d.vm(obj).map_or(false, |v| v.power == PowerState::Running) {
+                return Err(ApiError { code: "VM_BAD_POWER_STATE".into(), details: vec![obj.into(), "halted".into(), "running".into()] });
+            }
+            let snap = v.snapshot(obj).map(|x| x.name.clone());
+            crate::xva::XvaInfo {
+                name: snap.map(|n| format!("{} – {}", v.name, n)).unwrap_or_else(|| v.name.clone()),
+                description: v.description.clone(),
+                template: d.user_template(obj).is_some() || v.snapshot(obj).is_some(),
+                os: v.os.clone(),
+                vcpus: v.vcpus,
+                memory: v.mem_dyn_max,
+                disks: v.disks.iter().filter(|k| k.kind == "Disk").map(|k| k.size).collect(),
+                used: v.disks.iter().filter(|k| k.kind == "Disk").map(|k| k.size / 3).sum(),
+                nets: v.nics.iter().map(|n| n.network.clone()).collect(),
+                ..Default::default()
+            }
+        };
+        if via_snapshot {
+            said("VM.snapshot", &[json!(obj), json!(format!("{} (for an export)", info.name))]);
+            demo_work(900);
+        }
+        said("GET /export", &[json!(obj), json!(if compress { "zstd" } else { "false" })]);
+        let bytes = if compress { info.used / 2 } else { info.used } as u64;
+        let slow = if cfg!(test) { 0 } else if std::env::var("SVM_DEMO_SLOW").is_ok() { 40 } else { 4 };
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(slow) {
+            if t.cancel.load(Ordering::Relaxed) {
+                return Err(ApiError { code: CANCELLED.into(), details: vec![] });
+            }
+            let part = start.elapsed().as_secs_f64() / slow as f64;
+            t.set_part(part);
+            t.sent.store((bytes as f64 * part) as u64, Ordering::Relaxed);
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if t.cancel.load(Ordering::Relaxed) {
+            return Err(ApiError { code: CANCELLED.into(), details: vec![] });
+        }
+        crate::xva::write_xva(to, &info).map_err(|e| ApiError::other(format!("Couldn't write {}: {}", to.display(), e)))?;
+        t.sent.store(bytes, Ordering::Relaxed);
+        t.set_part(1.0);
+        if via_snapshot {
+            note("The snapshot was only for the export: deleting it.");
+            said("VM.destroy", &[json!("the snapshot")]);
+        }
+        Ok(bytes)
+    }
+    /// Reads what the file holds, pretends to send it in about four seconds, then adds it to the
+    /// demo pool (a template when it holds one) as asked.
+    fn import_vm(&self, imp: &ImportVm, t: &Arc<Transfer>) -> Result<String, ApiError> {
+        let info = crate::xva::read_header(&imp.file).map_err(ApiError::other)?;
+        t.total.store(info.size, Ordering::Relaxed);
+        said("PUT /import", &[json!(imp.sr), json!(imp.file.display().to_string())]);
+        let slow = if cfg!(test) { 0 } else if std::env::var("SVM_DEMO_SLOW").is_ok() { 40 } else { 4 };
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(slow) {
+            if t.cancel.load(Ordering::Relaxed) {
+                return Err(ApiError { code: CANCELLED.into(), details: vec![] });
+            }
+            t.sent.store((info.size as f64 * start.elapsed().as_secs_f64() / slow as f64) as u64, Ordering::Relaxed);
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if t.cancel.load(Ordering::Relaxed) {
+            return Err(ApiError { code: CANCELLED.into(), details: vec![] });
+        }
+        t.sent.store(info.size, Ordering::Relaxed);
+        t.finishing.store(true, Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(500));
+        let mut d = self.data.lock().unwrap();
+        let base = d.vms.first().cloned().unwrap_or_default();
+        let rref = format!("vm-import-{}", d.vms.len() + d.user_templates.len());
+        let mut v = demo_copy(&base, &rref, &imp.name, &info.description, None, &d.srs);
+        let x = d.sr(&imp.sr).cloned().unwrap_or_default();
+        (v.os, v.vcpus, v.vcpus_max) = (info.os.clone(), info.vcpus.max(1), info.vcpus.max(1));
+        (v.mem_static_max, v.mem_dyn_min, v.mem_dyn_max, v.mem_static_min) = (info.memory, info.memory, info.memory, info.memory.min(GB));
+        let cds: Vec<VmDisk> = v.disks.iter().filter(|k| k.kind != "Disk").cloned().collect();
+        v.disks = info.disks.iter().enumerate().map(|(i, &size)| VmDisk { name: format!("{} {}", imp.name, i), device: i.to_string(), vdi: format!("{}-vdi-{}", rref, i), vbd: format!("{}-vbd-{}", rref, i), sr: x.rref.clone(), sr_name: x.name.clone(), kind: "Disk".into(), size, ..Default::default() }).collect();
+        v.disks.extend(cds);
+        v.storage_host = x.host.clone();
+        v.affinity = imp.host.clone();
+        let nets: Vec<(String, String)> = d.networks.iter().map(|n| (n.rref.clone(), n.name.clone())).collect();
+        v.nics = info
+            .nets
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                let (net, network) = match &imp.network {
+                    Some(r) => nets.iter().find(|n| n.0 == *r).cloned().unwrap_or_default(),
+                    None => nets.iter().find(|n| n.1 == *name).or(nets.first()).cloned().unwrap_or_default(),
+                };
+                VmNic { device: i.to_string(), vif: format!("{}-vif-{}", rref, i), net, network, mac: format!("aa:16:3e:9{}:{:02x}:{:02x}", i, d.vms.len(), i), ip: String::new() }
+            })
+            .collect();
+        if imp.template {
+            v.allowed.clear();
+            d.user_templates.push(v);
+        } else {
+            v.allowed = vec!["start".into()];
+            d.vms.push(v);
+        }
+        recompute(&mut d);
+        Ok(rref)
+    }
     /// Adds the VM to the demo pool, started on the server with the most memory free if asked.
     fn create_vm(&self, v: &NewVm, tr: &Trace) -> Result<String, ApiError> {
         for sr in &v.check {
@@ -4614,12 +4991,18 @@ impl Connection for DemoConnection {
         }
         demo_work(1500 + 1500 * m.disks.len() as u64);
         let mut d = self.data.lock().unwrap();
-        let srs: Vec<(String, String, Option<String>)> = d.srs.iter().map(|x| (x.rref.clone(), x.name.clone(), x.host.clone())).collect();
+        let srs: Vec<(String, String, Option<String>, bool)> = d.srs.iter().map(|x| (x.rref.clone(), x.name.clone(), x.host.clone(), x.is_thin())).collect();
         let v = d.vms.iter_mut().find(|v| v.rref == m.vm).ok_or_else(|| ApiError { code: "HANDLE_INVALID".into(), details: vec!["VM".into(), m.vm.clone()] })?;
         for k in v.disks.iter_mut() {
             if let Some((_, sr)) = m.disks.iter().find(|(vdi, _)| *vdi == k.vdi) {
-                if let Some((r, name, _)) = srs.iter().find(|x| x.0 == *sr) {
+                if let Some((r, name, _, thin)) = srs.iter().find(|x| x.0 == *sr) {
                     (k.sr, k.sr_name) = (r.clone(), name.clone());
+                    // what's written is known on thin storage (a third or so, from LVM); not on LVM
+                    k.used = match (*thin, k.used) {
+                        (false, _) => 0,
+                        (true, 0) => k.size * 7 / 20,
+                        (true, u) => u,
+                    };
                 }
             }
         }
@@ -5116,6 +5499,64 @@ mod tests {
         assert_eq!(c.upload_iso("sr-iso", None, &file, "other.iso", &t).unwrap_err().code, CANCELLED);
         assert!(!has("other.iso"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn demo_export_then_import() {
+        let dir = std::env::temp_dir().join(format!("svm-xva-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let c = DemoConnection::new();
+        // a running VM only from a snapshot
+        let to = dir.join("web.xva");
+        assert_eq!(c.export_vm("vm-web", &to, true, false, &Arc::new(Transfer::default())).unwrap_err().code, "VM_BAD_POWER_STATE");
+        let t = Arc::new(Transfer::default());
+        let bytes = c.export_vm("vm-web", &to, true, true, &t).unwrap();
+        assert!(bytes > 0 && t.fraction().map_or(false, |f| f > 0.9));
+        // what it holds, read back, then brought in under another name, its cards moved
+        let info = crate::xva::read_header(&to).unwrap();
+        let web = c.data.lock().unwrap().vm("vm-web").cloned().unwrap();
+        assert_eq!((info.name.as_str(), info.vcpus, info.template), ("Web Server", web.vcpus, false));
+        let imp = ImportVm { file: to.clone(), name: "Web Server 2".into(), sr: "sr-nfs".into(), network: Some("net-1".into()), ..Default::default() };
+        let t = Arc::new(Transfer::default());
+        let vm = c.import_vm(&imp, &t).unwrap();
+        let d = c.data.lock().unwrap().clone();
+        let v = d.vm(&vm).unwrap();
+        assert_eq!((v.name.as_str(), v.power), ("Web Server 2", PowerState::Halted));
+        assert!(v.disks.iter().filter(|k| k.kind == "Disk").all(|k| k.sr == "sr-nfs"));
+        assert!(!v.nics.is_empty() && v.nics.iter().all(|n| n.net == "net-1"));
+        // a stopped one leaves nothing
+        let t = Arc::new(Transfer::default());
+        t.cancel.store(true, Ordering::Relaxed);
+        let imp = ImportVm { name: "Never".into(), ..imp };
+        assert_eq!(c.import_vm(&imp, &t).unwrap_err().code, CANCELLED);
+        assert!(!c.data.lock().unwrap().vms.iter().any(|v| v.name == "Never"));
+        // a template comes in as one
+        let tpl = dir.join("tpl.xva");
+        c.export_vm("tpl-web", &tpl, false, false, &Arc::new(Transfer::default())).unwrap();
+        let imp = ImportVm { file: tpl.clone(), name: "Web template 2".into(), sr: "sr-nfs".into(), template: true, ..Default::default() };
+        let r = c.import_vm(&imp, &Arc::new(Transfer::default())).unwrap();
+        assert!(c.data.lock().unwrap().user_template(&r).is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn written_counts_what_a_disk_is_built_on() {
+        // a VM's disk on its snapshot's file, on a template's: all three go with it
+        let base = json!({"uuid": "u-base", "physical_utilisation": "9000", "sm_config": {}});
+        let snap = json!({"uuid": "u-snap", "physical_utilisation": 3000, "sm_config": {"vhd-parent": "u-base"}});
+        let leaf = json!({"uuid": "u-leaf", "physical_utilisation": 500, "sm_config": {"vhd-parent": "u-snap"}});
+        let by_uuid: HashMap<String, &Value> = [&base, &snap, &leaf].into_iter().map(|v| (s(v, "uuid"), v)).collect();
+        assert_eq!(written(&leaf, &by_uuid), 12500);
+        assert_eq!(written(&base, &by_uuid), 9000);
+        // a parent that isn't there (another pool's, or gone): only what's known
+        let lone = json!({"uuid": "u-lone", "physical_utilisation": 700, "sm_config": {"vhd-parent": "u-gone"}});
+        assert_eq!(written(&lone, &by_uuid), 700);
+    }
+
+    #[test]
+    fn task_refs_read() {
+        assert_eq!(task_refs("<value><array><data><value>OpaqueRef:1a-2b</value><value>OpaqueRef:NULL</value></data></array></value>"), vec!["OpaqueRef:1a-2b".to_string()]);
+        assert!(task_refs("").is_empty());
     }
 
     #[test]

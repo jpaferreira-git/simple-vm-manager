@@ -12,6 +12,7 @@ use crate::newvm::{NewVmAction, NewVmDialog};
 use crate::movevm::{MoveAction, MoveDialog};
 use crate::pool_update::{PlanSr, PlanVm, PoolUpdateAction, PoolUpdateDialog, PoolView, UpdateRun};
 use crate::upload::{UploadAction, UploadDialog};
+use crate::xva::{ExportAction, ExportDialog, Exported};
 use crate::secrets;
 use crate::update;
 use crate::icons::*;
@@ -19,7 +20,7 @@ use crate::model::*;
 use crate::theme::{self, Pal, ThemeMode};
 use eframe::egui::{self, pos2, vec2, Align2, Color32, FontFamily, FontId, Key, Modifiers, Rect, Rounding, Sense, Stroke, Ui};
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -184,6 +185,14 @@ enum Msg {
     Picked { sid: u32, sr: String, path: Option<PathBuf> },
     /// An upload to library `sr` ended.
     UploadDone { sr: String, result: Result<(), ApiError> },
+    /// The file chooser for a .xva to import closed (None: nothing chosen).
+    XvaPicked(Option<PathBuf>),
+    /// The Save dialog for an export closed (None: cancelled).
+    ExportPicked(Option<PathBuf>),
+    /// An export (job `log`, about `owner`) ended: the bytes saved.
+    Exported { sid: u32, owner: String, log: usize, text: String, path: PathBuf, result: Result<u64, ApiError> },
+    /// An import (job `log`) ended: the VM or template made, and how starting it went (if asked).
+    Imported { sid: u32, log: usize, name: String, file: String, template: bool, started: Option<Result<(), ApiError>>, result: Result<String, ApiError> },
     /// Saving an ISO file's description ended.
     DescriptionDone { sid: u32, sr: String, vdi: String, name: String, text: String, result: Result<(), ApiError> },
     ActionDone { sid: u32, vm: String, log: usize, err: Option<String>, label: &'static str, op: &'static str, text: String },
@@ -385,6 +394,8 @@ enum Dialog {
     Iso(Box<IsoDialog>),
     NewStorage(Box<StorageDialog>),
     Upload(Box<UploadDialog>),
+    /// Export: where a VM, template or snapshot is saved.
+    Export(Box<ExportDialog>),
     /// A pool's updates: what's waiting, fetching, installing.
     PoolUpdate(Box<PoolUpdateDialog>),
     /// Moving a VM to another server or storage.
@@ -425,9 +436,8 @@ enum Dialog {
     NewNetwork(Box<NetworkDialog>),
     /// Deleting a network: pool, network, its name, what happens in words.
     ConfirmDeleteNetwork { sid: u32, net: String, name: String, text: String },
-    /// Copy VM: where its disks can go (reference, label, whether it's where they are now: an
-    /// instant copy), and which.
-    CopyVm { sid: u32, vm: String, vm_name: String, name: String, stores: Vec<(String, String, bool)>, store: usize, focus: bool },
+    /// Copy VM: where its disks can go, and which.
+    CopyVm { sid: u32, vm: String, vm_name: String, name: String, stores: Vec<CopyStore>, store: usize, focus: bool },
     ConfirmDeleteTemplate { sid: u32, tpl: String, name: String, disk: i64 },
     /// Something was being made when contact with the server was lost, and is there now (maybe
     /// half made): delete it?
@@ -510,6 +520,8 @@ enum Intent {
     MakeTemplate(u32, String),
     /// Open the Copy VM dialog: server, VM.
     CopyVm(u32, String),
+    /// Export to a File… for a VM, a template or a snapshot.
+    ExportVm(u32, String),
     /// Open the New VM dialog on this template of the user's: server, template.
     NewVmFromTemplate(u32, String),
     /// Ask before deleting a template of the user's: server, template.
@@ -678,6 +690,9 @@ pub struct App {
     creating: u32,
     /// Files being uploaded, by ISO library (one at a time each).
     uploads: HashMap<String, Upload>,
+    /// Exports and imports under way, by their line in the log: the bytes moved, since when, and
+    /// whether it's an export (else an import).
+    streams: HashMap<usize, (Arc<Transfer>, Instant, bool)>,
     /// Passwords saved in the keychain, by (server, user).
     saved: HashMap<(String, String), String>,
     shot_path: Option<String>,
@@ -781,6 +796,7 @@ impl App {
             creating: 0,
             closing: false,
             uploads: HashMap::new(),
+            streams: HashMap::new(),
             shot_path: start.shot_path,
             shot_show: start.shot_show,
             frames: 0,
@@ -1080,6 +1096,8 @@ impl App {
     fn update_blocked(&self) -> Option<&'static str> {
         if self.uploads.values().any(Upload::active) {
             Some("An ISO file is uploading: wait for it to finish first.")
+        } else if !self.streams.is_empty() {
+            Some("A VM is being exported or imported: wait for it to finish first.")
         } else if self.creating > 0 {
             Some("A new VM is being made: wait for it to finish first.")
         } else if !self.vm_deleting.is_empty() {
@@ -1513,6 +1531,120 @@ impl App {
             crate::conn::watch(&prog);
             let result = conn.copy_vm(&vm, &name, sr.as_deref());
             let _ = tx.send(Msg::Made { sid, vm, name, log, title: "Copy VM", text, template: false, result });
+            ctx.request_repaint();
+        });
+    }
+
+    /// The Export dialog for a VM, a template or a snapshot (`obj`): a running VM is saved from a
+    /// snapshot taken for it.
+    fn ask_export(&mut self, sid: u32, obj: String) {
+        let Some(d) = self.server(sid).and_then(|s| s.data.as_ref()) else { return };
+        let disks = |v: &VmInfo| v.disks.iter().filter(|k| k.kind == "Disk").map(|k| k.size).sum::<i64>();
+        let dlg = if let Some(v) = d.vm(&obj) {
+            let running = matches!(v.power, PowerState::Running | PowerState::Paused);
+            ExportDialog::new(sid, obj.clone(), obj, Exported::Vm, v.name.clone(), String::new(), running, disks(v))
+        } else if let Some(t) = d.user_template(&obj) {
+            ExportDialog::new(sid, obj.clone(), obj, Exported::Template, t.name.clone(), String::new(), false, disks(t))
+        } else if let Some((v, x)) = d.vms.iter().find_map(|v| v.snapshot(&obj).map(|x| (v, x))) {
+            ExportDialog::new(sid, obj.clone(), v.rref.clone(), Exported::Snapshot, x.name.clone(), v.name.clone(), false, disks(v))
+        } else {
+            return;
+        };
+        self.dialog = Dialog::Export(Box::new(dlg));
+    }
+
+    /// New VM, from a file, in pool `sid` (else the first connected), `path` already chosen.
+    fn open_import(&mut self, sid: Option<u32>, path: Option<PathBuf>) {
+        let pools: Vec<u32> = self.servers.iter().filter(|s| s.data.is_some()).map(|s| s.id).collect();
+        match sid.filter(|id| pools.contains(id)).or(pools.first().copied()) {
+            Some(sid) => {
+                if let Some(d) = self.server(sid).and_then(|s| s.data.as_ref()) {
+                    self.dialog = Dialog::NewVm(Box::new(NewVmDialog::new(sid, d, None).with_file(path)));
+                }
+            }
+            None => self.dialog = Dialog::Message { title: "Import".into(), text: "Connect to a server first: the VM in the file goes into one of its pools.".into() },
+        }
+    }
+
+    /// The system's Save dialog for an export (on a worker thread, so the window keeps drawing).
+    fn pick_export_path(&mut self, dir: PathBuf, name: String, ctx: &egui::Context) {
+        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let dialog = rfd::AsyncFileDialog::new().set_title("Export to a file").add_filter("XenServer VM (.xva)", &["xva"]).set_directory(dir).set_file_name(name);
+            let path = pollster::block_on(dialog.save_file()).map(|f| f.path().to_path_buf());
+            let _ = tx.send(Msg::ExportPicked(path));
+            ctx.request_repaint();
+        });
+    }
+
+    /// The system's file chooser for a .xva to import.
+    fn pick_xva(&mut self, ctx: &egui::Context) {
+        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let mut dialog = rfd::AsyncFileDialog::new().set_title("Import a VM").add_filter("XenServer VM (.xva)", &["xva", "XVA"]);
+            let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from);
+            if let Some(dir) = home.map(|h| h.join("Downloads")).filter(|d| d.is_dir()) {
+                dialog = dialog.set_directory(dir);
+            }
+            let path = pollster::block_on(dialog.pick_file()).map(|f| f.path().to_path_buf());
+            let _ = tx.send(Msg::XvaPicked(path));
+            ctx.request_repaint();
+        });
+    }
+
+    /// Saves what the Export dialog says in the background, under Activities (with how much is
+    /// saved, how fast, and Stop in its details). A VM or template that's off is marked busy
+    /// meanwhile: the server won't start or change it while it's read.
+    fn start_export(&mut self, d: &ExportDialog, path: PathBuf, ctx: &egui::Context) {
+        let Some(s) = self.server(d.sid) else { return };
+        let (sid, obj, owner) = (d.sid, d.obj.clone(), d.owner.clone());
+        let file = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        let text = match d.kind {
+            Exported::Vm => format!("Exporting VM '{}' to {}", d.name, file),
+            Exported::Template => format!("Exporting template '{}' to {}", d.name, file),
+            Exported::Snapshot => format!("Exporting the snapshot '{}' of '{}' to {}", d.name, d.of, file),
+        };
+        let about = if d.kind == Exported::Snapshot { d.of.clone() } else { d.name.clone() };
+        let (conn, tx, ctx, server) = (s.conn.clone(), self.tx.clone(), ctx.clone(), s.name());
+        let log = self.add_log(sid, &server, Some(&owner), &about, &text, "In progress");
+        let prog = self.progress(log);
+        self.if_closed(log, format!("The file {} isn't finished: what's been saved is deleted.", file));
+        let t = Arc::new(Transfer::default());
+        self.streams.insert(log, (t.clone(), Instant::now(), true));
+        if !d.running && d.kind != Exported::Snapshot {
+            if let Some(s) = self.server_mut(sid) {
+                s.busy.insert(owner.clone(), ("Exporting…".into(), "download"));
+            }
+        }
+        let (compress, via_snapshot) = (d.compress, d.running);
+        std::thread::spawn(move || {
+            crate::conn::watch(&prog);
+            let result = conn.export_vm(&obj, &path, compress, via_snapshot, &t);
+            let _ = tx.send(Msg::Exported { sid, owner, log, text, path, result });
+            ctx.request_repaint();
+        });
+    }
+
+    /// Brings a .xva into a pool in the background, under Activities (how much of the file is
+    /// sent, how fast, and Stop in its details); started afterwards when asked.
+    fn start_import(&mut self, sid: u32, imp: ImportVm, ctx: &egui::Context) {
+        let Some(s) = self.server(sid) else { return };
+        let file = imp.file.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        let text = if imp.template { format!("Importing {} as template '{}'", file, imp.name) } else { format!("Importing {} as VM '{}'", file, imp.name) };
+        let (conn, tx, ctx, server) = (s.conn.clone(), self.tx.clone(), ctx.clone(), s.name());
+        let log = self.add_log(sid, &server, None, &imp.name, &text, "In progress");
+        let prog = self.progress(log);
+        self.if_closed(log, format!("The import of {} stops; the server deletes what it had of it.", file));
+        let t = Arc::new(Transfer::default());
+        self.streams.insert(log, (t.clone(), Instant::now(), false));
+        std::thread::spawn(move || {
+            crate::conn::watch(&prog);
+            let result = conn.import_vm(&imp, &t);
+            let started = match (&result, imp.start) {
+                (Ok(vm), true) => Some(conn.start_traced(vm, &format!("\"{}\"", imp.name), &prog.trace)),
+                _ => None,
+            };
+            let _ = tx.send(Msg::Imported { sid, log, name: imp.name.clone(), file, template: imp.template, started, result });
             ctx.request_repaint();
         });
     }
@@ -2085,6 +2217,75 @@ impl App {
                     }
                     if let Some(s) = self.server_mut(sid) {
                         s.next_refresh = Instant::now();
+                    }
+                }
+                Msg::XvaPicked(path) => {
+                    if let (Some(p), Dialog::NewVm(d)) = (path, &mut self.dialog) {
+                        d.set_file(p);
+                    }
+                }
+                Msg::ExportPicked(path) => {
+                    if let (Some(p), Dialog::Export(d)) = (path, &mut self.dialog) {
+                        d.chose(p);
+                    }
+                }
+                Msg::Exported { sid, owner, log, text, path, result } => {
+                    self.streams.remove(&log);
+                    if let Some(s) = self.server_mut(sid) {
+                        s.busy.remove(&owner);
+                    }
+                    match result {
+                        Ok(bytes) => {
+                            let took = fmt_took(self.log.get(log).map(|e| e.started.elapsed()).unwrap_or_default());
+                            let folder = path.parent().map(short_home).unwrap_or_default();
+                            self.end_log(log, "Done", Some(format!("{} in {} ({}, in {})", text.replacen("Exporting", "Exported", 1), folder, fmt_bytes(bytes as i64), took)));
+                        }
+                        Err(e) if e.code == CANCELLED => {
+                            let stopped = text.replacen("Exporting", "Stopped exporting", 1);
+                            self.end_log(log, "Cancelled", Some(format!("{}: nothing was kept", stopped)));
+                        }
+                        Err(e) => {
+                            let why = export_problem(&e);
+                            self.end_log(log, "Failed", Some(format!("{}: {}", text.replacen("Exporting", "Couldn't export", 1), why)));
+                            if self.shot_path.is_none() {
+                                self.dialog = Dialog::Message { title: "Export".into(), text: format!("{} failed.\n\n{}", text, why) };
+                            }
+                        }
+                    }
+                }
+                Msg::Imported { sid, log, name, file, template, started, result } => {
+                    self.streams.remove(&log);
+                    self.refresh_soon(sid);
+                    let what = if template { "template" } else { "VM" };
+                    match result {
+                        Ok(made) => {
+                            let took = fmt_took(self.log.get(log).map(|e| e.started.elapsed()).unwrap_or_default());
+                            let mut line = format!("Imported {} as {} '{}' (in {})", file, what, name, took);
+                            let mut status = "Done";
+                            match started {
+                                Some(Ok(())) => line.push_str(", and started it"),
+                                Some(Err(e)) => {
+                                    line.push_str(&format!(", but it didn't start: {}", e.message()));
+                                    status = "Failed";
+                                }
+                                None => {}
+                            }
+                            if let Some(e) = self.log.get_mut(log) {
+                                e.obj_ref = Some(made.clone());
+                            }
+                            self.end_log(log, status, Some(line));
+                            if template {
+                                self.expanded.insert("cat:tpls".into());
+                            }
+                        }
+                        Err(e) if e.code == CANCELLED => self.end_log(log, "Cancelled", Some(format!("Stopped importing {}: nothing of it was kept", file))),
+                        Err(e) => {
+                            let why = export_problem(&e);
+                            self.end_log(log, "Failed", Some(format!("Couldn't import {}: {}", file, why)));
+                            if self.shot_path.is_none() {
+                                self.dialog = Dialog::Message { title: "Import".into(), text: format!("Importing {} failed.\n\n{}", file, why) };
+                            }
+                        }
                     }
                 }
                 Msg::Picked { sid, sr, path } => {
@@ -2871,7 +3072,7 @@ impl App {
                             "template" => self.select(format!("tpl:{}:tpl-web", id)),
                             // a running VM chosen: it can't be made a template now
                             "new-template" => self.select(format!("vm:{}:vm-web", id)),
-                            "make-template" | "copy-vm" | "template-made" | "vm-off" | "vm-edited" | "move-vm-off" => self.select(format!("vm:{}:vm-desk", id)),
+                            "make-template" | "copy-vm" | "copy-vm-thin" | "template-made" | "vm-off" | "vm-edited" | "move-vm-off" => self.select(format!("vm:{}:vm-desk", id)),
                             "move-vm-local" => self.select(format!("vm:{}:vm-mail", id)),
                             "sr-shared" => {
                                 self.expanded.insert(format!("folder:{}:srs", id));
@@ -2994,6 +3195,18 @@ impl App {
         }
         let (s, h) = self.host_of(node)?;
         Some((s.id, h.control_domain.clone(), h.name.clone(), format!("XenServer {}", h.version), PowerState::Running))
+    }
+
+    /// Whether a VM can be exported now: off or suspended as it is, running from a snapshot.
+    fn export_ok(&self, node: &Node) -> bool {
+        self.vm_of(node).map_or(false, |(s, d, v)| {
+            let state = match v.power {
+                PowerState::Halted | PowerState::Suspended => true,
+                PowerState::Running | PowerState::Paused => v.can_snapshot(),
+                _ => false,
+            };
+            state && !s.busy.contains_key(&v.rref) && d.host_down_for(v).is_none()
+        })
     }
 
     fn vm_of<'a>(&'a self, node: &Node) -> Option<(&'a ServerEntry, &'a PoolData, &'a VmInfo)> {
@@ -3356,10 +3569,21 @@ impl App {
                     let Some(v) = d.vm(&vm) else { continue };
                     // where its disks can go: where they are (an instant copy), or other storage for
                     // disks that the server holding them also sees (a full copy)
-                    let now: Option<&SrInfo> = v.disks.iter().find(|k| k.kind == "Disk").and_then(|k| d.sr(&k.sr));
-                    let mut stores: Vec<(String, String, bool)> = vec![];
+                    let disks: Vec<&crate::model::VmDisk> = v.disks.iter().filter(|k| k.kind == "Disk").collect();
+                    let now: Option<&SrInfo> = disks.first().and_then(|k| d.sr(&k.sr));
+                    let store = |x: &SrInfo, instant: bool| CopyStore {
+                        rref: x.rref.clone(),
+                        name: x.name.clone(),
+                        instant,
+                        thin: x.is_thin(),
+                        free: (x.size - x.used).max(0),
+                        // an instant copy's disks stay where each is; a full copy's all go there
+                        need: disks.iter().filter(|k| !instant || k.sr == x.rref).map(|k| k.size).sum(),
+                        written: if disks.iter().all(|k| k.used > 0) { disks.iter().filter(|k| !instant || k.sr == x.rref).map(|k| k.used).sum() } else { 0 },
+                    };
+                    let mut stores: Vec<CopyStore> = vec![];
                     if let Some(x) = now {
-                        stores.push((x.rref.clone(), format!("{}  ·  where it is, an instant copy", x.name), true));
+                        stores.push(store(x, true));
                     }
                     let mut others: Vec<&SrInfo> = d
                         .srs
@@ -3371,11 +3595,14 @@ impl App {
                         })
                         .collect();
                     others.sort_by_key(|x| (x.host.is_some(), -(x.size - x.used)));
-                    stores.extend(others.iter().map(|x| (x.rref.clone(), format!("{}  ·  {} free, a full copy", x.name, fmt_bytes((x.size - x.used).max(0))), false)));
+                    stores.extend(others.iter().map(|x| store(x, false)));
                     let taken: Vec<String> = d.vms.iter().map(|v| v.name.clone()).collect();
                     let name = unique_name(&format!("{} (copy)", v.name), &taken);
-                    self.dialog = Dialog::CopyVm { sid, vm, vm_name: v.name.clone(), name, stores, store: 0, focus: true };
+                    // (the copy-vm-thin screenshot: onto thin storage, the NFS share)
+                    let store = if self.shot_show == "copy-vm-thin" { stores.iter().position(|s| !s.instant && s.thin).unwrap_or(0) } else { 0 };
+                    self.dialog = Dialog::CopyVm { sid, vm, vm_name: v.name.clone(), name, stores, store, focus: true };
                 }
+                Intent::ExportVm(sid, obj) => self.ask_export(sid, obj),
                 Intent::ShowLog(index) => self.dialog = Dialog::LogDetail { index, copied: None },
                 Intent::EditVm(sid, vm, change) => self.edit_vm(sid, vm, change, ctx),
                 Intent::AskEditVm(sid, vm, change, title, text) => self.dialog = Dialog::ConfirmEditVm { sid, vm, change, title, text },
@@ -3397,6 +3624,11 @@ impl App {
                     if let Some(u) = self.uploads.get(&sr) {
                         u.t.cancel.store(true, Ordering::Relaxed);
                     }
+                }
+                // a .xva dropped on the window: New VM, from that file
+                Intent::Dropped(paths) if paths.iter().any(|p| p.extension().map_or(false, |e| e.eq_ignore_ascii_case("xva"))) => {
+                    let p = paths.into_iter().find(|p| p.extension().map_or(false, |e| e.eq_ignore_ascii_case("xva")));
+                    self.open_import(sel.sid, p);
                 }
                 Intent::Dropped(paths) => match self.drop_library(sel).map(|(sid, sr, _)| (sid, sr)) {
                     Some((sid, sr)) => {
@@ -3837,8 +4069,17 @@ impl App {
                     let secs = u.started.elapsed().as_secs_f64();
                     (total > 0).then(|| (sent, total, (secs >= 2.0 && sent > 0).then(|| sent as f64 / secs)))
                 });
-                let fraction = upload.map(|(sent, total, _)| sent as f32 / total as f32);
+                // an export's or import's bytes: of how much for an import; an export's size isn't
+                // known till it ends, so its bar is the server's own progress
+                let stream = self.streams.get(&i).map(|(t, since, _)| {
+                    let (sent, total) = (t.sent.load(Ordering::Relaxed) as i64, t.total.load(Ordering::Relaxed) as i64);
+                    let secs = since.elapsed().as_secs_f64();
+                    (t.fraction(), sent, total, (secs >= 2.0 && sent > 0).then(|| sent as f64 / secs))
+                });
+                let upload = upload.or_else(|| stream.filter(|s| s.2 > 0).map(|(_, sent, total, rate)| (sent, total, rate)));
+                let fraction = upload.map(|(sent, total, _)| sent as f32 / total as f32).or_else(|| stream.and_then(|s| s.0));
                 let fraction = if running { fraction.or_else(|| p.and_then(|p| p.fraction())) } else { None };
+                let saved = stream.filter(|s| s.2 == 0 && s.1 > 0 && running).map(|s| (s.1, s.3));
                 let copied = if running { upload.map(|(s, t, _)| (s, t)).or_else(|| p.and_then(|p| p.copied())) } else { None };
                 let rate = if running { upload.and_then(|u| u.2).or_else(|| p.and_then(|p| p.rate())) } else { None };
                 let w = ui.available_width();
@@ -3860,7 +4101,10 @@ impl App {
                     if let Some((done, total)) = copied {
                         detail.push(format!("{} of {}", fmt_bytes(done), fmt_bytes(total)));
                     }
-                    if let Some(r) = rate {
+                    if let Some((done, _)) = saved {
+                        detail.push(format!("{} saved", fmt_bytes(done)));
+                    }
+                    if let Some(r) = rate.or_else(|| saved.and_then(|s| s.1)) {
                         detail.push(format!("{}/s", fmt_bytes(r as i64)));
                     }
                 }
@@ -3946,7 +4190,7 @@ impl App {
         if m.response.hovered() || m.inner.is_some() {
             ui.painter().set(slot, egui::epaint::RectShape::filled(r, Rounding::same(6.0), pal.hover));
         }
-        if self.shot_path.is_some() && (self.shot_show == "activities" || self.shot_show == "activities-moving") {
+        if self.shot_path.is_some() && matches!(self.shot_show.as_str(), "activities" | "activities-moving" | "exporting" | "importing") {
             // the check's screenshot shows it open
             egui::Area::new(egui::Id::new("activities-shot")).order(egui::Order::Foreground).fixed_pos(r.left_bottom() + vec2(0.0, 4.0)).show(ui.ctx(), |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| body(ui, &mut vec![]));
@@ -4162,6 +4406,10 @@ impl App {
                         out.push(Intent::NewVmFromTemplate(sid, t.clone()));
                         ui.close_menu();
                     }
+                    if ui.add_enabled(!busy, egui::Button::new("Export to a File…")).clicked() {
+                        out.push(Intent::ExportVm(sid, t.clone()));
+                        ui.close_menu();
+                    }
                     ui.separator();
                     if ui.add_enabled(!busy, egui::Button::new(egui::RichText::new("Delete Template…").color(self.pal.red))).clicked() {
                         out.push(Intent::AskDeleteTemplate(sid, t));
@@ -4233,6 +4481,11 @@ impl App {
                             out.push(intent);
                             ui.close_menu();
                         }
+                    }
+                    if ui.add_enabled(self.export_ok(node) && !deleting, egui::Button::new("Export to a File…")).on_disabled_hover_text(CANT_EXPORT).clicked() {
+                        out.push(Intent::Select(node.key.clone()));
+                        out.push(Intent::ExportVm(sid, vm.clone()));
+                        ui.close_menu();
                     }
                     let del = ui.add_enabled(!deleting && busy.is_none(), egui::Button::new(egui::RichText::new("Delete VM…").color(pal.red)));
                     if del.on_disabled_hover_text(busy.as_deref().unwrap_or("")).clicked() {
@@ -4403,6 +4656,7 @@ impl App {
         let snap_ok = self.vm_of(sel).map_or(false, |(s, d, v)| v.can_snapshot() && !s.busy.contains_key(&v.rref) && d.host_down_for(v).is_none());
         // Copy VM and Make Template: only while it's off
         let off = self.vm_of(sel).map_or(false, |(s, _, v)| v.power == PowerState::Halted && !s.busy.contains_key(&v.rref));
+        let export_ok = self.export_ok(sel);
         // Move: running or off, nothing under way, its server there
         let move_ok = self.vm_of(sel).map_or(false, |(s, d, v)| matches!(v.power, PowerState::Running | PowerState::Halted) && !s.busy.contains_key(&v.rref) && d.host_down_for(v).is_none());
         let root = self.root_of(sel).map(|(sid, connected)| (sid, if connected { "Disconnect" } else { "Remove" }, self.server(sid).map(|s| s.name()).unwrap_or_default()));
@@ -4456,7 +4710,7 @@ impl App {
                 if tool_btn(ui, Face::Glyph("trash", pal.red), busy.as_deref().unwrap_or("Delete VM…"), !deleting && busy.is_none(), &pal).clicked() {
                     out.push(Intent::AskDeleteVm(*sid, vref.clone()));
                 }
-                copy_menu(ui, &pal, *sid, vref, off && !deleting, out);
+                copy_menu(ui, &pal, *sid, vref, off && !deleting, export_ok && !deleting, out);
                 if tool_btn(ui, Face::Glyph("move", pal.accent), "Move to another server or storage…", move_ok && !deleting, &pal).clicked() {
                     out.push(Intent::MoveVm(*sid, vref.clone(), None));
                 }
@@ -4545,6 +4799,10 @@ impl App {
                         out.push(intent);
                         ui.close_menu();
                     }
+                }
+                if ui.add_enabled(export_ok && !deleting, egui::Button::new("Export to a File…")).on_disabled_hover_text(CANT_EXPORT).clicked() {
+                    out.push(Intent::ExportVm(*sid, vref.clone()));
+                    ui.close_menu();
                 }
                 let del = ui.add_enabled(!deleting && busy.is_none(), egui::Button::new(egui::RichText::new("Delete VM…").color(pal.red)));
                 if del.on_disabled_hover_text(busy.as_deref().unwrap_or("")).clicked() {
@@ -6161,13 +6419,13 @@ impl App {
                             let c = Cell::Custom(if editing { 240.0 } else { (measure(&x.description) + 34.0).min(380.0) });
                             if x.description.trim().is_empty() { c } else { Cell::by_text(&x.description, c) }
                         }
-                        Col::Actions => Cell::Custom(86.0),
+                        Col::Actions => Cell::Custom(116.0),
                     })
                     .collect()
             })
             .collect();
         let mut edit = self.snap_edit.take();
-        let (mut close, mut save, mut delete, mut revert, mut template) = (false, None, None, None, None);
+        let (mut close, mut save, mut delete, mut revert, mut template, mut export) = (false, None, None, None, None, None);
         let (saving, deleting) = (&self.snap_saving, &self.snap_deleting);
         let (with_description, with_holds) = (cols.contains(&Col::Description), cols.contains(&Col::Holds));
         self.table_with(ui, "snaps", &headers, &rows, false, &mut |ui, row, col, r, hot| {
@@ -6218,8 +6476,19 @@ impl App {
                     return;
                 }
                 let ok = doing.is_none() && !gone;
+                // Export to a File
+                let xb = Rect::from_center_size(pos2(r.max.x - 43.0, r.center().y), vec2(26.0, 26.0));
+                let xresp = ui.interact(xb, ui.id().with(("export", &x.rref)), if ok { Sense::click() } else { Sense::hover() }).on_hover_text("Export this snapshot to a file…");
+                if ok && xresp.hovered() {
+                    p.rect_filled(xb, Rounding::same(5.0), pal.border);
+                }
+                let xc = if !ok { pal.ink_faint.gamma_multiply(0.45) } else if xresp.hovered() { pal.accent } else if hot { pal.ink_soft } else { pal.ink_faint };
+                paint_glyph(&p, Rect::from_center_size(xb.center(), vec2(16.0, 16.0)), "download", xc);
+                if ok && xresp.clicked() {
+                    export = Some(x.rref.clone());
+                }
                 // Make Template, from a snapshot of its disks only
-                let tb = Rect::from_center_size(pos2(r.max.x - 43.0, r.center().y), vec2(26.0, 26.0));
+                let tb = Rect::from_center_size(pos2(r.max.x - 73.0, r.center().y), vec2(26.0, 26.0));
                 let tok = ok && !x.memory;
                 let tip = if x.memory { "Templates come from snapshots of the disks only (this one holds its memory too)" } else { "Make a template from this snapshot…" };
                 let tresp = ui.interact(tb, ui.id().with(("template", &x.rref)), if tok { Sense::click() } else { Sense::hover() }).on_hover_text(tip);
@@ -6231,7 +6500,7 @@ impl App {
                 if tok && tresp.clicked() {
                     template = Some(x.rref.clone());
                 }
-                let rb = Rect::from_center_size(pos2(r.max.x - 73.0, r.center().y), vec2(26.0, 26.0));
+                let rb = Rect::from_center_size(pos2(r.max.x - 103.0, r.center().y), vec2(26.0, 26.0));
                 let rresp = ui.interact(rb, ui.id().with(("revert", &x.rref)), if ok { Sense::click() } else { Sense::hover() }).on_hover_text("Revert the VM to this snapshot…");
                 if ok && rresp.hovered() {
                     p.rect_filled(rb, Rounding::same(5.0), pal.border);
@@ -6316,6 +6585,9 @@ impl App {
         if let Some(snap) = template {
             out.push(Intent::MakeTemplate(sid, snap));
         }
+        if let Some(snap) = export {
+            out.push(Intent::ExportVm(sid, snap));
+        }
     }
 
     /// The Templates folder: the user's templates, each with its system, size and description, and
@@ -6368,18 +6640,27 @@ impl App {
                 if wide {
                     r.push(Cell::Text(or(&t.description, "—").into()));
                 }
-                r.push(Cell::Custom(56.0));
+                r.push(Cell::Custom(86.0));
                 r
             })
             .collect();
-        let (mut new_vm, mut delete) = (None, None);
+        let (mut new_vm, mut delete, mut export) = (None, None, None);
         let opened = self.table_with(ui, "tpls", &headers, &rows, true, &mut |ui, row, _col, r, hot| {
             let (sid, _, t, busy) = &tpls[row];
             if *busy {
                 return;
             }
             let p = ui.painter().clone();
-            let nb = Rect::from_center_size(pos2(r.max.x - 43.0, r.center().y), vec2(26.0, 26.0));
+            let xb = Rect::from_center_size(pos2(r.max.x - 43.0, r.center().y), vec2(26.0, 26.0));
+            let xresp = ui.interact(xb, ui.id().with(("texport", &t.rref)), Sense::click()).on_hover_text("Export this template to a file…");
+            if xresp.hovered() {
+                p.rect_filled(xb, Rounding::same(5.0), pal.border);
+            }
+            paint_glyph(&p, Rect::from_center_size(xb.center(), vec2(16.0, 16.0)), "download", if xresp.hovered() { pal.accent } else if hot { pal.ink_soft } else { pal.ink_faint });
+            if xresp.clicked() {
+                export = Some((*sid, t.rref.clone()));
+            }
+            let nb = Rect::from_center_size(pos2(r.max.x - 73.0, r.center().y), vec2(26.0, 26.0));
             let nresp = ui.interact(nb, ui.id().with(("tnew", &t.rref)), Sense::click()).on_hover_text("Make a VM from this template…");
             if nresp.hovered() {
                 p.rect_filled(nb, Rounding::same(5.0), pal.border);
@@ -6400,6 +6681,8 @@ impl App {
         });
         if let Some((sid, t)) = new_vm {
             out.push(Intent::NewVmFromTemplate(sid, t));
+        } else if let Some((sid, t)) = export {
+            out.push(Intent::ExportVm(sid, t));
         } else if let Some((sid, t)) = delete {
             out.push(Intent::AskDeleteTemplate(sid, t));
         } else if let Some(i) = opened {
@@ -6666,6 +6949,13 @@ impl App {
         let (theme_mode, zoom_now) = (self.theme_mode, self.zoom);
         let saved_keys: Vec<(String, String)> = self.saved.keys().cloned().collect();
         let mut new_vm: Option<(u32, NewVm, Arc<Trace>)> = None;
+        // New VM, from a file: the file chooser, or the import to start
+        let mut pick_xva = false;
+        let mut import: Option<(u32, ImportVm)> = None;
+        // the Export dialog: its Save dialog, or the export to start (and where)
+        let mut export_browse: Option<(PathBuf, String)> = None;
+        let mut export_now: Option<PathBuf> = None;
+        let mut stop_stream: Option<usize> = None;
         // storage the New VM dialog wants checked: pool, storage, server
         let mut checks: Vec<(u32, String, Option<String>)> = vec![];
         // from the Upload dialog: the file chooser (None), or a link's file and its name
@@ -6684,7 +6974,12 @@ impl App {
             (total > 0).then(|| sent as f32 / total as f32)
         });
         let detail_fraction = match &self.dialog {
-            Dialog::LogDetail { index, .. } => upload_fraction(*index),
+            Dialog::LogDetail { index, .. } => upload_fraction(*index).or_else(|| self.streams.get(index).and_then(|s| s.0.fraction())),
+            _ => None,
+        };
+        // an export or import shown in full can be stopped there
+        let detail_stream: Option<(usize, bool)> = match &self.dialog {
+            Dialog::LogDetail { index, .. } => self.streams.get(index).map(|s| (*index, s.2)),
             _ => None,
         };
         // the Updates dialog: what it shows of its pool, and what's asked of it
@@ -6694,6 +6989,26 @@ impl App {
         };
         let mut pool_action = PoolUpdateAction::None;
         let mut move_action: Option<(u32, MoveAction)> = None;
+        // Move: the servers' load, read every few seconds while it's open, for its CPU bar
+        let move_load = match &self.dialog {
+            Dialog::MoveVm(m) => self.server(m.sid).and_then(|s| {
+                let d = s.data.as_ref()?;
+                let v = d.vm(&m.vm)?;
+                let want: Vec<(String, String, String)> = d.hosts.iter().filter(|h| h.is_up()).map(|h| (h.rref.clone(), h.uuid.clone(), h.address.clone())).collect();
+                Some((s.conn.clone(), want, v.uuid.clone(), v.host.clone()))
+            }),
+            _ => None,
+        };
+        if let Some((conn, want, uuid, home)) = move_load {
+            self.poll_hosts(ctx, &conn, want);
+            // the last half minute or so, so a moment's spike doesn't decide it
+            let recent = |v: &[f64]| (!v.is_empty()).then(|| v.iter().rev().take(6).sum::<f64>() / v.len().min(6) as f64);
+            let load = self.host_perf.iter().filter_map(|(h, (_, r))| r.as_ref().ok().and_then(|p| recent(&p.host.cpu)).map(|c| (h.clone(), c))).collect();
+            let own = home.and_then(|h| self.host_perf.get(&h)).and_then(|(_, r)| r.as_ref().ok()).and_then(|p| p.vm(&uuid)).and_then(|p| recent(&p.cpu));
+            if let Dialog::MoveVm(m) = &mut self.dialog {
+                m.set_load(load, own);
+            }
+        }
         match &mut self.dialog {
             Dialog::MoveVm(d) => {
                 move_action = Some((d.sid, d.ui(ctx, &pal)));
@@ -6852,6 +7167,12 @@ impl App {
                 IsoAction::Reattach(sid, sr, lib) => reattach = Some((sid, sr, lib)),
                 IsoAction::None => {}
             },
+            Dialog::Export(d) => match d.ui(ctx, &pal) {
+                ExportAction::None => {}
+                ExportAction::Close => close = true,
+                ExportAction::Browse => export_browse = Some(d.browse_start()),
+                ExportAction::Export(p) => export_now = Some(p),
+            },
             Dialog::NewVm(d) => {
                 match d.ui(ctx, &pal) {
                     NewVmAction::None => {}
@@ -6860,6 +7181,11 @@ impl App {
                         let trace = Arc::new(Trace::default());
                         d.creating(trace.clone());
                         new_vm = Some((sid, spec, trace));
+                    }
+                    NewVmAction::PickFile => pick_xva = true,
+                    NewVmAction::Import(sid, imp) => {
+                        import = Some((sid, imp));
+                        close = true;
                     }
                 }
                 let sid = d.sid;
@@ -7108,29 +7434,29 @@ impl App {
                         ui.horizontal(|ui| {
                             field_label(ui, "Disks on:", LABEL_WIDTH);
                             crate::newvm::combo_style(ui, &pal);
-                            let shown = stores.get(*store).map(|s| s.1.clone()).unwrap_or_default();
+                            let shown = stores.get(*store).map(|s| s.label()).unwrap_or_default();
                             crate::newvm::combo("copy-sr", shown, ui.available_width()).show_ui(ui, |ui| {
                                 for (i, s) in stores.iter().enumerate() {
-                                    ui.selectable_value(store, i, s.1.as_str());
+                                    ui.selectable_value(store, i, s.label());
                                 }
                             });
                         });
                     }
-                    let instant = stores.get(*store).map_or(true, |s| s.2);
-                    let note = if instant {
-                        "The copy shares the original's disks until either changes them, so it's ready at once and takes no room to begin with."
-                    } else {
-                        "Its disks are written out in full on the other storage: as long as copying them takes."
-                    };
+                    let chosen = stores.get(*store);
+                    let note = chosen.map_or_else(|| CopyStore::INSTANT.to_string(), |s| s.note());
                     ui.add(egui::Label::new(egui::RichText::new(note).size(12.0).color(pal.ink_soft)).wrap());
+                    let short = chosen.and_then(|s| s.short());
+                    if let Some(why) = &short {
+                        ui.add(egui::Label::new(egui::RichText::new(why.as_str()).size(12.5).color(pal.red)).wrap());
+                    }
                     ui.add_space(4.0);
                     dialog_buttons(ui, |ui| {
                         if dialog_button(ui, &pal, "close", "Cancel", Look::Plain, true) || ui.input(|i| i.key_pressed(Key::Escape)) {
                             close = true;
                         }
-                        let ready = !name.trim().is_empty();
+                        let ready = !name.trim().is_empty() && short.is_none();
                         if dialog_button(ui, &pal, "copy", "Copy", Look::Primary, ready) || (ready && ui.input(|i| i.key_pressed(Key::Enter))) {
-                            let sr = stores.get(*store).filter(|s| !s.2).map(|s| s.0.clone());
+                            let sr = stores.get(*store).filter(|s| !s.instant).map(|s| s.rref.clone());
                             copy_to = Some((*sid, vm.clone(), name.trim().to_string(), sr));
                         }
                     });
@@ -7600,6 +7926,12 @@ impl App {
                             if dialog_button(ui, &pal, "check", "Close", Look::Primary, true) || ui.input(|i| i.key_pressed(Key::Escape)) {
                                 close = true;
                             }
+                            if let (Some((log, export)), true) = (detail_stream, running) {
+                                let label = if export { "Stop Export" } else { "Stop Import" };
+                                if dialog_button(ui, &pal, "close", label, Look::Danger, true) {
+                                    stop_stream = Some(log);
+                                }
+                            }
                         });
                     });
                 }
@@ -7713,6 +8045,25 @@ impl App {
         }
         if let Some((sid, spec, trace)) = new_vm {
             self.create_vm(sid, spec, trace, ctx);
+        }
+        if pick_xva {
+            self.pick_xva(ctx);
+        }
+        if let Some((sid, imp)) = import {
+            self.start_import(sid, imp, ctx);
+        }
+        if let Some((dir, name)) = export_browse {
+            self.pick_export_path(dir, name, ctx);
+        }
+        if let Some(path) = export_now {
+            if let Dialog::Export(d) = std::mem::replace(&mut self.dialog, Dialog::None) {
+                self.start_export(&d, path, ctx);
+            }
+        }
+        if let Some(log) = stop_stream {
+            if let Some((t, _, _)) = self.streams.get(&log) {
+                t.cancel.store(true, Ordering::Relaxed);
+            }
         }
         for (sid, sr, host) in checks {
             self.check_sr(sid, sr, host, ctx);
@@ -7846,7 +8197,7 @@ impl App {
             // nothing under way, and no look at the server due (one is right after a job)
             && self.vm_saving.is_empty()
             && self.edit_queue.is_empty()
-            && self.servers.iter().all(|s| (s.busy.is_empty() || matches!(self.shot_show.as_str(), "activities-moving" | "close-asked")) && !s.fetching && s.next_refresh > Instant::now());
+            && self.servers.iter().all(|s| (s.busy.is_empty() || matches!(self.shot_show.as_str(), "activities-moving" | "close-asked" | "exporting")) && !s.fetching && s.next_refresh > Instant::now());
         if !self.shot_requested && ((self.shot_ready && self.frames >= 120 && settled && self.started.elapsed() >= Duration::from_secs(wait)) || timed_out) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot);
             self.shot_requested = true;
@@ -7974,7 +8325,7 @@ impl eframe::App for App {
                     out.push(Intent::Tab(Tab::Snapshots));
                     out.extend(sel.sid.map(|sid| Intent::MakeTemplate(sid, "vm-web-snap-2".into())));
                 }
-                "copy-vm" => out.extend(sel.sid.map(|sid| Intent::CopyVm(sid, "vm-desk".into()))),
+                "copy-vm" | "copy-vm-thin" => out.extend(sel.sid.map(|sid| Intent::CopyVm(sid, "vm-desk".into()))),
                 "log-detail" => {
                     // a copy that lost its server part way, as it'd be logged
                     if let Some(sid) = sel.sid {
@@ -8025,6 +8376,27 @@ impl eframe::App for App {
                         if let Some(vdi) = vdi {
                             self.move_vm(sid, MoveVm { vm: "vm-mail".into(), host: "host-a".into(), disks: vec![(vdi, "sr-local1".into())], eject: None, running: true }, ctx);
                         }
+                    }
+                }
+                "export" => out.extend(sel.sid.map(|sid| Intent::ExportVm(sid, "vm-web".into()))),
+                "export-off" => out.extend(sel.sid.map(|sid| Intent::ExportVm(sid, "vm-desk".into()))),
+                "new-vm-import" => self.open_import(sel.sid, demo_xva()),
+                "exporting" => {
+                    // a VM that's off being saved, under way when the screenshot's taken (with
+                    // SVM_DEMO_SLOW and SVM_SHOT_WAIT), and Activities open
+                    if let Some(sid) = sel.sid {
+                        self.ask_export(sid, "vm-desk".into());
+                        if let Dialog::Export(d) = std::mem::replace(&mut self.dialog, Dialog::None) {
+                            let to = std::env::temp_dir().join("svm-demo").join("Test Desktop.xva");
+                            self.start_export(&d, to, ctx);
+                        }
+                    }
+                }
+                "importing" => {
+                    // the demo's file going into the pool, Activities open
+                    if let (Some(sid), Some(file)) = (sel.sid, demo_xva()) {
+                        let imp = ImportVm { file, name: "Home Assistant".into(), sr: "sr-nfs".into(), start: true, ..Default::default() };
+                        self.start_import(sid, imp, ctx);
                     }
                 }
                 "activities" => {
@@ -8624,6 +8996,62 @@ fn busy_tip(doing: &str) -> String {
     format!("It's {}: delete it once that's done", doing.trim_end_matches('…').to_lowercase())
 }
 
+/// Where Copy VM can put the copy's disks.
+#[derive(Clone)]
+struct CopyStore {
+    rref: String,
+    name: String,
+    /// Where they are now: an instant copy, sharing the original's disks.
+    instant: bool,
+    /// A disk on it takes only what's written on it; on LVM (thick) its whole size.
+    thin: bool,
+    free: i64,
+    /// The size of the disks that go there (all of them, or for an instant copy those on it).
+    need: i64,
+    /// What's written on them (on thin storage), 0 when not known.
+    written: i64,
+}
+
+impl CopyStore {
+    const INSTANT: &'static str = "The copy shares the original's disks until either changes them, so it's ready at once and takes no room to begin with.";
+
+    fn label(&self) -> String {
+        if self.instant {
+            format!("{}  ·  where it is, an instant copy", self.name)
+        } else {
+            format!("{}  ·  {}, {} free", self.name, if self.thin { "thin" } else { "thick" }, fmt_bytes(self.free))
+        }
+    }
+
+    /// What the copy takes there, in words.
+    fn note(&self) -> String {
+        let need = fmt_bytes(self.need);
+        match (self.instant, self.thin) {
+            (_, _) if self.need == 0 => "It has no disks there: only the VM itself is copied.".into(),
+            (true, true) => Self::INSTANT.into(),
+            (true, false) => format!("It's ready at once, sharing the original's disks until either changes them; but on LVM storage the copy's disks take their whole size from the start: {}.", need),
+            (false, true) if self.written > 0 => format!("Only what's been written on its disks is copied there, and takes room: about {} ({} in all).", fmt_bytes(self.written), need),
+            (false, true) => {
+                let more = if self.need > self.free { format!(" It has {} free: enough only if less than that is written on them.", fmt_bytes(self.free)) } else { String::new() };
+                format!("Only what's been written on its disks is copied there, and takes room: at most their size, {}.{}", need, more)
+            }
+            (false, false) => format!("Its disks take their whole size there, {}, however little is written on them; copying takes as long as writing that out.", need),
+        }
+    }
+
+    /// Why it can't go there: on LVM each disk takes its whole size, and there isn't that; on thin
+    /// storage what's written on them, when that's known.
+    fn short(&self) -> Option<String> {
+        if !self.thin && self.need > self.free {
+            Some(format!("{} has only {} free; the copy's disks need {}.", self.name, fmt_bytes(self.free), fmt_bytes(self.need)))
+        } else if self.thin && !self.instant && self.written > self.free {
+            Some(format!("{} has only {} free; what's written on the copy's disks comes to about {}.", self.name, fmt_bytes(self.free), fmt_bytes(self.written)))
+        } else {
+            None
+        }
+    }
+}
+
 /// A storage's kind in a word or two: "NFS (v3)", "LVM", "iSCSI"… (a server's own storage says
 /// it's local where it says which server it's in)
 fn sr_kind_words(x: &SrInfo) -> String {
@@ -8909,28 +9337,42 @@ fn force_of(op: &str) -> Option<usize> {
 /// Why Copy VM and Make Template wait for a VM to be off.
 const SHUT_DOWN_FIRST: &str = "Shut it down first: a copy of a running VM is like one after a power cut";
 
-/// Copy VM and Make Template: one button (the copy icon and an arrow) opening both, each greyed
-/// out while the VM is on.
-fn copy_menu(ui: &mut Ui, pal: &Pal, sid: u32, vm: &str, off: bool, out: &mut Vec<Intent>) {
+/// Why Export waits: the VM is busy, its server is down, or it's in a state it can't be saved in.
+const CANT_EXPORT: &str = "It can't be exported right now (busy, or its server isn't answering)";
+
+/// Copy VM, Make Template and Export to a File: one button (the copy icon and an arrow) opening
+/// them, Copy and Make Template greyed out while the VM is on (`off`), Export while it can't be
+/// (`export`; a running VM is exported from a snapshot).
+fn copy_menu(ui: &mut Ui, pal: &Pal, sid: u32, vm: &str, off: bool, export: bool, out: &mut Vec<Intent>) {
     let m = egui::menu::menu_custom_button(ui, egui::Button::new("").frame(false).min_size(TOOL_BTN), |ui| {
         ui.set_min_width(200.0);
-        for (glyph, label, intent) in [("copy", "Copy VM…", Intent::CopyVm(sid, vm.to_string())), ("template", "Make Template…", Intent::MakeTemplate(sid, vm.to_string()))] {
-            let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), if off { Sense::click() } else { Sense::hover() });
-            if off && resp.hovered() {
+        let entries = [
+            ("copy", "Copy VM…", Intent::CopyVm(sid, vm.to_string()), off, SHUT_DOWN_FIRST),
+            ("template", "Make Template…", Intent::MakeTemplate(sid, vm.to_string()), off, SHUT_DOWN_FIRST),
+            ("download", "Export to a File…", Intent::ExportVm(sid, vm.to_string()), export, CANT_EXPORT),
+        ];
+        for (glyph, label, intent, ok, why) in entries {
+            let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), if ok { Sense::click() } else { Sense::hover() });
+            if ok && resp.hovered() {
                 ui.painter().rect_filled(r, Rounding::same(5.0), pal.hover);
             }
-            let ink = if off { pal.ink } else { pal.ink_faint };
-            paint_glyph(ui.painter(), Rect::from_min_size(r.min + vec2(7.0, 7.0), vec2(16.0, 16.0)), glyph, if off { pal.accent } else { pal.ink_faint });
+            let ink = if ok { pal.ink } else { pal.ink_faint };
+            paint_glyph(ui.painter(), Rect::from_min_size(r.min + vec2(7.0, 7.0), vec2(16.0, 16.0)), glyph, if ok { pal.accent } else { pal.ink_faint });
             ui.painter().text(pos2(r.min.x + 32.0, r.center().y), Align2::LEFT_CENTER, label, FontId::proportional(13.0), ink);
-            let resp = if off { resp } else { resp.on_hover_text(SHUT_DOWN_FIRST) };
-            if off && resp.clicked() {
+            let resp = if ok { resp } else { resp.on_hover_text(why) };
+            if ok && resp.clicked() {
                 out.push(intent);
                 ui.close_menu();
             }
         }
     });
-    paint_tool_btn(ui.painter(), m.response.rect, &Face::Glyph("copy", pal.accent), off, m.response.hovered() || m.inner.is_some(), true, pal);
-    m.response.on_hover_text(if off { "Copy VM, or make a template from it" } else { "Copy VM, Make Template: shut it down first" });
+    let any = off || export;
+    paint_tool_btn(ui.painter(), m.response.rect, &Face::Glyph("copy", pal.accent), any, m.response.hovered() || m.inner.is_some(), true, pal);
+    m.response.on_hover_text(match (off, export) {
+        (true, _) => "Copy VM, make a template from it, or export it to a file",
+        (false, true) => "Export it to a file (Copy VM and Make Template: shut it down first)",
+        _ => "Copy VM, Make Template: shut it down first",
+    });
 }
 
 /// The VM's power menu: one button, the power symbol in the colour of the VM's state (a ring
@@ -9197,6 +9639,48 @@ fn edit_problem(e: &ApiError) -> String {
     }
 }
 
+/// A .xva for the screenshot checks (in the system's temporary folder): a VM's settings, no disks.
+fn demo_xva() -> Option<PathBuf> {
+    let dir = std::env::temp_dir().join("svm-demo");
+    std::fs::create_dir_all(&dir).ok()?;
+    let p = dir.join("Home Assistant.xva");
+    let info = crate::xva::XvaInfo {
+        name: "Home Assistant".into(),
+        description: "Home automation".into(),
+        os: "Home Assistant OS 16.2".into(),
+        vcpus: 2,
+        memory: 4 << 30,
+        disks: vec![32 << 30],
+        used: 6 << 30,
+        nets: vec!["Pool-wide network 0".into()],
+        ..Default::default()
+    };
+    crate::xva::write_xva(&p, &info).ok()?;
+    Some(p)
+}
+
+/// A folder as it's shown: the home folder as "~".
+fn short_home(p: &Path) -> String {
+    let full = p.display().to_string();
+    match std::env::var("HOME") {
+        Ok(h) if !h.is_empty() && full.starts_with(&h) => format!("~{}", &full[h.len()..]),
+        _ => full,
+    }
+}
+
+/// Why an export or import failed, in words.
+fn export_problem(e: &ApiError) -> String {
+    match e.code.as_str() {
+        "VM_BAD_POWER_STATE" => "The VM's state changed meanwhile: try again.".into(),
+        "SR_FULL" | "SR_BACKEND_FAILURE_44" => "There isn't room for its disks on that storage.".into(),
+        "IMPORT_INCOMPATIBLE_VERSION" => "It was exported from a newer XenServer than this pool's.".into(),
+        "IMPORT_ERROR" => format!("The server couldn't read the file ({}). Is it whole?", e.details.join(" ").trim()),
+        "OTHER_OPERATION_IN_PROGRESS" => "Something else is being done with it right now: try again when it's finished.".into(),
+        LOST_CONTACT => "The server stopped answering.".into(),
+        _ => e.message(),
+    }
+}
+
 /// Why taking, reverting to or deleting a snapshot failed, in plain words where the server's
 /// answer is a known one.
 fn snapshot_problem(e: &ApiError) -> String {
@@ -9446,6 +9930,27 @@ fn setup_fonts(ctx: &egui::Context) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copy_says_what_it_takes() {
+        const GB: i64 = 1 << 30;
+        let to = |instant: bool, thin: bool, free: i64| CopyStore { rref: "sr".into(), name: "Local storage".into(), instant, thin, free: free * GB, need: 64 * GB, written: 0 };
+        // thin: only what's written goes, so a short store is only warned about
+        assert!(to(false, true, 900).note().starts_with("Only what's been written"));
+        assert!(to(false, true, 20).note().ends_with("enough only if less than that is written on them."));
+        assert_eq!(to(false, true, 20).short(), None);
+        // thick (LVM): the whole size, here or on other storage, and it has to fit
+        assert!(to(false, false, 900).note().starts_with("Its disks take their whole size there, 64"));
+        assert!(to(true, false, 900).note().contains("on LVM storage"));
+        assert_eq!(to(true, false, 20).short().as_deref(), Some("Local storage has only 20 GB free; the copy's disks need 64 GB."));
+        assert_eq!(to(true, true, 0).note(), CopyStore::INSTANT);
+        assert_eq!(to(false, false, 900).label(), "Local storage  ·  thick, 900 GB free");
+        // thin, and what's written known: that's what has to fit
+        let known = |free: i64| CopyStore { written: 22 * GB, ..to(false, true, free) };
+        assert_eq!(known(900).note(), "Only what's been written on its disks is copied there, and takes room: about 22 GB (64 GB in all).");
+        assert_eq!(known(55).short(), None);
+        assert_eq!(known(20).short().as_deref(), Some("Local storage has only 20 GB free; what's written on the copy's disks comes to about 22 GB."));
+    }
 
     #[test]
     fn columns_sort_as_people_expect() {

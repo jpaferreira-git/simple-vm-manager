@@ -47,6 +47,9 @@ pub struct VmDisk {
     pub sr_name: String,
     pub kind: String,
     pub size: i64,
+    /// What's written on it, on thin storage (its file and those it's built on: a snapshot's, a
+    /// template's); 0 when not known (on LVM each disk takes its whole size).
+    pub used: i64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -131,6 +134,28 @@ pub struct MoveVm {
     pub eject: Option<String>,
     /// It runs (moved live), else it's off.
     pub running: bool,
+}
+
+/// A .xva file brought into a pool (New VM, from a file).
+#[derive(Clone, Debug, Default)]
+pub struct ImportVm {
+    pub file: std::path::PathBuf,
+    /// The name it gets.
+    pub name: String,
+    /// Where its disks go.
+    pub sr: String,
+    /// The server that takes the file: the one whose own storage `sr` is (None: the coordinator).
+    pub address: Option<String>,
+    /// Its home server (None: any).
+    pub host: Option<String>,
+    /// Every network card moved onto this network (None: as the file has them).
+    pub network: Option<String>,
+    /// Started once it's in.
+    pub start: bool,
+    /// The file holds a template (or a snapshot), so it comes in as a template.
+    pub template: bool,
+    /// What the references are called, for the job's details.
+    pub names: std::collections::HashMap<String, String>,
 }
 
 /// A change to a VM, made on its Overview.
@@ -1077,6 +1102,12 @@ impl SrInfo {
     /// fail, it never answers, so it's checked before it's used.
     pub fn can_go_offline(&self) -> bool {
         self.shared || matches!(self.kind.as_str(), "iso" | "nfs" | "smb" | "cifs" | "lvmoiscsi" | "lvmohba" | "gfs2")
+    }
+
+    /// Thin: a disk on it takes only what's been written on it (files, as on EXT, XFS, NFS, SMB,
+    /// ZFS, GFS2). On LVM (local, iSCSI, Fibre Channel) each disk takes its whole size.
+    pub fn is_thin(&self) -> bool {
+        matches!(self.kind.as_str(), "ext" | "xfs" | "nfs" | "smb" | "cifs" | "file" | "zfs" | "gfs2")
     }
 }
 

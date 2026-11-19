@@ -18,6 +18,7 @@ mod secrets;
 mod theme;
 mod update;
 mod upload;
+mod xva;
 
 use eframe::egui;
 
@@ -40,8 +41,9 @@ fn main() -> eframe::Result {
     // iso-upload-choose|iso-upload-web|iso-upload-done|iso-delete|new-vm|new-vm-advanced|new-vm-custom|new-vm-no-start|new-vm-created|new-vm-offline|vm-delete|host-console|vm-busy|settings|update|update-progress|host-shutdown|host-restart|pool|pool-details|pool-updates|pool-updating|pool-update-stopped|move-vm|move-vm-off|move-vm-local|sr-shared|host-details|iso-library|vm-storage|activities-moving|close-asked|new-template|networks-sorted|delete-network|host-slow-restart|new-network|new-network-error|new-storage|new-storage-inside|new-storage-error|
     // sr-unmounted|sr-detached|sr-auto-repair|sr-repair-failed|host-down|snapshots|snapshot-take|
     // snapshot-revert|snapshot-delete|snapshot-taken|templates|template|new-vm-template|make-template|
-    // make-template-snapshot|copy-vm|template-made|vm-off|vm-edited|vm-bios|vm-rename|host|host-off|host-waking|
-    // host-maintenance|host-in-maintenance|host-exit-maintenance|vm-performance|host-performance|alerts|alerts-all|alerts-dismissed|alert-rules|details|activities|log-detail picks what the screenshot shows (default: a VM's
+    // make-template-snapshot|copy-vm|copy-vm-thin|template-made|vm-off|vm-edited|vm-bios|vm-rename|host|host-off|host-waking|
+    // host-maintenance|host-in-maintenance|host-exit-maintenance|vm-performance|host-performance|alerts|alerts-all|alerts-dismissed|alert-rules|
+    // export|export-off|exporting|new-vm-import|importing|details|activities|log-detail picks what the screenshot shows (default: a VM's
     // General tab; welcome is Home with no server; storage, search, logs, console and isos show that
     // tab; iso-describe an ISO's description being typed; iso-upload a demo upload under way, -done its
     // finished card; iso-upload-choose and -web the Upload dialog's two steps; sr-unmounted the ISO
@@ -54,7 +56,9 @@ fn main() -> eframe::Result {
     // it), vm-performance and host-performance the Web Server's and demo-host-01's Performance tab
     // (a week; SVM_PERF_SPAN=minutes|hours|year for another span), alerts the Alerts page (one
     // opened; alerts-all with everything, alerts-dismissed with one dismissed as it starts),
-    // alert-rules the Web Server's Alerts dialog; the rest open a dialog).
+    // alert-rules the Web Server's Alerts dialog; copy-vm-thin Copy VM onto the NFS share (thin); export the running Web Server's Export dialog,
+    // export-off the Test Desktop's (off); exporting and importing one under way in Activities (with
+    // SVM_DEMO_SLOW and SVM_SHOT_WAIT); new-vm-import New VM from a demo .xva; the rest open a dialog).
     // --theme system|light|dark and --sidebar open|folded override the saved choices; --width 760…2560
     // sets the screenshot window's width (1180 by default; wider to check a wide layout), --height
     // 480…1600 its height (740 by default).

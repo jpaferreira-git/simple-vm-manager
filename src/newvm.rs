@@ -2,7 +2,8 @@
 //! server it runs on, where its disk goes and its network), with the rest worked out: the
 //! template from the ISO's name (or, when nothing fits, Other install media: BIOS, nothing
 //! assumed), the name from the template, all of a VM's CPUs in one socket. Advanced holds the
-//! template, the boot mode, the CPU layout and a description.
+//! template, the boot mode, the CPU layout and a description. From a file (a .xva exported here
+//! or from XenCenter), it's an import: the file's VM, with its name, server, storage and network.
 
 use crate::app::{dialog_button, dialog_buttons, dialog_window, field_label, flat_button, text_field, Look, FIELD_HEIGHT};
 use crate::conn::{ApiError, Said, Trace, CHECK_SECS, NOT_ANSWERING, NOT_PLUGGED};
@@ -26,6 +27,10 @@ pub enum NewVmAction {
     Close,
     /// Make it, in the pool with this id.
     Create(u32, NewVm),
+    /// Open the file chooser for a .xva.
+    PickFile,
+    /// Bring the file into the pool with this id.
+    Import(u32, ImportVm),
 }
 
 /// One of the user's own templates (made from a VM): its disks come with it.
@@ -62,6 +67,8 @@ struct Store {
     /// Reached over the network, so checked before it's used; and where it is.
     remote: bool,
     location: String,
+    /// A disk on it takes only what's written on it (not its whole size, as on LVM).
+    thin: bool,
 }
 
 /// A storage being checked (since when), found answering, or not (why).
@@ -125,12 +132,20 @@ pub struct NewVmDialog {
     checks: HashMap<(String, Option<String>), Check>,
     /// For the screenshot checks: Create, as if clicked.
     press: bool,
+    /// Browse was clicked (the file chooser opens).
+    press_pick: bool,
     /// The user's own templates; making it from one of them (else from an ISO), and which.
     own: Vec<Own>,
     from_own: bool,
     own_pick: usize,
-    /// From a template of the user's: keep its network cards (else `net`).
+    /// From a template of the user's (or a file): keep its network cards (else `net`).
     keep_nics: bool,
+    /// Each server's address (an import onto a server's own storage goes to that server).
+    addresses: HashMap<String, String>,
+    /// Brought in from a .xva file (an import), and which, with what it holds or why it can't be read.
+    from_file: bool,
+    file: Option<std::path::PathBuf>,
+    file_info: Option<Result<crate::xva::XvaInfo, String>>,
 }
 
 impl NewVmDialog {
@@ -148,13 +163,14 @@ impl NewVmDialog {
             .srs
             .iter()
             .filter(|x| !x.is_iso() && x.kind != "udev" && x.size > 0)
-            .map(|x| Store { rref: x.rref.clone(), name: x.name.clone(), host: x.host.clone(), free: (x.size - x.used).max(0), remote: x.can_go_offline(), location: x.location.clone() })
+            .map(|x| Store { rref: x.rref.clone(), name: x.name.clone(), host: x.host.clone(), free: (x.size - x.used).max(0), remote: x.can_go_offline(), location: x.location.clone(), thin: x.is_thin() })
             .collect();
         stores.sort_by_key(|s| (s.host.is_some(), -s.free));
         let default_store = d.default_sr.as_deref().and_then(|r| stores.iter().position(|s| s.rref == r));
-        // networks, but not the servers' internal ones
-        let nets: Vec<(String, String)> = d.networks.iter().filter(|n| !n.bridge.starts_with("xapi")).map(|n| (n.rref.clone(), n.name.clone())).collect();
-        let net = d.networks.iter().filter(|n| !n.bridge.starts_with("xapi")).position(|n| n.bridge == "xenbr0").or(if nets.is_empty() { None } else { Some(0) });
+        // every network (VLANs and private ones too: their bridges are "xapi…" as well; the
+        // servers' internal ones were left out when the pool was read), the first card's first
+        let nets: Vec<(String, String)> = d.networks.iter().map(|n| (n.rref.clone(), n.name.clone())).collect();
+        let net = d.networks.iter().position(|n| n.bridge == "xenbr0").or(if nets.is_empty() { None } else { Some(0) });
         let mut servers: Vec<Server> = d.hosts.iter().map(|h| Server { rref: h.rref.clone(), name: h.name.clone(), mem_free: h.mem_free, cpus: h.cpu_count }).collect();
         servers.sort_by_key(|s| s.name.to_lowercase());
         let mut own: Vec<Own> = d
@@ -216,10 +232,15 @@ impl NewVmDialog {
             not_started: None,
             checks: HashMap::new(),
             press: false,
+            press_pick: false,
             own,
             from_own: false,
             own_pick: 0,
             keep_nics: true,
+            addresses: d.hosts.iter().map(|h| (h.rref.clone(), h.address.clone())).collect(),
+            from_file: false,
+            file: None,
+            file_info: None,
         };
         dlg.server = dlg.first_server();
         dlg.server_changed();
@@ -258,7 +279,81 @@ impl NewVmDialog {
 
     /// The user's template chosen, when making it from one.
     fn own(&self) -> Option<&Own> {
-        self.own.get(self.own_pick).filter(|_| self.from_own)
+        self.own.get(self.own_pick).filter(|_| self.from_own && !self.from_file)
+    }
+
+    /// Brought in from a file: `path` chosen (else the form waits for one).
+    pub fn with_file(mut self, path: Option<std::path::PathBuf>) -> NewVmDialog {
+        self.switch_to_file();
+        if let Some(p) = path {
+            self.set_file(p);
+        }
+        self
+    }
+
+    fn switch_to_file(&mut self) {
+        // not started unless asked: a copy of a VM that's running would come up beside it, with
+        // the same addresses and name on the network
+        (self.from_file, self.from_own, self.name_typed, self.keep_nics, self.start) = (true, false, false, true, false);
+        self.size = 0;
+        self.file_changed();
+    }
+
+    /// The file chosen: what it holds is read (only its description, at the start).
+    pub fn set_file(&mut self, p: std::path::PathBuf) {
+        self.file_info = Some(crate::xva::read_header(&p));
+        self.file = Some(p);
+        self.name_typed = false;
+        self.file_changed();
+    }
+
+    /// What the file holds, once it's been read and could be.
+    fn xva(&self) -> Option<&crate::xva::XvaInfo> {
+        self.file_info.as_ref().and_then(|r| r.as_ref().ok()).filter(|_| self.from_file)
+    }
+
+    /// Another file: its VM's name (unless one was typed), its cards kept as they are.
+    fn file_changed(&mut self) {
+        self.keep_nics = true;
+        if let (Some(x), false) = (self.xva(), self.name_typed) {
+            let name = if x.name.trim().is_empty() { "Imported VM".to_string() } else { x.name.trim().to_string() };
+            self.name = unique_name(&name, &self.taken);
+        } else if !self.name_typed {
+            self.name.clear();
+        }
+        self.server = self.first_server();
+        self.server_changed();
+    }
+
+    /// The import asked for, or why the choices don't add up.
+    fn try_import(&self) -> Result<ImportVm, String> {
+        let file = self.file.clone().ok_or("Pick the file to import.")?;
+        let x = self.xva().ok_or("The file can't be read.")?;
+        let host = self.server.map(|i| &self.servers[i]);
+        let store = self.chosen_store().ok_or("Pick where its disks go.")?;
+        let net = if self.keep_nics { None } else { self.net.and_then(|i| self.nets.get(i)) };
+        if !self.keep_nics && net.is_none() {
+            return Err("Pick its network.".into());
+        }
+        let mut names = HashMap::new();
+        names.insert(store.rref.clone(), store.name.clone());
+        if let Some(n) = net {
+            names.insert(n.0.clone(), n.1.clone());
+        }
+        if let Some(h) = host {
+            names.insert(h.rref.clone(), h.name.clone());
+        }
+        Ok(ImportVm {
+            file,
+            name: self.name.trim().to_string(),
+            sr: store.rref.clone(),
+            address: store.host.as_ref().and_then(|h| self.addresses.get(h).cloned()),
+            host: host.map(|h| h.rref.clone()),
+            network: net.map(|n| n.0.clone()),
+            start: self.start && !x.template,
+            template: x.template,
+            names,
+        })
     }
 
     /// For the screenshot checks: Advanced open.
@@ -319,7 +414,9 @@ impl NewVmDialog {
     fn to_check(&self) -> Vec<(String, Option<String>)> {
         let host = self.server.map(|i| self.servers[i].rref.clone());
         let mut out = vec![];
-        if let Some(t) = self.own() {
+        if self.from_file {
+            // only where its disks go
+        } else if let Some(t) = self.own() {
             // the template's disks' storage, when it's on the network
             if self.stores.iter().any(|s| s.rref == t.sr && s.remote) {
                 out.push((t.sr.clone(), host.clone()));
@@ -453,6 +550,9 @@ impl NewVmDialog {
 
     /// The server whose own library holds the ISO (None: a shared library).
     fn iso_host(&self) -> Option<String> {
+        if self.from_file || self.own().is_some() {
+            return None;
+        }
         self.isos.get(self.iso).and_then(|i| i.host.clone())
     }
 
@@ -485,6 +585,9 @@ impl NewVmDialog {
 
     /// The chosen CPUs, memory and disk (in bytes), or why Custom's numbers won't do.
     fn sizes(&self) -> Result<(i64, i64, i64), String> {
+        if self.from_file {
+            return self.xva().map(|x| (x.vcpus, x.memory, x.disks.iter().sum())).ok_or_else(|| "Pick the file to import.".to_string());
+        }
         if let Some(t) = self.own() {
             if self.size < 3 {
                 return Ok((t.vcpus, t.memory, t.disk));
@@ -525,6 +628,32 @@ impl NewVmDialog {
     /// What stops it being made.
     fn problems(&self) -> Vec<String> {
         let mut stop = vec![];
+        if self.from_file {
+            let Some(x) = self.xva() else {
+                stop.push("Pick the file to import.".into());
+                return stop;
+            };
+            if self.name.trim().is_empty() {
+                stop.push("Give it a name.".into());
+            }
+            match self.chosen_store() {
+                None if self.stores.is_empty() => stop.push("There's no storage for disks in this pool.".into()),
+                None => stop.push("Pick where its disks go.".into()),
+                Some(s) => {
+                    // on thin storage what's written on its disks has to fit (all of them, when the
+                    // file doesn't say); on LVM each disk takes its whole size
+                    let need = if s.thin && x.used > 0 { x.used } else { x.disks.iter().sum() };
+                    if need > s.free {
+                        stop.push(format!("{} has only {} free; its disks need {}.", s.name, fmt_bytes(s.free), fmt_bytes(need)));
+                    }
+                }
+            }
+            let most_cpus = self.can_run().iter().map(|s| s.cpus).max().unwrap_or(0);
+            if !x.template && most_cpus > 0 && x.vcpus > most_cpus {
+                stop.push(format!("It has {} CPUs, more than the server has ({}).", x.vcpus, most_cpus));
+            }
+            return stop;
+        }
         if let Some(t) = self.own() {
             if self.name.trim().is_empty() {
                 stop.push("Give it a name.".into());
@@ -581,12 +710,15 @@ impl NewVmDialog {
 
     /// When the server (or, for any server, none of them) hasn't the memory free to start it.
     fn short_of_memory(&self) -> Option<String> {
+        if self.from_file && (!self.start || self.xva().map_or(true, |x| x.template)) {
+            return None;
+        }
         let (_, mem, _) = self.sizes().ok()?;
         let room = self.can_run().iter().map(|s| s.mem_free).max()?;
         if mem <= room {
             return None;
         }
-        let then = "it can be created, but won't start until there's room.";
+        let then = if self.from_file { "it can be imported, but won't start until there's room." } else { "it can be created, but won't start until there's room." };
         Some(match self.server {
             Some(i) => format!("{} has {} free and this VM needs {}: {}", self.servers[i].name, fmt_bytes(room), fmt_bytes(mem), then),
             None => format!("No server has {} free ({} at most): {}", fmt_bytes(mem), fmt_bytes(room), then),
@@ -734,10 +866,14 @@ impl NewVmDialog {
                 if let Some(short) = self.short_of_memory() {
                     alert(ui, pal, false, "Not enough memory.", &short, None);
                 }
-                for p in stop.iter().filter(|p| !p.starts_with("Give it a name")) {
+                for p in stop.iter().filter(|p| !p.starts_with("Give it a name") && !p.starts_with("Pick the file")) {
                     ui.add(egui::Label::new(egui::RichText::new(p.as_str()).size(12.5).color(pal.red)).wrap());
                 }
-                ui.checkbox(&mut self.start, "Start it and open the console");
+                if !self.from_file {
+                    ui.checkbox(&mut self.start, "Start it and open the console");
+                } else if self.xva().map_or(false, |x| !x.template) {
+                    ui.checkbox(&mut self.start, "Start it once it's imported");
+                }
             }
             if let Some(what) = &self.busy {
                 ui.horizontal(|ui| {
@@ -789,6 +925,15 @@ impl NewVmDialog {
                 }
                 let press = std::mem::take(&mut self.press);
                 let ready = !busy && stop.is_empty() && self.checks_passed();
+                if self.from_file {
+                    if dialog_button(ui, pal, "upload", "Import", Look::Primary, ready) || (press && ready) {
+                        match self.try_import() {
+                            Ok(imp) => action = NewVmAction::Import(self.sid, imp),
+                            Err(why) => self.error = Some(why),
+                        }
+                    }
+                    return;
+                }
                 if dialog_button(ui, pal, "plus", "Create", Look::Primary, ready) || press {
                     match self.try_request() {
                         Ok(spec) => action = NewVmAction::Create(self.sid, spec),
@@ -797,6 +942,9 @@ impl NewVmDialog {
                 }
             });
         });
+        if std::mem::take(&mut self.press_pick) {
+            action = NewVmAction::PickFile;
+        }
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             action = NewVmAction::Close;
         }
@@ -833,14 +981,23 @@ impl NewVmDialog {
 
     fn form(&mut self, ui: &mut Ui, pal: &Pal) {
         combo_style(ui, pal);
-        // from an ISO, or from one of the user's templates (when there are any)
-        if !self.own.is_empty() {
-            ui.horizontal(|ui| {
-                field_label(ui, "Create from:", LABEL_WIDTH);
-                let mut i = self.from_own as usize;
-                if crate::isolib::segmented(ui, pal, &["An ISO", "A template"], &mut i, ui.available_width()) {
+        // from an ISO, from one of the user's templates (when there are any), or a file
+        ui.horizontal(|ui| {
+            field_label(ui, "Create from:", LABEL_WIDTH);
+            let options: &[&str] = if self.own.is_empty() { &["An ISO", "A file"] } else { &["An ISO", "A template", "A file"] };
+            let file_at = options.len() - 1;
+            let mut i = if self.from_file { file_at } else { self.from_own as usize };
+            if crate::isolib::segmented(ui, pal, options, &mut i, ui.available_width()) {
+                self.name_typed = false;
+                self.error = None;
+                if i == file_at {
+                    self.switch_to_file();
+                } else {
+                    if self.from_file {
+                        self.start = true;
+                    }
+                    self.from_file = false;
                     self.from_own = i == 1;
-                    self.name_typed = false;
                     self.size = if self.from_own { 0 } else { 1 };
                     if self.from_own {
                         self.own_changed();
@@ -851,7 +1008,11 @@ impl NewVmDialog {
                         self.iso_changed();
                     }
                 }
-            });
+            }
+        });
+        if self.from_file {
+            self.file_form(ui, pal);
+            return;
         }
         if self.from_own {
             ui.horizontal(|ui| {
@@ -1016,6 +1177,133 @@ impl NewVmDialog {
             }
         });
         self.advanced_part(ui, pal);
+    }
+
+    /// From a file: the file, what it holds, then its name, server, storage and network.
+    fn file_form(&mut self, ui: &mut Ui, pal: &Pal) {
+        ui.horizontal(|ui| {
+            field_label(ui, "File:", LABEL_WIDTH);
+            let w = ui.available_width() - 108.0;
+            let (r, resp) = ui.allocate_exact_size(vec2(w, FIELD_HEIGHT), Sense::click());
+            ui.painter().rect(r, Rounding::same(5.0), pal.input, Stroke::new(1.0_f32, pal.border_strong));
+            let shown = self.file.as_ref().map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default());
+            let (text, ink) = match &shown {
+                Some(n) => (n.clone(), pal.ink),
+                None => ("No file chosen: a .xva, exported here or from XenCenter".to_string(), pal.ink_faint),
+            };
+            let clip = r.shrink2(vec2(8.0, 0.0));
+            let g = ui.painter().layout_no_wrap(text, FontId::proportional(13.0), ink);
+            ui.painter().with_clip_rect(clip).galley(pos2(clip.min.x, r.center().y - g.size().y / 2.0), g, ink);
+            if let Some(p) = &self.file {
+                resp.clone().on_hover_text(p.display().to_string());
+            }
+            let browse = dialog_button(ui, pal, "folder", "Browse…", Look::Plain, true);
+            if browse || resp.clicked() {
+                self.press_pick = true;
+            }
+        });
+        match &self.file_info {
+            Some(Ok(x)) => {
+                let x = x.clone();
+                ui.horizontal(|ui| {
+                    ui.add_space(LABEL_WIDTH + ui.spacing().item_spacing.x);
+                    let w = ui.available_width();
+                    egui::Frame::none().fill(pal.rail).stroke(Stroke::new(1.0_f32, pal.border)).rounding(Rounding::same(8.0)).inner_margin(egui::Margin::symmetric(12.0, 9.0)).show(ui, |ui| {
+                        ui.set_width(w - 24.0);
+                        ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                        ui.spacing_mut().item_spacing.y = 3.0;
+                        let title = if x.template { format!("{}  ·  a template", x.name) } else { x.name.clone() };
+                        ui.add(egui::Label::new(egui::RichText::new(title).font(FontId::new(13.5, FontFamily::Name("bold".into()))).color(pal.ink)).truncate());
+                        ui.add(egui::Label::new(egui::RichText::new(crate::xva::summary(&x)).size(12.5).color(pal.ink_soft)).wrap());
+                        let mut more = vec![format!("{} file", fmt_bytes(x.size as i64))];
+                        if x.used > 0 {
+                            more.push(format!("{} written on its disks", fmt_bytes(x.used)));
+                        }
+                        if let Some(c) = x.compressed {
+                            more.push(format!("compressed ({})", c));
+                        }
+                        if x.template {
+                            more.push("it comes in as a template".into());
+                        }
+                        ui.add(egui::Label::new(egui::RichText::new(more.join("  ·  ")).size(12.0).color(pal.ink_faint)).wrap());
+                        });
+                    });
+                });
+            }
+            Some(Err(why)) => {
+                let why = why.clone();
+                alert(ui, pal, true, "This file can't be imported.", &why, None);
+            }
+            None => {}
+        }
+        if self.xva().is_none() {
+            return;
+        }
+        ui.horizontal(|ui| {
+            field_label(ui, "Name:", LABEL_WIDTH);
+            if text_field(ui, pal, &mut self.name, ui.available_width(), false).changed() {
+                self.name_typed = true;
+            }
+        });
+        ui.horizontal(|ui| {
+            field_label(ui, "Server:", LABEL_WIDTH);
+            let label = |s: &Server| format!("{}  ·  {} memory free", s.name, fmt_bytes(s.mem_free));
+            let shown = self.server.map(|i| label(&self.servers[i])).unwrap_or_else(|| "Any server".into());
+            let mut picked = self.server;
+            combo("import-server", shown, ui.available_width()).show_ui(ui, |ui| {
+                if self.stores.iter().any(|s| s.host.is_none()) {
+                    ui.selectable_value(&mut picked, None, "Any server");
+                }
+                for (i, s) in self.servers.iter().enumerate() {
+                    ui.selectable_value(&mut picked, Some(i), label(s));
+                }
+            });
+            if picked != self.server {
+                self.server = picked;
+                self.server_changed();
+            }
+        });
+        ui.horizontal(|ui| {
+            field_label(ui, "Disks on:", LABEL_WIDTH);
+            let label = |s: &Store| format!("{}  ·  {} free", s.name, fmt_bytes(s.free));
+            let shown = self.chosen_store().map(label).unwrap_or_else(|| "No storage".into());
+            let mut picked = self.store;
+            combo("import-sr", shown, ui.available_width()).show_ui(ui, |ui| {
+                for (i, s) in self.stores.iter().enumerate().filter(|(_, s)| self.usable(s)) {
+                    ui.selectable_value(&mut picked, i, label(s));
+                }
+            });
+            self.store = picked;
+        });
+        let file_nets = self.xva().map(|x| x.nets.clone()).unwrap_or_default();
+        if !file_nets.is_empty() {
+            ui.horizontal(|ui| {
+                field_label(ui, "Network:", LABEL_WIDTH);
+                let mut uniq = file_nets.clone();
+                uniq.dedup();
+                let as_file = format!("As in the file ({})", uniq.join(", "));
+                let shown = if self.keep_nics { as_file.clone() } else { self.net.and_then(|i| self.nets.get(i)).map(|n| n.1.clone()).unwrap_or_default() };
+                let mut choice = if self.keep_nics { None } else { self.net };
+                combo("import-net", shown, ui.available_width()).show_ui(ui, |ui| {
+                    ui.selectable_value(&mut choice, None, as_file.as_str());
+                    ui.separator();
+                    for (i, n) in self.nets.iter().enumerate() {
+                        ui.selectable_value(&mut choice, Some(i), n.1.as_str());
+                    }
+                });
+                self.keep_nics = choice.is_none();
+                if choice.is_some() {
+                    self.net = choice;
+                }
+            });
+            if self.keep_nics {
+                let known: Vec<&String> = file_nets.iter().filter(|n| !self.nets.iter().any(|m| m.1 == **n)).collect();
+                if !known.is_empty() {
+                    let names: Vec<String> = known.iter().map(|n| format!("'{}'", n)).collect();
+                    note(ui, pal, &format!("This pool has no network called {}: the server connects those cards as it sees fit. Pick a network to be sure.", names.join(" or ")));
+                }
+            }
+        }
     }
 
     /// Custom's CPUs, memory and disk, centred in a panel under the cards.
@@ -1347,6 +1635,16 @@ fn size_card(ui: &mut Ui, pal: &Pal, size: egui::Vec2, title: &str, lines: &[Str
 mod tests {
     use super::*;
     use crate::conn::{Connection, DemoConnection};
+
+    #[test]
+    fn every_network_offered() {
+        // VLANs' bridges are "xapi…" too: offered like the rest, the first card's network first
+        let d = DemoConnection::new().fetch(0).unwrap();
+        let dlg = NewVmDialog::new(1, &d, None);
+        let names: Vec<&str> = dlg.nets.iter().map(|n| n.1.as_str()).collect();
+        assert!(names.contains(&"Office VLAN"), "{:?}", names);
+        assert_eq!(dlg.net.map(|i| dlg.nets[i].1.as_str()), Some("Pool-wide network 0"));
+    }
 
     #[test]
     fn server_then_storage() {
