@@ -18,6 +18,7 @@ affiliated with or endorsed by the makers of XenServer or XCP-ng.
 | ![Every VM's snapshots and schedules](docs/screenshot-dark-snapshots-page.png) | ![A snapshot schedule](docs/screenshot-dark-schedule.png) |
 | ![Your templates](docs/screenshot-dark-templates.png) | ![A new VM from a template](docs/screenshot-dark-new-vm-template.png) |
 | ![A server's Overview](docs/screenshot-dark-host.png) | ![A pool's Overview](docs/screenshot-dark-pool.png) |
+| ![Searching every field of a VM, in its Details tab](docs/screenshot-dark-details.png) | ![A server's Details tab](docs/screenshot-dark-host-details.png) |
 | ![A VM's week, in its Performance tab](docs/screenshot-dark-performance.png) | ![A server's Performance tab](docs/screenshot-dark-host-performance.png) |
 | ![Every pool's alerts](docs/screenshot-dark-alerts.png) | ![Alert limits for a VM](docs/screenshot-dark-alert-rules.png) |
 | ![A pool's updates](docs/screenshot-dark-updates.png) | ![Updating a pool](docs/screenshot-dark-updating.png) |
