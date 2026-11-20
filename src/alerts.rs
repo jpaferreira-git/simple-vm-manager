@@ -97,6 +97,39 @@ fn rate(b: f64) -> String {
     }
 }
 
+/// What a snapshot schedule's message (VMSS_…, from the server's vmss plugin) says: whether its
+/// run went well, and in words; a failure's VMs with what each went wrong with ("Web Server:
+/// SR_BACKEND_FAILURE_44 · There is insufficient space").
+pub fn schedule_said(m: &XenMessage) -> (bool, String) {
+    match m.name.as_str() {
+        "VMSS_SNAPSHOT_SUCCEEDED" => (true, "took its snapshots".into()),
+        "VMSS_SNAPSHOT_LOCK_FAILED" | "VMSS_SNAPSHOT_MISSED_EVENT" => (false, "skipped a run: the one before was still going".into()),
+        "VMSS_LICENSE_ERROR" => (false, "can't run: the pool's license doesn't include snapshot schedules".into()),
+        "VMSS_XAPI_LOGON_FAILURE" => (false, "couldn't log in to the server".into()),
+        _ => {
+            // "Snapshot failed on 1 out of 2 VMs with the following errors: … Details:\nVM: Web
+            // Server UUID: … Error:['SR_BACKEND_FAILURE_44', '', 'There is insufficient space'],"
+            let each: Vec<String> = m
+                .body
+                .lines()
+                .filter_map(|l| {
+                    let rest = l.trim().strip_prefix("VM: ")?;
+                    let (name, err) = (rest.split(" UUID:").next()?.trim(), rest.split("Error:").nth(1)?);
+                    let parts: Vec<&str> = err.trim().trim_end_matches(',').trim_matches(|c| c == '[' || c == ']').split(',').map(|p| p.trim().trim_matches('\'').trim_matches('"').trim()).filter(|p| !p.is_empty()).collect();
+                    Some(if parts.is_empty() { name.to_string() } else { format!("{}: {}", name, parts.join(" · ")) })
+                })
+                .collect();
+            let text = if !each.is_empty() {
+                each.join("; ")
+            } else {
+                let t = m.body.trim().trim_start_matches("failed with error:").trim();
+                if t.is_empty() { "the server didn't say why".into() } else { t.to_string() }
+            };
+            (false, text)
+        }
+    }
+}
+
 /// Days in a message name's end: "…_EXPIRING_07" → 7.
 fn days_in(name: &str) -> Option<i64> {
     name.rsplit('_').next()?.parse().ok()
@@ -142,6 +175,18 @@ pub fn describe(m: &XenMessage, obj: &str) -> Said {
         "VM_SNAPSHOTTED" => said(format!("A snapshot of {} was taken", it), ""),
         "VM_CHECKPOINTED" => said(format!("A snapshot of {} was taken with its memory", it), ""),
         "VM_SNAPSHOT_REVERTED" => said(format!("{} was put back to a snapshot", it), ""),
+        // (a snapshot schedule's, from the server's vmss plugin: `obj` is the schedule's name)
+        n if n.starts_with("VMSS_") => {
+            let who = if obj.is_empty() { "A snapshot schedule".to_string() } else { format!("Snapshot schedule '{}'", obj) };
+            let (ok, text) = schedule_said(m);
+            match n {
+                "VMSS_SNAPSHOT_SUCCEEDED" => said(format!("{} took its snapshots", who), ""),
+                "VMSS_SNAPSHOT_FAILED" => said(format!("{} couldn't take its snapshots", who), &text),
+                "VMSS_XAPI_LOGON_FAILURE" => said("Snapshot schedules couldn't log in to the server".to_string(), "Restarting the server's toolstack (xe-toolstack-restart) usually mends it"),
+                _ if ok => said(format!("{}: {}", who, text), ""),
+                _ => said(format!("{} {}", who, text), ""),
+            }
+        }
         "HA_HOST_FAILED" => said(format!("{} failed", it), "High availability noticed it stopped"),
         "HA_HOST_WAS_FENCED" => said(format!("{} was restarted by high availability", it), "It lost touch with the pool"),
         "HA_PROTECTED_VM_RESTART_FAILED" => said(format!("{} couldn't be started again", it), "High availability tried and failed"),
@@ -389,6 +434,21 @@ mod tests {
         let sr = "value: 0.96\nconfig:\n<variable><name value='physical_utilisation'/><alarm_trigger_level value='0.9'/></variable>";
         let m = XenMessage { name: "ALARM".into(), body: sr.into(), ..Default::default() };
         assert_eq!(describe(&m, "Local storage").title, "Local storage is 96% full");
+    }
+
+    #[test]
+    fn schedule_messages_in_words() {
+        // as the server's vmss plugin writes them
+        let body = "Snapshot failed on 2 out of 3 VMs with the following errors: \n\nDetails:\nVM: Web Server UUID: 1234 Error:['SR_BACKEND_FAILURE_44', '', 'There is insufficient space'],\nVM: Home Assistant UUID: 5678 Error:['VM_BAD_POWER_STATE']";
+        let m = XenMessage { name: "VMSS_SNAPSHOT_FAILED".into(), priority: 1, cls: "VMSS".into(), body: body.into(), ..Default::default() };
+        assert_eq!(schedule_said(&m), (false, "Web Server: SR_BACKEND_FAILURE_44 · There is insufficient space; Home Assistant: VM_BAD_POWER_STATE".to_string()));
+        assert_eq!(describe(&m, "Nightly").title, "Snapshot schedule 'Nightly' couldn't take its snapshots");
+        let m = XenMessage { name: "VMSS_SNAPSHOT_SUCCEEDED".into(), priority: 5, body: "VMSS_SNAPSHOT_SUCCEEDED".into(), ..Default::default() };
+        assert_eq!((schedule_said(&m).0, describe(&m, "").title.as_str()), (true, "A snapshot schedule took its snapshots"));
+        let m = XenMessage { name: "VMSS_SNAPSHOT_LOCK_FAILED".into(), ..Default::default() };
+        assert_eq!(describe(&m, "Nightly").title, "Snapshot schedule 'Nightly' skipped a run: the one before was still going");
+        let m = XenMessage { name: "VMSS_SNAPSHOT_FAILED".into(), body: "failed with error: Something odd.".into(), ..Default::default() };
+        assert_eq!(schedule_said(&m).1, "Something odd.");
     }
 
     #[test]

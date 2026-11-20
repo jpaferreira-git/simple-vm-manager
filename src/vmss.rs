@@ -1,5 +1,5 @@
-//! Snapshot schedules (XenServer's VMSS): a pool's list of them (Schedules…, on the Snapshots
-//! page), one schedule's settings and VMs (New Schedule, Edit), and choosing the schedule some
+//! Snapshot schedules (XenServer's VMSS): a pool's list of them (the Snapshots page's Schedules
+//! tab), one schedule's settings and VMs (New Schedule, Edit), and choosing the schedule some
 //! VMs are on (Schedule…, on the page for the VMs ticked, or a VM's Snapshots tab).
 
 use crate::app::{dialog_button, dialog_buttons, dialog_window, field_label, text_field, Look, LABEL_WIDTH};
@@ -12,7 +12,6 @@ use std::collections::HashSet;
 /// A pool, as the schedule dialogs see it.
 pub struct SchedPool<'a> {
     pub sid: u32,
-    pub name: String,
     pub data: &'a PoolData,
 }
 
@@ -47,7 +46,7 @@ fn switch(ui: &mut Ui, pal: &Pal, on: bool, enabled: bool) -> egui::Response {
 }
 
 /// A small square button with a glyph (Edit, Delete); true when clicked.
-fn glyph_button(ui: &mut Ui, pal: &Pal, glyph: &str, tip: &str, danger: bool, enabled: bool) -> bool {
+pub fn glyph_button(ui: &mut Ui, pal: &Pal, glyph: &str, tip: &str, danger: bool, enabled: bool) -> bool {
     let (b, resp) = ui.allocate_exact_size(vec2(26.0, 26.0), if enabled { Sense::click() } else { Sense::hover() });
     let resp = resp.on_hover_text(tip);
     let hot = enabled && resp.hovered();
@@ -71,145 +70,129 @@ fn small(ui: &mut Ui, pal: &Pal, text: &str) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// The list (Schedules…)
+// The list (the Snapshots page's Schedules tab)
 
 pub enum ListAction {
     None,
-    Close,
-    New(u32),
     Edit(u32, String),
     Delete(u32, String),
     Enable(u32, String, bool),
+    Run(u32, String),
 }
 
-/// A pool's snapshot schedules: each turned on or off, edited or deleted; New Schedule.
-pub struct SchedulesDialog {
-    pub sid: u32,
-    /// The one Delete was clicked for, asked about.
-    asking: Option<String>,
+/// What the server last said about a schedule (its vmss plugin's messages): when, whether its
+/// run went well, and in words.
+pub struct SchedNews {
+    pub time: i64,
+    pub ok: bool,
+    pub text: String,
 }
 
-impl SchedulesDialog {
-    pub fn new(sid: u32) -> Self {
-        SchedulesDialog { sid, asking: None }
+/// When it last ran, in words: "last ran today, 03:00", or that it hasn't yet.
+pub fn last_ran(x: &ScheduleInfo) -> String {
+    x.last_run.map_or("hasn't run yet (the server looks every 15 minutes)".to_string(), |t| format!("last ran {}", fmt_when(t, now(), local_offset(now())).to_lowercase()))
+}
+
+/// What went wrong on its last run, if the server's latest word about it is that it failed
+/// (after it last ran well).
+pub fn failure<'a>(x: &ScheduleInfo, news: Option<&'a SchedNews>) -> Option<&'a SchedNews> {
+    news.filter(|n| !n.ok && x.last_run.map_or(true, |t| n.time >= t))
+}
+
+/// Why Run now is off for it, if it is.
+pub fn run_off(x: &ScheduleInfo) -> Option<&'static str> {
+    if !x.enabled {
+        Some("Turn it on first: the server doesn't run a paused schedule, not even now")
+    } else if x.vms.is_empty() {
+        Some("It has no VMs to take snapshots of")
+    } else {
+        None
     }
+}
 
-    /// `busy`: schedules being saved, turned on or off, or deleted.
-    pub fn ui(&mut self, ctx: &egui::Context, pal: &Pal, pools: &[SchedPool], busy: &HashSet<String>) -> ListAction {
-        let mut action = ListAction::None;
-        if !pools.iter().any(|p| p.sid == self.sid) {
-            if let Some(p) = pools.first() {
-                self.sid = p.sid;
-            }
-        }
-        dialog_window(ctx, "Snapshot Schedules").id(egui::Id::new("schedules-dialog")).show(ctx, |ui| {
-            ui.set_width(560.0);
-            ui.spacing_mut().item_spacing.y = 8.0;
-            if pools.len() > 1 {
-                ui.horizontal(|ui| {
-                    field_label(ui, "Pool:", LABEL_WIDTH);
-                    combo_style(ui, pal);
-                    let shown = pools.iter().find(|p| p.sid == self.sid).map(|p| p.name.clone()).unwrap_or_default();
-                    combo("schedules-pool", shown, ui.available_width() - 4.0).show_ui(ui, |ui| {
-                        for p in pools {
-                            ui.selectable_value(&mut self.sid, p.sid, p.name.as_str());
-                        }
-                    });
-                });
-            }
-            let Some(pool) = pools.iter().find(|p| p.sid == self.sid) else {
-                small(ui, pal, "No pool is connected.");
-                dialog_buttons(ui, |ui| {
-                    if dialog_button(ui, pal, "close", "Close", Look::Plain, true) {
-                        action = ListAction::Close;
+/// A pool's snapshot schedules, as cards: each turned on or off, run now, edited or deleted
+/// (asked about first, in place: `asking`). `busy`: schedules being saved, turned on or off,
+/// deleted ("<ref>") or run ("run:<ref>").
+pub fn schedule_list(ui: &mut Ui, pal: &Pal, pool: &SchedPool, busy: &HashSet<String>, news: &std::collections::HashMap<String, SchedNews>, asking: &mut Option<String>) -> ListAction {
+    let mut action = ListAction::None;
+    let d = pool.data;
+    let sid = pool.sid;
+    for x in &d.schedules {
+        let working = busy.contains(&x.rref);
+        let running = busy.contains(&format!("run:{}", x.rref));
+        let failed = failure(x, news.get(&x.rref));
+        egui::Frame::none().fill(pal.surface).stroke(Stroke::new(1.0_f32, pal.border)).rounding(Rounding::same(8.0)).inner_margin(egui::Margin::symmetric(12.0, 9.0)).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 3.0;
+            ui.horizontal(|ui| {
+                let tip = if x.enabled { "On: it takes its snapshots. Click to pause it." } else { "Paused: it takes no snapshots. Click to turn it on." };
+                if switch(ui, pal, x.enabled, !working && !running).on_hover_text(tip).clicked() {
+                    action = ListAction::Enable(sid, x.rref.clone(), !x.enabled);
+                }
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new(&x.name).size(14.0).color(if x.enabled { pal.ink } else { pal.ink_soft }));
+                if !x.enabled {
+                    ui.label(egui::RichText::new("paused").size(12.0).color(pal.orange));
+                }
+                if working || running {
+                    ui.add(egui::Spinner::new().size(13.0));
+                }
+                if running {
+                    ui.label(egui::RichText::new("taking its snapshots…").size(12.0).color(pal.ink_soft));
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let free = !working && !running;
+                    if glyph_button(ui, pal, "trash", "Delete this schedule…", true, free) {
+                        *asking = Some(x.rref.clone());
+                    }
+                    if glyph_button(ui, pal, "edit", "Edit: when it runs, how many it keeps, its VMs…", false, free) {
+                        action = ListAction::Edit(sid, x.rref.clone());
+                    }
+                    let tip = run_off(x).unwrap_or("Run it now: a snapshot of each of its VMs, as at its times");
+                    if glyph_button(ui, pal, "camera", tip, false, free && run_off(x).is_none()) {
+                        action = ListAction::Run(sid, x.rref.clone());
                     }
                 });
-                return;
-            };
-            let d = pool.data;
-            small(ui, pal, "Each takes a snapshot of its VMs by itself, at its times, and keeps the last few it took (deleting the oldest). A VM is on one schedule at most.");
-            if let Some(why) = &d.schedules_off {
-                ui.label(egui::RichText::new(why).size(12.5).color(pal.orange));
-            }
-            ui.add_space(2.0);
-            if d.schedules.is_empty() {
-                ui.label(egui::RichText::new("No schedules in this pool yet.").color(pal.ink_faint));
-            }
-            egui::ScrollArea::vertical().max_height(360.0).auto_shrink([false, true]).show(ui, |ui| {
-                for x in &d.schedules {
-                    let working = busy.contains(&x.rref);
-                    egui::Frame::none().fill(pal.surface).stroke(Stroke::new(1.0_f32, pal.border)).rounding(Rounding::same(8.0)).inner_margin(egui::Margin::symmetric(12.0, 9.0)).show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        ui.spacing_mut().item_spacing.y = 3.0;
-                        ui.horizontal(|ui| {
-                            let tip = if x.enabled { "On: it takes its snapshots. Click to pause it." } else { "Paused: it takes no snapshots. Click to turn it on." };
-                            if switch(ui, pal, x.enabled, !working).on_hover_text(tip).clicked() {
-                                action = ListAction::Enable(self.sid, x.rref.clone(), !x.enabled);
-                            }
-                            ui.add_space(4.0);
-                            ui.label(egui::RichText::new(&x.name).size(14.0).color(if x.enabled { pal.ink } else { pal.ink_soft }));
-                            if working {
-                                ui.add(egui::Spinner::new().size(13.0));
-                            }
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if glyph_button(ui, pal, "trash", "Delete this schedule…", true, !working) {
-                                    self.asking = Some(x.rref.clone());
-                                }
-                                if glyph_button(ui, pal, "edit", "Edit this schedule…", false, !working) {
-                                    action = ListAction::Edit(self.sid, x.rref.clone());
-                                }
-                            });
-                        });
-                        let holds = if x.memory { "disks and memory" } else { "disks" };
-                        ui.label(egui::RichText::new(format!("{}  ·  {}", x.summary(), holds)).size(12.5).color(pal.ink_soft));
-                        let names = vm_names(d, &x.vms);
-                        let last = x.last_run.map_or("not run yet".to_string(), |t| format!("last ran {}", fmt_when(t, now(), local_offset(now())).to_lowercase()));
-                        let vms = if names.is_empty() { "No VMs on it".to_string() } else { names_of(&names) };
-                        ui.label(egui::RichText::new(format!("{}  ·  {}", vms, last)).size(12.0).color(pal.ink_faint));
-                    });
-                    ui.add_space(2.0);
-                }
             });
-            if let Some(r) = self.asking.clone() {
-                match d.schedules.iter().find(|x| x.rref == r) {
-                    Some(x) => {
-                        let n = x.vms.len();
-                        let text = match n {
-                            0 => "The snapshots it took stay.".to_string(),
-                            1 => "Its VM stops getting snapshots from it; the snapshots it took stay.".to_string(),
-                            _ => format!("Its {} VMs stop getting snapshots from it; the snapshots it took stay.", n),
-                        };
-                        egui::Frame::none().fill(pal.red.gamma_multiply(if pal.dark { 0.18 } else { 0.08 })).rounding(Rounding::same(8.0)).inner_margin(egui::Margin::symmetric(12.0, 9.0)).show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.label(egui::RichText::new(format!("Delete the schedule '{}'?", x.name)).color(pal.ink));
-                            small(ui, pal, &text);
-                            ui.horizontal(|ui| {
-                                if dialog_button(ui, pal, "trash", "Delete", Look::Danger, true) {
-                                    action = ListAction::Delete(self.sid, r.clone());
-                                    self.asking = None;
-                                }
-                                if dialog_button(ui, pal, "close", "Keep it", Look::Plain, true) {
-                                    self.asking = None;
-                                }
-                            });
-                        });
-                    }
-                    None => self.asking = None,
-                }
+            let holds = if x.memory { "disks and memory" } else { "disks" };
+            ui.label(egui::RichText::new(format!("{}  ·  {}", x.summary(), holds)).size(12.5).color(pal.ink_soft));
+            let names = vm_names(d, &x.vms);
+            let vms = if names.is_empty() { "No VMs on it".to_string() } else { names_of(&names) };
+            ui.label(egui::RichText::new(format!("{}  ·  {}", vms, last_ran(x))).size(12.0).color(pal.ink_faint));
+            if let Some(n) = failed {
+                let when = fmt_when(n.time, now(), local_offset(now())).to_lowercase();
+                ui.add(egui::Label::new(egui::RichText::new(format!("Its run {} failed: {}", when, n.text)).size(12.0).color(pal.red)).wrap());
             }
-            ui.add_space(4.0);
-            dialog_buttons(ui, |ui| {
-                if dialog_button(ui, pal, "close", "Close", Look::Plain, true) || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                    action = ListAction::Close;
-                }
-                let can = d.schedules_off.is_none();
-                if dialog_button(ui, pal, "plus", "New Schedule", Look::Primary, can) {
-                    action = ListAction::New(self.sid);
-                }
-            });
         });
-        action
+        if asking.as_deref() == Some(x.rref.as_str()) {
+            let n = x.vms.len();
+            let text = match n {
+                0 => "The snapshots it took stay.".to_string(),
+                1 => "Its VM stops getting snapshots from it; the snapshots it took stay.".to_string(),
+                _ => format!("Its {} VMs stop getting snapshots from it; the snapshots it took stay.", n),
+            };
+            ui.add_space(2.0);
+            egui::Frame::none().fill(pal.red.gamma_multiply(if pal.dark { 0.18 } else { 0.08 })).rounding(Rounding::same(8.0)).inner_margin(egui::Margin::symmetric(12.0, 9.0)).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(egui::RichText::new(format!("Delete the schedule '{}'?", x.name)).color(pal.ink));
+                small(ui, pal, &text);
+                ui.horizontal(|ui| {
+                    if dialog_button(ui, pal, "trash", "Delete", Look::Danger, true) {
+                        action = ListAction::Delete(sid, x.rref.clone());
+                        *asking = None;
+                    }
+                    if dialog_button(ui, pal, "close", "Keep it", Look::Plain, true) {
+                        *asking = None;
+                    }
+                });
+            });
+        }
+        ui.add_space(6.0);
     }
+    if asking.as_ref().map_or(false, |r| !d.schedules.iter().any(|x| x.rref == *r)) {
+        *asking = None;
+    }
+    action
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -225,7 +208,6 @@ pub enum EditAction {
 pub struct ScheduleDialog {
     pub sid: u32,
     /// Opened from the list of schedules: back to it after.
-    pub from_list: bool,
     x: ScheduleInfo,
     search: String,
     focus: bool,
@@ -233,13 +215,13 @@ pub struct ScheduleDialog {
 
 impl ScheduleDialog {
     /// For `x` (None: a new one, on the VMs `vms`).
-    pub fn new(sid: u32, x: Option<&ScheduleInfo>, vms: Vec<String>, from_list: bool) -> Self {
+    pub fn new(sid: u32, x: Option<&ScheduleInfo>, vms: Vec<String>) -> Self {
         let x = match x {
             Some(x) => x.clone(),
             None => ScheduleInfo { enabled: true, kind: "snapshot".into(), keep: 7, every: Every::Daily, hour: 3, min: 0, days: vec!["Sunday".into()], vms, ..Default::default() },
         };
         let focus = x.rref.is_empty();
-        ScheduleDialog { sid, from_list, x, search: String::new(), focus }
+        ScheduleDialog { sid, x, search: String::new(), focus }
     }
 
     /// What stops it being saved.

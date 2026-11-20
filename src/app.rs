@@ -5,6 +5,7 @@ use crate::conn::*;
 use crate::console::{self, ConsoleView};
 use crate::alerts::{AlertSettings, Severity, Watched, XenMessage};
 use crate::history::{Records, Span};
+use crate::ipconf::{IpAction, IpChange, IpDialog};
 use crate::isolib::{mount_trouble, IsoAction, IsoDialog, MountTrouble};
 use crate::newnet::{NetworkAction, NetworkDialog, PoolCards};
 use crate::newsr::{Guest, StorageAction, StorageDialog};
@@ -13,7 +14,7 @@ use crate::movevm::{MoveAction, MoveDialog};
 use crate::pool_update::{PlanSr, PlanVm, PoolUpdateAction, PoolUpdateDialog, PoolView, UpdateRun};
 use crate::upload::{UploadAction, UploadDialog};
 use crate::xva::{ExportAction, ExportDialog, Exported};
-use crate::vmss::{EditAction, ListAction, PickAction, PickDialog, SchedPool, ScheduleDialog, SchedulesDialog};
+use crate::vmss::{EditAction, ListAction, PickAction, PickDialog, SchedNews, SchedPool, ScheduleDialog};
 use details::FieldRecords;
 use snapshots::SnapView;
 use crate::secrets;
@@ -107,6 +108,8 @@ enum Msg {
     Fetched(u32, Result<PoolData, ApiError>),
     /// A Details tab's every field, read (`key`: "vm:<ref>", "host:<ref>", "pool:").
     Records { sid: u32, key: String, result: Result<Vec<(String, serde_json::Value)>, ApiError> },
+    /// A network card's address (and hostname) changed, or not.
+    IpDone { sid: u32, pif: String, log: usize, text: String, result: Result<(), ApiError> },
     /// A Details tab saved as a file (or not: why).
     DetailsSaved { sid: u32, server: String, title: String, path: PathBuf, result: Result<(), String> },
     /// At startup: whether there's a keychain, the passwords saved in it for earlier servers, and
@@ -371,6 +374,8 @@ enum Tab {
     Snapshots,
     /// Every pool's VMs with their snapshots and schedules (All servers; the toolbar's Snapshots).
     AllSnapshots,
+    /// Every pool's snapshot schedules (the toolbar's Snapshots, its second tab).
+    AllSchedules,
     /// The Templates folder's list.
     Templates,
     Logs,
@@ -380,7 +385,7 @@ impl Tab {
     /// A page of All servers that a toolbar button opens: not a tab in its row too, the button
     /// shown pressed instead.
     fn on_toolbar(self) -> bool {
-        matches!(self, Tab::IsoLibrary | Tab::VmStorage | Tab::Templates | Tab::AllSnapshots | Tab::Networks | Tab::Alerts)
+        matches!(self, Tab::IsoLibrary | Tab::VmStorage | Tab::Templates | Tab::AllSnapshots | Tab::AllSchedules | Tab::Networks | Tab::Alerts)
     }
 
     fn label(self) -> &'static str {
@@ -399,7 +404,10 @@ impl Tab {
             Tab::IsoLibrary => "ISO Library",
             Tab::VmStorage => "VM Storage",
             Tab::Networks => "Networks",
-            Tab::Snapshots | Tab::AllSnapshots => "Snapshots",
+            Tab::Snapshots => "Snapshots",
+            // (under the Snapshots page's name)
+            Tab::AllSnapshots => "VMs",
+            Tab::AllSchedules => "Schedules",
             Tab::Templates => "Templates",
             Tab::Logs => "Logs",
         }
@@ -408,10 +416,11 @@ impl Tab {
 
 enum Dialog {
     None,
-    /// A pool's snapshot schedules; one of them (new or to change); the one some VMs are on.
-    Schedules(Box<SchedulesDialog>),
+    /// A snapshot schedule (new or to change); the one some VMs are on.
     Schedule(Box<ScheduleDialog>),
     PickSchedule(Box<PickDialog>),
+    /// A server's network card's address (and, on its management card, its hostname).
+    Ip(Box<IpDialog>),
     /// A snapshot of each of several VMs: (pool, VM, its name, can hold its memory), the name,
     /// description, and whether those that can hold their memory do.
     TakeSnapshots { vms: Vec<(u32, String, String, bool)>, name: String, description: String, memory: bool, focus: bool },
@@ -520,16 +529,22 @@ enum Intent {
     Snapshots,
     /// A VM's Snapshots tab: pool, VM.
     OpenVmSnapshots(u32, String),
-    /// A pool's snapshot schedules (Schedules…; this pool's, else the first).
-    Schedules(Option<u32>),
-    /// A new snapshot schedule for these VMs of a pool (from the list of schedules: back to it after).
-    NewSchedule(u32, Vec<String>, bool),
-    /// Editing a pool's snapshot schedule (from the list of them: back to it after).
-    EditSchedule(u32, String, bool),
+    /// The snapshot schedules (the Snapshots page's Schedules tab).
+    Schedules,
+    /// A new snapshot schedule for these VMs of a pool.
+    NewSchedule(u32, Vec<String>),
+    /// Editing a pool's snapshot schedule.
+    EditSchedule(u32, String),
+    /// A pool's snapshot schedule deleted, turned on or off (true: on), or run now.
+    DeleteSchedule(u32, String),
+    EnableSchedule(u32, String, bool),
+    RunSchedule(u32, String),
     /// Choosing the snapshot schedule these VMs of a pool are on.
     PickSchedule(u32, Vec<String>),
     /// A VM of a pool taken off its snapshot schedule (its Snapshots tab's Remove).
     Unschedule(u32, String),
+    /// Change IP… on a server's network card: pool, server, card (PIF).
+    ChangeIp(u32, String, String),
     /// A snapshot of each of these VMs (pool, VM), asked for first.
     TakeSnapshots(Vec<(u32, String)>),
     /// The Networks page: every pool's networks (the toolbar's Networks).
@@ -569,6 +584,8 @@ enum Intent {
     ExportVm(u32, String),
     /// Open the New VM dialog on this template of the user's: server, template.
     NewVmFromTemplate(u32, String),
+    /// New VM from one of a VM's snapshots: pool, snapshot.
+    NewVmFromSnapshot(u32, String),
     /// Ask before deleting a template of the user's: server, template.
     AskDeleteTemplate(u32, String),
     /// Ask before reverting a VM to a snapshot, or deleting one: server, snapshot.
@@ -685,6 +702,8 @@ pub struct App {
     /// The Details tabs' every field, by pool and item (see `FieldRecords`), and their search.
     field_records: HashMap<(u32, String), FieldRecords>,
     details_search: String,
+    /// Network cards whose address is being changed (PIFs).
+    ip_busy: HashSet<String>,
     dialog: Dialog,
     console: Option<ConsoleView>,
     /// Earlier servers and the account used on each, newest first.
@@ -708,6 +727,8 @@ pub struct App {
     snap_edit: Option<IsoEdit>,
     /// Snapshot descriptions being saved, by snapshot, shown until the server answers.
     snap_saving: HashMap<String, String>,
+    /// The snapshot ticked in a VM's Snapshots tab (one at a time), for the buttons over its list.
+    snap_pick: Option<String>,
     /// The Snapshots page: which VMs it shows, words in their names, the VMs ticked.
     snap_view: SnapView,
     /// Snapshot schedule work under way: a schedule's reference (turned on or off, deleted), or
@@ -715,6 +736,8 @@ pub struct App {
     sched_busy: HashSet<String>,
     /// Snapshots being deleted.
     snap_deleting: HashSet<String>,
+    /// The snapshot schedule Delete was clicked for on the Schedules tab, asked about in place.
+    sched_asking: Option<String>,
     /// ISO files being deleted, by disc.
     iso_deleting: HashSet<String>,
     /// VMs being deleted right now.
@@ -820,6 +843,7 @@ impl App {
             closed_sections: HashSet::new(),
             field_records: HashMap::new(),
             details_search: String::new(),
+            ip_busy: HashSet::new(),
             dialog: Dialog::None,
             console: None,
             known_hosts: load_history(),
@@ -833,9 +857,11 @@ impl App {
             iso_edit: None,
             iso_saving: HashMap::new(),
             snap_edit: None,
+            snap_pick: None,
             snap_saving: HashMap::new(),
             snap_view: SnapView::default(),
             sched_busy: HashSet::new(),
+            sched_asking: None,
             snap_deleting: HashSet::new(),
             iso_deleting: HashSet::new(),
             vm_deleting: HashSet::new(),
@@ -1099,9 +1125,17 @@ impl App {
             return;
         };
         let (conn, tx, ctx, server) = (s.conn.clone(), self.tx.clone(), ctx.clone(), s.name());
+        let snapshot = s.data.as_ref().map_or(false, |d| d.vms.iter().any(|v| v.snapshot(&spec.template).is_some()));
         self.creating += 1;
-        let what = if spec.from_template { format!("Creating VM '{}' from a template", spec.name) } else { format!("Creating VM '{}'", spec.name) };
+        let what = match (spec.from_template, snapshot) {
+            (true, true) => format!("Creating VM '{}' from a snapshot", spec.name),
+            (true, false) => format!("Creating VM '{}' from a template", spec.name),
+            _ => format!("Creating VM '{}'", spec.name),
+        };
         let prog = self.job(format!("newvm:{}:{}", sid, spec.name), sid, &server, None, &spec.name, &what);
+        if let Dialog::NewVm(d) = &mut self.dialog {
+            d.watch(prog.clone());
+        }
         if let Some(&log) = self.jobs.get(&format!("newvm:{}:{}", sid, spec.name)) {
             self.if_closed(log, format!("'{}' is left half made: when the app opens again, it asks whether to delete it.", spec.name));
         }
@@ -1542,6 +1576,74 @@ impl App {
         };
         let r = vmss.clone();
         self.schedule_job(sid, vmss, doing, done, failed, move |c| c.set_schedule_enabled(&r, on).map(|_| String::new()), ctx);
+    }
+
+    /// Runs a snapshot schedule now (the server's vmss plugin, as at its times). The plugin
+    /// answers "True", or what went wrong; a failed VM's reason is in its alert, read soon after.
+    fn run_schedule(&mut self, sid: u32, vmss: String, ctx: &egui::Context) {
+        let name = self.server(sid).and_then(|s| s.data.as_ref()).and_then(|d| d.schedules.iter().find(|x| x.rref == vmss)).map(|x| x.name.clone()).unwrap_or_default();
+        let (doing, done, failed) = (format!("Running snapshot schedule '{}' now", name), format!("Ran snapshot schedule '{}': its VMs' snapshots taken", name), format!("Snapshot schedule '{}' couldn't take its snapshots", name));
+        let r = vmss.clone();
+        self.schedule_job(sid, format!("run:{}", vmss), doing, done, failed, move |c| {
+            let said = c.run_schedule(&r)?;
+            match said.trim().trim_end_matches('.').trim() {
+                "True" => Ok(String::new()),
+                "" => Err(ApiError::other("The server's snapshot plugin says it failed. Its alert about it says why: it shows on the schedule in a moment, and under Alerts.")),
+                t => Err(ApiError::other(t.to_string())),
+            }
+        }, ctx);
+    }
+
+    /// What the server last said about each snapshot schedule of pool `sid` (its vmss plugin's
+    /// messages), by schedule.
+    pub(super) fn schedule_news(&self, sid: u32) -> HashMap<String, SchedNews> {
+        let mut out: HashMap<String, SchedNews> = HashMap::new();
+        let (Some(d), Some(c)) = (self.server(sid).and_then(|s| s.data.as_ref()), self.messages.get(&sid)) else { return out };
+        for m in c.list.iter().filter(|m| m.cls == "VMSS" && !self.dismissing.contains(&m.rref)) {
+            let Some(x) = d.schedules.iter().find(|x| !x.uuid.is_empty() && x.uuid == m.obj_uuid) else { continue };
+            if out.get(&x.rref).map_or(true, |n| m.time > n.time) {
+                let (ok, text) = crate::alerts::schedule_said(m);
+                out.insert(x.rref.clone(), SchedNews { time: m.time, ok, text });
+            }
+        }
+        out
+    }
+
+    /// Changes a server's network card's address and its hostname in the background: the
+    /// hostname first (the connection stays), then the address (which may move it).
+    fn change_ip(&mut self, c: IpChange, ctx: &egui::Context) {
+        let Some(s) = self.server(c.sid) else { return };
+        let (conn, tx, ctx, server) = (s.conn.clone(), self.tx.clone(), ctx.clone(), s.name());
+        let mut parts = vec![];
+        if let Some((mode, ip, ..)) = &c.address {
+            parts.push(match mode.as_str() {
+                "Static" => format!("{}'s address to {}", c.device, ip),
+                "DHCP" => format!("{}'s address to automatic (DHCP)", c.device),
+                _ => format!("{}'s address to none", c.device),
+            });
+        }
+        if let Some(name) = &c.hostname {
+            parts.push(format!("its hostname to '{}'", name));
+        }
+        let text = format!("Changing {} on '{}'", parts.join(" and "), c.host_name);
+        let log = self.add_log(c.sid, &server, Some(&c.host), &c.host_name, &text, "In progress");
+        let prog = self.progress(log);
+        self.ip_busy.insert(c.pif.clone());
+        let (sid, pif) = (c.sid, c.pif.clone());
+        std::thread::spawn(move || {
+            crate::conn::watch(&prog);
+            let result = (|| {
+                if let Some(name) = &c.hostname {
+                    conn.set_hostname(&c.host, name)?;
+                }
+                if let Some((mode, ip, mask, gw, dns)) = &c.address {
+                    conn.set_ip(&c.pif, mode, ip, mask, gw, dns)?;
+                }
+                Ok(())
+            })();
+            let _ = tx.send(Msg::IpDone { sid, pif, log, text, result });
+            ctx.request_repaint();
+        });
     }
 
     /// Puts VMs of a pool on a snapshot schedule, or on none; `key` as in `sched_busy` (pick: the
@@ -2166,6 +2268,24 @@ impl App {
         while let Ok(m) = self.rx.try_recv() {
             match m {
                 Msg::Fetched(id, r) => self.on_fetched(id, r),
+                Msg::IpDone { sid, pif, log, text, result } => {
+                    self.ip_busy.remove(&pif);
+                    self.refresh_soon(sid);
+                    match result {
+                        Ok(()) => {
+                            self.end_log(log, "Done", Some(text.replacen("Changing", "Changed", 1)));
+                            if matches!(&self.dialog, Dialog::Ip(d) if d.pif == pif) {
+                                self.dialog = Dialog::None;
+                            }
+                        }
+                        Err(e) => {
+                            self.end_log(log, "Failed", Some(format!("{}: {}", text, e.message())));
+                            if self.shot_path.is_none() {
+                                self.dialog = Dialog::Message { title: "Change IP".into(), text: format!("{} failed.\n\n{}", text, e.message()) };
+                            }
+                        }
+                    }
+                }
                 Msg::Records { sid, key, result } => {
                     let e = self.field_records.entry((sid, key)).or_default();
                     e.loading = false;
@@ -3051,10 +3171,10 @@ impl App {
                     }
                     self.refresh_soon(sid);
                     match &result {
-                        // its dialog is done with (back to the list it came from)
+                        // its dialog is done with
                         Ok(_) if key.starts_with("save:") => {
-                            if let Dialog::Schedule(d) = &self.dialog {
-                                self.dialog = if d.from_list { Dialog::Schedules(Box::new(SchedulesDialog::new(sid))) } else { Dialog::None };
+                            if matches!(self.dialog, Dialog::Schedule(_)) {
+                                self.dialog = Dialog::None;
                             }
                         }
                         Ok(_) if key.starts_with("off:") => {
@@ -3078,7 +3198,7 @@ impl App {
                         Ok(_) => {}
                         Err(e) => {
                             // said in a dialog, unless another one (not a schedule's) is open
-                            if matches!(self.dialog, Dialog::None | Dialog::Schedules(_) | Dialog::Schedule(_) | Dialog::PickSchedule(_)) {
+                            if matches!(self.dialog, Dialog::None | Dialog::Schedule(_) | Dialog::PickSchedule(_)) {
                                 self.dialog = Dialog::Message { title: "Snapshot Schedules".into(), text: format!("{}.\n\n{}", failed, schedule_problem(e)) };
                             }
                         }
@@ -3245,7 +3365,7 @@ impl App {
                                 self.host_rebooting.insert("host-b".into(), crate::pool_update::now() - 14 * 60);
                                 self.select(format!("host:{}:host-b", id));
                             }
-                            "host" | "host-details" | "host-shutdown" | "host-restart" | "host-maintenance" | "host-performance" => self.select(format!("host:{}:host-a", id)),
+                            "host" | "host-details" | "change-ip" | "host-shutdown" | "host-restart" | "host-maintenance" | "host-performance" => self.select(format!("host:{}:host-a", id)),
                             // (with SVM_DEMO_OFF=host-b, or SVM_DEMO_MAINTENANCE=host-b)
                             "host-off" | "host-in-maintenance" | "host-exit-maintenance" => self.select(format!("host:{}:host-b", id)),
                             "host-waking" => {
@@ -3794,6 +3914,11 @@ impl App {
                 Intent::ShowLog(index) => self.dialog = Dialog::LogDetail { index, copied: None },
                 Intent::EditVm(sid, vm, change) => self.edit_vm(sid, vm, change, ctx),
                 Intent::AskEditVm(sid, vm, change, title, text) => self.dialog = Dialog::ConfirmEditVm { sid, vm, change, title, text },
+                Intent::NewVmFromSnapshot(sid, snap) => {
+                    if let Some(d) = self.server(sid).and_then(|s| s.data.as_ref()) {
+                        self.dialog = Dialog::NewVm(Box::new(NewVmDialog::new(sid, d, None).with_snapshot(d, &snap)));
+                    }
+                }
                 Intent::NewVmFromTemplate(sid, tpl) => {
                     if let Some(d) = self.server(sid).and_then(|s| s.data.as_ref()) {
                         self.dialog = Dialog::NewVm(Box::new(NewVmDialog::new(sid, d, None).with_template(&tpl)));
@@ -3866,25 +3991,33 @@ impl App {
                     self.select(format!("vm:{}:{}", sid, vm));
                     self.tab = Tab::Snapshots;
                 }
-                Intent::Schedules(sid) => {
-                    if let Some(sid) = sid.or_else(|| self.servers.iter().find(|s| s.data.is_some()).map(|s| s.id)) {
-                        self.dialog = Dialog::Schedules(Box::new(SchedulesDialog::new(sid)));
-                    }
+                Intent::Schedules => {
+                    self.select("root".into());
+                    self.tab = Tab::AllSchedules;
                 }
-                Intent::NewSchedule(sid, vms, from_list) => {
-                    self.dialog = Dialog::Schedule(Box::new(ScheduleDialog::new(sid, None, vms, from_list)));
+                Intent::NewSchedule(sid, vms) => {
+                    self.dialog = Dialog::Schedule(Box::new(ScheduleDialog::new(sid, None, vms)));
                 }
-                Intent::EditSchedule(sid, vmss, from_list) => {
+                Intent::EditSchedule(sid, vmss) => {
                     if let Some(x) = self.server(sid).and_then(|s| s.data.as_ref()).and_then(|d| d.schedules.iter().find(|x| x.rref == vmss)) {
-                        self.dialog = Dialog::Schedule(Box::new(ScheduleDialog::new(sid, Some(x), vec![], from_list)));
+                        self.dialog = Dialog::Schedule(Box::new(ScheduleDialog::new(sid, Some(x), vec![])));
                     }
                 }
+                Intent::DeleteSchedule(sid, vmss) => self.delete_schedule(sid, vmss, ctx),
+                Intent::EnableSchedule(sid, vmss, on) => self.enable_schedule(sid, vmss, on, ctx),
+                Intent::RunSchedule(sid, vmss) => self.run_schedule(sid, vmss, ctx),
                 Intent::PickSchedule(sid, vms) => {
                     let Some(d) = self.server(sid).and_then(|s| s.data.as_ref()) else { continue };
                     // the schedule they're all on, if they are
                     let on: Vec<Option<String>> = vms.iter().map(|r| d.vm(r).and_then(|v| v.schedule.clone())).collect();
                     let now = on.first().cloned().flatten().filter(|first| on.iter().all(|x| x.as_deref() == Some(first.as_str())));
                     self.dialog = Dialog::PickSchedule(Box::new(PickDialog::new(sid, vms, now)));
+                }
+                Intent::ChangeIp(sid, host, pif) => {
+                    let d = self.server(sid).and_then(|s| s.data.as_ref());
+                    if let Some((d, h, n)) = d.and_then(|d| d.host(&host).and_then(|h| h.nics.iter().find(|n| n.pif == pif).map(|n| (d, h, n)))) {
+                        self.dialog = Dialog::Ip(Box::new(IpDialog::new(sid, d, h, n)));
+                    }
                 }
                 Intent::Unschedule(sid, vm) => self.set_vm_schedule(sid, format!("off:{}:{}", sid, vm), vec![vm], None, ctx),
                 Intent::TakeSnapshots(list) => {
@@ -4081,7 +4214,8 @@ impl App {
         let (level, with_name) = [(0, true), (0, false), (2, true), (2, false), (3, true)].into_iter().find(|&(l, n)| fits(l, n)).unwrap_or((3, false));
         let compact = |rank: u8| level >= rank;
         // the All servers page shown, its button pressed
-        let page = (sel.kind == Kind::Root && self.tab.on_toolbar()).then_some(self.tab);
+        // (the Snapshots page's two tabs, one button)
+        let page = (sel.kind == Kind::Root && self.tab.on_toolbar()).then_some(if self.tab == Tab::AllSchedules { Tab::AllSnapshots } else { self.tab });
         let on = |t: Tab| page == Some(t);
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
@@ -5063,6 +5197,13 @@ impl App {
         let (actions, least) = room;
         let pal = self.pal;
         let (title, sub) = self.header_text(sel);
+        // a page of All servers the toolbar opens (or Logs): its own name and icon, not "All servers"
+        let page = (sel.kind == Kind::Root).then(|| root_page(current)).flatten();
+        let (title, sub) = match page {
+            Some((name, _)) => (name.to_string(), String::new()),
+            None => (title, sub),
+        };
+        let tool = page.map(|p| p.1);
         // a pool with something wrong: a dot on its Details, which says what
         let dot = (sel.kind == Kind::Pool && sel.sid.and_then(|id| self.server(id)).map_or(false, |s| !self.pool_issues(s).is_empty())).then_some(Tab::Details);
         let (title_font, sub_font, tab_font) = (FontId::new(16.0, FontFamily::Name("bold".into())), FontId::proportional(13.0), FontId::proportional(13.5));
@@ -5090,7 +5231,7 @@ impl App {
         if let Some((used, sub)) = one_line {
             let (row, _) = ui.allocate_exact_size(vec2(avail, 46.0), Sense::hover());
             hairline(ui, row);
-            self.paint_header(ui, row, sel, &title, &sub, row.center().y, rename, out);
+            self.paint_header(ui, row, sel, tool, &title, &sub, row.center().y, rename, out);
             self.paint_tabs(ui, row, row.min.x + used + 28.0, tabs, current, dot, out)
         } else {
             // the actions go after the tabs when there's room; otherwise on the name's line (whose
@@ -5105,7 +5246,7 @@ impl App {
             let sub = if on_head && avail - head_w - 14.0 < takes { String::new() } else { sub };
             let used = if sub.is_empty() { bare_w } else { head_w };
             let (head, _) = ui.allocate_exact_size(vec2(avail, 38.0), Sense::hover());
-            self.paint_header(ui, head, sel, &title, &sub, head.center().y + 2.0, rename, out);
+            self.paint_header(ui, head, sel, tool, &title, &sub, head.center().y + 2.0, rename, out);
             let (strip, _) = ui.allocate_exact_size(vec2(avail, 32.0), Sense::hover());
             hairline(ui, strip);
             // the tabs closer together if need be, to leave the buttons the least they take
@@ -5124,11 +5265,16 @@ impl App {
     /// on either turns it into a box to type a new one in (Enter or a click elsewhere saves it,
     /// Esc puts it back); while a change is being saved, a spinner instead.
     #[allow(clippy::too_many_arguments)]
-    fn paint_header(&mut self, ui: &mut Ui, r: Rect, sel: &Node, title: &str, sub: &str, mid: f32, rename: Option<(u32, String, bool)>, out: &mut Vec<Intent>) {
+    fn paint_header(&mut self, ui: &mut Ui, r: Rect, sel: &Node, tool: Option<&str>, title: &str, sub: &str, mid: f32, rename: Option<(u32, String, bool)>, out: &mut Vec<Intent>) {
         let pal = self.pal;
         let p = ui.painter().clone();
         let font = FontId::new(16.0, FontFamily::Name("bold".into()));
-        paint_icon(&p, Rect::from_center_size(pos2(r.min.x + 20.0, mid), vec2(16.0, 16.0)), sel.icon, &pal, pal.window);
+        // (a toolbar page's: its button's icon, in its colour)
+        match tool {
+            Some("activity") => paint_glyph(&p, Rect::from_center_size(pos2(r.min.x + 20.0, mid), vec2(16.0, 16.0)), "activity", pal.ink_soft),
+            Some(op) => paint_tool(&p, Rect::from_center_size(pos2(r.min.x + 20.0, mid), vec2(22.0, 22.0)), op, true, &pal),
+            None => paint_icon(&p, Rect::from_center_size(pos2(r.min.x + 20.0, mid), vec2(16.0, 16.0)), sel.icon, &pal, pal.window),
+        }
         let g = p.layout_no_wrap(title.to_string(), font.clone(), pal.ink);
         let mut w = g.size().x;
         let x = r.min.x + 36.0;
@@ -5241,7 +5387,8 @@ impl App {
     fn tabs_for(&self, sel: &Node) -> Vec<Tab> {
         let has_data = sel.sid.and_then(|id| self.server(id)).map_or(false, |s| s.data.is_some());
         match sel.kind {
-            Kind::Root => vec![Tab::Home, Tab::IsoLibrary, Tab::VmStorage, Tab::Templates, Tab::AllSnapshots, Tab::Networks, Tab::Search, Tab::Logs, Tab::Alerts],
+            // (Logs: from Activities' "All of it in Logs")
+            Kind::Root => vec![Tab::Home, Tab::IsoLibrary, Tab::VmStorage, Tab::Templates, Tab::AllSnapshots, Tab::AllSchedules, Tab::Networks, Tab::Logs, Tab::Alerts],
             Kind::Category => vec![Tab::Home, Tab::Search, Tab::Logs],
             Kind::Sr if self.sr_of(sel).map_or(false, |(_, x)| x.is_iso()) => vec![Tab::General, Tab::IsoFiles, Tab::Logs],
             Kind::Folder if sel.rref.as_deref() == Some("nets") => vec![Tab::Networking],
@@ -5250,8 +5397,8 @@ impl App {
             Kind::Folder => vec![Tab::Storage],
             _ if !has_data => vec![Tab::General, Tab::Logs],
             Kind::Vm => vec![Tab::Overview, Tab::Performance, Tab::Snapshots, Tab::Console, Tab::Logs, Tab::Details],
-            Kind::Host => vec![Tab::Overview, Tab::Performance, Tab::Storage, Tab::Networking, Tab::Console, Tab::Logs, Tab::Details],
-            Kind::Pool => vec![Tab::Overview, Tab::Storage, Tab::Networking, Tab::Logs, Tab::Details],
+            Kind::Host => vec![Tab::Overview, Tab::Performance, Tab::Storage, Tab::Console, Tab::Logs, Tab::Details],
+            Kind::Pool => vec![Tab::Overview, Tab::Storage, Tab::Logs, Tab::Details],
             _ => vec![Tab::General, Tab::Logs],
         }
     }
@@ -5870,6 +6017,7 @@ impl App {
     }
 
     /// A table whose `Cell::Custom` cells are drawn by `custom(ui, row, column, rect, row hovered)`.
+    /// The row given to `table_pick` for it this frame is tinted (the one ticked).
     fn table_with(&self, ui: &mut Ui, id: &str, headers: &[&str], rows: &[Vec<Cell>], clickable: bool, custom: &mut dyn FnMut(&mut Ui, usize, usize, Rect, bool)) -> Option<usize> {
         let pal = self.pal;
         let (head_font, font) = (FontId::new(12.0, FontFamily::Name("bold".into())), FontId::proportional(13.0));
@@ -6018,6 +6166,7 @@ impl App {
             if rows.is_empty() {
                 p.text(pos2(area.min.x + pad, area.min.y + head_h + row_h / 2.0), Align2::LEFT_CENTER, "Nothing to show", font.clone(), pal.ink_soft);
             }
+            let picked: Option<usize> = ui.data(|d| d.get_temp(egui::Id::new(("table-picked", id)))).flatten();
             // (each row is known by where it is in `rows`, wherever it's shown)
             for (di, &ri) in order.iter().enumerate() {
                 let r = &rows[ri];
@@ -6025,7 +6174,10 @@ impl App {
                 let resp = ui.interact(rr, ui.id().with((id, ri)), if clickable { Sense::click() } else { Sense::hover() });
                 // (the pointer may be on a button in the row, which then counts as hovered instead)
                 let hot = resp.hovered() || ui.rect_contains_pointer(rr);
-                if hot {
+                if picked == Some(ri) {
+                    let tint = if pal.dark { 0.18 } else { 0.10 } + if hot { 0.06 } else { 0.0 };
+                    p.rect_filled(rr.shrink2(vec2(2.0, 2.0)), Rounding::same(6.0), pal.accent.gamma_multiply(tint));
+                } else if hot {
                     p.rect_filled(rr.shrink2(vec2(2.0, 2.0)), Rounding::same(6.0), pal.hover);
                 } else if di > 0 {
                     p.line_segment([pos2(rr.min.x + pad, rr.min.y), pos2(rr.max.x - pad, rr.min.y)], Stroke::new(1.0_f32, pal.border.gamma_multiply(0.6)));
@@ -6584,10 +6736,105 @@ impl App {
         }
     }
 
-    /// The Snapshots tab: a VM's snapshots, the newest first, each with when it was taken, what it
-    /// holds, a description that's edited in place, and Revert and Delete at the row's end. The
-    /// one the VM's current state comes from says "Now". Taking one is the camera by the power
-    /// buttons (and here, while there are none).
+    /// A VM's snapshot schedule, in a box over its snapshots (as the alerts at a page's top): its
+    /// name, when it runs, how many it keeps and when it last ran, or what went wrong; at its end,
+    /// Run now, Edit and Remove (off it) as icons. Blue while it runs as it should; orange when
+    /// it's paused or its last run failed; grey on none, with Schedule….
+    fn schedule_box(&self, ui: &mut Ui, sid: u32, vm: &str, x: Option<&ScheduleInfo>, others: &[String], off: Option<&str>, out: &mut Vec<Intent>) {
+        let pal = self.pal;
+        let news = x.and_then(|x| self.schedule_news(sid).remove(&x.rref));
+        let failed = x.and_then(|x| crate::vmss::failure(x, news.as_ref()));
+        let warn = x.map_or(false, |x| !x.enabled) || failed.is_some();
+        // (fill, edge, the second line's ink)
+        let (fill, edge, soft) = match (x.is_some(), warn, pal.dark) {
+            (false, _, _) => (pal.surface, pal.border, pal.ink_soft),
+            (true, true, true) => (Color32::from_rgb(42, 36, 27), Color32::from_rgb(91, 67, 32), Color32::from_rgb(182, 169, 143)),
+            (true, true, false) => (Color32::from_rgb(255, 247, 222), Color32::from_rgb(236, 200, 128), Color32::from_rgb(120, 92, 40)),
+            (true, false, true) => (Color32::from_rgb(25, 36, 52), Color32::from_rgb(42, 72, 112), Color32::from_rgb(150, 170, 198)),
+            (true, false, false) => (Color32::from_rgb(237, 244, 254), Color32::from_rgb(176, 204, 240), Color32::from_rgb(68, 96, 138)),
+        };
+        let removing = self.sched_busy.contains(&format!("off:{}:{}", sid, vm));
+        let running = x.map_or(false, |x| self.sched_busy.contains(&format!("run:{}", x.rref)));
+        egui::Frame::none().fill(fill).stroke(Stroke::new(1.0_f32, edge)).rounding(Rounding::same(12.0)).inner_margin(egui::Margin::symmetric(14.0, 10.0)).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
+                let (r, _) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::hover());
+                let clock = match (x.is_some(), warn) {
+                    (false, _) => pal.ink_faint,
+                    (true, true) => pal.orange,
+                    (true, false) => pal.accent,
+                };
+                paint_glyph(ui.painter(), r, "clock", clock);
+                // the buttons' room at the end
+                let room = (ui.available_width() - if x.is_some() { 3.0 * 30.0 + 10.0 } else { flat_button_width(ui, "Schedule…") + 10.0 }).max(120.0);
+                ui.vertical(|ui| {
+                    ui.set_max_width(room);
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    let bold = FontId::new(13.5, FontFamily::Name("bold".into()));
+                    match x {
+                        Some(x) => {
+                            ui.label(egui::RichText::new(format!("On the schedule '{}'", x.name)).font(bold).color(pal.ink));
+                            let mut line = format!("{}  ·  {}", x.summary(), crate::vmss::last_ran(x));
+                            if !x.enabled {
+                                line = format!("Paused: it takes no snapshots  ·  {}", x.summary());
+                            }
+                            ui.add(egui::Label::new(egui::RichText::new(line).size(12.5).color(soft)).wrap());
+                            if let Some(n) = failed {
+                                let when = fmt_when(n.time, unix_now(), local_offset(n.time)).to_lowercase();
+                                ui.add(egui::Label::new(egui::RichText::new(format!("Its run {} failed: {}", when, n.text)).size(12.5).color(pal.red)).wrap());
+                            }
+                            if running {
+                                ui.label(egui::RichText::new("Taking its snapshots now…").size(12.5).color(soft));
+                            }
+                        }
+                        None => {
+                            ui.label(egui::RichText::new("No snapshot schedule").font(bold).color(pal.ink));
+                            ui.label(egui::RichText::new("Only the snapshots you take.").size(12.5).color(soft));
+                        }
+                    }
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    match x {
+                        Some(x) => {
+                            let free = !removing && !running;
+                            let tip = format!("Take it off '{}': no more snapshots taken by themselves. The snapshots it took stay, and so does the schedule{}.", x.name, if others.is_empty() { "" } else { ", for its other VMs" });
+                            if crate::vmss::glyph_button(ui, &pal, "close", &tip, true, free) {
+                                out.push(Intent::Unschedule(sid, vm.to_string()));
+                            }
+                            if crate::vmss::glyph_button(ui, &pal, "edit", "Edit its schedule: when it runs, how many it keeps, its VMs…", false, free) {
+                                out.push(Intent::EditSchedule(sid, x.rref.clone()));
+                            }
+                            let tip = match crate::vmss::run_off(x) {
+                                Some(why) => why.to_string(),
+                                None if others.is_empty() => "Run it now: a snapshot of this VM, as at its times".to_string(),
+                                None => format!("Run it now: a snapshot of this VM and of {}, as at its times", crate::vmss::names_of(others)),
+                            };
+                            if crate::vmss::glyph_button(ui, &pal, "camera", &tip, false, free && crate::vmss::run_off(x).is_none()) {
+                                out.push(Intent::RunSchedule(sid, x.rref.clone()));
+                            }
+                            if removing || running {
+                                ui.add(egui::Spinner::new().size(13.0));
+                            }
+                        }
+                        None => {
+                            let tip = off.unwrap_or("Put it on a snapshot schedule: it takes snapshots by itself and keeps the last few");
+                            if flat_button(ui, "clock", "Schedule…", Some(pal.accent), off.is_none(), false, &pal).on_hover_text(tip).clicked() {
+                                out.push(Intent::PickSchedule(sid, vec![vm.to_string()]));
+                            }
+                        }
+                    }
+                });
+            });
+        });
+    }
+
+    /// The Snapshots tab: a VM's snapshots, the newest first, each with a tick box, when it was
+    /// taken, what it holds and a description that's edited in place. Over the list, labelled
+    /// buttons act on the one ticked (one at a time): Revert, New VM, Make Template, Export,
+    /// Delete. The one the VM's current state comes from says "Now". Taking one is the camera by
+    /// the power buttons (and here, while there are none).
     fn snapshots_tab(&mut self, ui: &mut Ui, sel: &Node, out: &mut Vec<Intent>) {
         let pal = self.pal;
         let Some((s, _, v)) = self.vm_of(sel) else { return };
@@ -6595,11 +6842,12 @@ impl App {
         let doing = s.busy.get(&v.rref).map(|b| b.0.clone());
         let gone = self.vm_of(sel).map_or(false, |(_, d, v)| d.host_down_for(v).is_some());
         let can_take = v.can_snapshot() && doing.is_none() && !gone;
-        // the snapshot schedule it's on (name, when and how many it keeps, on), and why the pool
-        // can't have them, if it can't
-        let (sched, sched_off) = self.vm_of(sel).map_or((None, None), |(_, d, v)| {
-            let x = v.schedule.as_deref().and_then(|r| d.schedules.iter().find(|x| x.rref == r));
-            (x.map(|x| (x.name.clone(), x.summary(), x.enabled, x.rref.clone())), d.schedules_off.clone())
+        // the snapshot schedule it's on (and its other VMs' names), and why the pool can't have
+        // them, if it can't
+        let (sched, others, sched_off) = self.vm_of(sel).map_or((None, vec![], None), |(_, d, v)| {
+            let x = v.schedule.as_deref().and_then(|r| d.schedules.iter().find(|x| x.rref == r)).cloned();
+            let others: Vec<String> = x.as_ref().map(|x| x.vms.iter().filter(|r| **r != v.rref).filter_map(|r| d.vm(r).map(|o| o.name.clone())).collect()).unwrap_or_default();
+            (x, others, d.schedules_off.clone())
         });
         ui.add_space(10.0);
         if let Some(what) = &doing {
@@ -6609,42 +6857,7 @@ impl App {
             });
             ui.add_space(4.0);
         }
-        ui.horizontal_wrapped(|ui| {
-            ui.set_min_height(28.0);
-            let (r, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
-            paint_glyph(ui.painter(), r, "clock", if sched.is_some() { pal.accent } else { pal.ink_faint });
-            match &sched {
-                Some((name, summary, on, _)) => {
-                    ui.label(egui::RichText::new(format!("On the schedule '{}'", name)).color(pal.ink));
-                    ui.label(egui::RichText::new(format!("{}{}", summary, if *on { "" } else { "  ·  paused" })).size(12.5).color(if *on { pal.ink_soft } else { pal.orange }));
-                }
-                None => {
-                    ui.label(egui::RichText::new("No snapshot schedule: only the snapshots you take").color(pal.ink_soft));
-                }
-            }
-            match &sched {
-                // its schedule's settings (when, how many it keeps, its VMs), or off it
-                Some((name, _, _, vmss)) => {
-                    let removing = self.sched_busy.contains(&format!("off:{}:{}", sid, vref));
-                    if flat_button(ui, "edit", "Edit…", Some(pal.accent), !removing, false, &pal).on_hover_text("Edit its schedule: when it runs, how many it keeps, its VMs").clicked() {
-                        out.push(Intent::EditSchedule(sid, vmss.clone(), false));
-                    }
-                    let tip = format!("Take it off '{}': no more snapshots taken by themselves. The snapshots it took stay, and so does the schedule, for its other VMs.", name);
-                    if flat_button(ui, "close", if removing { "Removing…" } else { "Remove" }, None, !removing, false, &pal).on_hover_text(tip).clicked() {
-                        out.push(Intent::Unschedule(sid, vref.clone()));
-                    }
-                    if removing {
-                        ui.add(egui::Spinner::new().size(13.0));
-                    }
-                }
-                None => {
-                    let tip = sched_off.as_deref().unwrap_or("Put it on a snapshot schedule: it takes snapshots by itself and keeps the last few");
-                    if flat_button(ui, "clock", "Schedule…", Some(pal.accent), sched_off.is_none(), false, &pal).on_hover_text(tip).on_disabled_hover_text(tip).clicked() {
-                        out.push(Intent::PickSchedule(sid, vec![vref.clone()]));
-                    }
-                }
-            }
-        });
+        self.schedule_box(ui, sid, &vref, sched.as_ref(), &others, sched_off.as_deref(), out);
         ui.add_space(2.0);
         if snaps.is_empty() {
             ui.add_space(24.0);
@@ -6660,31 +6873,91 @@ impl App {
             });
             return;
         }
-        let count = format!("{} snapshot{}", snaps.len(), if snaps.len() == 1 { "" } else { "s" });
-        ui.label(egui::RichText::new(count).color(pal.ink_soft));
-        ui.label(egui::RichText::new("Revert puts the VM back as it was then; what changed since is lost.").size(12.0).color(pal.ink_faint));
+        // the one ticked (one at a time), and the buttons over the list that act on it
+        let picked = self.snap_pick.as_deref().and_then(|r| snaps.iter().find(|x| x.rref == r)).filter(|x| !self.snap_deleting.contains(&x.rref)).cloned();
+        // (their labels in full, shorter in a narrower window, and on two lines in a narrow one:
+        // always with their words)
+        const FULL: [&str; 5] = ["Revert…", "New VM…", "Make Template…", "Export to a File…", "Delete…"];
+        const SHORT: [&str; 5] = ["Revert", "New VM", "Template", "Export", "Delete"];
+        let need = |l: &[&str; 5]| l.iter().map(|l| flat_button_width(ui, l)).sum::<f32>() + 6.0 * 5.0 + 9.0;
+        let room = ui.available_width();
+        let labels = if room >= need(&FULL) { FULL } else { SHORT };
+        let one_line = room >= need(&SHORT);
+        ui.add_space(6.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.set_min_height(28.0);
+            ui.spacing_mut().item_spacing.x = 6.0;
+            let busy = doing.is_some();
+            let ok = picked.is_some() && !busy;
+            let disks = ok && picked.as_ref().map_or(false, |x| !x.memory);
+            // why one is off: nothing ticked, the VM busy, or (New VM, Make Template) its memory
+            let tip = |t: &str| -> String {
+                if picked.is_none() {
+                    "Tick a snapshot in the list first".into()
+                } else if busy {
+                    format!("Wait until the VM is done: {}", doing.as_deref().unwrap_or_default())
+                } else {
+                    t.into()
+                }
+            };
+            let memory = |what: &str, t: &str| -> String {
+                if ok && !disks { format!("{} come from snapshots of the disks only (this one holds its memory too)", what) } else { tip(t) }
+            };
+            if flat_button(ui, "revert", labels[0], Some(pal.orange), ok, false, &pal).on_hover_text(tip("Put the VM back as it was when this snapshot was taken (it asks first)")).clicked() {
+                out.extend(picked.as_ref().map(|x| Intent::AskRevert(sid, x.rref.clone())));
+            }
+            if flat_button(ui, "newvm", labels[1], Some(pal.accent), disks, false, &pal).on_hover_text(memory("New VMs", "A new VM from this snapshot: its disks as they were then")).clicked() {
+                out.extend(picked.as_ref().map(|x| Intent::NewVmFromSnapshot(sid, x.rref.clone())));
+            }
+            if flat_button(ui, "template", labels[2], Some(pal.accent), disks, false, &pal).on_hover_text(memory("Templates", "A template from this snapshot")).clicked() {
+                out.extend(picked.as_ref().map(|x| Intent::MakeTemplate(sid, x.rref.clone())));
+            }
+            if flat_button(ui, "download", labels[3], Some(pal.accent), ok, false, &pal).on_hover_text(tip("Save this snapshot in a .xva file on this computer")).clicked() {
+                out.extend(picked.as_ref().map(|x| Intent::ExportVm(sid, x.rref.clone())));
+            }
+            // (a hairline, then the one that takes it away; on a line of its own, no hairline)
+            if one_line {
+                let (bar, _) = ui.allocate_exact_size(vec2(3.0, 26.0), Sense::hover());
+                ui.painter().line_segment([pos2(bar.center().x, bar.min.y + 5.0), pos2(bar.center().x, bar.max.y - 5.0)], Stroke::new(1.0_f32, pal.border));
+            }
+            if flat_button(ui, "trash", labels[4], Some(pal.red), picked.is_some(), false, &pal).on_hover_text(if picked.is_some() { "Delete this snapshot, with its copies of the disks (it asks first)".into() } else { tip("") }).clicked() {
+                out.extend(picked.as_ref().map(|x| Intent::AskDeleteSnapshot(sid, x.rref.clone())));
+            }
+        });
+        // how many, and what to do (or, with one ticked, what Revert does)
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            let count = format!("{} snapshot{}", snaps.len(), if snaps.len() == 1 { "" } else { "s" });
+            ui.label(egui::RichText::new(count).size(12.0).color(pal.ink_soft));
+            let hint = match (&picked, snaps.len()) {
+                (Some(_), _) => "·  Revert puts the VM back as it was then; what changed since is lost.",
+                (None, 1) => "·  Tick it to use the buttons above.",
+                (None, _) => "·  Tick one to use the buttons above.",
+            };
+            ui.label(egui::RichText::new(hint).size(12.0).color(pal.ink_faint));
+        });
         let now = unix_now();
         let offset = local_offset(now);
         let font = FontId::proportional(13.0);
         let measure = |t: &str| ui.painter().layout_no_wrap(t.to_string(), font.clone(), pal.ink).size().x;
         const PILL: f32 = 42.0;
-        // Revert and Delete always show: in a narrower window "Holds" goes (a memory module after
-        // the time instead), then the description (shown over the name instead)
+        // the tick box and the name always show: in a narrower window "Holds" goes (a memory module
+        // after the time instead), then the description (shown over the name instead)
         #[derive(Clone, Copy, PartialEq)]
         enum Col {
+            Tick,
             Name,
             Taken,
             Holds,
             Description,
-            Actions,
         }
         let avail = ui.available_width();
-        let cols: Vec<Col> = if avail >= 700.0 {
-            vec![Col::Name, Col::Taken, Col::Holds, Col::Description, Col::Actions]
-        } else if avail >= 540.0 {
-            vec![Col::Name, Col::Taken, Col::Description, Col::Actions]
+        let cols: Vec<Col> = if avail >= 620.0 {
+            vec![Col::Tick, Col::Name, Col::Taken, Col::Holds, Col::Description]
+        } else if avail >= 460.0 {
+            vec![Col::Tick, Col::Name, Col::Taken, Col::Description]
         } else {
-            vec![Col::Name, Col::Taken, Col::Actions]
+            vec![Col::Tick, Col::Name, Col::Taken]
         };
         let headers: Vec<&str> = cols
             .iter()
@@ -6693,7 +6966,7 @@ impl App {
                 Col::Taken => "Taken",
                 Col::Holds => "Holds",
                 Col::Description => "Description",
-                Col::Actions => "",
+                Col::Tick => "",
             })
             .collect();
         let rows: Vec<Vec<Cell>> = snaps
@@ -6701,6 +6974,7 @@ impl App {
             .map(|x| {
                 cols.iter()
                     .map(|c| match c {
+                        Col::Tick => Cell::Custom(18.0),
                         Col::Name => Cell::by_text(&x.name, Cell::Custom(24.0 + measure(&x.name) + if parent.as_deref() == Some(x.rref.as_str()) { PILL + 8.0 } else { 0.0 })),
                         Col::Taken => {
                             let when = x.time.map(|t| fmt_when(t, now, offset)).unwrap_or_else(|| "—".into());
@@ -6716,20 +6990,41 @@ impl App {
                             let c = Cell::Custom(if editing { 240.0 } else { (measure(&x.description) + 34.0).min(380.0) });
                             if x.description.trim().is_empty() { c } else { Cell::by_text(&x.description, c) }
                         }
-                        Col::Actions => Cell::Custom(116.0),
                     })
                     .collect()
             })
             .collect();
         let mut edit = self.snap_edit.take();
-        let (mut close, mut save, mut delete, mut revert, mut template, mut export) = (false, None, None, None, None, None);
+        let (mut close, mut save, mut tick) = (false, None, None);
         let (saving, deleting) = (&self.snap_saving, &self.snap_deleting);
         let (with_description, with_holds) = (cols.contains(&Col::Description), cols.contains(&Col::Holds));
-        self.table_with(ui, "snaps", &headers, &rows, false, &mut |ui, row, col, r, hot| {
+        let on = picked.as_ref().map(|x| x.rref.clone());
+        table_pick(ui, "snaps", on.as_ref().and_then(|r| snaps.iter().position(|x| x.rref == *r)));
+        let clicked = self.table_with(ui, "snaps", &headers, &rows, true, &mut |ui, row, col, r, hot| {
             let x = &snaps[row];
             let gone = deleting.contains(&x.rref);
             let p = ui.painter().clone();
             let current = parent.as_deref() == Some(x.rref.as_str());
+            if cols[col] == Col::Tick {
+                // its round tick box (one at a time: ticking it unticks the other)
+                if gone {
+                    return;
+                }
+                let ticked = on.as_deref() == Some(x.rref.as_str());
+                let b = Rect::from_center_size(pos2(r.min.x + 9.0, r.center().y), vec2(16.0, 16.0));
+                let resp = ui.interact(b.expand(4.0), ui.id().with(("pick", &x.rref)), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
+                // (a round one: one at a time, as a radio button)
+                if ticked {
+                    p.circle_filled(b.center(), 8.0, pal.accent);
+                    p.circle_filled(b.center(), 3.2, pal.on_accent);
+                } else {
+                    p.circle_stroke(b.center(), 7.5, Stroke::new(1.3_f32, if resp.hovered() || hot { pal.ink_soft } else { pal.border_strong }));
+                }
+                if resp.clicked() {
+                    tick = Some(x.rref.clone());
+                }
+                return;
+            }
             if cols[col] == Col::Name {
                 // the camera (a clock on one its schedule took), the name (cut short if need
                 // be), and "Now" on the one the VM's current state comes from
@@ -6770,58 +7065,6 @@ impl App {
                     let m = Rect::from_center_size(pos2(end + 16.0, r.center().y), vec2(16.0, 16.0));
                     paint_glyph(&p, m, "memory", pal.ink_soft);
                     ui.interact(m.expand(3.0), ui.id().with(("mem", &x.rref)), Sense::hover()).on_hover_text("Holds its memory too: reverting resumes the VM where it was");
-                }
-                return;
-            }
-            if cols[col] == Col::Actions {
-                // Revert, then the bin
-                if gone {
-                    return;
-                }
-                let ok = doing.is_none() && !gone;
-                // Export to a File
-                let xb = Rect::from_center_size(pos2(r.max.x - 43.0, r.center().y), vec2(26.0, 26.0));
-                let xresp = ui.interact(xb, ui.id().with(("export", &x.rref)), if ok { Sense::click() } else { Sense::hover() }).on_hover_text("Export this snapshot to a file…");
-                if ok && xresp.hovered() {
-                    p.rect_filled(xb, Rounding::same(5.0), pal.border);
-                }
-                let xc = if !ok { pal.ink_faint.gamma_multiply(0.45) } else if xresp.hovered() { pal.accent } else if hot { pal.ink_soft } else { pal.ink_faint };
-                paint_glyph(&p, Rect::from_center_size(xb.center(), vec2(16.0, 16.0)), "download", xc);
-                if ok && xresp.clicked() {
-                    export = Some(x.rref.clone());
-                }
-                // Make Template, from a snapshot of its disks only
-                let tb = Rect::from_center_size(pos2(r.max.x - 73.0, r.center().y), vec2(26.0, 26.0));
-                let tok = ok && !x.memory;
-                let tip = if x.memory { "Templates come from snapshots of the disks only (this one holds its memory too)" } else { "Make a template from this snapshot…" };
-                let tresp = ui.interact(tb, ui.id().with(("template", &x.rref)), if tok { Sense::click() } else { Sense::hover() }).on_hover_text(tip);
-                if tok && tresp.hovered() {
-                    p.rect_filled(tb, Rounding::same(5.0), pal.border);
-                }
-                let tc = if !tok { pal.ink_faint.gamma_multiply(0.45) } else if tresp.hovered() { pal.accent } else if hot { pal.ink_soft } else { pal.ink_faint };
-                paint_glyph(&p, Rect::from_center_size(tb.center(), vec2(16.0, 16.0)), "template", tc);
-                if tok && tresp.clicked() {
-                    template = Some(x.rref.clone());
-                }
-                let rb = Rect::from_center_size(pos2(r.max.x - 103.0, r.center().y), vec2(26.0, 26.0));
-                let rresp = ui.interact(rb, ui.id().with(("revert", &x.rref)), if ok { Sense::click() } else { Sense::hover() }).on_hover_text("Revert the VM to this snapshot…");
-                if ok && rresp.hovered() {
-                    p.rect_filled(rb, Rounding::same(5.0), pal.border);
-                }
-                let rc = if !ok { pal.ink_faint.gamma_multiply(0.45) } else if rresp.hovered() { pal.orange } else if hot { pal.ink_soft } else { pal.ink_faint };
-                paint_glyph(&p, Rect::from_center_size(rb.center(), vec2(16.0, 16.0)), "revert", rc);
-                if ok && rresp.clicked() {
-                    revert = Some(x.rref.clone());
-                }
-                let b = Rect::from_center_size(pos2(r.max.x - 13.0, r.center().y), vec2(26.0, 26.0));
-                let resp = ui.interact(b, ui.id().with(("delete", &x.rref)), Sense::click()).on_hover_text("Delete this snapshot…");
-                if resp.hovered() {
-                    p.rect_filled(b, Rounding::same(5.0), pal.red.gamma_multiply(if pal.dark { 0.25 } else { 0.12 }));
-                }
-                let colour = if resp.hovered() { pal.red } else if hot { pal.ink_soft } else { pal.ink_faint };
-                paint_glyph(&p, Rect::from_center_size(b.center(), vec2(16.0, 16.0)), "trash", colour);
-                if resp.clicked() {
-                    delete = Some(x.rref.clone());
                 }
                 return;
             }
@@ -6879,17 +7122,10 @@ impl App {
         if let Some((snap, text)) = save {
             out.push(Intent::SaveSnapshotDescription(sid, snap, text));
         }
-        if let Some(snap) = revert {
-            out.push(Intent::AskRevert(sid, snap));
-        }
-        if let Some(snap) = delete {
-            out.push(Intent::AskDeleteSnapshot(sid, snap));
-        }
-        if let Some(snap) = template {
-            out.push(Intent::MakeTemplate(sid, snap));
-        }
-        if let Some(snap) = export {
-            out.push(Intent::ExportVm(sid, snap));
+        // a click on its box or anywhere on its row ticks it, or unticks it if it was
+        let tick = tick.or_else(|| clicked.map(|i| snaps[i].rref.clone()).filter(|r| !self.snap_deleting.contains(r)));
+        if let Some(r) = tick {
+            self.snap_pick = if on.as_deref() == Some(r.as_str()) { None } else { Some(r) };
         }
     }
 
@@ -7224,7 +7460,8 @@ impl App {
         // one (server, snapshot, a snapshot of now first), delete one (server, snapshot)
         let mut take_snap: Option<(u32, String, String, String, bool)> = None;
         // from the snapshot schedule dialogs, and Take Snapshot for several VMs
-        let (mut sched_list, mut sched_edit, mut sched_pick) = (None, None, None);
+        let (mut sched_edit, mut sched_pick) = (None, None);
+        let mut ip_action: Option<IpAction> = None;
         let mut take_many: Option<(Vec<(u32, String, String, bool)>, String, String, bool)> = None;
         let mut revert_to: Option<(u32, String, bool)> = None;
         let mut delete_snap: Option<(u32, String)> = None;
@@ -7319,19 +7556,19 @@ impl App {
             Dialog::MoveVm(d) => {
                 move_action = Some((d.sid, d.ui(ctx, &pal)));
             }
-            Dialog::Schedules(d) => {
-                let pools: Vec<SchedPool> = self.servers.iter().filter_map(|s| s.data.as_ref().map(|data| SchedPool { sid: s.id, name: s.name(), data })).collect();
-                sched_list = Some(d.ui(ctx, &pal, &pools, &self.sched_busy));
-            }
             Dialog::Schedule(d) => {
-                let pool = self.servers.iter().find(|s| s.id == d.sid).and_then(|s| s.data.as_ref().map(|data| SchedPool { sid: s.id, name: s.name(), data }));
+                let pool = self.servers.iter().find(|s| s.id == d.sid).and_then(|s| s.data.as_ref().map(|data| SchedPool { sid: s.id, data }));
                 let saving = self.sched_busy.contains(&format!("save:{}", d.sid));
-                sched_edit = Some((d.sid, d.from_list, d.ui(ctx, &pal, pool.as_ref(), saving)));
+                sched_edit = Some(d.ui(ctx, &pal, pool.as_ref(), saving));
             }
             Dialog::PickSchedule(d) => {
-                let pool = self.servers.iter().find(|s| s.id == d.sid).and_then(|s| s.data.as_ref().map(|data| SchedPool { sid: s.id, name: s.name(), data }));
+                let pool = self.servers.iter().find(|s| s.id == d.sid).and_then(|s| s.data.as_ref().map(|data| SchedPool { sid: s.id, data }));
                 let saving = self.sched_busy.contains(&format!("pick:{}", d.sid));
                 sched_pick = Some(d.ui(ctx, &pal, pool.as_ref(), saving));
+            }
+            Dialog::Ip(d) => {
+                let saving = self.ip_busy.contains(&d.pif);
+                ip_action = Some(d.ui(ctx, &pal, saving));
             }
             Dialog::TakeSnapshots { vms, name, description, memory, focus } => {
                 dialog_window(ctx, "Take Snapshots").show(ctx, |ui| {
@@ -8494,30 +8731,23 @@ impl App {
             }
             self.snap_view.picked.clear();
         }
-        match sched_list {
-            Some(ListAction::Close) => self.dialog = Dialog::None,
-            Some(ListAction::New(sid)) => self.dialog = Dialog::Schedule(Box::new(ScheduleDialog::new(sid, None, vec![], true))),
-            Some(ListAction::Edit(sid, vmss)) => {
-                if let Some(x) = self.server(sid).and_then(|s| s.data.as_ref()).and_then(|d| d.schedules.iter().find(|x| x.rref == vmss)) {
-                    self.dialog = Dialog::Schedule(Box::new(ScheduleDialog::new(sid, Some(x), vec![], true)));
-                }
-            }
-            Some(ListAction::Delete(sid, vmss)) => self.delete_schedule(sid, vmss, ctx),
-            Some(ListAction::Enable(sid, vmss, on)) => self.enable_schedule(sid, vmss, on, ctx),
-            Some(ListAction::None) | None => {}
-        }
         match sched_edit {
-            Some((sid, from_list, EditAction::Close)) => self.dialog = if from_list { Dialog::Schedules(Box::new(SchedulesDialog::new(sid))) } else { Dialog::None },
-            Some((_, _, EditAction::Save(sid, x))) => self.save_schedule(sid, x, ctx),
-            Some((_, _, EditAction::None)) | None => {}
+            Some(EditAction::Close) => self.dialog = Dialog::None,
+            Some(EditAction::Save(sid, x)) => self.save_schedule(sid, x, ctx),
+            Some(EditAction::None) | None => {}
+        }
+        match ip_action {
+            Some(IpAction::Close) => self.dialog = Dialog::None,
+            Some(IpAction::Save(c)) => self.change_ip(c, ctx),
+            Some(IpAction::None) | None => {}
         }
         match sched_pick {
             Some(PickAction::Close) => self.dialog = Dialog::None,
             Some(PickAction::Set(sid, vms, vmss)) => self.set_vm_schedule(sid, format!("pick:{}", sid), vms, vmss, ctx),
-            Some(PickAction::New(sid, vms)) => self.dialog = Dialog::Schedule(Box::new(ScheduleDialog::new(sid, None, vms, false))),
+            Some(PickAction::New(sid, vms)) => self.dialog = Dialog::Schedule(Box::new(ScheduleDialog::new(sid, None, vms))),
             Some(PickAction::Edit(sid, vmss)) => {
                 if let Some(x) = self.server(sid).and_then(|s| s.data.as_ref()).and_then(|d| d.schedules.iter().find(|x| x.rref == vmss)) {
-                    self.dialog = Dialog::Schedule(Box::new(ScheduleDialog::new(sid, Some(x), vec![], false)));
+                    self.dialog = Dialog::Schedule(Box::new(ScheduleDialog::new(sid, Some(x), vec![])));
                 }
             }
             Some(PickAction::None) | None => {}
@@ -8705,6 +8935,13 @@ impl eframe::App for App {
                 "about" => out.push(Intent::About),
                 "sr-detached" | "sr-repair-failed" => out.extend(sel.sid.map(|sid| Intent::RepairSr(sid, "sr-iso".into()))),
                 "snapshots" => out.push(Intent::Tab(Tab::Snapshots)),
+                // a VM's Snapshots tab whose schedule's last run failed; one on no schedule
+                "snapshots-failed" => out.extend(sel.sid.map(|sid| Intent::OpenVmSnapshots(sid, "vm-db".into()))),
+                "snapshots-unscheduled" => out.extend(sel.sid.map(|sid| Intent::OpenVmSnapshots(sid, "vm-desk".into()))),
+                "snapshots-picked" => {
+                    out.push(Intent::Tab(Tab::Snapshots));
+                    self.snap_pick = Some("vm-web-snap-2".into());
+                }
                 // the Snapshots page, and snapshot schedules
                 "snapshots-page" => out.push(Intent::Snapshots),
                 "snapshots-ticked" => {
@@ -8715,15 +8952,28 @@ impl eframe::App for App {
                 }
                 "schedules" => {
                     out.push(Intent::Snapshots);
-                    out.push(Intent::Schedules(sel.sid));
+                    out.push(Intent::Schedules);
+                }
+                "change-ip" => {
+                    let dlg = sel.sid.and_then(|sid| {
+                        let d = self.server(sid)?.data.as_ref()?;
+                        let h = d.host("host-a")?;
+                        let mut dlg = IpDialog::new(sid, d, h, h.nics.iter().find(|n| n.management)?);
+                        dlg.typed_ip("10.20.0.21");
+                        Some(dlg)
+                    });
+                    if let Some(dlg) = dlg {
+                        self.dialog = Dialog::Ip(Box::new(dlg));
+                    }
                 }
                 "schedule-edit" => {
                     out.push(Intent::Snapshots);
-                    out.extend(sel.sid.map(|sid| Intent::EditSchedule(sid, "vmss-nightly".into(), true)));
+                    out.push(Intent::Schedules);
+                    out.extend(sel.sid.map(|sid| Intent::EditSchedule(sid, "vmss-nightly".into())));
                 }
                 "schedule-new" => {
                     out.push(Intent::Snapshots);
-                    out.extend(sel.sid.map(|sid| Intent::NewSchedule(sid, vec!["vm-desk".into(), "vm-build".into()], false)));
+                    out.extend(sel.sid.map(|sid| Intent::NewSchedule(sid, vec!["vm-desk".into(), "vm-build".into()])));
                 }
                 "schedule-pick" => {
                     out.push(Intent::Tab(Tab::Snapshots));
@@ -8755,6 +9005,29 @@ impl eframe::App for App {
                 "move-vm-local" => out.extend(sel.sid.map(|sid| Intent::MoveVm(sid, "vm-mail".into(), Some("host-a".into())))),
                 "move-vm-off" => out.extend(sel.sid.map(|sid| Intent::MoveVm(sid, "vm-desk".into(), Some("host-b".into())))),
                 "new-vm-template" => out.extend(sel.sid.map(|sid| Intent::NewVmFromTemplate(sid, "tpl-web".into()))),
+                "new-vm-cloud-init" | "new-vm-user-data" => {
+                    if let Some(sid) = sel.sid {
+                        if let Some(d) = self.server(sid).and_then(|s| s.data.as_ref()) {
+                            let dlg = NewVmDialog::new(sid, d, None).with_template("tpl-web").with_cloud_init("joao", "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIM2v3kq7Yw joao@laptop");
+                            let dlg = if self.shot_show == "new-vm-user-data" { dlg.with_own_user_data() } else { dlg };
+                            self.dialog = Dialog::NewVm(Box::new(dlg));
+                        }
+                    }
+                }
+                "new-vm-copying" => {
+                    let snap = sel.sid.and_then(|sid| self.server(sid)?.data.as_ref()?.vm("vm-web")?.snapshots.iter().find(|x| !x.memory).map(|x| (sid, x.rref.clone())));
+                    if let Some((sid, x)) = snap {
+                        if let Some(d) = self.server(sid).and_then(|s| s.data.as_ref()) {
+                            let dlg = NewVmDialog::new(sid, d, None).with_snapshot(d, &x).shot_copying();
+                            self.dialog = Dialog::NewVm(Box::new(dlg));
+                        }
+                    }
+                }
+                "new-vm-snapshot" => {
+                    // the Web Server's latest snapshot of its disks only
+                    let snap = sel.sid.and_then(|sid| self.server(sid)?.data.as_ref()?.vm("vm-web")?.snapshots.iter().find(|x| !x.memory).map(|x| (sid, x.rref.clone())));
+                    out.extend(snap.map(|(sid, x)| Intent::NewVmFromSnapshot(sid, x)));
+                }
                 "make-template" => out.extend(sel.sid.map(|sid| Intent::MakeTemplate(sid, "vm-desk".into()))),
                 "make-template-snapshot" => {
                     out.push(Intent::Tab(Tab::Snapshots));
@@ -9075,16 +9348,23 @@ impl eframe::App for App {
             let actions = self.tab_actions_width(&sel, current);
             // (a VM's or a server's console is a button at the row's end, not a tab among the others;
             // All servers' pages that the toolbar opens are its buttons only)
-            let shown: Vec<Tab> = tabs.iter().copied().filter(|t| *t != Tab::Console && !(sel.kind == Kind::Root && t.on_toolbar())).collect();
+            // (All servers: Home alone; a page the toolbar opens, none, but the Snapshots page's
+            // two: its VMs' snapshots, and the schedules)
+            let shown: Vec<Tab> = match (sel.kind, current) {
+                (Kind::Root, Tab::AllSnapshots | Tab::AllSchedules) => vec![Tab::AllSnapshots, Tab::AllSchedules],
+                (Kind::Root, Tab::Home) => vec![Tab::Home],
+                (Kind::Root, _) => vec![],
+                _ => tabs.iter().copied().filter(|t| *t != Tab::Console).collect(),
+            };
             // the least room they take: all in one Actions menu (a connection's, its one button)
             let least = if self.root_of(&sel).is_some() { actions } else { (ACTIONS_BTN + TOOL_GAP + SEP_W + 8.0).min(actions) };
             // (the Alerts page's Dismiss all: room for it, its icon at least)
-            let page = if sel.kind == Kind::Root && matches!(current, Tab::Alerts | Tab::AllSnapshots) { SQUARE.x + SEP_W + 12.0 } else { 0.0 };
+            let page = if sel.kind == Kind::Root && matches!(current, Tab::Alerts | Tab::AllSchedules) { SQUARE.x + SEP_W + 12.0 } else { 0.0 };
             let free = self.header_and_tabs(ui, &sel, &shown, current, (actions.max(page), least.max(page)), &mut out);
             if sel.kind == Kind::Root && current == Tab::Alerts {
                 self.alerts_actions(ui, free, &mut out);
-            } else if sel.kind == Kind::Root && current == Tab::AllSnapshots {
-                self.snapshots_actions(ui, free, &mut out);
+            } else if sel.kind == Kind::Root && current == Tab::AllSchedules {
+                self.schedules_actions(ui, free, &mut out);
             } else if actions > 0.0 {
                 self.tab_actions(ui, free, &sel, current, actions, &mut out);
             } else if sel.kind == Kind::Root && current == Tab::IsoLibrary {
@@ -9189,6 +9469,7 @@ impl eframe::App for App {
                 Tab::Networks => self.networks_page(ui, &mut out),
                 Tab::Snapshots => self.snapshots_tab(ui, &sel, &mut out),
                 Tab::AllSnapshots => self.snapshots_page(ui, &mut out),
+                Tab::AllSchedules => self.schedules_page(ui, &mut out),
                 Tab::Templates => self.templates_tab(ui, &sel, &mut out),
                 Tab::Logs => self.logs(ui, &sel, &mut out),
             });
@@ -9318,7 +9599,7 @@ fn schedule_problem(e: &ApiError) -> String {
 }
 
 /// "45 s", "3 min 20 s", "1 h 05 min".
-fn fmt_took(d: Duration) -> String {
+pub(crate) fn fmt_took(d: Duration) -> String {
     let s = d.as_secs();
     match s {
         0..=59 => format!("{} s", s.max(1)),
@@ -9723,6 +10004,12 @@ pub(crate) fn flat_button(ui: &mut Ui, glyph: &str, label: &str, tint: Option<Co
     resp
 }
 
+/// Tints row `row` of the table `id` (by where it is in its `rows`) as the one ticked, from this
+/// frame on; None: none.
+fn table_pick(ui: &Ui, id: &str, row: Option<usize>) {
+    ui.data_mut(|d| d.insert_temp(egui::Id::new(("table-picked", id)), row));
+}
+
 /// How wide a `flat_button` with its label is: 10 + icon 16 + 6 + label + 10.
 fn flat_button_width(ui: &Ui, label: &str) -> f32 {
     42.0 + ui.painter().layout_no_wrap(label.to_string(), FontId::proportional(13.0), Color32::WHITE).size().x
@@ -9913,31 +10200,34 @@ fn paint_tool_btn(p: &egui::Painter, r: Rect, face: &Face, enabled: bool, hot: b
 /// How wide the Console button is.
 const CONSOLE_BTN: f32 = 104.0;
 
-/// The Console button before the tab row's separator: a screen and its name on a soft blue pill,
-/// filled blue while the console is shown (as the tab it stands for).
+/// The Console button before the tab row's separator: a terminal's black with a white prompt and
+/// name, in both themes; ringed in the accent colour while the console is shown (as the tab it
+/// stands for).
 fn console_button(ui: &mut Ui, pal: &Pal, on: bool) -> egui::Response {
     let (r, resp) = ui.allocate_exact_size(vec2(CONSOLE_BTN, TOOL_BTN.y), Sense::click());
     let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
     let p = ui.painter();
     let pill = Rect::from_center_size(r.center(), vec2(r.width() - 2.0, 26.0));
     let hot = resp.hovered();
-    let (fill, ink) = if on {
-        (if hot { pal.accent.gamma_multiply(0.85) } else { pal.accent }, pal.on_accent)
-    } else {
-        (pal.accent.gamma_multiply(match (pal.dark, hot) {
-            (true, false) => 0.22,
-            (true, true) => 0.36,
-            (false, false) => 0.14,
-            (false, true) => 0.26,
-        }), if pal.dark { pal.ink } else { pal.accent })
-    };
+    let fill = if hot { Color32::from_rgb(44, 48, 56) } else { Color32::from_rgb(16, 18, 22) };
+    let ink = Color32::from_rgb(242, 244, 247);
     p.rect_filled(pill, Rounding::same(7.0), fill);
-    let glyph = if on { pal.on_accent } else { pal.accent };
-    let font = FontId::new(13.0, FontFamily::Name("bold".into()));
+    if on {
+        p.rect_stroke(pill.expand(1.0), Rounding::same(8.0), Stroke::new(2.0_f32, pal.accent));
+    } else if pal.dark {
+        // (an edge, to stand out on a dark toolbar)
+        p.rect_stroke(pill, Rounding::same(7.0), Stroke::new(1.0_f32, Color32::from_white_alpha(28)));
+    }
+    let font = FontId::new(13.0, FontFamily::Monospace);
     let text = p.layout_no_wrap("Console".into(), font, ink);
-    let x = pill.center().x - (16.0 + 7.0 + text.size().x) / 2.0;
-    paint_glyph_on(p, Rect::from_center_size(pos2(x + 8.0, pill.center().y), vec2(16.0, 16.0)), "console", glyph, fill);
-    p.galley(pos2(x + 23.0, pill.center().y - text.size().y / 2.0), text, ink);
+    // a prompt, ">_", then its name
+    let x = pill.center().x - (12.0 + 8.0 + text.size().x) / 2.0;
+    let c = pos2(x + 4.0, pill.center().y);
+    let s = Stroke::new(1.6_f32, ink);
+    p.line_segment([c + vec2(-2.5, -3.5), c + vec2(1.0, 0.0)], s);
+    p.line_segment([c + vec2(1.0, 0.0), c + vec2(-2.5, 3.5)], s);
+    p.line_segment([c + vec2(3.0, 4.0), c + vec2(8.0, 4.0)], s);
+    p.galley(pos2(x + 20.0, pill.center().y - text.size().y / 2.0), text, ink);
     resp
 }
 
@@ -9986,6 +10276,21 @@ fn vsep(ui: &mut Ui, pal: &Pal) {
 }
 
 /// `active`: the page it opens is the one shown (pressed: a soft background).
+/// An All servers page with a name of its own (a toolbar button's, or Logs): its name, and its
+/// button's icon (`paint_tool`'s op; "activity" for Logs, as the Activities button).
+fn root_page(tab: Tab) -> Option<(&'static str, &'static str)> {
+    match tab {
+        Tab::IsoLibrary => Some(("ISO Library", "iso")),
+        Tab::VmStorage => Some(("VM Storage", "storage")),
+        Tab::Templates => Some(("Templates", "templates")),
+        Tab::AllSnapshots | Tab::AllSchedules => Some(("Snapshots", "snapshots")),
+        Tab::Networks => Some(("Networks", "networks")),
+        Tab::Alerts => Some(("Alerts", "alerts")),
+        Tab::Logs => Some(("Logs", "activity")),
+        _ => None,
+    }
+}
+
 fn tool_button(ui: &mut Ui, op: &str, label: &str, enabled: bool, active: bool, compact: bool, pal: &Pal) -> egui::Response {
     let w = if compact { SQUARE.x } else { tool_width(ui, label) };
     let sense = if enabled { Sense::click() } else { Sense::hover() };

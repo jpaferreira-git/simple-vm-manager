@@ -255,10 +255,12 @@ impl App {
                         (name, format!("sr:{}:{}", s.id, x.rref))
                     }),
                     "Pool" => Some((pool.clone(), format!("srv:{}", s.id))),
+                    // (a snapshot schedule: its name, no page of its own)
+                    "VMSS" => d.schedules.iter().find(|x| x.uuid == m.obj_uuid).map(|x| (x.name.clone(), String::new())),
                     _ => None,
                 };
                 let (obj, node) = match found {
-                    Some((o, n)) => (o, Some(n)),
+                    Some((o, n)) => (o, Some(n).filter(|n| !n.is_empty())),
                     None => (String::new(), None),
                 };
                 let said = describe(m, &obj);

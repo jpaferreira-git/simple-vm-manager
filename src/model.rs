@@ -523,6 +523,8 @@ pub struct HostInfo {
     pub rref: String,
     pub uuid: String,
     pub name: String,
+    /// Its system's own name for itself (its hostname), not always its name here.
+    pub hostname: String,
     pub description: String,
     pub address: String,
     pub version: String,
@@ -632,6 +634,13 @@ pub struct HostNic {
     /// Its hardware address ("aa:bb:cc:dd:ee:ff") and its address's netmask, when it has one.
     pub mac: String,
     pub netmask: String,
+    /// The card (PIF), to change its address.
+    pub pif: String,
+    /// How it gets its address: "DHCP", "Static" or "None" (no address).
+    pub mode: String,
+    /// Its gateway and DNS servers (comma-separated), when set.
+    pub gateway: String,
+    pub dns: String,
 }
 
 impl HostInfo {
@@ -881,6 +890,8 @@ pub const WEEK_DAYS: [&str; 7] = ["Monday", "Tuesday", "Wednesday", "Thursday", 
 pub struct ScheduleInfo {
     /// Empty for one not made yet.
     pub rref: String,
+    /// Its uuid: the server's messages about it (VMSS_SNAPSHOT_FAILED…) name it by this.
+    pub uuid: String,
     pub name: String,
     pub description: String,
     pub enabled: bool,
@@ -1181,6 +1192,9 @@ pub struct NewVm {
     pub copy_to: Option<String>,
     /// Keep the template's network cards (`network` is ignored).
     pub keep_nics: bool,
+    /// Set up by cloud-init on its first start (from a template or a snapshot): a small disk with
+    /// what it's told is attached to it.
+    pub cloud_init: Option<crate::cloudinit::CloudInit>,
     /// What the references above are called (the template, storage, ISO, network, server), for
     /// the steps shown while it's made.
     pub names: std::collections::HashMap<String, String>,
@@ -1549,6 +1563,24 @@ pub fn civil_from_days(z: i64) -> (i64, i64, i64) {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     (yoe + era * 400 + if m <= 2 { 1 } else { 0 }, m, d)
+}
+
+/// A snapshot's name as the app shows it. One a snapshot schedule took has the name the server's
+/// vmss plugin gave it, its date and time in UTC in digits ("20261120-1843"); it's shown as the
+/// snapshots you take are named, its date and time here ("20 Nov 2026, 15:43").
+pub fn snapshot_name(name: &str, scheduled: bool, time: Option<i64>) -> String {
+    let b = name.as_bytes();
+    let plugins = b.len() == 13 && b[8] == b'-' && b.iter().enumerate().all(|(i, c)| i == 8 || c.is_ascii_digit());
+    match time {
+        Some(t) if scheduled && plugins => fmt_date_time(t, local_offset(t)),
+        _ => name.to_string(),
+    }
+}
+
+/// The name the server's vmss plugin gives a snapshot taken at `t`: "20261120-1843" (UTC).
+pub fn plugin_snapshot_name(t: i64) -> String {
+    let (y, m, d) = civil_from_days(t.div_euclid(86_400));
+    format!("{:04}{:02}{:02}-{:02}{:02}", y, m, d, t.rem_euclid(86_400) / 3600, t.rem_euclid(3600) / 60)
 }
 
 /// The local time zone's offset at `t`, in seconds east of UTC (0 where it can't be had).

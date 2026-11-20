@@ -16,8 +16,10 @@ affiliated with or endorsed by the makers of XenServer or XCP-ng.
 | ![Creating a VM](docs/screenshot-dark-new-vm.png) | ![A new VM's advanced options](docs/screenshot-dark-new-vm-advanced.png) |
 | ![A VM's snapshots](docs/screenshot-dark-snapshots.png) | ![Taking a snapshot](docs/screenshot-dark-snapshot-take.png) |
 | ![Every VM's snapshots and schedules](docs/screenshot-dark-snapshots-page.png) | ![A snapshot schedule](docs/screenshot-dark-schedule.png) |
+| ![Your snapshot schedules, with what each one last did](docs/screenshot-dark-schedules.png) | ![A new VM from a snapshot](docs/screenshot-dark-new-vm-snapshot.png) |
 | ![Your templates](docs/screenshot-dark-templates.png) | ![A new VM from a template](docs/screenshot-dark-new-vm-template.png) |
 | ![A server's Overview](docs/screenshot-dark-host.png) | ![A pool's Overview](docs/screenshot-dark-pool.png) |
+| ![Changing a server's IP address](docs/screenshot-dark-change-ip.png) | ![A new VM set up by cloud-init](docs/screenshot-dark-cloud-init.png) |
 | ![Searching every field of a VM, in its Details tab](docs/screenshot-dark-details.png) | ![A server's Details tab](docs/screenshot-dark-host-details.png) |
 | ![A VM's week, in its Performance tab](docs/screenshot-dark-performance.png) | ![A server's Performance tab](docs/screenshot-dark-host-performance.png) |
 | ![Every pool's alerts](docs/screenshot-dark-alerts.png) | ![Alert limits for a VM](docs/screenshot-dark-alert-rules.png) |
@@ -46,7 +48,9 @@ affiliated with or endorsed by the makers of XenServer or XCP-ng.
   down without shutting down (power cut, crash) turns red within about half a minute, though the
   pool itself only gives up on it after ten: the app knocks on each server's address as it looks.
 - **Home overview** — servers, running VMs, memory and storage in use at a glance, each server's load
-  and the latest activity.
+  and the latest activity: *All servers*' one tab. A page the toolbar opens (ISO Library, VM
+  Storage, Templates, Snapshots, Networks, Alerts) has its own name and its button's icon at the
+  top, as does Logs (from Activities' *All of it in Logs*).
 - **A VM's Overview** — what matters most, at a glance and to change right there: its name and
   description (each with a pencil), its state in a pill (where it runs, for how long), its system
   and address (to copy); its load over the last ten minutes, live (CPU, memory, disk and network,
@@ -99,8 +103,8 @@ affiliated with or endorsed by the makers of XenServer or XCP-ng.
   position and MAC), then *All fields*: every field the server keeps on it and on its metrics
   (references shown by name, sizes in GB too), read again while the tab is open. A search finds
   any of them (marked where found), a value's click copies it, and *Export* saves it all as a CSV
-  spreadsheet or a PDF. Pools and servers have Overview, Storage,
-  Networking, Logs and Details, and servers Performance too. At the tab row's right end: the
+  spreadsheet or a PDF. Pools and servers have Overview, Storage, Logs and Details, and servers
+  Performance too. At the tab row's right end: the
   **Console** button, then the actions (power, snapshot, move, copy, delete; a server's
   maintenance mode, restart and shut down). In a window too narrow for them, they all fold into
   one **Actions** menu.
@@ -165,10 +169,16 @@ affiliated with or endorsed by the makers of XenServer or XCP-ng.
   down, what was made is undone and its answer stays there. Once made, the dialog can be closed
   while the VM starts (which can take a while). An ISO the app doesn't recognise still gives a
   readable name ("fedora-coreos-44.20260928.3.1-live-iso.x86_64.iso" → "Fedora CoreOS 44").
+- **cloud-init** — making a VM from a template or a snapshot, *Cloud-init* (under Advanced) sets
+  it up on its first start, for systems that have cloud-init (cloud images, or a template made from
+  a VM with it): its hostname (from its name, unless you type one) and a user with sudo, a
+  password and/or SSH keys; or user-data you write yourself. It goes on a small disk labelled
+  CIDATA (cloud-init's NoCloud source, as Xen Orchestra does it), "cloud-init config", attached to
+  the new VM: delete it once the VM is set up, as it holds the password.
 - **Templates** — the copy button next to a VM's camera (or its right-click menu) has *Make
   Template…*: a template from the VM, which stays as it is, its disks copied in an instant on their
-  own storage. A snapshot's row has it too (from a snapshot of the disks only), so a VM that's on
-  needn't stop; otherwise the VM has to be off, as a copy of a running one is like one after a power
+  own storage. A snapshot has it too, over the Snapshots tab's list (from a snapshot of the disks
+  only), so a VM that's on needn't stop; otherwise the VM has to be off, as a copy of a running one is like one after a power
   cut (said when a snapshot was taken while it ran). The dialog reminds you to generalize it first:
   Windows' sysprep; on Linux an empty machine ID and new SSH host keys. *Templates* on the toolbar
   lists your templates (not the built-in ones) of every pool, with when each was made, and New VM
@@ -194,7 +204,7 @@ affiliated with or endorsed by the makers of XenServer or XCP-ng.
   saves a VM in one file on this computer, as XenServer and XenCenter write it: its settings and its
   disks, compressed on the server if you like. A running VM keeps running: the app takes a snapshot,
   saves that and deletes it (its disks are then as after a power cut, which it says first). A
-  template's row and a snapshot's have it too. *New VM* brings one back with *Create from: A file*
+  template's row has it too, and so do the Snapshots tab's buttons. *New VM* brings one back with *Create from: A file*
   (or drop a .xva on the window): what's in it is read first (its system, CPUs, memory, disks and
   cards), then its name, server, storage and network are yours to choose, and it can start once
   it's in; a template comes in as a template. Both go under Activities with how much and how fast,
@@ -206,21 +216,30 @@ affiliated with or endorsed by the makers of XenServer or XCP-ng.
   its disks as they are now, named with the date and time unless you name it, and, for a running VM,
   its memory too if you tick it, so that reverting resumes it right where it was. The VM's
   *Snapshots* tab lists them, the newest first: when each was taken, what it holds, a description
-  you can edit in place, and "Now" on the one the VM's current state comes from. *Revert* (the
-  arrow at a row's end) asks first, offers to take a snapshot of now before it, turns the VM off if
-  it's on, puts it back, and then leaves it as it was at the time: resumed, started again, or off.
-  The bin deletes one, with its copies of the disks. In a narrow window the tab keeps Revert and
-  Delete in view, dropping the other columns first.
+  you can edit in place, and "Now" on the one the VM's current state comes from. Pick one (a click
+  on its round box or its row: one at a time) and the buttons over the list act on it. *Revert* asks
+  first, offers to take a snapshot of now before it, turns the VM off if it's on, puts it back, and
+  then leaves it as it was at the time: resumed, started again, or off. *Delete* takes one away,
+  with its copies of the disks. *New VM* makes a VM of its own from a snapshot of the disks: its
+  disks as they were then (in an instant on their own storage), named after the VM, with its CPUs,
+  memory and cards unless you change them. In a narrower window the buttons' words get shorter,
+  then go on two lines, and the list drops its Holds and Description columns.
 - **Snapshots page and schedules** — *Snapshots* on the toolbar lists every pool's VMs: how many
   snapshots each has, its latest and its oldest (orange past 30 days: an old snapshot slows its
   disks a little and holds on to everything changed since), and the schedule it's on; filters
   (with snapshots, without, on a schedule), a search, and every column sorts. A click opens a VM's
   Snapshots tab; tick several to take a snapshot of each at once, or to put them on a schedule.
-  *Schedules…* lists a pool's snapshot schedules (XenServer's VMSS): each takes its VMs' snapshots
-  by itself, every hour, day or chosen days of the week, keeps the last 1 to 10 it took (deleting
-  the oldest), with their memory or not; turn one on or off, edit it, pick its VMs, delete it. A
-  VM's Snapshots tab says which schedule it's on, with *Edit…* and *Remove* (off it), and marks
-  with a clock the snapshots a schedule took. A pool whose license doesn't include schedules says so.
+  Its tabs are *VMs* (this list) and *Schedules*, which lists each pool's snapshot schedules (XenServer's VMSS): each takes
+  its VMs' snapshots by itself, every hour, day or chosen days of the week (on the server's clock:
+  the server looks every 15 minutes), keeps the last 1 to 10 it took (deleting the oldest), with
+  their memory or not; turn one on or off, run it now (the camera), edit it, pick its VMs, delete
+  it. Each says when it last ran and, when its last run failed, why, as the server's alert said
+  (also under Alerts: "Snapshot schedule 'Nightly' couldn't take its snapshots"). A VM's Snapshots
+  tab shows its schedule in a box over the list: blue while it runs, orange when it's paused or its
+  last run failed, grey on none (with *Schedule…*), and at its end Run now, Edit and Remove (off
+  it) as icons; the snapshots a schedule took have a clock, and the name the server gives them
+  ("20261120-1843", its date and time in UTC) shows as the date and time here, as the snapshots you
+  take are named. A pool whose license doesn't include schedules says so.
 - **Move a VM** — the Move button next to a VM's tabs, *Move…* on its right-click menu, or drag it
   onto a server in the tree: one dialog for the server it goes to (each with its free memory, or
   why it can't take it) and the storage of each of its disks (where it is when that server sees
@@ -251,6 +270,12 @@ affiliated with or endorsed by the makers of XenServer or XCP-ng.
   servers (those that can't are shut down, said first), and it's marked as XenCenter marks it, so
   both show the same. *Exit maintenance* (by its state, or the spanner) offers to bring its VMs
   back: moved back live, and the ones shut down started on it again.
+- **IP address and DNS** — a server's Overview lists its network cards: the one it's managed
+  through, its address and whether it's fixed or from DHCP (the gateway and DNS servers on
+  hovering it). The pencil at a card's end changes them, and on the management card its hostname
+  too. Typos are caught first (an address on another network, one another card has, a gateway off
+  its network), and it warns before changing the address it's reached at: for the pool coordinator
+  the app follows it to the new address by itself.
 - **VM power actions** — Start, Shut Down, Reboot, Suspend, Resume, Force Shut Down, Force Reboot,
   enabled only when the server allows them, with confirmations for the disruptive ones. They're
   all behind one button at the right end of a VM's tabs: the power symbol in the colour of the

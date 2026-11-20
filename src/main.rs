@@ -4,11 +4,13 @@
 
 mod alerts;
 mod app;
+mod cloudinit;
 mod conn;
 mod console;
 mod details;
 mod history;
 mod icons;
+mod ipconf;
 mod isolib;
 mod model;
 mod movevm;
@@ -42,12 +44,12 @@ fn main() -> eframe::Result {
     // --show home|welcome|objects|networks|storage|isos|search|logs|vm|console|add-server|confirm|about|iso|
     // iso-advanced|iso-error|iso-disconnect|iso-describe|iso-upload|
     // iso-upload-choose|iso-upload-web|iso-upload-done|iso-delete|new-vm|new-vm-advanced|new-vm-custom|new-vm-no-start|new-vm-created|new-vm-offline|vm-delete|host-console|vm-busy|settings|update|update-progress|host-shutdown|host-restart|pool|pool-details|pool-updates|pool-updating|pool-update-stopped|move-vm|move-vm-off|move-vm-local|sr-shared|host-details|iso-library|vm-storage|activities-moving|close-asked|new-template|networks-sorted|delete-network|host-slow-restart|new-network|new-network-error|new-storage|new-storage-inside|new-storage-error|
-    // sr-unmounted|sr-detached|sr-auto-repair|sr-repair-failed|host-down|snapshots|snapshot-take|
+    // sr-unmounted|sr-detached|sr-auto-repair|sr-repair-failed|host-down|snapshots|snapshots-picked|snapshots-failed|snapshots-unscheduled|snapshot-take|
     // snapshot-revert|snapshot-delete|snapshot-taken|templates|template|new-vm-template|make-template|
     // make-template-snapshot|copy-vm|copy-vm-thin|template-made|vm-off|vm-edited|vm-bios|vm-rename|host|host-off|host-waking|
     // host-maintenance|host-in-maintenance|host-exit-maintenance|vm-performance|host-performance|alerts|alerts-all|alerts-dismissed|alert-rules|
     // export|export-off|exporting|new-vm-import|importing|snapshots-page|snapshots-ticked|schedules|schedule-edit|schedule-new|
-    // schedule-pick|take-snapshots|details|details-search|activities|log-detail picks what the screenshot shows (default: a VM's
+    // schedule-pick|take-snapshots|details|details-search|change-ip|new-vm-snapshot|new-vm-copying|new-vm-cloud-init|new-vm-user-data|activities|log-detail picks what the screenshot shows (default: a VM's
     // General tab; welcome is Home with no server; storage, search, logs, console and isos show that
     // tab; iso-describe an ISO's description being typed; iso-upload a demo upload under way, -done its
     // finished card; iso-upload-choose and -web the Upload dialog's two steps; sr-unmounted the ISO

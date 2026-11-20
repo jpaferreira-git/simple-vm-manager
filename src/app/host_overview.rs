@@ -361,7 +361,7 @@ impl App {
                         }
                     });
                 };
-                let net: Card = &|ui, _, _| {
+                let net: Card = &|ui, _, out| {
                     section(ui, &pal, "Network");
                     panel(ui, &pal, |ui| {
                         if h.nics.is_empty() {
@@ -369,7 +369,10 @@ impl App {
                         }
                         for (i, n) in h.nics.iter().enumerate() {
                             let traffic = nic_load.and_then(|l| l.iter().find(|l| l.0 == n.device));
-                            nic_row(ui, &pal, n, traffic.filter(|_| up), i + 1 == h.nics.len());
+                            let busy = this.ip_busy.contains(&n.pif);
+                            if nic_row(ui, &pal, n, traffic.filter(|_| up), up, busy, i + 1 == h.nics.len()) {
+                                out.push(Intent::ChangeIp(sid, h.rref.clone(), n.pif.clone()));
+                            }
                         }
                     });
                 };
@@ -961,15 +964,19 @@ fn store_row(ui: &mut Ui, pal: &Pal, d: &PoolData, x: &SrInfo, aside: &str, trou
 }
 
 /// A network card: its device (and whether the server is managed through it) and what goes in and
-/// out of it now; under that its network, its address and its speed.
-fn nic_row(ui: &mut Ui, pal: &Pal, n: &HostNic, traffic: Option<&(String, Vec<f64>, Vec<f64>)>, last: bool) {
+/// out of it now; under that its network, its address (and how it gets it) and its speed; at the
+/// end a pencil to change its address (a spinner while it's changed). Whether the pencil was
+/// clicked.
+fn nic_row(ui: &mut Ui, pal: &Pal, n: &HostNic, traffic: Option<&(String, Vec<f64>, Vec<f64>)>, up: bool, busy: bool, last: bool) -> bool {
     let w = ui.available_width();
-    let (r, _) = ui.allocate_exact_size(vec2(w, 58.0), Sense::hover());
+    let (r, row_resp) = ui.allocate_exact_size(vec2(w, 58.0), Sense::hover());
     let p = ui.painter().clone();
     let top = r.min.y + 21.0;
     paint_icon(&p, Rect::from_min_size(pos2(r.min.x + 16.0, top - 8.0), vec2(16.0, 16.0)), IconKind::Net, pal, pal.surface);
     let tx = r.min.x + 44.0;
-    let right = r.max.x - 16.0;
+    // (on the first line, with its name and traffic)
+    let pen = Rect::from_center_size(pos2(r.max.x - 25.0, top), vec2(28.0, 28.0));
+    let right = pen.min.x - 8.0;
     let dev = p.text(pos2(tx, top), Align2::LEFT_CENTER, &n.device, FontId::proportional(14.0), if n.carrier { pal.ink } else { pal.ink_soft });
     if n.management {
         p.text(pos2(dev.max.x + 10.0, top), Align2::LEFT_CENTER, "management", FontId::proportional(12.5), pal.ink_faint);
@@ -990,10 +997,46 @@ fn nic_row(ui: &mut Ui, pal: &Pal, n: &HostNic, traffic: Option<&(String, Vec<f6
         s if s > 0 => format!("{} Mb/s", s),
         _ => String::new(),
     };
-    let about: Vec<&str> = [n.network.as_str(), n.ip.as_str(), if n.carrier { speed.as_str() } else { "" }].into_iter().filter(|t| !t.is_empty()).collect();
+    // its address with the network's size (10.0.0.5/24), and whether it's fixed or from DHCP
+    let address = match (n.ip.is_empty(), crate::ipconf::parse_mask(&n.netmask), n.mode.as_str()) {
+        (true, _, "DHCP") => "DHCP, no address yet".to_string(),
+        (true, _, _) => String::new(),
+        (false, m, mode) => {
+            let ip = m.map_or(n.ip.clone(), |m| format!("{}/{}", n.ip, m.count_ones()));
+            match mode {
+                "DHCP" => format!("{} (DHCP)", ip),
+                "Static" => format!("{} (fixed)", ip),
+                _ => ip,
+            }
+        }
+    };
+    let about: Vec<&str> = [n.network.as_str(), address.as_str(), if n.carrier { speed.as_str() } else { "" }].into_iter().filter(|t| !t.is_empty()).collect();
     let (g, _) = fit(&p, &about.join("  ·  "), FontId::proportional(12.5), pal.ink_faint, right - tx);
     p.galley(pos2(tx, r.min.y + 40.0 - g.size().y / 2.0), g, pal.ink_faint);
     if !last {
         p.line_segment([pos2(tx, r.max.y - 0.5), pos2(r.max.x, r.max.y - 0.5)], Stroke::new(1.0_f32, pal.border.gamma_multiply(0.6)));
     }
+    // its gateway and DNS servers, on hovering it
+    let mut more = vec![];
+    if !n.gateway.is_empty() {
+        more.push(format!("Gateway {}", n.gateway));
+    }
+    if !n.dns.is_empty() {
+        more.push(format!("DNS {}", n.dns.split(',').map(str::trim).collect::<Vec<_>>().join(", ")));
+    }
+    if !more.is_empty() {
+        row_resp.on_hover_text(more.join("\n"));
+    }
+    if busy {
+        ui.put(pen.shrink(7.0), egui::Spinner::new());
+        return false;
+    }
+    let resp = ui.interact(pen, ui.id().with(("ip", &n.pif)), if up { Sense::click() } else { Sense::hover() });
+    let resp = if up { resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Change its address…") } else { resp.on_hover_text("Its address can be changed once the server answers") };
+    if up && resp.hovered() {
+        p.rect_filled(pen, Rounding::same(6.0), pal.hover);
+    }
+    let col = if !up { pal.ink_faint.gamma_multiply(0.45) } else if resp.hovered() { pal.accent } else { pal.ink_soft };
+    paint_glyph(&p, Rect::from_center_size(pen.center(), vec2(16.0, 16.0)), "edit", col);
+    up && resp.clicked()
 }

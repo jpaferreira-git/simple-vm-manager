@@ -1,7 +1,7 @@
 //! All servers' Snapshots page (the toolbar's Snapshots): every pool's VMs, with how many
 //! snapshots each has, its latest and its oldest, and the schedule it's on. A click opens a VM's
-//! Snapshots tab; the VMs ticked get a snapshot each, or a schedule, at once. Schedules…, next to
-//! the tabs, lists a pool's schedules.
+//! Snapshots tab; the VMs ticked get a snapshot each, or a schedule, at once. Its second tab,
+//! Schedules, lists each pool's snapshot schedules.
 
 use super::performance::segmented;
 use super::*;
@@ -72,17 +72,86 @@ impl App {
         lines
     }
 
-    /// The page's action next to the tabs: Schedules…
-    pub(super) fn snapshots_actions(&self, ui: &mut Ui, free: Rect, out: &mut Vec<Intent>) {
+    /// The Schedules tab's action next to its tabs: New Schedule (with several pools, each
+    /// pool's list has its own instead).
+    pub(super) fn schedules_actions(&self, ui: &mut Ui, free: Rect, out: &mut Vec<Intent>) {
         let pal = self.pal;
+        let pools: Vec<(u32, &PoolData)> = self.servers.iter().filter_map(|s| s.data.as_ref().map(|d| (s.id, d))).collect();
+        if pools.len() > 1 {
+            return;
+        }
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(free).layout(egui::Layout::right_to_left(egui::Align::Center)));
         child.spacing_mut().item_spacing.x = 4.0;
-        let has_pool = self.servers.iter().any(|s| s.data.is_some());
-        let compact = free.width() < flat_button_width(&child, "Schedules…") + 16.0 + SEP_W;
-        if flat_button(&mut child, "clock", "Schedules…", Some(pal.accent), has_pool, compact, &pal).on_hover_text("Your pools' snapshot schedules: each takes its VMs' snapshots by itself").clicked() {
-            out.push(Intent::Schedules(None));
+        let off = pools.first().and_then(|p| p.1.schedules_off.clone());
+        let tip = off.as_deref().unwrap_or("A schedule that takes its VMs' snapshots by itself");
+        let compact = free.width() < flat_button_width(&child, "New Schedule") + 16.0 + SEP_W;
+        if flat_button(&mut child, "plus", "New Schedule", Some(pal.accent), !pools.is_empty() && off.is_none(), compact, &pal).on_hover_text(tip).clicked() {
+            out.extend(pools.first().map(|p| Intent::NewSchedule(p.0, vec![])));
         }
         vsep(&mut child, &pal);
+    }
+
+    /// The Schedules tab: each pool's snapshot schedules, as cards (on or off, run now, edit,
+    /// delete), with what the server last said about each.
+    pub(super) fn schedules_page(&mut self, ui: &mut Ui, out: &mut Vec<Intent>) {
+        let pal = self.pal;
+        let pools: Vec<(u32, String)> = self.servers.iter().filter(|s| s.data.is_some()).map(|s| (s.id, s.name())).collect();
+        ui.add_space(10.0);
+        if pools.is_empty() {
+            ui.label(egui::RichText::new("Connect to a server to see its snapshot schedules.").color(pal.ink_soft));
+            return;
+        }
+        let mut asking = self.sched_asking.take();
+        let mut acts = vec![];
+        egui::ScrollArea::vertical().id_salt("schedules").auto_shrink([false; 2]).show(ui, |ui| {
+            ui.set_max_width(ui.available_width().min(900.0));
+            ui.spacing_mut().item_spacing.y = 4.0;
+            ui.add(egui::Label::new(egui::RichText::new("Each schedule takes a snapshot of its VMs by itself, at its times (on the server's clock), and keeps the last few it took, deleting the oldest. A VM is on one schedule at most.").size(12.0).color(pal.ink_faint)).wrap());
+            ui.add_space(8.0);
+            for (sid, name) in &pools {
+                let Some(d) = self.server(*sid).and_then(|s| s.data.as_ref()) else { continue };
+                if pools.len() > 1 {
+                    // the pool's name, and its own New Schedule
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(name.as_str()).size(14.0).color(pal.ink));
+                        ui.add_space(6.0);
+                        if flat_button(ui, "plus", "New Schedule", Some(pal.accent), d.schedules_off.is_none(), false, &pal).clicked() {
+                            acts.push(Intent::NewSchedule(*sid, vec![]));
+                        }
+                    });
+                }
+                if let Some(why) = &d.schedules_off {
+                    ui.label(egui::RichText::new(why.as_str()).size(12.5).color(pal.orange));
+                }
+                if d.schedules.is_empty() {
+                    ui.add_space(14.0);
+                    ui.vertical_centered(|ui| {
+                        ui.set_max_width(420.0);
+                        ui.label(egui::RichText::new("No snapshot schedules yet").size(15.0).color(pal.ink));
+                        ui.add_space(4.0);
+                        ui.add(egui::Label::new(egui::RichText::new("A schedule takes its VMs' snapshots by itself, every hour, day or week, and keeps the last few.").color(pal.ink_soft)).wrap());
+                        ui.add_space(10.0);
+                        if pools.len() == 1 && flat_button(ui, "plus", "New Schedule", Some(pal.accent), d.schedules_off.is_none(), false, &pal).clicked() {
+                            acts.push(Intent::NewSchedule(*sid, vec![]));
+                        }
+                    });
+                    ui.add_space(14.0);
+                    continue;
+                }
+                let news = self.schedule_news(*sid);
+                let pool = SchedPool { sid: *sid, data: d };
+                match crate::vmss::schedule_list(ui, &pal, &pool, &self.sched_busy, &news, &mut asking) {
+                    ListAction::Edit(sid, x) => acts.push(Intent::EditSchedule(sid, x)),
+                    ListAction::Delete(sid, x) => acts.push(Intent::DeleteSchedule(sid, x)),
+                    ListAction::Enable(sid, x, on) => acts.push(Intent::EnableSchedule(sid, x, on)),
+                    ListAction::Run(sid, x) => acts.push(Intent::RunSchedule(sid, x)),
+                    ListAction::None => {}
+                }
+                ui.add_space(8.0);
+            }
+        });
+        self.sched_asking = asking;
+        out.extend(acts);
     }
 
     pub(super) fn snapshots_page(&mut self, ui: &mut Ui, out: &mut Vec<Intent>) {
@@ -177,7 +246,15 @@ impl App {
         let font = FontId::proportional(13.0);
         let measure = |t: &str| ui.painter().layout_no_wrap(t.to_string(), font.clone(), pal.ink).size().x;
         // when first (what matters most, kept when the name is cut short), then its name
-        let latest_text = |l: &Line| l.latest.as_ref().map(|x| format!("{}  ·  {}", x.time.map(|t| fmt_when(t, now, offset)).unwrap_or_default(), x.name));
+        // (its name only when it says more than when it was taken: a schedule's, or one named
+        // with the date and time as Take Snapshot names them, says no more)
+        let latest_text = |l: &Line| {
+            l.latest.as_ref().map(|x| {
+                let when = x.time.map(|t| fmt_when(t, now, offset)).unwrap_or_default();
+                let dated = x.time.map_or(false, |t| (0..=10).any(|k| x.name == fmt_date_time(t - k * 60, local_offset(t))));
+                if dated { when } else { format!("{}  ·  {}", when, x.name) }
+            })
+        };
         let rows: Vec<Vec<Cell>> = shown
             .iter()
             .map(|l| {

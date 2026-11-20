@@ -5,8 +5,8 @@
 //! template, the boot mode, the CPU layout and a description. From a file (a .xva exported here
 //! or from XenCenter), it's an import: the file's VM, with its name, server, storage and network.
 
-use crate::app::{dialog_button, dialog_buttons, dialog_window, field_label, flat_button, text_field, Look, FIELD_HEIGHT};
-use crate::conn::{ApiError, Said, Trace, CHECK_SECS, NOT_ANSWERING, NOT_PLUGGED};
+use crate::app::{dialog_button, dialog_buttons, dialog_window, field_label, flat_button, fmt_took, text_field, Look, FIELD_HEIGHT};
+use crate::conn::{ApiError, Progress, Said, Trace, CHECK_SECS, NOT_ANSWERING, NOT_PLUGGED};
 use crate::icons::paint_glyph;
 use crate::model::*;
 use crate::theme::Pal;
@@ -22,6 +22,20 @@ const LABEL_WIDTH: f32 = 100.0;
 /// The space between the form's rows.
 const ROW_GAP: f32 = 12.0;
 
+/// What it's doing while it's made.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Step {
+    Ready,
+    Check,
+    Copy,
+    Clone,
+    Disk,
+    SetUp,
+    CloudInit,
+    Start,
+    Undo,
+}
+
 pub enum NewVmAction {
     None,
     Close,
@@ -34,6 +48,9 @@ pub enum NewVmAction {
 }
 
 /// One of the user's own templates (made from a VM): its disks come with it.
+/// cloud-init's user and SSH keys as last typed (this session), offered again.
+static CI_LAST: std::sync::Mutex<crate::cloudinit::CloudInit> = std::sync::Mutex::new(crate::cloudinit::CloudInit { hostname: String::new(), user: String::new(), password: String::new(), keys: String::new(), custom: None });
+
 struct Own {
     rref: String,
     name: String,
@@ -46,6 +63,8 @@ struct Own {
     sr: String,
     /// Its network cards' networks, by name.
     nets: Vec<String>,
+    /// A VM's snapshot (its name), not a template: the new VM is named after the VM.
+    of: Option<String>,
 }
 
 struct Iso {
@@ -117,11 +136,24 @@ pub struct NewVmDialog {
     sockets: i64,
     description: String,
     advanced: bool,
+    /// cloud-init, from a template or a snapshot: shown (its part open), used, what it's told,
+    /// whether its hostname was typed (else it follows the name), the user-data typed by hand.
+    ci_open: bool,
+    ci_on: bool,
+    ci: crate::cloudinit::CloudInit,
+    ci_host_typed: bool,
+    ci_custom: bool,
+    ci_text: String,
     start: bool,
     busy: Option<String>,
     error: Option<String>,
     /// What was asked of the server while making it, and its answers.
     trace: Option<Arc<Trace>>,
+    /// While it's made: how far the server's task is (as under Activities), since when, and the
+    /// step it was at, when and how far when first seen (for the time left).
+    progress: Option<Arc<Progress>>,
+    since: Option<Instant>,
+    pace: Option<(Step, Instant, f32)>,
     copied: Option<Instant>,
     /// The VM, once made (while it starts).
     made_vm: Option<String>,
@@ -188,6 +220,7 @@ impl NewVmDialog {
                     disk: disks.iter().map(|k| k.size).sum(),
                     sr: disks.first().map(|k| k.sr.clone()).unwrap_or_default(),
                     nets: t.nics.iter().map(|n| n.network.clone()).filter(|n| !n.is_empty()).collect(),
+                    of: None,
                 }
             })
             .collect();
@@ -223,10 +256,19 @@ impl NewVmDialog {
             sockets: 1,
             description: String::new(),
             advanced: false,
+            ci_open: false,
+            ci_on: false,
+            ci: CI_LAST.lock().map(|c| c.clone()).unwrap_or_default(),
+            ci_host_typed: false,
+            ci_custom: false,
+            ci_text: String::new(),
             start: true,
             busy: None,
             error: None,
             trace: None,
+            progress: None,
+            since: None,
+            pace: None,
             copied: None,
             made_vm: None,
             not_started: None,
@@ -258,12 +300,73 @@ impl NewVmDialog {
         self
     }
 
+    /// cloud-init on and open, with a user (for the screenshots).
+    pub fn with_cloud_init(mut self, user: &str, key: &str) -> NewVmDialog {
+        (self.ci_open, self.ci_on, self.ci.user, self.ci.password, self.ci.keys) = (true, true, user.into(), String::new(), key.into());
+        self
+    }
+
+    /// For the screenshot checks: cloud-init's user-data typed by hand.
+    pub fn with_own_user_data(mut self) -> NewVmDialog {
+        let mut c = self.ci.clone();
+        c.hostname = crate::cloudinit::hostname_for(&self.name);
+        self.ci_text = c.user_data() + "packages:\n  - nginx\nruncmd:\n  - systemctl enable --now nginx\n";
+        (self.ci_open, self.ci_on, self.ci_custom) = (true, true, true);
+        self
+    }
+
+    /// For the screenshot checks: being made, its disks copied in full, 37% there after three
+    /// minutes.
+    pub fn shot_copying(mut self) -> NewVmDialog {
+        if let Some(i) = self.stores.iter().position(|s| self.own().map_or(false, |t| t.sr != s.rref) && s.host.is_some()) {
+            if let Some(h) = self.stores[i].host.clone() {
+                self.server = self.server_index(&h);
+            }
+            self.store = i;
+        }
+        let trace = Arc::new(Trace::default());
+        let me = self.own().map(|t| t.name.clone()).unwrap_or_default();
+        let to = self.chosen_store().map(|s| s.name.clone()).unwrap_or_default();
+        trace.push(Said::Asked, format!("VM.copy  vm=\"{}\"  new_name=\"{}\"  sr=\"{}\"", me, self.name.trim(), to));
+        self.creating(trace);
+        let p = Progress::new();
+        p.set_fraction(0.37);
+        self.watch(p);
+        let ago = |s| Instant::now().checked_sub(Duration::from_secs(s));
+        self.since = ago(184);
+        self.pace = ago(170).map(|t| (Step::Copy, t, 0.02));
+        self
+    }
+
+    /// From one of a VM's snapshots: its disks as they were then, copied for a VM of its own (a
+    /// snapshot is kept as a template is). Its CPUs, memory and cards are the VM's.
+    pub fn with_snapshot(mut self, d: &PoolData, snap: &str) -> NewVmDialog {
+        let Some((v, x)) = d.vms.iter().find_map(|v| v.snapshot(snap).map(|x| (v, x))) else { return self };
+        let disks: Vec<&VmDisk> = v.disks.iter().filter(|k| k.kind == "Disk").collect();
+        self.own.push(Own {
+            rref: snap.into(),
+            name: x.name.clone(),
+            os: format!("snapshot of {}", v.name),
+            vcpus: v.vcpus.max(1),
+            memory: v.mem_dyn_max.max(1),
+            mem_min: v.mem_static_min,
+            disk: disks.iter().map(|k| k.size).sum(),
+            sr: disks.first().map(|k| k.sr.clone()).unwrap_or_default(),
+            nets: v.nics.iter().map(|n| n.network.clone()).filter(|n| !n.is_empty()).collect(),
+            of: Some(v.name.clone()),
+        });
+        self.from_own = true;
+        self.own_pick = self.own.len() - 1;
+        self.own_changed();
+        self
+    }
+
     /// Another of the user's templates (or a switch to them): its name (unless one was typed), its
     /// size, its disks staying where they are (on the server that sees them), its network cards.
     fn own_changed(&mut self) {
         let Some(t) = self.own.get(self.own_pick) else { return };
         if !self.name_typed {
-            let base = t.name.trim_end_matches(" template").trim_end_matches(" Template").trim();
+            let base = t.of.as_deref().unwrap_or_else(|| t.name.trim_end_matches(" template").trim_end_matches(" Template").trim());
             self.name = unique_name(if base.is_empty() { &t.name } else { base }, &self.taken);
         }
         self.size = 0;
@@ -381,7 +484,113 @@ impl NewVmDialog {
         self.error = None;
         self.advanced = false;
         self.trace = Some(trace);
+        (self.progress, self.since, self.pace) = (None, Some(Instant::now()), None);
         self.busy = Some(format!("Creating {}…", self.name.trim()));
+    }
+
+    /// How far the server is, as under Activities (the job's own progress).
+    pub fn watch(&mut self, p: Arc<Progress>) {
+        self.progress = Some(p);
+    }
+
+    /// What it's doing now, by the calls asked so far.
+    fn step(&self) -> Step {
+        let mut step = Step::Ready;
+        for (k, text) in self.trace.as_ref().map(|t| t.lines()).unwrap_or_default() {
+            match (k, text.split_whitespace().next().unwrap_or("")) {
+                (Said::Note, _) if text.starts_with("cloud-init") => step = Step::CloudInit,
+                (Said::Asked, "VM.copy") => step = Step::Copy,
+                (Said::Asked, "VM.clone") => step = Step::Clone,
+                (Said::Asked, "VM.provision") => step = Step::Disk,
+                (Said::Asked, "VM.start") => step = Step::Start,
+                (Said::Asked, "SR.scan" | "SR.get_PBDs") if step == Step::Ready => step = Step::Check,
+                (Said::Asked, "VM.destroy") => step = Step::Undo,
+                (Said::Asked, _) if step != Step::CloudInit => step = Step::SetUp,
+                _ => {}
+            }
+        }
+        step
+    }
+
+    /// While it's made, as under Activities: what it's doing now, for how long, how far (with the
+    /// time left once that can be told) and a bar; a sliding one while there's no figure.
+    fn progress_part(&mut self, ui: &mut Ui, pal: &Pal) {
+        let step = self.step();
+        let store = self.chosen_store().map(|s| s.name.clone()).unwrap_or_default();
+        let words = match step {
+            Step::Ready => "Getting ready".to_string(),
+            Step::Check => "Checking the storage answers".to_string(),
+            Step::Copy => format!("Copying its disks to {}", store),
+            Step::Clone if self.own().is_some() => "Copying its disks, in an instant".to_string(),
+            Step::Clone => "Making it from the template".to_string(),
+            Step::Disk => format!("Making its disk on {}", store),
+            Step::SetUp => "Setting up its CPUs, memory and network".to_string(),
+            Step::CloudInit => "Writing its cloud-init disk".to_string(),
+            Step::Start => "Starting it".to_string(),
+            Step::Undo => "Undoing what was made".to_string(),
+        };
+        // the server's own figure, for the long steps it measures
+        let fraction = self.progress.as_ref().and_then(|p| p.fraction()).filter(|_| matches!(step, Step::Copy | Step::Clone | Step::Disk));
+        let now = Instant::now();
+        if self.pace.as_ref().map_or(false, |p| p.0 != step) {
+            self.pace = None;
+        }
+        if let (None, Some(f)) = (&self.pace, fraction) {
+            self.pace = Some((step, now, f));
+        }
+        let left = match (&self.pace, fraction) {
+            (Some((_, t0, f0)), Some(f)) if f > f0 + 0.01 && f < 1.0 && now.duration_since(*t0) >= Duration::from_secs(10) => {
+                Some(Duration::from_secs_f64(now.duration_since(*t0).as_secs_f64() * (1.0 - f) as f64 / (f - f0) as f64))
+            }
+            _ => None,
+        };
+        let mut detail = vec![format!("{} so far", fmt_took(self.since.map(|t| t.elapsed()).unwrap_or_default()))];
+        if let Some(l) = left {
+            let m = (l.as_secs() + 59) / 60;
+            detail.push(match m {
+                0..=1 => "about a minute left".to_string(),
+                2..=59 => format!("about {} min left", m),
+                _ => format!("about {} h {:02} min left", m / 60, m % 60),
+            });
+        }
+        let quiet = self.progress.as_ref().and_then(|p| p.silent_for()).filter(|d| d.as_secs() >= 5);
+
+        let w = ui.available_width();
+        let (r, _) = ui.allocate_exact_size(vec2(w, 70.0), Sense::hover());
+        let p = ui.painter();
+        p.rect(r, Rounding::same(8.0), pal.rail, Stroke::new(1.0_f32, pal.border));
+        let (x, right) = (r.min.x + 40.0, r.max.x - 14.0);
+        egui::Spinner::new().size(16.0).color(pal.accent).paint_at(ui, Rect::from_center_size(pos2(r.min.x + 21.0, r.min.y + 21.0), vec2(16.0, 16.0)));
+        let pct = fraction.map(|f| p.text(pos2(right, r.min.y + 21.0), Align2::RIGHT_CENTER, format!("{}%", (f * 100.0).floor()), FontId::new(14.0, FontFamily::Name("bold".into())), pal.ink));
+        let room = pct.map_or(right, |g| g.min.x - 12.0) - x;
+        let g = p.layout_no_wrap(words, FontId::proportional(14.0), pal.ink);
+        let g = if g.size().x > room { p.layout(g.job.text.clone(), FontId::proportional(13.0), pal.ink, room) } else { g };
+        p.galley(pos2(x, r.min.y + 21.0 - g.size().y / 2.0), g, pal.ink);
+        let d = p.text(pos2(x, r.min.y + 40.0), Align2::LEFT_CENTER, detail.join("  ·  "), FontId::proportional(12.5), pal.ink_soft);
+        if let Some(q) = quiet {
+            let gone = crate::conn::LOST_AFTER.saturating_sub(q).as_secs();
+            p.text(pos2(d.max.x + 10.0, r.min.y + 40.0), Align2::LEFT_CENTER, format!("no answer for {} s, gives up in {} s", q.as_secs(), gone), FontId::proportional(12.5), pal.orange);
+        }
+        let bar = Rect::from_min_max(pos2(x, r.min.y + 55.0), pos2(right, r.min.y + 60.0));
+        p.rect_filled(bar, Rounding::same(2.5), pal.border);
+        match fraction {
+            Some(f) => {
+                p.rect_filled(Rect::from_min_size(bar.min, vec2(bar.width() * f.clamp(0.0, 1.0), bar.height())), Rounding::same(2.5), pal.accent);
+            }
+            None => {
+                // a piece sliding along it: under way, how far not known
+                let t = ui.input(|i| i.time) as f32 % 1.6 / 1.6;
+                let len = bar.width() * 0.22;
+                let a = bar.min.x - len + t * (bar.width() + len);
+                let seg = Rect::from_min_max(pos2(a.max(bar.min.x), bar.min.y), pos2((a + len).min(bar.max.x), bar.max.y));
+                if seg.width() > 0.0 {
+                    p.rect_filled(seg, Rounding::same(2.5), pal.accent);
+                }
+            }
+        }
+        if self.made_vm.is_some() {
+            ui.label(egui::RichText::new("It's made: closing this leaves it starting.").size(12.5).color(pal.ink_faint));
+        }
     }
 
     /// It couldn't be made: why, in the dialog.
@@ -675,6 +884,9 @@ impl NewVmDialog {
                 Some(s) if s.rref != t.sr && t.disk > s.free => stop.push(format!("{} has only {} free; the disks need {}.", s.name, fmt_bytes(s.free), fmt_bytes(t.disk))),
                 _ => {}
             }
+            if let Some(why) = self.cloud_init().and_then(|c| c.problem()) {
+                stop.push(why.into());
+            }
             return stop;
         }
         if self.isos.is_empty() {
@@ -765,6 +977,7 @@ impl NewVmDialog {
                 from_template: true,
                 copy_to: (store.rref != t.sr).then(|| store.rref.clone()),
                 keep_nics: self.keep_nics,
+                cloud_init: self.cloud_init(),
                 ..Default::default()
             });
         }
@@ -790,6 +1003,7 @@ impl NewVmDialog {
             names.insert(h.rref.clone(), h.name.clone());
         }
         Ok(NewVm {
+            cloud_init: None,
             name: self.name.trim().to_string(),
             description: self.description.trim().to_string(),
             template: template.rref.clone(),
@@ -818,6 +1032,9 @@ impl NewVmDialog {
         let made = self.not_started.is_some();
         // the server turned it down: why, and what it was asked
         let refused = !busy && self.error.is_some() && self.trace.is_some();
+        // (the form scrolls in a window too short for it all, as with cloud-init's part open;
+        // what's under it, and the buttons, stay in view)
+        let room = (ctx.screen_rect().height() - 230.0).max(200.0);
         dialog_window(ctx, &title).id(egui::Id::new("new-vm")).show(ctx, |ui| {
             ui.set_width(WIDTH);
             ui.spacing_mut().item_spacing.y = ROW_GAP;
@@ -825,7 +1042,12 @@ impl NewVmDialog {
             if busy || made || refused {
                 self.summary(ui, pal);
             } else {
-                self.form(ui, pal);
+                // (its bar beside the fields, not over them)
+                ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
+                egui::ScrollArea::vertical().max_height(room).auto_shrink([false, true]).show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = ROW_GAP;
+                    self.form(ui, pal);
+                });
             }
             let stop = self.problems();
             if let Some(why) = &self.not_started {
@@ -875,12 +1097,9 @@ impl NewVmDialog {
                     ui.checkbox(&mut self.start, "Start it once it's imported");
                 }
             }
-            if let Some(what) = &self.busy {
-                ui.horizontal(|ui| {
-                    ui.add(egui::Spinner::new().size(14.0));
-                    ui.add(egui::Label::new(egui::RichText::new(what.as_str()).color(pal.ink_soft)).wrap());
-                });
-                ctx.request_repaint_after(Duration::from_millis(100));
+            if self.busy.is_some() {
+                self.progress_part(ui, pal);
+                ctx.request_repaint_after(Duration::from_millis(50));
             }
             if let (Some(e), false) = (&self.error, refused) {
                 ui.add(egui::Label::new(egui::RichText::new(e.as_str()).color(pal.red)).wrap());
@@ -969,9 +1188,10 @@ impl NewVmDialog {
             ui.set_width(ui.available_width());
             ui.spacing_mut().item_spacing.y = 3.0;
             ui.label(egui::RichText::new(spec.name.as_str()).font(FontId::new(14.0, FontFamily::Name("bold".into()))).color(pal.ink));
+            let what = if self.own().map_or(false, |t| t.of.is_some()) { "snapshot" } else { "template" };
             let from = match self.own() {
-                Some(t) if spec.copy_to.is_some() => format!("Made from the template {}, its disks copied in full", t.name),
-                Some(t) => format!("Made from the template {}, in an instant", t.name),
+                Some(t) if spec.copy_to.is_some() => format!("Made from the {} {}, its disks copied in full", what, t.name),
+                Some(t) => format!("Made from the {} {}, in an instant", what, t.name),
                 None => format!("Installs from {}", self.isos.get(self.iso).map(|i| i.name.as_str()).unwrap_or_default()),
             };
             ui.add(egui::Label::new(egui::RichText::new(parts.join("  ·  ")).size(12.5).color(pal.ink_soft)).wrap());
@@ -1016,7 +1236,7 @@ impl NewVmDialog {
         }
         if self.from_own {
             ui.horizontal(|ui| {
-                field_label(ui, "Template:", LABEL_WIDTH);
+                field_label(ui, if self.own().map_or(false, |t| t.of.is_some()) { "Snapshot:" } else { "Template:" }, LABEL_WIDTH);
                 let label = |t: &Own| if t.os.is_empty() { t.name.clone() } else { format!("{}   ·  {}", t.name, t.os) };
                 let shown = self.own.get(self.own_pick).map(label).unwrap_or_default();
                 let mut picked = self.own_pick;
@@ -1073,7 +1293,8 @@ impl NewVmDialog {
                 let (c, m, k) = (t.vcpus, t.memory, t.disk);
                 let lines = vec![format!("{} CPU{}", c, if c == 1 { "" } else { "s" }), format!("{} memory", fmt_bytes(m)), format!("{} disk", fmt_bytes(k))];
                 let custom = vec!["Other CPUs".to_string(), "and memory".to_string()];
-                for (i, title, lines) in [(0usize, "As the template", lines), (3usize, "Custom", custom)] {
+                let same = if t.of.is_some() { "As the VM" } else { "As the template" };
+                for (i, title, lines) in [(0usize, same, lines), (3usize, "Custom", custom)] {
                     if size_card(ui, pal, vec2(w, h), title, &lines, self.size == i).clicked() && self.size != i {
                         if i == 3 {
                             (self.cpus, self.memory) = (c.to_string(), format!("{}", (m as f64 / GB as f64 * 10.0).round() / 10.0));
@@ -1136,8 +1357,9 @@ impl NewVmDialog {
         ui.horizontal(|ui| {
             field_label(ui, if self.from_own { "Disks on:" } else { "Disk on:" }, LABEL_WIDTH);
             let tpl_sr = self.own().map(|t| t.sr.clone());
+            let what = if self.own().map_or(false, |t| t.of.is_some()) { "snapshot" } else { "template" };
             let label = |s: &Store| match &tpl_sr {
-                Some(r) if *r == s.rref => format!("{}  ·  with the template, an instant copy", s.name),
+                Some(r) if *r == s.rref => format!("{}  ·  with the {}, an instant copy", s.name, what),
                 Some(_) => format!("{}  ·  {} free, a full copy", s.name, fmt_bytes(s.free)),
                 None => format!("{}  ·  {} free", s.name, fmt_bytes(s.free)),
             };
@@ -1153,7 +1375,10 @@ impl NewVmDialog {
         // Network
         ui.horizontal(|ui| {
             field_label(ui, "Network:", LABEL_WIDTH);
-            let as_template = self.own().map(|t| if t.nets.is_empty() { "As in the template (none)".to_string() } else { format!("As in the template ({})", t.nets.join(", ")) });
+            let as_template = self.own().map(|t| {
+                let what = if t.of.is_some() { "VM" } else { "template" };
+                if t.nets.is_empty() { format!("As in the {} (none)", what) } else { format!("As in the {} ({})", what, t.nets.join(", ")) }
+            });
             let shown = match (&as_template, self.keep_nics) {
                 (Some(a), true) => a.clone(),
                 _ => self.net.and_then(|i| self.nets.get(i)).map(|n| n.1.clone()).unwrap_or_else(|| "No network".into()),
@@ -1177,6 +1402,116 @@ impl NewVmDialog {
             }
         });
         self.advanced_part(ui, pal);
+        self.cloud_init_part(ui, pal);
+    }
+
+    /// What cloud-init is told, when it's used.
+    fn cloud_init(&self) -> Option<crate::cloudinit::CloudInit> {
+        if !self.ci_on || self.own().is_none() {
+            return None;
+        }
+        let mut c = self.ci.clone();
+        if !self.ci_host_typed {
+            c.hostname = crate::cloudinit::hostname_for(&self.name);
+        }
+        c.custom = self.ci_custom.then(|| self.ci_text.clone());
+        Some(c)
+    }
+
+    /// cloud-init, folded like Advanced: on or off, its hostname, a user (with a password, SSH
+    /// keys or both), or user-data typed by hand.
+    fn cloud_init_part(&mut self, ui: &mut Ui, pal: &Pal) {
+        if self.own().is_none() {
+            return;
+        }
+        let summary = match self.cloud_init() {
+            None => "Off".to_string(),
+            Some(c) if c.custom.is_some() => "Your own user-data".to_string(),
+            Some(c) if c.user.trim().is_empty() => c.hostname.clone(),
+            Some(c) => format!("{}  ·  user {}", c.hostname, c.user.trim()),
+        };
+        let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::click());
+        if resp.hovered() {
+            ui.painter().rect_filled(r, Rounding::same(5.0), pal.hover);
+        }
+        let c = pos2(r.min.x + 10.0, r.center().y);
+        let chev = if self.ci_open { vec![c + vec2(-3.5, -1.5), c + vec2(0.0, 2.0), c + vec2(3.5, -1.5)] } else { vec![c + vec2(-1.5, -3.5), c + vec2(2.0, 0.0), c + vec2(-1.5, 3.5)] };
+        ui.painter().add(egui::Shape::line(chev, Stroke::new(1.4_f32, pal.ink_soft)));
+        ui.painter().text(pos2(r.min.x + 22.0, r.center().y), Align2::LEFT_CENTER, "Cloud-init", FontId::proportional(13.0), pal.ink);
+        ui.painter().text(pos2(r.max.x - 8.0, r.center().y), Align2::RIGHT_CENTER, summary, FontId::proportional(12.0), if self.ci_on { pal.ink_soft } else { pal.ink_faint });
+        if resp.clicked() {
+            self.ci_open = !self.ci_open;
+            if self.ci_open {
+                // (brought into view, in a short window)
+                resp.scroll_to_me(Some(egui::Align::TOP));
+            }
+        }
+        if !self.ci_open {
+            return;
+        }
+        // off; a hostname and a user (from the fields); or user-data typed by hand
+        ui.horizontal(|ui| {
+            field_label(ui, "Set up:", LABEL_WIDTH);
+            let mut mode = if !self.ci_on { 0 } else if self.ci_custom { 2 } else { 1 };
+            if crate::isolib::segmented(ui, pal, &["Off", "Hostname and user", "My own user-data"], &mut mode, ui.available_width()) {
+                if mode == 2 && self.ci_text.trim().is_empty() {
+                    // started from what the fields say
+                    let mut c = self.ci.clone();
+                    if !self.ci_host_typed {
+                        c.hostname = crate::cloudinit::hostname_for(&self.name);
+                    }
+                    c.custom = None;
+                    self.ci_text = c.user_data();
+                }
+                (self.ci_on, self.ci_custom) = (mode > 0, mode == 2);
+            }
+        });
+        let note = |ui: &mut Ui, text: &str| crate::isolib::note(ui, pal, text);
+        if !self.ci_on {
+            note(ui, "For systems with cloud-init in them (cloud images, or a template made from a VM that has it): it sets their hostname and a user to log in with.");
+            return;
+        }
+        let hint = |ui: &Ui, r: &egui::Response, empty: bool, text: &str| {
+            if empty && !r.has_focus() {
+                ui.painter().text(r.rect.left_center() + vec2(8.0, 0.0), Align2::LEFT_CENTER, text, FontId::proportional(13.0), pal.ink_faint);
+            }
+        };
+        if self.ci_custom {
+            ui.horizontal_top(|ui| {
+                field_label(ui, "User-data:", LABEL_WIDTH);
+                ui.add(egui::TextEdit::multiline(&mut self.ci_text).desired_rows(8).desired_width(ui.available_width()).font(egui::TextStyle::Monospace).code_editor());
+            });
+        } else {
+            ui.horizontal(|ui| {
+                field_label(ui, "Hostname:", LABEL_WIDTH);
+                if !self.ci_host_typed {
+                    self.ci.hostname = crate::cloudinit::hostname_for(&self.name);
+                }
+                if text_field(ui, pal, &mut self.ci.hostname, ui.available_width(), false).changed() {
+                    self.ci_host_typed = true;
+                }
+            });
+            ui.horizontal(|ui| {
+                field_label(ui, "User:", LABEL_WIDTH);
+                let r = text_field(ui, pal, &mut self.ci.user, ui.available_width(), false);
+                hint(ui, &r, self.ci.user.is_empty(), "to log in with (it gets sudo); none: only the hostname");
+            });
+            if !self.ci.user.trim().is_empty() {
+                ui.horizontal(|ui| {
+                    field_label(ui, "Password:", LABEL_WIDTH);
+                    let r = text_field(ui, pal, &mut self.ci.password, ui.available_width(), true);
+                    hint(ui, &r, self.ci.password.is_empty(), "none: an SSH key only");
+                });
+                ui.horizontal_top(|ui| {
+                    field_label(ui, "SSH keys:", LABEL_WIDTH);
+                    ui.add(egui::TextEdit::multiline(&mut self.ci.keys).desired_rows(2).desired_width(ui.available_width()).font(egui::TextStyle::Monospace).hint_text("ssh-ed25519 AAAA… you@computer  (one a line)"));
+                });
+            }
+        }
+        note(ui, "It goes on a 4 MB disk, 'cloud-init config'. Delete that disk once the VM is set up: it holds the password.");
+        if let Ok(mut last) = CI_LAST.lock() {
+            (last.user, last.keys) = (self.ci.user.clone(), self.ci.keys.clone());
+        }
     }
 
     /// From a file: the file, what it holds, then its name, server, storage and network.

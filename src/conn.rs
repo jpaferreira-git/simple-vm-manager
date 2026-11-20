@@ -375,6 +375,10 @@ pub trait Connection: Send + Sync {
     /// Makes a snapshot schedule (`x.rref` empty) or changes one, and puts exactly the VMs `x.vms`
     /// on it (taking off those no longer listed). Its reference.
     fn save_schedule(&self, x: &ScheduleInfo) -> Result<String, ApiError>;
+    /// Runs a snapshot schedule now, as at its times (VMSS.snapshot_now: the server's vmss
+    /// plugin takes its VMs' snapshots and deletes those past what it keeps). The plugin's answer:
+    /// "True", or what went wrong.
+    fn run_schedule(&self, vmss: &str) -> Result<String, ApiError>;
     /// Deletes a snapshot schedule, its VMs taken off it first (the snapshots it took stay).
     fn delete_schedule(&self, vmss: &str) -> Result<(), ApiError>;
     /// Puts VMs on a snapshot schedule, or (None) on none.
@@ -461,6 +465,12 @@ pub trait Connection: Send + Sync {
     /// Every field the server keeps on a VM, a server or the pool (`kind`: "vm", "host" or
     /// "pool"; `rref` isn't needed for the pool), then those of its metrics: (what, the record).
     fn records(&self, kind: &str, rref: &str) -> Result<Vec<(String, Value)>, ApiError>;
+    /// Sets a server's network card's address (PIF.reconfigure_ip): `mode` "DHCP", "Static" or
+    /// "None"; for Static its IP, netmask, gateway and DNS servers (comma-separated). A management
+    /// card whose address moves takes the connection with it: this one follows to the new address.
+    fn set_ip(&self, pif: &str, mode: &str, ip: &str, netmask: &str, gateway: &str, dns: &str) -> Result<(), ApiError>;
+    /// A server's own name for itself (its hostname), changed at once (host.set_hostname_live).
+    fn set_hostname(&self, host: &str, name: &str) -> Result<(), ApiError>;
     /// Copies a file into an ISO library as `name` (see `iso_file_name`): a new disc in the library,
     /// then the file's bytes sent to it, from this computer or as they arrive from the web.
     /// `address` is the server to send them to for a library that only one server sees; a shared
@@ -977,6 +987,104 @@ impl RealConnection {
         }
     }
 
+    /// cloud-init's disk for a new VM: a small FAT disk labelled CIDATA with its user-data and
+    /// meta-data, on `sr`, written through /import_raw_vdi and attached as its next disk. The
+    /// disk goes again if it can't be attached.
+    fn add_config_drive(&self, vm: &str, sr: &str, ci: &crate::cloudinit::CloudInit, names: &HashMap<String, String>, tr: &Trace) -> Result<(), ApiError> {
+        let t = 120_000;
+        let call = |shown: String, method: &str, args: Vec<Value>| {
+            tr.push(Said::Asked, shown);
+            let started = Instant::now();
+            let r = self.call(method, args, t);
+            tr.outcome(&r, started.elapsed());
+            r
+        };
+        let me = named(names, vm);
+        tr.push(Said::Note, "cloud-init: its disk, read on the first start");
+        let uuid = call(format!("VM.get_uuid  vm={}", me), "VM.get_uuid", vec![json!(vm)])?.as_str().unwrap_or_default().to_string();
+        let ud = ci.user_data();
+        let md = ci.meta_data(&format!("svm-{}", uuid));
+        let image = crate::cloudinit::config_drive(&[("user-data", ud.as_bytes()), ("meta-data", md.as_bytes())], u32::from_str_radix(&uuid.replace('-', "")[..8.min(uuid.len())], 16).unwrap_or(0xC1DA_7A00));
+        let record = json!({
+            "name_label": "cloud-init config", "name_description": "What cloud-init sets up on the VM's first start (it holds its user's password, if one was given): delete it once the VM is set up.",
+            "SR": sr, "virtual_size": crate::cloudinit::DRIVE_SIZE, "type": "user", "sharable": false, "read_only": false,
+            "other_config": {}, "xenstore_data": {}, "sm_config": { "vmhint": vm }, "tags": [],
+        });
+        let vdi = call(format!("VDI.create  name=\"cloud-init config\"  SR={}  size=4 MiB", named(names, sr)), "VDI.create", vec![record])?.as_str().unwrap_or_default().to_string();
+        let done = (|| -> Result<(), ApiError> {
+            // on a server's own storage, written at that server
+            let address = if call(format!("SR.get_shared  sr={}", named(names, sr)), "SR.get_shared", vec![json!(sr)])?.as_bool().unwrap_or(true) {
+                None
+            } else {
+                let pbd = call(format!("SR.get_PBDs  sr={}", named(names, sr)), "SR.get_PBDs", vec![json!(sr)])?.as_array().and_then(|a| a.first().cloned());
+                match pbd {
+                    Some(p) => {
+                        let host = call("PBD.get_host".into(), "PBD.get_host", vec![p])?;
+                        call(format!("host.get_address  host={}", named(names, host.as_str().unwrap_or_default())), "host.get_address", vec![host])?.as_str().map(String::from)
+                    }
+                    None => None,
+                }
+            };
+            tr.push(Said::Asked, format!("PUT /import_raw_vdi  vdi=cloud-init config  ({} KB: user-data, meta-data)", crate::cloudinit::DRIVE_SIZE / 1024));
+            let started = Instant::now();
+            let r = self.write_vdi(&vdi, address.as_deref(), &image);
+            tr.outcome(&r.as_ref().map(|_| Value::Null).map_err(|e| e.clone()), started.elapsed());
+            r?;
+            let device = call(format!("VM.get_allowed_VBD_devices  vm={}", me), "VM.get_allowed_VBD_devices", vec![json!(vm)])?
+                .as_array()
+                .and_then(|a| a.first().cloned())
+                .and_then(|d| d.as_str().map(String::from))
+                .ok_or_else(|| ApiError::other("The VM has no room for cloud-init's disk."))?;
+            let drive = json!({
+                "VM": vm, "VDI": vdi, "userdevice": device, "bootable": false, "mode": "RW", "type": "Disk", "unpluggable": true,
+                "empty": false, "other_config": { "owner": "" }, "qos_algorithm_type": "", "qos_algorithm_params": {}, "device": "", "currently_attached": false,
+            });
+            call(format!("VBD.create  VM={}  VDI=cloud-init config  userdevice={}", me, device), "VBD.create", vec![drive])?;
+            Ok(())
+        })();
+        if done.is_err() {
+            let _ = self.call("VDI.destroy", vec![json!(vdi)], t);
+        }
+        done
+    }
+
+    /// Writes `bytes` over a new disk (VDI) through /import_raw_vdi (at `address`, else the
+    /// coordinator), then waits for the task's verdict: the PUT is answered before it's written.
+    fn write_vdi(&self, vdi: &str, address: Option<&str>, bytes: &[u8]) -> Result<(), ApiError> {
+        let task = self.call("task.create", vec![json!("Write a disk"), json!("")], 30_000)?.as_str().unwrap_or_default().to_string();
+        let (coordinator, session) = {
+            let st = self.state.lock().unwrap();
+            (st.host.clone(), st.session.clone().unwrap_or_default())
+        };
+        let host = address.filter(|a| !a.is_empty()).map(str::to_string).unwrap_or(coordinator);
+        let host = if host.contains(':') && !host.starts_with('[') { format!("[{}]", host) } else { host };
+        let port = if self.port == DEFAULT_PORT { String::new() } else { format!(":{}", self.port) };
+        let url = format!("https://{}{}/import_raw_vdi?session_id={}&vdi={}&task_id={}&format=raw", host, port, session, vdi, task);
+        let agent = ureq::AgentBuilder::new()
+            .tls_connector(self.tls.clone())
+            .timeout_connect(Duration::from_secs(30))
+            .timeout(Duration::from_secs(300))
+            .redirects(0)
+            .user_agent(concat!("SimpleVMManager/", env!("CARGO_PKG_VERSION")))
+            .build();
+        let sent = agent.put(&url).set("Content-Length", &bytes.len().to_string()).send_bytes(bytes);
+        let put_error = match sent {
+            Ok(_) => None,
+            Err(ureq::Error::Status(code, _)) => Some(ApiError::other(format!("The server answered the disk's writing with HTTP {}.", code))),
+            Err(e) => Some(ApiError::other(e.to_string())),
+        };
+        if put_error.is_some() {
+            let _ = self.call("task.cancel", vec![json!(task)], 30_000);
+        }
+        let verdict = self.task_result(&task, Duration::from_secs(if put_error.is_some() { 30 } else { 300 }));
+        let _ = self.call("task.destroy", vec![json!(task)], 30_000);
+        match verdict {
+            Ok(true) => Ok(()),
+            Err(e) if e.code != CANCELLED => Err(e),
+            _ => Err(put_error.unwrap_or_else(|| ApiError::other("The server didn't finish writing the disk in time."))),
+        }
+    }
+
     /// New VM from one of the user's templates: its disks copied (in an instant on their own
     /// storage, in full onto `copy_to`), made a VM, then its CPUs, memory, home server and
     /// network card as chosen; the ISO in its DVD drive, if any, taken out. Anything made before a
@@ -1040,6 +1148,9 @@ impl RealConnection {
                     });
                     call(format!("VIF.create  VM={}  network={}  device=0  MTU={}", me, named(&names, net), mtu.max(68)), "VIF.create", vec![card], t)?;
                 }
+            }
+            if let Some(ci) = &v.cloud_init {
+                self.add_config_drive(&vm, v.copy_to.as_deref().unwrap_or(&v.sr), ci, &names, tr)?;
             }
             Ok(())
         })();
@@ -1407,6 +1518,10 @@ impl RealConnection {
     fn task_watched(&self, method: &str, extra: Vec<Value>, timeout_ms: u64) -> Result<Value, ApiError> {
         let task = self.call_raw(&format!("Async.{}", method), extra, 60_000)?.as_str().unwrap_or_default().to_string();
         let watch = watched();
+        // (how far an earlier task got isn't this one's)
+        if let Some(w) = &watch {
+            w.permille.store(u64::MAX, Ordering::Relaxed);
+        }
         let end = Instant::now() + Duration::from_millis(timeout_ms);
         let mut heard = Instant::now();
         loop {
@@ -1645,6 +1760,7 @@ fn schedule_of(rref: &str, r: &Value) -> ScheduleInfo {
     let kind = s(r, "type");
     ScheduleInfo {
         rref: rref.to_string(),
+        uuid: s(r, "uuid"),
         name: s(r, "name_label"),
         description: s(r, "name_description"),
         enabled: b(r, "enabled"),
@@ -1820,6 +1936,7 @@ impl Connection for RealConnection {
                 rref: k,
                 uuid: s(&r, "uuid"),
                 name: s(&r, "name_label"),
+                hostname: s(&r, "hostname"),
                 description: s(&r, "name_description"),
                 address: s(&r, "address"),
                 version: if version.is_empty() { s(&sw, "platform_version") } else { version },
@@ -1924,7 +2041,7 @@ impl Connection for RealConnection {
         // (if these can't be read, the rest still shows); and each network's card and VLAN
         let pif_metrics = self.all("PIF_metrics", t).unwrap_or_default();
         let mut cards: HashMap<String, (String, i64)> = HashMap::new();
-        for (_, r) in self.all("PIF", t).unwrap_or_default() {
+        for (pif, r) in self.all("PIF", t).unwrap_or_default() {
             let null = |k: &str| matches!(s(&r, k).as_str(), "" | "OpaqueRef:NULL");
             let vlan = r.get("VLAN").map_or(-1, |_| n(&r, "VLAN"));
             if null("bond_slave_of") {
@@ -1943,6 +2060,10 @@ impl Connection for RealConnection {
                 speed: n(&m, "speed"),
                 mac: s(&r, "MAC"),
                 netmask: s(&r, "netmask"),
+                pif,
+                mode: s(&r, "ip_configuration_mode"),
+                gateway: s(&r, "gateway"),
+                dns: s(&r, "DNS"),
             };
             if let Some(h) = pd.hosts.iter_mut().find(|h| h.rref == s(&r, "host")) {
                 h.nics.push(nic);
@@ -2022,11 +2143,13 @@ impl Connection for RealConnection {
         let mut snapshots: HashMap<String, Vec<SnapshotInfo>> = HashMap::new();
         for (k, r) in vm_records.iter().filter(|(_, r)| b(r, "is_a_snapshot")) {
             let info = r.get("snapshot_info").cloned().unwrap_or(Value::Null);
+            let time = parse_xen_time(&s(r, "snapshot_time"));
             snapshots.entry(s(r, "snapshot_of")).or_default().push(SnapshotInfo {
                 rref: k.clone(),
-                name: s(r, "name_label"),
+                // (a schedule's "20261120-1843" as its date and time here)
+                name: snapshot_name(&s(r, "name_label"), b(r, "is_vmss_snapshot"), time),
                 description: s(r, "name_description"),
-                time: parse_xen_time(&s(r, "snapshot_time")),
+                time,
                 // a checkpoint's record is suspended: its memory is saved with it
                 memory: s(r, "power_state") == "Suspended",
                 was_running: s(&info, "power-state-at-snapshot") == "Running",
@@ -2500,6 +2623,11 @@ impl Connection for RealConnection {
 
     fn set_schedule_enabled(&self, vmss: &str, on: bool) -> Result<(), ApiError> {
         self.call("VMSS.set_enabled", vec![json!(vmss), json!(on)], 30_000).map(|_| ())
+    }
+
+    fn run_schedule(&self, vmss: &str) -> Result<String, ApiError> {
+        // (as long as its VMs' snapshots take, one after another)
+        self.call("VMSS.snapshot_now", vec![json!(vmss)], 4 * 3_600_000).map(|v| val_str(&v))
     }
 
     fn edit_vm(&self, vm: &str, change: &VmChange) -> Result<(), ApiError> {
@@ -3097,6 +3225,37 @@ impl Connection for RealConnection {
         again.map(|_| ()).map_err(|e| ApiError { code: NOT_RESTARTED.into(), details: vec![e.message()] })
     }
 
+    fn set_ip(&self, pif: &str, mode: &str, ip: &str, netmask: &str, gateway: &str, dns: &str) -> Result<(), ApiError> {
+        let t = 30_000;
+        let old = self.call("PIF.get_IP", vec![json!(pif)], t)?.as_str().unwrap_or_default().to_string();
+        let management = self.call("PIF.get_management", vec![json!(pif)], t)?.as_bool().unwrap_or(false);
+        let moves = management && mode == "Static" && !ip.is_empty() && ip != old;
+        if moves {
+            // where to log in next: the new address first (the pool's other servers after it)
+            let mut st = self.state.lock().unwrap();
+            st.members.retain(|m| !m.eq_ignore_ascii_case(ip));
+            st.members.insert(0, ip.to_string());
+        }
+        let r = self.call("PIF.reconfigure_ip", vec![json!(pif), json!(mode), json!(ip), json!(netmask), json!(gateway), json!(dns)], 90_000);
+        if moves {
+            // the connection was to the old address: the next call logs in at the new one
+            let mut st = self.state.lock().unwrap();
+            if st.host.eq_ignore_ascii_case(&old) {
+                st.host = ip.to_string();
+            }
+            st.session = None;
+        }
+        match r {
+            // its answer went down with the old address
+            Err(e) if moves && e.code == "CONNECTION" => Ok(()),
+            r => r.map(|_| ()),
+        }
+    }
+
+    fn set_hostname(&self, host: &str, name: &str) -> Result<(), ApiError> {
+        self.call("host.set_hostname_live", vec![json!(host), json!(name)], 60_000).map(|_| ())
+    }
+
     fn records(&self, kind: &str, rref: &str) -> Result<Vec<(String, Value)>, ApiError> {
         let t = 30_000;
         let valid = |r: &str| !r.is_empty() && r != "OpaqueRef:NULL";
@@ -3663,6 +3822,7 @@ impl DemoConnection {
             rref: r.into(),
             uuid: demo_uuid(),
             name: name.into(),
+            hostname: name.into(),
             description: if master { "Pool coordinator".into() } else { "Pool member".into() },
             address: addr.into(),
             version: "8.4.0".into(),
@@ -3687,9 +3847,21 @@ impl DemoConnection {
             // till 31 July next year
             license_expiry: parse_xen_time(&format!("{}0731T00:00:00Z", 1971 + SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0) / 31_556_952)),
             nics: vec![
-                HostNic { device: "eth0".into(), network: "Pool-wide network 0".into(), ip: addr.into(), management: true, carrier: true, speed: 1000, mac: format!("aa:16:3e:00:{}:01", &r[r.len() - 1..]), netmask: "255.255.0.0".into() },
-                HostNic { device: "eth1".into(), network: "Storage network".into(), ip: addr.replace("10.20.", "10.30."), management: false, carrier: true, speed: 10000, mac: format!("aa:16:3e:00:{}:02", &r[r.len() - 1..]), netmask: "255.255.0.0".into() },
-                HostNic { device: "eth2".into(), network: "Pool-wide network 2".into(), ip: String::new(), management: false, carrier: false, speed: 0, mac: format!("aa:16:3e:00:{}:03", &r[r.len() - 1..]), netmask: String::new() },
+                HostNic {
+                    device: "eth0".into(), network: "Pool-wide network 0".into(), ip: addr.into(), management: true, carrier: true, speed: 1000,
+                    mac: format!("aa:16:3e:00:{}:01", &r[r.len() - 1..]), netmask: "255.255.0.0".into(), pif: format!("{}-pif-eth0", r),
+                    mode: "Static".into(), gateway: "10.20.0.1".into(), dns: "10.20.0.1, 1.1.1.1".into(),
+                },
+                HostNic {
+                    device: "eth1".into(), network: "Storage network".into(), ip: addr.replace("10.20.", "10.30."), management: false, carrier: true, speed: 10000,
+                    mac: format!("aa:16:3e:00:{}:02", &r[r.len() - 1..]), netmask: "255.255.0.0".into(), pif: format!("{}-pif-eth1", r),
+                    mode: "Static".into(), gateway: String::new(), dns: String::new(),
+                },
+                HostNic {
+                    device: "eth2".into(), network: "Pool-wide network 2".into(), ip: String::new(), management: false, carrier: false, speed: 0,
+                    mac: format!("aa:16:3e:00:{}:03", &r[r.len() - 1..]), netmask: String::new(), pif: format!("{}-pif-eth2", r),
+                    mode: "None".into(), gateway: String::new(), dns: String::new(),
+                },
             ],
             power_on_mode: if master { String::new() } else { "wake-on-lan".into() },
             maintenance: false,
@@ -3933,7 +4105,14 @@ impl DemoConnection {
 
     /// New VM from one of the user's templates: the calls a real server gets, with made-up answers.
     fn demo_from_template(&self, v: &NewVm, tr: &Trace) -> Result<String, ApiError> {
-        let tpl = self.data.lock().unwrap().user_template(&v.template).cloned().ok_or_else(|| ApiError { code: "HANDLE_INVALID".into(), details: vec!["VM".into(), v.template.clone()] })?;
+        // a template of the user's, or a VM's snapshot (kept as a template is)
+        let tpl = {
+            let d = self.data.lock().unwrap();
+            d.user_template(&v.template).cloned().or_else(|| {
+                d.vms.iter().find(|x| x.snapshot(&v.template).is_some()).map(|x| VmInfo { power: PowerState::Halted, host: None, snapshots: vec![], parent: None, schedule: None, ..x.clone() })
+            })
+        }
+        .ok_or_else(|| ApiError { code: "HANDLE_INVALID".into(), details: vec!["VM".into(), v.template.clone()] })?;
         let rref = format!("vm-new-{}", self.data.lock().unwrap().vms.len());
         let me = format!("\"{}\"", v.name);
         let mut steps = vec![match &v.copy_to {
@@ -3955,9 +4134,23 @@ impl DemoConnection {
             std::thread::sleep(Duration::from_millis(150));
             tr.push(Said::Answer, "OK  (0.1 s)");
         }
+        if v.cloud_init.is_some() {
+            tr.push(Said::Note, "cloud-init: its disk, read on the first start");
+            for asked in ["VDI.create  name=\"cloud-init config\"  size=4 MiB", "PUT /import_raw_vdi  vdi=cloud-init config  (4096 KB: user-data, meta-data)", "VBD.create  VDI=cloud-init config  userdevice=1"] {
+                tr.push(Said::Asked, asked);
+                std::thread::sleep(Duration::from_millis(150));
+                tr.push(Said::Answer, "OK  (0.1 s)");
+            }
+        }
         let mut d = self.data.lock().unwrap();
         let mut vm = demo_copy(&tpl, &rref, &v.name, &v.description, v.copy_to.as_deref(), &d.srs);
         (vm.vcpus, vm.mem_static_max, vm.mem_dyn_min, vm.mem_dyn_max, vm.affinity) = (v.vcpus, v.memory, v.memory, v.memory, v.host.clone());
+        if v.cloud_init.is_some() {
+            let sr = v.copy_to.clone().unwrap_or_else(|| v.sr.clone());
+            let sr_name = d.srs.iter().find(|x| x.rref == sr).map(|x| x.name.clone()).unwrap_or_default();
+            let n = vm.disks.len();
+            vm.disks.push(VmDisk { name: "cloud-init config".into(), device: n.to_string(), vbd: format!("{}-vbd-ci", rref), vdi: format!("{}-vdi-ci", rref), sr, sr_name, kind: "Disk".into(), size: crate::cloudinit::DRIVE_SIZE as i64, ..Default::default() });
+        }
         if !v.keep_nics {
             let net = v.network.as_deref().and_then(|r| d.networks.iter().find(|n| n.rref == r));
             vm.nics = net.map(|n| VmNic { device: "0".into(), vif: format!("{}-vif-0", rref), net: n.rref.clone(), mac: "aa:bb:cc:00:11:23".into(), network: n.name.clone(), ip: String::new() }).into_iter().collect();
@@ -4002,7 +4195,9 @@ fn demo_templates() -> Vec<TemplateInfo> {
 /// running out, a snapshot taken…) and the limits set that raised them.
 fn demo_alerts(d: &PoolData) -> (Vec<XenMessage>, HashMap<String, String>, (String, String)) {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|t| t.as_secs() as i64).unwrap_or(0);
-    let uuid_of = |r: &str| -> String { d.vms.iter().find(|v| v.rref == r).map(|v| v.uuid.clone()).or_else(|| d.hosts.iter().find(|h| h.rref == r).map(|h| h.uuid.clone())).or_else(|| d.srs.iter().find(|x| x.rref == r).map(|x| x.uuid.clone())).unwrap_or_default() };
+    let uuid_of = |r: &str| -> String {
+        d.vms.iter().find(|v| v.rref == r).map(|v| v.uuid.clone()).or_else(|| d.hosts.iter().find(|h| h.rref == r).map(|h| h.uuid.clone())).or_else(|| d.srs.iter().find(|x| x.rref == r).map(|x| x.uuid.clone())).or_else(|| d.schedules.iter().find(|x| x.rref == r).map(|x| x.uuid.clone())).unwrap_or_default()
+    };
     let cpu = "<variable>\n\t<name value=\"cpu_usage\"/>\n\t<alarm_trigger_level value=\"0.9\"/>\n\t<alarm_trigger_period value=\"300\"/>\n\t<alarm_auto_inhibit_period value=\"3600\"/>\n</variable>";
     let full = "<variable>\n\t<name value=\"physical_utilisation\"/>\n\t<alarm_trigger_level value=\"0.9\"/>\n\t<alarm_trigger_period value=\"300\"/>\n</variable>";
     let msg = |i: usize, name: &str, priority: i64, cls: &str, obj: &str, ago: i64, body: String| XenMessage {
@@ -4021,6 +4216,10 @@ fn demo_alerts(d: &PoolData) -> (Vec<XenMessage>, HashMap<String, String>, (Stri
         msg(4, "HOST_SERVER_CERTIFICATE_EXPIRING_30", 3, "Host", "host-a", 2 * 86_400 + 3 * 3600, "The TLS server certificate is expiring soon. Refresh it before it expires.".into()),
         msg(5, "VM_SNAPSHOTTED", 5, "VM", "vm-web", 2 * 86_400 + 7 * 3600, "Snapshot 'Before nginx 1.26' was taken".into()),
         msg(6, "POOL_MASTER_TRANSITION", 4, "Host", "host-a", 5 * 86_400, "This host is now the pool coordinator".into()),
+        // the snapshot schedules' (as the server's vmss plugin writes them): last night's went
+        // well; the database's last hour's didn't (its storage full), after it last ran well
+        msg(7, "VMSS_SNAPSHOT_SUCCEEDED", 5, "VMSS", "vmss-nightly", 6 * 3600 + 19 * 60, "VMSS_SNAPSHOT_SUCCEEDED".into()),
+        msg(8, "VMSS_SNAPSHOT_FAILED", 1, "VMSS", "vmss-db", 5 * 60, "Snapshot failed on 1 out of 1 VMs with the following errors: \n\nDetails:\nVM: Database UUID: 6f2c0d4e-demo Error:['SR_BACKEND_FAILURE_44', '', 'There is insufficient space']".into()),
     ];
     let mut limits = HashMap::new();
     limits.insert("vm-web".to_string(), format!("<config>{}</config>", cpu));
@@ -4058,6 +4257,7 @@ fn demo_schedules() -> Vec<ScheduleInfo> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|t| t.as_secs() as i64).unwrap_or(0);
     let schedule = |rref: &str, name: &str, description: &str, every: Every, hour: u32, min: u32, keep: i64, vms: &[&str], ago: i64| ScheduleInfo {
         rref: rref.into(),
+        uuid: format!("{}-uuid", rref),
         name: name.into(),
         description: description.into(),
         enabled: true,
@@ -4218,15 +4418,16 @@ fn demo_details(v: &mut VmInfo) {
         })
         .collect();
     // what its snapshot schedule took (see demo_schedules): the Web Server's and the Mail Relay's
-    // every night, the database's every hour
-    let (auto_name, ago): (&str, &[i64]) = match v.rref.as_str() {
-        "vm-web" | "vm-mail" => ("Nightly snapshot", &[6, 30]),
-        "vm-db" => ("Hourly snapshot", &[0, 1, 2]),
-        _ => ("", &[]),
+    // every night, the database's every hour; named as the server's plugin names them
+    let ago: &[i64] = match v.rref.as_str() {
+        "vm-web" | "vm-mail" => &[6, 30],
+        "vm-db" => &[0, 1, 2],
+        _ => &[],
     };
     for (i, hours) in ago.iter().enumerate() {
-        let time = Some(now - hours * 3600 - 20 * 60);
-        v.snapshots.push(SnapshotInfo { rref: format!("{}-auto-{}", v.rref, i), name: auto_name.into(), time, was_running: true, scheduled: true, ..Default::default() });
+        let t = now - hours * 3600 - 20 * 60;
+        let name = snapshot_name(&plugin_snapshot_name(t), true, Some(t));
+        v.snapshots.push(SnapshotInfo { rref: format!("{}-auto-{}", v.rref, i), name, time: Some(t), was_running: true, scheduled: true, ..Default::default() });
     }
     v.snapshots.sort_by_key(|x| std::cmp::Reverse(x.time));
     v.parent = v.snapshots.first().map(|x| x.rref.clone());
@@ -4998,6 +5199,33 @@ impl Connection for DemoConnection {
         link_schedules(&mut d);
         Ok(())
     }
+    /// A snapshot of each of its VMs, a second each, named as the server's plugin names them;
+    /// past what it keeps, its oldest go.
+    fn run_schedule(&self, vmss: &str) -> Result<String, ApiError> {
+        said("VMSS.snapshot_now", &[json!(vmss)]);
+        let Some(x) = self.data.lock().unwrap().schedules.iter().find(|x| x.rref == vmss).cloned() else { return Err(ApiError::other("No such schedule")) };
+        for vm in &x.vms {
+            demo_work(1000);
+            let mut d = self.data.lock().unwrap();
+            let Some(v) = d.vms.iter_mut().find(|v| v.rref == *vm) else { continue };
+            let time = SystemTime::now().duration_since(UNIX_EPOCH).map(|t| t.as_secs() as i64).ok();
+            // (as the plugin names them, shown as the app shows those)
+            let name = snapshot_name(&plugin_snapshot_name(time.unwrap_or(0)), true, time);
+            let rref = format!("{}-snap-{}", v.rref, demo_uuid());
+            let was_running = v.power == PowerState::Running;
+            v.snapshots.insert(0, SnapshotInfo { rref, name, description: String::new(), time, memory: x.memory, was_running, scheduled: true });
+            while v.snapshots.iter().filter(|s| s.scheduled).count() > x.keep as usize {
+                if let Some(i) = v.snapshots.iter().rposition(|s| s.scheduled) {
+                    v.snapshots.remove(i);
+                }
+            }
+        }
+        let mut d = self.data.lock().unwrap();
+        if let Some(y) = d.schedules.iter_mut().find(|y| y.rref == vmss) {
+            y.last_run = SystemTime::now().duration_since(UNIX_EPOCH).map(|t| t.as_secs() as i64).ok();
+        }
+        Ok("True".into())
+    }
     fn set_schedule_enabled(&self, vmss: &str, on: bool) -> Result<(), ApiError> {
         said("VMSS.set_enabled", &[json!(vmss), json!(on)]);
         demo_work(200);
@@ -5479,6 +5707,31 @@ impl Connection for DemoConnection {
         recompute(&mut d);
         Ok(())
     }
+    fn set_ip(&self, pif: &str, mode: &str, ip: &str, netmask: &str, gateway: &str, dns: &str) -> Result<(), ApiError> {
+        said("PIF.reconfigure_ip", &[json!(pif), json!(mode), json!(ip), json!(netmask), json!(gateway), json!(dns)]);
+        std::thread::sleep(Duration::from_millis(1200));
+        let mut d = self.data.lock().unwrap();
+        let h = d.hosts.iter_mut().find(|h| h.nics.iter().any(|n| n.pif == pif)).ok_or_else(|| ApiError { code: "HANDLE_INVALID".into(), details: vec!["PIF".into(), pif.into()] })?;
+        let n = h.nics.iter_mut().find(|n| n.pif == pif).unwrap();
+        n.mode = mode.into();
+        if mode == "Static" {
+            (n.ip, n.netmask, n.gateway, n.dns) = (ip.into(), netmask.into(), gateway.into(), dns.into());
+        } else if mode == "None" {
+            (n.ip, n.netmask, n.gateway, n.dns) = Default::default();
+        }
+        if n.management && !n.ip.is_empty() {
+            h.address = n.ip.clone();
+        }
+        Ok(())
+    }
+    fn set_hostname(&self, host: &str, name: &str) -> Result<(), ApiError> {
+        said("host.set_hostname_live", &[json!(host), json!(name)]);
+        std::thread::sleep(Duration::from_millis(400));
+        let mut d = self.data.lock().unwrap();
+        let h = d.hosts.iter_mut().find(|h| h.rref == host).ok_or_else(|| ApiError { code: "HANDLE_INVALID".into(), details: vec!["host".into(), host.into()] })?;
+        h.hostname = name.into();
+        Ok(())
+    }
     fn records(&self, kind: &str, rref: &str) -> Result<Vec<(String, Value)>, ApiError> {
         said(&format!("{}.get_record", kind), &[json!(rref)]);
         std::thread::sleep(Duration::from_millis(120));
@@ -5507,6 +5760,17 @@ impl Connection for DemoConnection {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn schedule_snapshot_names_read_as_dates() {
+        // the vmss plugin's "20261120-1843" (UTC) as the app names snapshots, in local time
+        let t = parse_xen_time("20261120T18:43:07Z").unwrap();
+        assert_eq!(plugin_snapshot_name(t), "20261120-1843");
+        assert_eq!(snapshot_name("20261120-1843", true, Some(t)), fmt_date_time(t, local_offset(t)));
+        // a name the user gave it, or one not a schedule's, as it is
+        assert_eq!(snapshot_name("Before update", true, Some(t)), "Before update");
+        assert_eq!(snapshot_name("20261120-1843", false, Some(t)), "20261120-1843");
+    }
 
     #[test]
     fn demo_makes_nfs_storage() {
@@ -5769,11 +6033,23 @@ mod tests {
         // a VM from a template: its network cards kept, or one on the chosen network
         let spec = NewVm { name: "Web 2".into(), template: "tpl-web".into(), vcpus: 2, cores_per_socket: 2, memory: 4 * GB, sr: "sr-nfs".into(), from_template: true, keep_nics: true, ..Default::default() };
         let kept = c.create_vm(&spec, &Trace::default()).unwrap();
-        let moved = c.create_vm(&NewVm { name: "Web 3".into(), keep_nics: false, network: Some("net-1".into()), ..spec }, &Trace::default()).unwrap();
+        let moved = c.create_vm(&NewVm { name: "Web 3".into(), keep_nics: false, network: Some("net-1".into()), ..spec.clone() }, &Trace::default()).unwrap();
         let d = c.fetch(0).unwrap();
         assert_eq!(d.vm(&kept).unwrap().nics[0].network, "Pool-wide network 0");
         assert_eq!(d.vm(&moved).unwrap().nics[0].network, "Storage network");
         assert_eq!(d.vm(&kept).unwrap().disks[0].size, 40 * GB);
+        // a VM from a VM's snapshot: a VM of its own, off, with no snapshots
+        let snap = d.vm("vm-web").unwrap().snapshots.iter().find(|x| !x.memory).unwrap().rref.clone();
+        let from_snap = c.create_vm(&NewVm { name: "Web 4".into(), template: snap, ..spec.clone() }, &Trace::default()).unwrap();
+        let d = c.fetch(0).unwrap();
+        let v = d.vm(&from_snap).unwrap();
+        assert!(v.power == PowerState::Halted && v.snapshots.is_empty() && v.name == "Web 4" && v.disks[0].size == 40 * GB);
+        // with cloud-init: its small disk attached too
+        let ci = crate::cloudinit::CloudInit { hostname: "web-5".into(), user: "joao".into(), password: "x".into(), ..Default::default() };
+        let with_ci = c.create_vm(&NewVm { name: "Web 5".into(), cloud_init: Some(ci), ..spec.clone() }, &Trace::default()).unwrap();
+        let d = c.fetch(0).unwrap();
+        let disks = &d.vm(&with_ci).unwrap().disks;
+        assert!(disks.iter().any(|k| k.name == "cloud-init config" && k.size == 4 << 20));
         // deleted
         c.delete_vm("tpl-win", true).unwrap();
         assert!(c.fetch(0).unwrap().user_template("tpl-win").is_none());
@@ -5794,6 +6070,14 @@ mod tests {
         assert_eq!((y.when().as_str(), y.vms.len()), ("Sat at 22:00", 2));
         assert!(d.schedules.iter().find(|x| x.rref == "vmss-db").unwrap().vms.is_empty());
         // changed: one VM taken off; paused; then deleted, its VM on none
+        // run now: a snapshot of each of its VMs, marked as the schedule's, and when it ran
+        let before = c.fetch(0).unwrap().vm("vm-web").unwrap().snapshots.len();
+        assert_eq!(c.run_schedule("vmss-nightly").unwrap(), "True");
+        let d = c.fetch(0).unwrap();
+        let web = d.vm("vm-web").unwrap();
+        assert!(web.snapshots[0].scheduled && web.snapshots[0].name.contains(", "));
+        assert!(web.snapshots.len() <= before + 1 && web.snapshots.iter().filter(|s| s.scheduled).count() <= 7);
+        assert!(d.schedules.iter().find(|x| x.rref == "vmss-nightly").unwrap().last_run.unwrap() > SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64 - 60);
         c.save_schedule(&ScheduleInfo { rref: made.clone(), vms: vec!["vm-db".into()], ..x.clone() }).unwrap();
         assert_eq!(c.fetch(0).unwrap().vm("vm-desk").unwrap().schedule, None);
         c.set_schedule_enabled(&made, false).unwrap();
@@ -5822,6 +6106,22 @@ mod tests {
         // never run yet: the epoch, said as nothing
         let never = schedule_of("x", &json!({ "last_run_time": "19700101T00:00:00Z", "frequency": "hourly", "schedule": { "min": "15" } }));
         assert_eq!((never.last_run, never.when().as_str(), never.keep), (None, "Every hour at :15", 1));
+    }
+
+    #[test]
+    fn addresses_changed() {
+        let c = DemoConnection::new();
+        c.set_ip("host-a-pif-eth0", "Static", "10.20.0.21", "255.255.0.0", "10.20.0.1", "1.1.1.1").unwrap();
+        c.set_hostname("host-a", "xen-01").unwrap();
+        let d = c.fetch(0).unwrap();
+        let h = d.host("host-a").unwrap();
+        assert_eq!((h.address.as_str(), h.hostname.as_str()), ("10.20.0.21", "xen-01"));
+        assert_eq!((h.nics[0].ip.as_str(), h.nics[0].dns.as_str()), ("10.20.0.21", "1.1.1.1"));
+        // a card's address taken away
+        c.set_ip("host-a-pif-eth1", "None", "", "", "", "").unwrap();
+        let d = c.fetch(0).unwrap();
+        let n = &d.host("host-a").unwrap().nics[1];
+        assert!(n.ip.is_empty() && n.mode == "None");
     }
 
     #[test]
