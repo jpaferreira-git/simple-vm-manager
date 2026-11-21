@@ -81,11 +81,28 @@ struct Around {
     nets: Vec<(String, String)>,
     most_cpus: i64,
     most_memory: i64,
+    /// The pool's USB devices: each, its server's name, and the name of the VM it's passed to
+    /// (when another); and why VMs here can't have them, when they can't.
+    usbs: Vec<(UsbInfo, String, Option<String>)>,
+    usb_off: Option<String>,
+    /// The server it can have USB devices from only, by name: the one it runs on, or the one its
+    /// disks are on.
+    usb_host: Option<String>,
+    /// Its place in the Server Helper's start order (from 1), when the helper starts it.
+    order: Option<usize>,
 }
 
 impl App {
     pub(super) fn overview(&mut self, ui: &mut Ui, sel: &Node, out: &mut Vec<Intent>) {
         let pal = self.pal;
+        // (the Server Helper's start order, to say so on Startup)
+        if let Some(sid) = sel.sid {
+            let ctx = ui.ctx().clone();
+            self.helper_poll(sid, &ctx);
+            if let Some(master) = self.server(sid).and_then(|s| s.data.as_ref()).and_then(|d| d.hosts.iter().find(|h| h.is_master)).map(|h| h.rref.clone()) {
+                self.helper_read(sid, &master, false, &ctx);
+            }
+        }
         let Some((s, d, v)) = self.vm_of(sel) else { return };
         let v = v.clone();
         let home = v.home().map(String::from);
@@ -106,6 +123,18 @@ impl App {
             nets: d.networks.iter().map(|n| (n.rref.clone(), n.name.clone())).collect(),
             most_cpus: d.hosts.iter().map(|h| h.cpu_count).max().unwrap_or(64).max(1),
             most_memory: d.hosts.iter().map(|h| h.mem_total).max().unwrap_or(0),
+            usbs: d
+                .usbs
+                .iter()
+                .map(|u| {
+                    let host = d.host(&u.host).map(|h| h.name.clone()).unwrap_or_default();
+                    let other = u.vm.as_deref().filter(|r| *r != v.rref).map(|r| d.vm(r).map(|x| x.name.clone()).unwrap_or_else(|| "another VM".into()));
+                    (u.clone(), host, other)
+                })
+                .collect(),
+            usb_off: d.usb_off.clone(),
+            usb_host: if v.power == PowerState::Running { v.host.as_deref() } else { v.storage_host.as_deref() }.and_then(|h| d.host(h)).map(|h| h.name.clone()),
+            order: self.helper.get(&s.id).and_then(|h| h.saved.as_ref()).and_then(|r| r.as_ref().ok()).filter(|x| x.order_on).and_then(|x| x.order.iter().position(|o| o.0 == v.uuid)).map(|i| i + 1),
         };
         let address = host_of.map(|h| h.address.clone()).unwrap_or_default();
         let conn = s.conn.clone();
@@ -199,15 +228,24 @@ impl App {
                         section(ui, &pal, "Network");
                         network(ui, &pal, &v, &at, out);
                     };
+                    let usb: Card = &|ui, _, out| {
+                        section(ui, &pal, "USB");
+                        usb_devices(ui, &pal, &v, &at, out);
+                    };
                     if w >= 720.0 {
                         // two by two: Resources and Disks, then Startup and Network, the two
-                        // panels of a row as tall as each other
+                        // panels of a row as tall as each other; then USB under Startup
                         let half = (w - 20.0) / 2.0;
                         pair(ui, "resources-disks", half, ov, out, res, dsk);
                         ui.add_space(24.0);
                         pair(ui, "startup-network", half, ov, out, start, net);
+                        ui.add_space(24.0);
+                        ui.vertical(|ui| {
+                            ui.set_width(half);
+                            usb(ui, ov, out);
+                        });
                     } else {
-                        for (i, card) in [res, start, dsk, net].into_iter().enumerate() {
+                        for (i, card) in [res, start, dsk, net, usb].into_iter().enumerate() {
                             if i > 0 {
                                 ui.add_space(24.0);
                             }
@@ -1090,9 +1128,18 @@ fn resources(ui: &mut Ui, pal: &Pal, v: &VmInfo, at: &Around, ov: &mut OverviewE
 fn startup(ui: &mut Ui, pal: &Pal, v: &VmInfo, at: &Around, out: &mut Vec<Intent>) {
     let can = free(at);
     panel(ui, pal, |ui| {
-        let (resp, _) = row(ui, pal, Some(Lead::Mark("power")), "Starts with its server", "", Tail::Switch(v.auto_power_on), can, false);
-        if resp.on_hover_text("Started when its server starts, after a power cut say").clicked() {
-            out.push(Intent::EditVm(at.sid, v.rref.clone(), VmChange::AutoPowerOn(!v.auto_power_on)));
+        if let Some(n) = at.order {
+            // (the Server Helper starts it, in order: changed on the pool's Helper tab)
+            let (resp, _) = row(ui, pal, Some(Lead::Mark("power")), "Starts with its server", &format!("#{} in the Helper's order", n), Tail::Chevron, true, false);
+            if resp.on_hover_text("The Server Helper starts it, in order, when the pool starts: its list is on the pool's Helper tab").clicked() {
+                out.push(Intent::Select(format!("srv:{}", at.sid)));
+                out.push(Intent::Tab(Tab::Helper));
+            }
+        } else {
+            let (resp, _) = row(ui, pal, Some(Lead::Mark("power")), "Starts with its server", "", Tail::Switch(v.auto_power_on), can, false);
+            if resp.on_hover_text("Started when its server starts, after a power cut say").clicked() {
+                out.push(Intent::EditVm(at.sid, v.rref.clone(), VmChange::AutoPowerOn(!v.auto_power_on)));
+            }
         }
         if v.virt_mode == "HVM" && v.firmware == "BIOS" {
             let now = boot_letters(&v.boot_order);
@@ -1180,7 +1227,7 @@ fn disks(ui: &mut Ui, pal: &Pal, v: &VmInfo, at: &Around, ov: &mut OverviewEdit,
                 pop_head(ui, pal, "In the DVD drive", &format!("{} ISO{}", at.isos.len(), if at.isos.len() == 1 { "" } else { "s" }));
                 // many: a box to find one
                 if at.isos.len() > 8 {
-                    ui.add(egui::TextEdit::singleline(&mut ov.dvd_search).hint_text("Find an ISO").desired_width(f32::INFINITY).margin(vec2(8.0, 6.0)));
+                    search_box(ui, pal, &mut ov.dvd_search, "Find an ISO", ui.available_width());
                 }
                 let find = ov.dvd_search.trim().to_lowercase();
                 egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
@@ -1278,6 +1325,99 @@ fn network(ui: &mut Ui, pal: &Pal, v: &VmInfo, at: &Around, out: &mut Vec<Intent
                     }
                 }
             });
+        });
+    });
+}
+
+/// Set for a screenshot with the Add USB device popover open.
+pub(super) const SHOT_USB_ADD: &str = "shot-usb-add";
+
+/// The USB devices passed to it (each with a way to take it off), and a device to pass to it: one
+/// plugged into a server it can run on that no other VM has. It gets one when it starts, and from
+/// then on starts on that server only.
+fn usb_devices(ui: &mut Ui, pal: &Pal, v: &VmInfo, at: &Around, out: &mut Vec<Intent>) {
+    let can = free(at);
+    let running = v.power == PowerState::Running;
+    // where it can have one from: the server it runs on, or the one its disks are on
+    let only = if running { v.host.clone() } else { v.storage_host.clone() };
+    panel(ui, pal, |ui| {
+        let mine: Vec<&(UsbInfo, String, Option<String>)> = at.usbs.iter().filter(|u| u.0.vm.as_deref() == Some(v.rref.as_str())).collect();
+        for (x, host, _) in mine.iter().map(|u| (&u.0, &u.1, &u.2)) {
+            let name = x.name();
+            let value = if running && !x.attached { "at its next start".to_string() } else { host.clone() };
+            let (resp, anchor) = row(ui, pal, Some(Lead::Mark("usb")), &x.short(), &value, Tail::More, can, false);
+            popover(ui, resp.id.with("pop"), resp.clicked(), &anchor, 320.0, |ui| {
+                pop_head(ui, pal, &name, &x.ids);
+                let now = if x.attached {
+                    "The VM has it now."
+                } else if running {
+                    "The VM gets it when it next starts: restart it to use it."
+                } else {
+                    "The VM gets it when it starts."
+                };
+                pop_note(ui, pal, &format!("Plugged into {}, port {}. {}", or(host, "its server"), or(&x.path, "unknown"), now), false);
+                if !x.serial.is_empty() {
+                    pop_note(ui, pal, &format!("Serial number {}", x.serial), false);
+                }
+                pop_note(ui, pal, &format!("While it has it, the VM starts on {} only, and can't move to another server.", or(host, "that server")), false);
+                pop_line(ui, pal);
+                if danger(ui, pal, "Take it off this VM…", true, "") {
+                    let unplug = if x.attached { " It's unplugged from the VM now." } else { "" };
+                    let text = format!("Take USB device '{}' off '{}'?{} It stays plugged into {}, for another VM.", name, v.name, unplug, or(host, "its server"));
+                    if let Some(vusb) = &x.vusb {
+                        out.push(Intent::AskEditVm(at.sid, v.rref.clone(), VmChange::RemoveUsb { vusb: vusb.clone(), name: name.clone() }, "Remove USB Device".into(), text));
+                    }
+                    close_popover(ui);
+                }
+            });
+        }
+        // why none can be passed to it
+        let why = if let Some(off) = &at.usb_off {
+            Some(off.clone())
+        } else if v.virt_mode != "HVM" {
+            Some("Only HVM VMs can have USB devices.".to_string())
+        } else if mine.len() >= 6 {
+            Some("A VM can have six USB devices at most.".to_string())
+        } else if at.usbs.is_empty() {
+            Some("No USB device is plugged into the pool's servers.".to_string())
+        } else {
+            None
+        };
+        let (resp, anchor) = row(ui, pal, Some(Lead::Glyph("plus")), "Add USB device", "", Tail::Nothing, can && why.is_none(), true);
+        if let Some(w) = &why {
+            resp.clone().on_hover_text(w.as_str());
+        }
+        // (a screenshot of it open: --show vm-usb-add)
+        if ui.data(|d| d.get_temp::<bool>(egui::Id::new(SHOT_USB_ADD))).unwrap_or(false) {
+            ui.memory_mut(|m| m.open_popup(resp.id.with("pop")));
+        }
+        popover(ui, resp.id.with("pop"), resp.clicked(), &anchor, 340.0, |ui| {
+            let others: Vec<&(UsbInfo, String, Option<String>)> = at.usbs.iter().filter(|u| u.0.vm.as_deref() != Some(v.rref.as_str())).collect();
+            let free_n = others.iter().filter(|u| u.0.vm.is_none()).count();
+            pop_head(ui, pal, "Pass a USB device to it", &format!("{} free", free_n));
+            egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 2.0;
+                for (x, host, other) in others.iter().map(|u| (&u.0, &u.1, &u.2)) {
+                    let here = only.as_deref().map_or(true, |h| h == x.host);
+                    let (sub, ok) = match other {
+                        Some(o) => (format!("{}'s", o), false),
+                        None if !here => (format!("on {}", or(host, "another server")), false),
+                        None => (host.clone(), true),
+                    };
+                    if choice(ui, pal, &x.short(), &sub, false, ok) {
+                        out.push(Intent::EditVm(at.sid, v.rref.clone(), VmChange::AddUsb { pusb: x.rref.clone(), group: x.group.clone(), name: x.name(), enable: !x.passthrough }));
+                        close_popover(ui);
+                    }
+                }
+            });
+            pop_line(ui, pal);
+            let at_start = if running { "It gets it when it next starts (restart it then)" } else { "It gets it when it starts" };
+            let whose = match (&at.usb_host, only.is_some()) {
+                (Some(h), true) if running => format!("{}. Only those on {} can be passed to it: it runs there.", at_start, h),
+                (Some(h), true) => format!("{}. Only those on {} can be passed to it: its disks are there.", at_start, h),
+                _ => format!("{}, and from then on starts on that device's server only.", at_start),
+            };
+            pop_note(ui, pal, &whose, false);
         });
     });
 }

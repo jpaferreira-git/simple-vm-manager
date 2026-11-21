@@ -5,7 +5,7 @@ use crate::alerts::{AlertSettings, XenMessage};
 use crate::history::{demo_host_records, demo_vm_records, read_records, Records, Span};
 use crate::model::*;
 use serde_json::{json, Map, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
@@ -484,6 +484,34 @@ pub trait Connection: Send + Sync {
     /// Brings a .xva file into the pool (see `ImportVm`), then names it, sets its home server and
     /// moves its network cards as asked. The VM (or template) made.
     fn import_vm(&self, imp: &ImportVm, t: &Arc<Transfer>) -> Result<String, ApiError>;
+    /// A server's own system (its control domain, with its settings; not its VMs' disks) saved in
+    /// `to`, a .xbk: an HTTP GET of /host_backup on it (at `address`). The bytes saved.
+    fn backup_host(&self, address: &str, to: &Path, t: &Arc<Transfer>) -> Result<u64, ApiError>;
+    /// A backup put on a server's backup partition (PUT /host_restore), for its installer to
+    /// restore when it's started from it.
+    fn restore_host(&self, address: &str, from: &Path, t: &Arc<Transfer>) -> Result<(), ApiError>;
+    /// What a server's status report can hold (xen-bugtool's list).
+    fn report_parts(&self, host: &str) -> Result<Vec<ReportPart>, ApiError>;
+    /// A server's status report (those `parts`) saved in `to`, a .tar.bz2: an HTTP GET of
+    /// /system-status on it. The bytes saved.
+    fn status_report(&self, address: &str, parts: &[String], to: &Path, t: &Arc<Transfer>) -> Result<u64, ApiError>;
+    /// A server's certificate replaced by a new self-signed one: the one it answers HTTPS with,
+    /// or (`internal`) the one the pool's servers use among themselves. Its new expiry, as read
+    /// back.
+    fn renew_certificate(&self, host: &str, internal: bool) -> Result<Option<i64>, ApiError>;
+    /// The pool's root password changed (every server's), once `old` is checked to be the one
+    /// this connection logs in with; the new one is used from then on.
+    fn change_password(&self, old: &str, new: &str) -> Result<(), ApiError>;
+    /// The Server Helper on a server (see helper.rs): its version, None when it isn't installed
+    /// (no "svm-helper" plugin there).
+    fn helper_version(&self, host: &str) -> Result<Option<String>, ApiError>;
+    /// One of the Server Helper's calls on a server (status, tick, test, uninstall): its answer.
+    fn helper_call(&self, host: &str, func: &str, args: &[(&str, String)]) -> Result<String, ApiError>;
+    /// The Server Helper's settings, as the pool keeps them ("" when there are none).
+    fn helper_settings(&self) -> Result<String, ApiError>;
+    /// Saves them; then each VM (`autostart`: VM, on) starts with its server by itself or not:
+    /// the ones the helper starts in order don't, those taken off its list do again.
+    fn save_helper_settings(&self, json: &str, autostart: &[(String, bool)]) -> Result<(), ApiError>;
     fn close(&self);
 }
 
@@ -814,12 +842,15 @@ struct RealState {
 pub struct RealConnection {
     port: u16,
     user: String,
-    password: String,
+    /// (changed with Change Root Password)
+    password: Mutex<String>,
     /// Only ever held for a moment (the window asks it for the server's name as it draws), never
     /// while waiting on the network.
     state: Mutex<RealState>,
     /// Held while logging in, so only one login happens at a time.
     login: Mutex<()>,
+    /// The coordinator's clock offset from UTC as last read: which server, when, the seconds.
+    clock: Mutex<Option<(String, Instant, i64)>>,
     id: AtomicU64,
     tls: Arc<native_tls::TlsConnector>,
     /// How many looks in a row each server (by reference) hasn't answered (see `knock_hosts`).
@@ -845,17 +876,26 @@ impl RealConnection {
     }
 
     /// One VM, template or snapshot into a .xva: an HTTP GET of /export (the coordinator sends it
-    /// on to the server that has its disks), written beside `to` and renamed once whole, the
-    /// server's task looked at meanwhile for how far it is.
+    /// on to the server that has its disks).
     fn export_one(&self, obj: &str, to: &Path, compress: bool, t: &Arc<Transfer>) -> Result<u64, ApiError> {
         let uuid = self.call("VM.get_uuid", vec![json!(obj)], 30_000)?.as_str().unwrap_or_default().to_string();
-        let label = to.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-        let task = self.call("task.create", vec![json!("Export"), json!(label)], 30_000)?.as_str().unwrap_or_default().to_string();
-        let (base, session) = self.http_base(None);
         let how = if compress { "zstd" } else { "false" };
-        let url = format!("{}/export?session_id={}&uuid={}&task_id={}&use_compression={}", base, session, uuid, task, how);
+        self.get_file(None, &format!("/export?uuid={}&use_compression={}", uuid, how), "Export", to, Duration::from_secs(600), t)
+    }
+
+    /// An HTTP GET of `what` (a path and its query, the session and task added) from the server at
+    /// `address` (or the coordinator) into `to`: written beside it and renamed once whole, the
+    /// server's task (`task_name`) looked at meanwhile for how far it is, and asked at the end
+    /// whether all went well (the server sends its answer's head before it starts, so a failure
+    /// halfway shows only there). `quiet`: how long the server may send nothing.
+    fn get_file(&self, address: Option<&str>, what: &str, task_name: &str, to: &Path, quiet: Duration, t: &Arc<Transfer>) -> Result<u64, ApiError> {
+        let label = to.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        let task = self.call("task.create", vec![json!(task_name), json!(label)], 30_000)?.as_str().unwrap_or_default().to_string();
+        let (base, session) = self.http_base(address);
+        let sep = if what.contains('?') { '&' } else { '?' };
+        let url = format!("{}{}{}session_id={}&task_id={}", base, what, sep, session, task);
         if let Some(w) = watched() {
-            w.trace.push(Said::Asked, format!("GET /export  uuid={}  use_compression={}", uuid, how));
+            w.trace.push(Said::Asked, format!("GET {}{}", what.replacen('?', "  ", 1).replace('&', "  "), address.map(|a| format!("  (from {})", a)).unwrap_or_default()));
             w.trace.push(Said::Note, format!("Saving it as {}", to.display()));
         }
         let part = to.with_file_name(format!("{}.part", label));
@@ -868,7 +908,7 @@ impl RealConnection {
         let agent = ureq::AgentBuilder::new()
             .tls_connector(self.tls.clone())
             .timeout_connect(Duration::from_secs(30))
-            .timeout_read(Duration::from_secs(600))
+            .timeout_read(quiet)
             .user_agent(concat!("SimpleVMManager/", env!("CARGO_PKG_VERSION")))
             .build();
         let resp = match agent.get(&url).call() {
@@ -879,7 +919,7 @@ impl RealConnection {
                 let _ = self.call("task.destroy", vec![json!(task)], 30_000);
                 return Err(match (verdict, e) {
                     (Err(e), _) if e.code != CANCELLED => e,
-                    (_, ureq::Error::Status(code, r)) => ApiError::other(format!("The server answered the export with HTTP {} {}.", code, r.status_text())),
+                    (_, ureq::Error::Status(code, r)) => ApiError::other(format!("The server answered with HTTP {} {}.", code, r.status_text())),
                     (_, e) => ApiError::other(e.to_string()),
                 });
             }
@@ -947,7 +987,7 @@ impl RealConnection {
             (Err(e), _) if e.code != CANCELLED => return finish(Err(e)),
             (_, Err(why)) => return finish(Err(ApiError::other(why))),
             (Ok(true), Ok(n)) => n,
-            (_, Ok(_)) => return finish(Err(ApiError::other("The server didn't say the export was whole."))),
+            (_, Ok(_)) => return finish(Err(ApiError::other("The server didn't say the file was whole."))),
         };
         if let Err(e) = std::fs::rename(&part, to) {
             return finish(Err(ApiError::other(format!("Couldn't name it {}: {}", to.display(), e))));
@@ -978,9 +1018,10 @@ impl RealConnection {
         RealConnection {
             port,
             user: user.into(),
-            password: password.into(),
+            password: Mutex::new(password.into()),
             state: Mutex::new(RealState { host, session: None, members: vec![] }),
             login: Mutex::new(()),
+            clock: Mutex::new(None),
             id: AtomicU64::new(0),
             tls: Arc::new(tls),
             silent: Mutex::new(HashMap::new()),
@@ -1262,7 +1303,7 @@ impl RealConnection {
             }
             tried.push(host.clone());
             let id = self.id.fetch_add(1, Ordering::Relaxed) + 1;
-            let params = vec![json!(self.user), json!(self.password), json!("2.0"), json!("SimpleVMManager")];
+            let params = vec![json!(self.user), json!(self.password.lock().unwrap().clone()), json!("2.0"), json!("SimpleVMManager")];
             match self.rpc(&host, id, "session.login_with_password", params, timeout_ms) {
                 Ok(v) => return Ok((host, v.as_str().unwrap_or_default().to_string())),
                 Err(e) if e.code == "HOST_IS_SLAVE" && !e.details.is_empty() => {
@@ -1639,6 +1680,21 @@ impl RealConnection {
         })
     }
 
+    /// How far the coordinator's local time is from UTC (seconds, to the quarter hour): its local
+    /// time less its UTC time, read every six hours (and when the coordinator changes).
+    fn clock_offset(&self, master: &str) -> Option<i64> {
+        if let Some((m, at, v)) = self.clock.lock().unwrap().clone() {
+            if m == master && at.elapsed() < Duration::from_secs(6 * 3600) {
+                return Some(v);
+            }
+        }
+        let read = |method: &str| self.call_raw(method, vec![json!(master)], 15_000).ok().and_then(|v| parse_xen_time(&val_str(&v)));
+        let (utc, local) = (read("host.get_servertime")?, read("host.get_server_localtime")?);
+        let off = ((local - utc) as f64 / 900.0).round() as i64 * 900;
+        *self.clock.lock().unwrap() = Some((master.to_string(), Instant::now(), off));
+        Some(off)
+    }
+
     fn all(&self, cls: &str, timeout_ms: u64) -> Result<Map<String, Value>, ApiError> {
         Ok(self.call(&format!("{}.get_all_records", cls), vec![], timeout_ms)?.as_object().cloned().unwrap_or_default())
     }
@@ -1897,11 +1953,12 @@ impl Connection for RealConnection {
         let mut pd = PoolData::default();
         let mut master = String::new();
         let mut repos: Vec<String> = vec![];
-        let mut no_vmss = false;
+        let (mut no_vmss, mut no_usb) = (false, false);
         for (_, r) in self.all("pool", t)? {
             pd.name = s(&r, "name_label");
-            // a license without snapshot schedules says so here
+            // a license without snapshot schedules (or USB pass-through) says so here
             no_vmss = s(r.get("restrictions").unwrap_or(&Value::Null), "restrict_vmss") == "true";
+            no_usb = s(r.get("restrictions").unwrap_or(&Value::Null), "restrict_usb_passthrough") == "true";
             master = s(&r, "master");
             pd.default_sr = Some(s(&r, "default_SR")).filter(|x| !x.is_empty() && x != "OpaqueRef:NULL");
             repos = list(&r, "repositories");
@@ -2017,6 +2074,11 @@ impl Connection for RealConnection {
                 links,
                 live_out: can(&["VDI_MIRROR"]),
                 live_in: can(&["VDI_MIRROR", "VDI_MIRROR_IN"]),
+                stats: features.get(&s(&r, "type")).map_or(false, |f| f.iter().any(|x| x == "SR_STATS")),
+                fill_limit: crate::alerts::read_variables(&s(r.get("other_config").unwrap_or(&Value::Null), "perfmon"))
+                    .into_iter()
+                    .find(|v| v.name == "physical_utilisation")
+                    .map(|v| (v.level.unwrap_or(0.8), v.period.unwrap_or(60))),
             });
         }
         // every network's name (a VM's card may be on one that isn't shown)
@@ -2261,6 +2323,46 @@ impl Connection for RealConnection {
         if no_vmss {
             pd.schedules_off = Some("The pool's license doesn't include snapshot schedules.".into());
         }
+        // its servers' USB devices and the VMs they're passed to (XenServer 7.3 and later)
+        match self.all("PUSB", t) {
+            Ok(all) => {
+                let given: HashMap<String, (String, String, bool)> = self
+                    .all("VUSB", t)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(k, r)| (s(&r, "USB_group"), (s(&r, "VM"), k, b(&r, "currently_attached"))))
+                    .collect();
+                for (k, r) in all {
+                    let group = s(&r, "USB_group");
+                    let to = given.get(&group);
+                    let ids = [s(&r, "vendor_id"), s(&r, "product_id")].into_iter().filter(|x| !x.is_empty()).collect::<Vec<_>>().join(":");
+                    pd.usbs.push(UsbInfo {
+                        rref: k,
+                        host: s(&r, "host"),
+                        group,
+                        path: s(&r, "path"),
+                        vendor: s(&r, "vendor_desc"),
+                        product: s(&r, "product_desc"),
+                        description: s(&r, "description"),
+                        ids,
+                        serial: s(&r, "serial"),
+                        passthrough: b(&r, "passthrough_enabled"),
+                        vm: to.map(|x| x.0.clone()),
+                        vusb: to.map(|x| x.1.clone()),
+                        attached: to.map_or(false, |x| x.2),
+                    });
+                }
+                pd.usbs.sort_by(|a, b| (&a.host, &a.path).cmp(&(&b.host, &b.path)));
+            }
+            Err(e) if e.code == "MESSAGE_METHOD_UNKNOWN" || e.code == "UNKNOWN_CLASS" || e.code == "MESSAGE_DEPRECATED" => {
+                pd.usb_off = Some("This pool's version can't pass USB devices to VMs (XenServer 7.3 and later can).".into());
+            }
+            Err(_) => {}
+        }
+        if no_usb {
+            pd.usb_off = Some("The pool's license doesn't include passing USB devices to VMs.".into());
+        }
+        pd.clock_offset = self.clock_offset(&master);
         Ok(pd)
     }
 
@@ -2726,6 +2828,25 @@ impl Connection for RealConnection {
                     self.call("VIF.unplug", vec![json!(vif)], long)?;
                 }
                 self.call("VIF.destroy", vec![json!(vif)], t).map(|_| ())
+            }
+            VmChange::AddUsb { pusb, group, enable, .. } => {
+                if *enable {
+                    self.call("PUSB.set_passthrough_enabled", vec![json!(pusb), json!(true)], t)?;
+                }
+                // USB goes through the newer device model (qemu-upstream); one still on the
+                // old one is moved to it, as XenCenter does
+                let platform = self.call("VM.get_platform", vec![json!(vm)], t)?;
+                if s(&platform, "device-model") == "qemu-trad" {
+                    set_key("VM", "platform", vm, "device-model", "qemu-upstream-compat")?;
+                }
+                // plugged in at its next start (the server can't plug one into a running VM)
+                self.call("VUSB.create", vec![json!(vm), json!(group), json!({})], t).map(|_| ())
+            }
+            VmChange::RemoveUsb { vusb, .. } => {
+                if self.call("VUSB.get_currently_attached", vec![json!(vusb)], t)?.as_bool().unwrap_or(false) {
+                    self.call("VUSB.unplug", vec![json!(vusb)], long)?;
+                }
+                self.call("VUSB.destroy", vec![json!(vusb)], t).map(|_| ())
             }
         }
     }
@@ -3707,6 +3828,131 @@ impl Connection for RealConnection {
         Ok(vm)
     }
 
+    fn backup_host(&self, address: &str, to: &Path, t: &Arc<Transfer>) -> Result<u64, ApiError> {
+        // (the server packs its system as it goes: a while between the bytes is fine)
+        self.get_file(Some(address), "/host_backup", "Back up a server", to, Duration::from_secs(900), t)
+    }
+
+    fn restore_host(&self, address: &str, from: &Path, t: &Arc<Transfer>) -> Result<(), ApiError> {
+        let size = std::fs::metadata(from).map_err(|e| ApiError::other(format!("Couldn't read {}: {}", from.display(), e)))?.len();
+        let f = std::fs::File::open(from).map_err(|e| ApiError::other(format!("Couldn't open {}: {}", from.display(), e)))?;
+        t.total.store(size, Ordering::Relaxed);
+        let label = from.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        let task = self.call("task.create", vec![json!("Restore a server's backup"), json!(label)], 30_000)?.as_str().unwrap_or_default().to_string();
+        let (base, session) = self.http_base(Some(address));
+        let url = format!("{}/host_restore?session_id={}&task_id={}", base, session, task);
+        if let Some(w) = watched() {
+            w.trace.push(Said::Asked, format!("PUT /host_restore  (to {})  file=\"{}\"  ({})", address, label, fmt_bytes(size as i64)));
+        }
+        let agent = ureq::AgentBuilder::new()
+            .tls_connector(self.tls.clone())
+            .timeout_connect(Duration::from_secs(30))
+            .timeout_write(Duration::from_secs(600))
+            .timeout_read(Duration::from_secs(1800))
+            .redirects(0)
+            .user_agent(concat!("SimpleVMManager/", env!("CARGO_PKG_VERSION")))
+            .build();
+        let body = Counting { inner: Box::new(std::io::BufReader::with_capacity(1 << 20, f)), t: t.clone() };
+        let sent = agent.put(&url).set("Content-Length", &size.to_string()).send(body);
+        t.finishing.store(true, Ordering::Relaxed);
+        let cancelled = t.cancel.load(Ordering::Relaxed);
+        let put_error = match sent {
+            Ok(_) => None,
+            Err(ureq::Error::Status(code, _)) => Some(ApiError::other(format!("The server answered with HTTP {}.", code))),
+            Err(e) => Some(ApiError::other(e.to_string())),
+        };
+        if cancelled || put_error.is_some() {
+            let _ = self.call("task.cancel", vec![json!(task)], 30_000);
+        }
+        // its restore script writes the backup partition as the file comes; then it's done
+        let verdict = self.task_result(&task, Duration::from_secs(if cancelled || put_error.is_some() { 60 } else { 900 }));
+        let _ = self.call("task.destroy", vec![json!(task)], 30_000);
+        if cancelled {
+            return Err(ApiError { code: CANCELLED.into(), details: vec![] });
+        }
+        match verdict {
+            Ok(true) => Ok(()),
+            Err(e) if e.code != CANCELLED => Err(e),
+            _ => Err(put_error.unwrap_or_else(|| ApiError::other("The server didn't say it had put the backup in place."))),
+        }
+    }
+
+    fn report_parts(&self, host: &str) -> Result<Vec<ReportPart>, ApiError> {
+        let xml = val_str(&self.call("host.get_system_status_capabilities", vec![json!(host)], 60_000)?);
+        Ok(parse_report_parts(&xml))
+    }
+
+    fn status_report(&self, address: &str, parts: &[String], to: &Path, t: &Arc<Transfer>) -> Result<u64, ApiError> {
+        // (the server gathers it all into a file before it sends a byte: minutes, on a busy one)
+        self.get_file(Some(address), &format!("/system-status?entries={}&output=tar.bz2", parts.join(",")), "Server status report", to, Duration::from_secs(1800), t)
+    }
+
+    fn renew_certificate(&self, host: &str, internal: bool) -> Result<Option<i64>, ApiError> {
+        let method = if internal { "host.refresh_server_certificate" } else { "host.reset_server_certificate" };
+        match self.call(method, vec![json!(host)], 180_000) {
+            Ok(_) => {}
+            // it restarts its HTTPS to take the new one: the answer may be lost with it
+            Err(e) if e.code == "CONNECTION" => note("Its HTTPS restarted with the new certificate before it answered: reading it back."),
+            Err(e) => return Err(e),
+        }
+        std::thread::sleep(Duration::from_secs(3));
+        let kind = if internal { "host_internal" } else { "host" };
+        let certs = self.all("Certificate", 30_000).unwrap_or_default();
+        let expiry = certs.values().filter(|r| s(r, "host") == host && s(r, "type") == kind).filter_map(|r| parse_xen_time(&s(r, "not_after"))).max();
+        if let (Some(t), Some(w)) = (expiry, watched()) {
+            w.trace.push(Said::Answer, format!("Its new certificate is good till {}", fmt_date_time(t, local_offset(t))));
+        }
+        Ok(expiry)
+    }
+
+    fn change_password(&self, old: &str, new: &str) -> Result<(), ApiError> {
+        if old != *self.password.lock().unwrap() {
+            return Err(ApiError { code: "WRONG_PASSWORD".into(), details: vec![] });
+        }
+        // (logged as asked, not with the passwords)
+        said("session.change_password", &[json!("…"), json!("…")]);
+        self.call_raw("session.change_password", vec![json!(old), json!(new)], 60_000)?;
+        *self.password.lock().unwrap() = new.to_string();
+        Ok(())
+    }
+
+    fn helper_version(&self, host: &str) -> Result<Option<String>, ApiError> {
+        match self.call_raw("host.call_plugin", vec![json!(host), json!(crate::helper::KEY), json!("version"), json!({})], 30_000) {
+            Ok(v) => {
+                let text = val_str(&v);
+                let version = serde_json::from_str::<Value>(&text).ok().map(|j| s(&j, "version")).unwrap_or_default();
+                Ok(Some(if version.is_empty() { "?".into() } else { version }))
+            }
+            Err(e) if e.code == "XENAPI_MISSING_PLUGIN" => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn helper_call(&self, host: &str, func: &str, args: &[(&str, String)]) -> Result<String, ApiError> {
+        let map: Map<String, Value> = args.iter().map(|(k, v)| (k.to_string(), json!(v))).collect();
+        // (its tick may start VMs or mount storage: a few minutes at most)
+        Ok(val_str(&self.call("host.call_plugin", vec![json!(host), json!(crate::helper::KEY), json!(func), Value::Object(map)], 300_000)?))
+    }
+
+    fn helper_settings(&self) -> Result<String, ApiError> {
+        let pool = self.all("pool", 30_000)?.keys().next().cloned().unwrap_or_default();
+        let oc = self.call("pool.get_other_config", vec![json!(pool)], 30_000)?;
+        Ok(s(&oc, crate::helper::KEY))
+    }
+
+    fn save_helper_settings(&self, text: &str, autostart: &[(String, bool)]) -> Result<(), ApiError> {
+        let t = 30_000;
+        let pool = self.all("pool", t)?.keys().next().cloned().unwrap_or_default();
+        let _ = self.call_raw("pool.remove_from_other_config", vec![json!(pool), json!(crate::helper::KEY)], t);
+        // (said without what it holds: tokens)
+        said("pool.add_to_other_config", &[json!(pool), json!(crate::helper::KEY), json!("…")]);
+        self.call_raw("pool.add_to_other_config", vec![json!(pool), json!(crate::helper::KEY), json!(text)], t)?;
+        for (vm, on) in autostart {
+            self.edit_vm(vm, &VmChange::AutoPowerOn(*on))?;
+        }
+        Ok(())
+    }
+
     /// The VM's VNC console through an HTTP CONNECT tunnel on the server's HTTPS port, as the
     /// original's console: CONNECT <console location>&session_id=<session> HTTP/1.0.
     fn open_console(&self, vm_ref: &str) -> Result<ConsoleStream, ApiError> {
@@ -3789,6 +4035,8 @@ fn demo_uuid() -> String {
 
 pub struct DemoConnection {
     data: Mutex<PoolData>,
+    /// The Server Helper: the servers it's on, its settings, what it did.
+    helper: Mutex<(HashSet<String>, String, Vec<String>)>,
     /// What its update channel has for its servers.
     updates: Mutex<PoolUpdates>,
     /// Its messages for people, the limits set on its VMs, servers and storage (by reference),
@@ -3989,6 +4237,26 @@ impl DemoConnection {
             });
             demo_details(d.vms.last_mut().unwrap());
         }
+        // USB devices: a Zigbee stick and a USB stick on demo-host-01, a UPS's cable on
+        // demo-host-02 passed to Mail Relay (SVM_DEMO_NO_USB: none, as a pool without)
+        if std::env::var("SVM_DEMO_NO_USB").is_err() {
+            let usb = |r: &str, host: &str, path: &str, vendor: &str, product: &str, ids: &str| UsbInfo {
+                rref: r.into(),
+                host: host.into(),
+                group: format!("{}-group", r),
+                path: path.into(),
+                vendor: vendor.into(),
+                product: product.into(),
+                ids: ids.into(),
+                ..Default::default()
+            };
+            d.usbs.push(usb("pusb-zigbee", "host-a", "1-3", "Silicon Labs", "CP2102N USB to UART Bridge", "10c4:ea60"));
+            d.usbs.push(usb("pusb-stick", "host-a", "2-1", "SanDisk Corp.", "Ultra Fit", "0781:5583"));
+            d.usbs.push(UsbInfo { passthrough: true, vm: Some("vm-mail".into()), vusb: Some("vusb-ups".into()), ..usb("pusb-ups", "host-b", "1-2", "American Power Conversion", "Back-UPS ES 700", "051d:0002") });
+        }
+        // its coordinator's clock: this computer's (SVM_DEMO_UTC: on UTC, as many servers are)
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|t| t.as_secs() as i64).unwrap_or(0);
+        d.clock_offset = Some(if std::env::var("SVM_DEMO_UTC").is_ok() { 0 } else { local_offset(now) });
         d.schedules = demo_schedules();
         for v in d.vms.iter_mut() {
             v.schedule = d.schedules.iter().find(|x| x.vms.contains(&v.rref)).map(|x| x.rref.clone());
@@ -4100,7 +4368,26 @@ impl DemoConnection {
         };
         let found = PoolUpdates { hash: "6f1c0e9a".into(), updates, hosts };
         let alerts = demo_alerts(&d);
-        DemoConnection { data: Mutex::new(d), updates: Mutex::new(found), alerts: Mutex::new(alerts) }
+        // SVM_DEMO_HELPER: the Server Helper is on every server
+        let helped: HashSet<String> = if std::env::var("SVM_DEMO_HELPER").is_ok() { d.hosts.iter().map(|h| h.rref.clone()).collect() } else { HashSet::new() };
+        let helper_log = vec![
+            "2026-11-20 08:00:01 sent 1 alert".to_string(),
+            "2026-11-20 16:45:02 Made up the missed 19:45 run of 'Nightly'".to_string(),
+            "2026-11-20 16:46:10 Mounted 'ISO library' again on demo-host-02".to_string(),
+        ];
+        // (with it, some settings: Telegram and ntfy on, two VMs started in order)
+        let helper_settings = if helped.is_empty() {
+            String::new()
+        } else {
+            let mut x = crate::helper::Settings::default();
+            x.telegram = crate::helper::Channel { on: true, url: "8123456789:AAF-demo-token".into(), extra: "-1001234567890".into() };
+            x.ntfy = crate::helper::Channel { on: true, url: "https://ntfy.sh/home-alerts".into(), extra: String::new() };
+            x.order_on = true;
+            x.order = d.vms.iter().filter(|v| v.rref == "vm-db" || v.rref == "vm-web").map(|v| (v.uuid.clone(), if v.rref == "vm-db" { 60 } else { 30 })).collect();
+            x.order.sort_by_key(|o| o.1 == 30);
+            x.to_json()
+        };
+        DemoConnection { data: Mutex::new(d), helper: Mutex::new((helped, helper_settings, helper_log)), updates: Mutex::new(found), alerts: Mutex::new(alerts) }
     }
 
     /// New VM from one of the user's templates: the calls a real server gets, with made-up answers.
@@ -4191,6 +4478,33 @@ fn demo_templates() -> Vec<TemplateInfo> {
 /// The discs in the demo's ISO library `sr`, two of them described.
 /// The demo's stand-in for a server task: `ms` of work, its progress reported to the thread's
 /// watched `Progress`.
+/// Pretends to move `bytes` in about four seconds (forty with SVM_DEMO_SLOW): received, the
+/// server's task said to be that far; or sent (`t.total` set). Stopped when asked.
+fn demo_transfer(t: &Arc<Transfer>, bytes: u64, received: bool) -> Result<(), ApiError> {
+    let slow = if cfg!(test) { 0 } else if std::env::var("SVM_DEMO_SLOW").is_ok() { 40 } else { 4 };
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(slow) {
+        if t.cancel.load(Ordering::Relaxed) {
+            return Err(ApiError { code: CANCELLED.into(), details: vec![] });
+        }
+        let part = start.elapsed().as_secs_f64() / slow as f64;
+        if received {
+            t.set_part(part);
+        }
+        t.sent.store((bytes as f64 * part) as u64, Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    if t.cancel.load(Ordering::Relaxed) {
+        return Err(ApiError { code: CANCELLED.into(), details: vec![] });
+    }
+    t.sent.store(bytes, Ordering::Relaxed);
+    t.finishing.store(true, Ordering::Relaxed);
+    if received {
+        t.set_part(1.0);
+    }
+    Ok(())
+}
+
 /// The demo pool's messages (a limit passed last night, a VM that crashed, a certificate
 /// running out, a snapshot taken…) and the limits set that raised them.
 fn demo_alerts(d: &PoolData) -> (Vec<XenMessage>, HashMap<String, String>, (String, String)) {
@@ -4209,7 +4523,7 @@ fn demo_alerts(d: &PoolData) -> (Vec<XenMessage>, HashMap<String, String>, (Stri
         time: now - ago,
         body,
     };
-    let list = vec![
+    let mut list = vec![
         msg(1, "ALARM", 3, "SR", "sr-local2", 40 * 60, format!("value: 0.962000\nconfig:\n{}", full)),
         msg(2, "ALARM", 3, "VM", "vm-web", 9 * 3600, format!("value: 0.973000\nconfig:\n{}", cpu)),
         msg(3, "VM_CRASHED", 2, "VM", "vm-mail", 26 * 3600, "The VM crashed and was restarted (actions_after_crash: restart)".into()),
@@ -4221,9 +4535,23 @@ fn demo_alerts(d: &PoolData) -> (Vec<XenMessage>, HashMap<String, String>, (Stri
         msg(7, "VMSS_SNAPSHOT_SUCCEEDED", 5, "VMSS", "vmss-nightly", 6 * 3600 + 19 * 60, "VMSS_SNAPSHOT_SUCCEEDED".into()),
         msg(8, "VMSS_SNAPSHOT_FAILED", 1, "VMSS", "vmss-db", 5 * 60, "Snapshot failed on 1 out of 1 VMs with the following errors: \n\nDetails:\nVM: Database UUID: 6f2c0d4e-demo Error:['SR_BACKEND_FAILURE_44', '', 'There is insufficient space']".into()),
     ];
+    // (with SVM_DEMO_NO_SR_STATS the pool can't watch how full its storage is: no such alert)
+    if std::env::var("SVM_DEMO_NO_SR_STATS").is_ok() {
+        list.retain(|m| !(m.name == "ALARM" && m.cls == "SR"));
+    }
+    // SVM_DEMO_MANY_ALERTS: demo-host-02 couldn't mount a storage at each of its last six starts
+    if std::env::var("SVM_DEMO_MANY_ALERTS").is_ok() {
+        for i in 0..6 {
+            list.push(msg(20 + i, "PBD_PLUG_FAILED_ON_SERVER_START", 3, "Host", "host-b", (2 + i as i64 * 5) * 3600, "".into()));
+        }
+    }
     let mut limits = HashMap::new();
     limits.insert("vm-web".to_string(), format!("<config>{}</config>", cpu));
     limits.insert("sr-local2".to_string(), format!("<config>{}</config>", full));
+    // (and with it, demo-host-01's local storage has a limit it's past: the app's own alert)
+    if std::env::var("SVM_DEMO_NO_SR_STATS").is_ok() {
+        limits.insert("sr-local1".to_string(), format!("<config>{}</config>", full.replace("0.9", "0.01")));
+    }
     (list, limits, (String::new(), String::new()))
 }
 
@@ -4644,7 +4972,20 @@ impl Connection for DemoConnection {
     }
     fn fetch(&self, _t: u64) -> Result<PoolData, ApiError> {
         std::thread::sleep(Duration::from_millis(150));
-        Ok(self.data.lock().unwrap().clone())
+        let mut d = self.data.lock().unwrap().clone();
+        // its storage's "fuller than" limits, as set; and whether the pool watches them itself
+        // (SVM_DEMO_NO_SR_STATS: it can't, as for most kinds of storage)
+        let limits = self.alerts.lock().unwrap().1.clone();
+        let watched = std::env::var("SVM_DEMO_NO_SR_STATS").is_err();
+        for x in d.srs.iter_mut() {
+            x.stats = watched;
+            x.fill_limit = limits.get(&x.rref).and_then(|p| crate::alerts::read_variables(p).into_iter().find(|v| v.name == "physical_utilisation")).map(|v| (v.level.unwrap_or(0.8), v.period.unwrap_or(60)));
+        }
+        // a VM has its USB device while it runs on that device's server
+        for u in d.usbs.iter_mut() {
+            u.attached = u.vm.as_deref().and_then(|v| d.vms.iter().find(|x| x.rref == v)).map_or(false, |v| v.power == PowerState::Running && v.host.as_deref() == Some(u.host.as_str()));
+        }
+        Ok(d)
     }
     fn run_action(&self, vm_ref: &str, a: &VmAction) -> Result<(), ApiError> {
         said(a.method, &[json!(vm_ref)]);
@@ -4727,6 +5068,7 @@ impl Connection for DemoConnection {
             links,
             live_out: true,
             live_in: true,
+            ..Default::default()
         });
         answered(&Ok(json!(rref)), Duration::from_millis(2000));
         Ok(rref)
@@ -4794,6 +5136,7 @@ impl Connection for DemoConnection {
             links,
             live_out: false,
             live_in: false,
+            ..Default::default()
         });
         Ok(())
     }
@@ -5251,10 +5594,33 @@ impl Connection for DemoConnection {
             VmChange::AddNic { .. } => "VIF.create",
             VmChange::MoveNic { .. } => "VIF.move",
             VmChange::RemoveNic { .. } => "VIF.destroy",
+            VmChange::AddUsb { .. } => "VUSB.create",
+            VmChange::RemoveUsb { .. } => "VUSB.destroy",
         };
         said(method, &[json!(vm)]);
         demo_work(if matches!(change, VmChange::AddDisk { .. } | VmChange::GrowDisk { .. }) { 1500 } else { 500 });
         let mut d = self.data.lock().unwrap();
+        // a USB device: given to it (one VM each), or taken off it
+        match change {
+            VmChange::AddUsb { pusb, .. } => {
+                if d.vm(vm).is_none() {
+                    return Err(ApiError { code: "HANDLE_INVALID".into(), details: vec!["VM".into(), vm.into()] });
+                }
+                let u = d.usbs.iter_mut().find(|u| u.rref == *pusb).ok_or_else(|| ApiError { code: "HANDLE_INVALID".into(), details: vec!["PUSB".into(), pusb.clone()] })?;
+                if u.vm.is_some() {
+                    return Err(ApiError { code: "USB_GROUP_CONFLICT".into(), details: vec![u.group.clone()] });
+                }
+                (u.passthrough, u.vm, u.vusb) = (true, Some(vm.to_string()), Some(format!("{}-vusb", u.rref)));
+                return Ok(());
+            }
+            VmChange::RemoveUsb { vusb, .. } => {
+                if let Some(u) = d.usbs.iter_mut().find(|u| u.vusb.as_deref() == Some(vusb.as_str())) {
+                    (u.vm, u.vusb, u.attached) = (None, None, false);
+                }
+                return Ok(());
+            }
+            _ => {}
+        }
         let (nets, srs) = (d.networks.clone(), d.srs.clone());
         let v = d.vms.iter_mut().find(|v| v.rref == vm).ok_or_else(|| ApiError { code: "HANDLE_INVALID".into(), details: vec!["VM".into(), vm.into()] })?;
         let off = v.power == PowerState::Halted;
@@ -5312,6 +5678,7 @@ impl Connection for DemoConnection {
                 }
             }
             VmChange::RemoveNic { vif } => v.nics.retain(|n| n.vif != *vif),
+            VmChange::AddUsb { .. } | VmChange::RemoveUsb { .. } => {}
         }
         Ok(())
     }
@@ -5754,6 +6121,113 @@ impl Connection for DemoConnection {
         let addr = debug_console_address().ok_or_else(|| ApiError::other("The demo server has no real consoles."))?;
         let (host, port) = split_host_port(addr.trim());
         Ok(ConsoleStream::Plain(tcp_connect(&host, port.unwrap_or(5900))?))
+    }
+    /// Pretends to pack the server's system for about four seconds, then writes a small file.
+    fn backup_host(&self, address: &str, to: &Path, t: &Arc<Transfer>) -> Result<u64, ApiError> {
+        said("GET /host_backup", &[json!(address)]);
+        let text = format!("Simple VM Manager demo: the backup of the server at {}\n", address);
+        demo_transfer(t, 1_600_000_000, true)?;
+        std::fs::write(to, &text).map_err(|e| ApiError::other(format!("Couldn't write {}: {}", to.display(), e)))?;
+        Ok(1_600_000_000)
+    }
+    fn restore_host(&self, address: &str, from: &Path, t: &Arc<Transfer>) -> Result<(), ApiError> {
+        let size = std::fs::metadata(from).map_err(|e| ApiError::other(format!("Couldn't read {}: {}", from.display(), e)))?.len();
+        t.total.store(size, Ordering::Relaxed);
+        said("PUT /host_restore", &[json!(address), json!(from.display().to_string())]);
+        demo_transfer(t, size, false)
+    }
+    fn report_parts(&self, host: &str) -> Result<Vec<ReportPart>, ApiError> {
+        said("host.get_system_status_capabilities", &[json!(host)]);
+        demo_work(300);
+        let part = |key: &str, default: bool, pii: &str| ReportPart { key: key.into(), default, pii: pii.into(), max_size: -1 };
+        Ok(vec![
+            part("xenserver-logs", true, "maybe"),
+            part("xenserver-config", true, "maybe"),
+            part("xenserver-databases", true, "yes"),
+            part("system-logs", true, "maybe"),
+            part("hardware-info", true, "maybe"),
+            part("xen-info", true, "no"),
+            part("network-config", true, "if_customized"),
+            part("disk-info", true, "maybe"),
+            part("vncterm", false, "maybe"),
+        ])
+    }
+    fn status_report(&self, address: &str, parts: &[String], to: &Path, t: &Arc<Transfer>) -> Result<u64, ApiError> {
+        said("GET /system-status", &[json!(address), json!(parts.join(",")), json!("tar.bz2")]);
+        demo_transfer(t, 48_000_000, true)?;
+        std::fs::write(to, format!("Simple VM Manager demo: the status report of the server at {} ({})\n", address, parts.join(", "))).map_err(|e| ApiError::other(format!("Couldn't write {}: {}", to.display(), e)))?;
+        Ok(48_000_000)
+    }
+    fn renew_certificate(&self, host: &str, internal: bool) -> Result<Option<i64>, ApiError> {
+        said(if internal { "host.refresh_server_certificate" } else { "host.reset_server_certificate" }, &[json!(host)]);
+        demo_work(1500);
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|t| t.as_secs() as i64).unwrap_or(0);
+        // the alert about it goes
+        let name = if internal { "HOST_INTERNAL_CERTIFICATE_EXPIRING" } else { "HOST_SERVER_CERTIFICATE_EXPIRING" };
+        let uuid = self.data.lock().unwrap().host(host).map(|h| h.uuid.clone()).unwrap_or_default();
+        self.alerts.lock().unwrap().0.retain(|m| !(m.name.starts_with(name) && m.obj_uuid == uuid));
+        Ok(Some(now + 3650 * 86_400))
+    }
+    fn change_password(&self, _old: &str, new: &str) -> Result<(), ApiError> {
+        said("session.change_password", &[json!("…"), json!("…")]);
+        demo_work(800);
+        if new.len() < 4 {
+            return Err(ApiError { code: "CHANGE_PASSWORD_REJECTED".into(), details: vec!["Authentication token manipulation error: password too short".into()] });
+        }
+        Ok(())
+    }
+    fn helper_version(&self, host: &str) -> Result<Option<String>, ApiError> {
+        std::thread::sleep(Duration::from_millis(120));
+        Ok(self.helper.lock().unwrap().0.contains(host).then(|| crate::helper::VERSION.to_string()))
+    }
+    fn helper_call(&self, host: &str, func: &str, _args: &[(&str, String)]) -> Result<String, ApiError> {
+        said("host.call_plugin", &[json!(host), json!(crate::helper::KEY), json!(func)]);
+        demo_work(400);
+        let mut h = self.helper.lock().unwrap();
+        // (the demo's console types nothing: "demo-install" stands for the command typed there)
+        if func == "demo-install" {
+            h.0.insert(host.to_string());
+            return Ok("installed".into());
+        }
+        if !h.0.contains(host) {
+            return Err(ApiError { code: "XENAPI_MISSING_PLUGIN".into(), details: vec![crate::helper::KEY.into()] });
+        }
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|t| t.as_secs() as i64).unwrap_or(0);
+        Ok(match func {
+            "status" => json!({ "version": crate::helper::VERSION, "host": host, "last_tick": now - 20, "log": h.2 }).to_string(),
+            "tick" => json!(["all well"]).to_string(),
+            "test" => {
+                let x = crate::helper::Settings::parse(&h.1);
+                let mut out = Map::new();
+                for (name, c) in [("telegram", &x.telegram), ("ntfy", &x.ntfy), ("discord", &x.discord), ("homeassistant", &x.homeassistant), ("webhook", &x.webhook)] {
+                    if c.on {
+                        out.insert(name.into(), json!("ok"));
+                    }
+                }
+                Value::Object(out).to_string()
+            }
+            "uninstall" => {
+                h.0.remove(host);
+                "removed".into()
+            }
+            _ => return Err(ApiError { code: "UNKNOWN_XENAPI_PLUGIN_FUNCTION".into(), details: vec![func.into()] }),
+        })
+    }
+    fn helper_settings(&self) -> Result<String, ApiError> {
+        std::thread::sleep(Duration::from_millis(100));
+        Ok(self.helper.lock().unwrap().1.clone())
+    }
+    fn save_helper_settings(&self, text: &str, autostart: &[(String, bool)]) -> Result<(), ApiError> {
+        said("pool.add_to_other_config", &[json!(crate::helper::KEY), json!("…")]);
+        demo_work(400);
+        self.helper.lock().unwrap().1 = text.to_string();
+        let mut d = self.data.lock().unwrap();
+        for (vm, on) in autostart {
+            if let Some(v) = d.vms.iter_mut().find(|v| v.rref == *vm) {
+                v.auto_power_on = *on;
+            }
+        }
+        Ok(())
     }
     fn close(&self) {}
 }
@@ -6279,6 +6753,58 @@ mod tests {
         let imp = ImportVm { file: tpl.clone(), name: "Web template 2".into(), sr: "sr-nfs".into(), template: true, ..Default::default() };
         let r = c.import_vm(&imp, &Arc::new(Transfer::default())).unwrap();
         assert!(c.data.lock().unwrap().user_template(&r).is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn demo_usb_devices() {
+        let c = DemoConnection::new();
+        let usb = |c: &DemoConnection, r: &str| c.fetch(0).unwrap().usbs.into_iter().find(|u| u.rref == r).unwrap();
+        // Mail Relay runs on the UPS's server: it has it now
+        let ups = usb(&c, "pusb-ups");
+        assert_eq!((ups.vm.as_deref(), ups.attached, ups.short().as_str()), (Some("vm-mail"), true, "Back-UPS ES 700"));
+        assert_eq!(ups.name(), "American Power Conversion Back-UPS ES 700");
+        // a free one to Test Desktop (off: at its start), then off it again
+        let stick = usb(&c, "pusb-stick");
+        assert!(stick.vm.is_none() && !stick.passthrough);
+        c.edit_vm("vm-desk", &VmChange::AddUsb { pusb: stick.rref.clone(), group: stick.group.clone(), name: stick.name(), enable: true }).unwrap();
+        let given = usb(&c, "pusb-stick");
+        assert_eq!((given.vm.as_deref(), given.passthrough, given.attached), (Some("vm-desk"), true, false));
+        // one VM each
+        let again = c.edit_vm("vm-web", &VmChange::AddUsb { pusb: stick.rref.clone(), group: stick.group.clone(), name: stick.name(), enable: false });
+        assert_eq!(again.unwrap_err().code, "USB_GROUP_CONFLICT");
+        c.edit_vm("vm-desk", &VmChange::RemoveUsb { vusb: given.vusb.clone().unwrap(), name: given.name() }).unwrap();
+        assert!(usb(&c, "pusb-stick").vm.is_none());
+    }
+
+    #[test]
+    fn demo_server_tools() {
+        let dir = std::env::temp_dir().join(format!("svm-tools-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let c = DemoConnection::new();
+        // a backup, sent back; a status report of what's in one by default
+        let to = dir.join("a.xbk");
+        let t = Arc::new(Transfer::default());
+        assert!(c.backup_host("10.20.0.11", &to, &t).unwrap() > 0 && to.exists());
+        c.restore_host("10.20.0.11", &to, &Arc::new(Transfer::default())).unwrap();
+        let parts: Vec<String> = c.report_parts("host-a").unwrap().into_iter().filter(|p| p.default).map(|p| p.key).collect();
+        assert!(parts.contains(&"xenserver-logs".to_string()) && !parts.contains(&"vncterm".to_string()));
+        let report = dir.join("a.tar.bz2");
+        c.status_report("10.20.0.11", &parts, &report, &Arc::new(Transfer::default())).unwrap();
+        assert!(report.exists());
+        // a stopped one keeps nothing
+        let t = Arc::new(Transfer::default());
+        t.cancel.store(true, Ordering::Relaxed);
+        assert_eq!(c.backup_host("10.20.0.11", &dir.join("b.xbk"), &t).unwrap_err().code, CANCELLED);
+        assert!(!dir.join("b.xbk").exists());
+        // a renewed certificate: its alert goes
+        let alerts = |c: &DemoConnection| c.alerts.lock().unwrap().0.iter().filter(|m| m.name.starts_with("HOST_SERVER_CERTIFICATE")).count();
+        assert_eq!(alerts(&c), 1);
+        assert!(c.renew_certificate("host-a", false).unwrap().is_some());
+        assert_eq!(alerts(&c), 0);
+        // a password the server won't take
+        assert_eq!(c.change_password("x", "ab").unwrap_err().code, "CHANGE_PASSWORD_REJECTED");
+        c.change_password("x", "a longer one").unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

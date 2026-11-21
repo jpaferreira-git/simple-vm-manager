@@ -391,7 +391,7 @@ pub fn write_xva(path: &Path, info: &XvaInfo) -> std::io::Result<u64> {
 }
 
 /// The folder new files go in: Downloads, else the home folder.
-fn downloads() -> PathBuf {
+pub(crate) fn downloads() -> PathBuf {
     let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
     let d = home.join("Downloads");
     if d.is_dir() {
@@ -423,7 +423,7 @@ pub fn default_path(name: &str) -> PathBuf {
 }
 
 /// A path as it's shown: under the home folder, as "~/…" (not on Windows).
-fn tilde(p: &Path) -> String {
+pub(crate) fn tilde(p: &Path) -> String {
     let full = p.display().to_string();
     match std::env::var("HOME") {
         Ok(h) if !cfg!(windows) && !h.is_empty() && full.starts_with(&format!("{}/", h.trim_end_matches('/'))) => format!("~{}", &full[h.trim_end_matches('/').len()..]),
@@ -432,7 +432,7 @@ fn tilde(p: &Path) -> String {
 }
 
 /// A path as typed: "~/…" read as the home folder.
-fn expand(raw: &str) -> PathBuf {
+pub(crate) fn expand(raw: &str) -> PathBuf {
     match raw.strip_prefix("~/") {
         Some(rest) => std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default().join(rest),
         None => PathBuf::from(raw),
@@ -441,7 +441,7 @@ fn expand(raw: &str) -> PathBuf {
 
 /// The room left on the disk holding `dir`.
 #[cfg(unix)]
-fn free_space(dir: &Path) -> Option<u64> {
+pub(crate) fn free_space(dir: &Path) -> Option<u64> {
     use std::os::unix::ffi::OsStrExt;
     let c = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
     let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
@@ -450,7 +450,7 @@ fn free_space(dir: &Path) -> Option<u64> {
 }
 
 #[cfg(not(unix))]
-fn free_space(_dir: &Path) -> Option<u64> {
+pub(crate) fn free_space(_dir: &Path) -> Option<u64> {
     None
 }
 

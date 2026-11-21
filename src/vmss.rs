@@ -155,7 +155,7 @@ pub fn schedule_list(ui: &mut Ui, pal: &Pal, pool: &SchedPool, busy: &HashSet<St
                 });
             });
             let holds = if x.memory { "disks and memory" } else { "disks" };
-            ui.label(egui::RichText::new(format!("{}  ·  {}", x.summary(), holds)).size(12.5).color(pal.ink_soft));
+            ui.label(egui::RichText::new(format!("{}  ·  {}", x.here(d).summary(), holds)).size(12.5).color(pal.ink_soft));
             let names = vm_names(d, &x.vms);
             let vms = if names.is_empty() { "No VMs on it".to_string() } else { names_of(&names) };
             ui.label(egui::RichText::new(format!("{}  ·  {}", vms, last_ran(x))).size(12.0).color(pal.ink_faint));
@@ -207,21 +207,24 @@ pub enum EditAction {
 /// A schedule's settings and its VMs, new or to change.
 pub struct ScheduleDialog {
     pub sid: u32,
-    /// Opened from the list of schedules: back to it after.
+    /// The schedule, its times on this computer's clock (`shift` seconds ahead of the pool's,
+    /// when that's known), turned back to the pool's when saved.
     x: ScheduleInfo,
+    shift: Option<i64>,
     search: String,
     focus: bool,
 }
 
 impl ScheduleDialog {
-    /// For `x` (None: a new one, on the VMs `vms`).
-    pub fn new(sid: u32, x: Option<&ScheduleInfo>, vms: Vec<String>) -> Self {
+    /// For `x` (None: a new one, on the VMs `vms`), shown on this computer's clock: `shift`
+    /// seconds ahead of the pool's (see `PoolData::schedule_shift`).
+    pub fn new(sid: u32, x: Option<&ScheduleInfo>, vms: Vec<String>, shift: Option<i64>) -> Self {
         let x = match x {
-            Some(x) => x.clone(),
+            Some(x) => x.shifted(shift.unwrap_or(0)),
             None => ScheduleInfo { enabled: true, kind: "snapshot".into(), keep: 7, every: Every::Daily, hour: 3, min: 0, days: vec!["Sunday".into()], vms, ..Default::default() },
         };
         let focus = x.rref.is_empty();
-        ScheduleDialog { sid, x, search: String::new(), focus }
+        ScheduleDialog { sid, x, shift, search: String::new(), focus }
     }
 
     /// What stops it being saved.
@@ -307,7 +310,19 @@ impl ScheduleDialog {
                         ui.selectable_value(&mut x.min, m, format!("{:02}", m));
                     }
                 });
-                ui.label(egui::RichText::new("on the pool's own clock").size(12.0).color(pal.ink_faint));
+                // on this computer's clock, and what that is on the servers'
+                let note = match self.shift {
+                    None => "on the pool's own clock".to_string(),
+                    Some(by) => {
+                        let there = x.shifted(-by);
+                        if there.hour == x.hour && there.min == x.min && there.days == x.days {
+                            "your time (the servers' too)".to_string()
+                        } else {
+                            format!("your time  ·  {} on the servers", there.at())
+                        }
+                    }
+                };
+                ui.label(egui::RichText::new(note).size(12.0).color(pal.ink_faint));
             });
             ui.horizontal(|ui| {
                 field_label(ui, "Keep:", LABEL_WIDTH);
@@ -350,7 +365,7 @@ impl ScheduleDialog {
                     let on = vms.iter().filter(|v| x.vms.contains(&v.rref)).count();
                     ui.label(egui::RichText::new(format!("VMS  ·  {} OF {} ON IT", on, vms.len())).size(11.0).color(pal.ink_faint));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.add(egui::TextEdit::singleline(&mut self.search).hint_text("Search VMs").desired_width(180.0).margin(vec2(8.0, 4.0)));
+                        crate::app::search_box(ui, pal, &mut self.search, "Search VMs", 180.0);
                     });
                 });
                 let q = self.search.trim().to_lowercase();
@@ -391,7 +406,8 @@ impl ScheduleDialog {
                 }
                 let ready = problem.is_none() && !saving;
                 if dialog_button(ui, pal, "check", if saving { "Saving…" } else { "Save" }, Look::Primary, ready) {
-                    let mut x = self.x.clone();
+                    // (on the pool's clock)
+                    let mut x = self.x.shifted(-self.shift.unwrap_or(0));
                     x.name = x.name.trim().to_string();
                     x.description = x.description.trim().to_string();
                     action = EditAction::Save(self.sid, x);
@@ -455,7 +471,7 @@ impl PickDialog {
                 ui.horizontal(|ui| {
                     ui.radio_value(&mut self.choice, Some(x.rref.clone()), x.name.as_str());
                     let off = if x.enabled { String::new() } else { "  ·  paused".to_string() };
-                    ui.label(egui::RichText::new(format!("{}{}", x.summary(), off)).size(12.0).color(pal.ink_faint));
+                    ui.label(egui::RichText::new(format!("{}{}", x.here(d).summary(), off)).size(12.0).color(pal.ink_faint));
                     // its settings and VMs, to change
                     if glyph_button(ui, pal, "edit", "Edit this schedule: when, how many it keeps, its VMs…", false, !saving) {
                         action = PickAction::Edit(self.sid, x.rref.clone());

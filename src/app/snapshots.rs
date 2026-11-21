@@ -53,7 +53,7 @@ impl App {
             for v in &d.vms {
                 let snaps: Vec<&SnapshotInfo> = v.snapshots.iter().filter(|x| !self.snap_deleting.contains(&x.rref)).collect();
                 let server = v.host.as_deref().or(v.home()).and_then(|h| d.host(h)).map_or("—".to_string(), |h| h.name.clone());
-                let schedule = v.schedule.as_deref().and_then(|r| d.schedules.iter().find(|x| x.rref == r)).map(|x| (x.name.clone(), x.when(), x.enabled));
+                let schedule = v.schedule.as_deref().and_then(|r| d.schedules.iter().find(|x| x.rref == r)).map(|x| (x.name.clone(), x.here(d).when(), x.enabled));
                 lines.push(Line {
                     sid: s.id,
                     pool: s.name(),
@@ -106,7 +106,7 @@ impl App {
         egui::ScrollArea::vertical().id_salt("schedules").auto_shrink([false; 2]).show(ui, |ui| {
             ui.set_max_width(ui.available_width().min(900.0));
             ui.spacing_mut().item_spacing.y = 4.0;
-            ui.add(egui::Label::new(egui::RichText::new("Each schedule takes a snapshot of its VMs by itself, at its times (on the server's clock), and keeps the last few it took, deleting the oldest. A VM is on one schedule at most.").size(12.0).color(pal.ink_faint)).wrap());
+            ui.add(egui::Label::new(egui::RichText::new("Each schedule takes a snapshot of its VMs by itself, at its times (shown in your time; the servers keep their own clock), and keeps the last few it took, deleting the oldest. A VM is on one schedule at most. A time missed (the server off then, or the schedule changed after it) is skipped till the next one.").size(12.0).color(pal.ink_faint)).wrap());
             ui.add_space(8.0);
             for (sid, name) in &pools {
                 let Some(d) = self.server(*sid).and_then(|s| s.data.as_ref()) else { continue };
@@ -181,7 +181,7 @@ impl App {
             if let Some(i) = segmented(ui, &pal, &labels, v.filter) {
                 v.filter = i;
             }
-            ui.add(egui::TextEdit::singleline(&mut v.search).hint_text("Search VMs").desired_width(220.0).margin(vec2(8.0, 6.0)));
+            search_box(ui, &pal, &mut v.search, "Search VMs", 220.0);
         });
         let q = v.search.trim().to_lowercase();
         let filter = v.filter;

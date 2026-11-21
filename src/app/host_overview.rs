@@ -286,6 +286,13 @@ impl App {
             .collect();
         stores.sort_by_key(|(x, _)| (x.host.is_none(), x.name.to_lowercase()));
         let nic_load = read.and_then(|r| r.as_ref().ok()).map(|p| &p.nics);
+        // its USB devices, each with the VM it's passed to (reference, name)
+        let usbs: Vec<(&UsbInfo, Option<(String, String)>)> = d
+            .usbs
+            .iter()
+            .filter(|u| u.host == h.rref)
+            .map(|u| (u, u.vm.as_ref().map(|r| (r.clone(), d.vm(r).map(|v| v.name.clone()).unwrap_or_else(|| "a VM".into())))))
+            .collect();
 
         let sid = s.id;
         let cpus = h.cpu_count;
@@ -377,6 +384,29 @@ impl App {
                     });
                 };
                 grid(ui, w, out, [cap, list, sto, net], ["capacity-vms", "storage-network"]);
+                // its USB devices, and the VMs they're passed to (a click goes to that VM)
+                if !usbs.is_empty() {
+                    ui.add_space(24.0);
+                    ui.vertical(|ui| {
+                        ui.set_width(if w >= 720.0 { (w - 20.0) / 2.0 } else { w });
+                        section(ui, &pal, "USB devices");
+                        panel(ui, &pal, |ui| {
+                            for (i, (u, vm)) in usbs.iter().enumerate() {
+                                let value = match vm {
+                                    Some(x) => format!("{}  ·  {}", x.1, if u.attached { "in use" } else { "at its start" }),
+                                    None => "Free".to_string(),
+                                };
+                                let tip = format!("{}  ·  port {}{}{}", u.name(), or(&u.path, "unknown"), if u.ids.is_empty() { String::new() } else { format!("  ·  {}", u.ids) }, if u.serial.is_empty() { String::new() } else { format!("  ·  serial {}", u.serial) });
+                                let (resp, _) = row(ui, &pal, Some(Lead::Mark("usb")), &u.short(), &value, if vm.is_some() { Tail::Chevron } else { Tail::Nothing }, vm.is_some(), i + 1 == usbs.len());
+                                if resp.on_hover_text(tip).clicked() {
+                                    if let Some((r, _)) = vm {
+                                        out.push(Intent::Select(format!("vm:{}:{}", sid, r)));
+                                    }
+                                }
+                            }
+                        });
+                    });
+                }
             });
         });
     }
@@ -389,10 +419,19 @@ impl App {
         let conn = s.conn.clone();
         let want = d.hosts.iter().filter(|h| h.is_up()).map(|h| (h.rref.clone(), h.uuid.clone(), h.address.clone())).collect();
         self.poll_hosts(ui.ctx(), &conn, want);
+        // the Server Helper's card while it's on none of its servers (unless put away)
+        let card_key = conn.hostname().to_lowercase();
+        if let Some(id) = sel.sid {
+            if !self.helper_hidden.contains(&card_key) {
+                self.helper_poll(id, &ui.ctx().clone());
+            }
+        }
+        let mut hide_card = false;
         let this = &*self;
         let Some(s) = sel.sid.and_then(|id| this.server(id)) else { return };
         let Some(d) = s.data.as_ref() else { return };
         let up: Vec<&HostInfo> = d.hosts.iter().filter(|h| h.is_up()).collect();
+        let helper_card = !this.helper_hidden.contains(&card_key) && this.helper.get(&s.id).map_or(false, |v| v.checked.is_some() && !v.hosts.is_empty() && v.hosts.iter().all(|(_, p)| !p.installed()) && v.hosts.iter().any(|(_, p)| *p == crate::helper::Presence::Missing));
 
         // one line: its version and its license (the rest, and what's wrong, in its Details)
         let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|t| t.as_secs() as i64).unwrap_or(0);
@@ -468,6 +507,14 @@ impl App {
                 if strip(ui, &pal, w, &line).map_or(false, |i| line[i].link) {
                     out.push(Intent::PoolUpdates(Some(sid)));
                 }
+                if helper_card {
+                    ui.add_space(16.0);
+                    match super::helper_page::helper_card(ui, &pal) {
+                        Some(true) => out.push(Intent::Tab(Tab::Helper)),
+                        Some(false) => hide_card = true,
+                        None => {}
+                    }
+                }
                 ui.add_space(22.0);
                 section(ui, &pal, "Load  ·  the last ten minutes");
                 load_tiles(ui, &pal, w, cpus, load);
@@ -506,6 +553,14 @@ impl App {
                 grid(ui, w, out, [cap, srv, list, sto], ["capacity-servers", "vms-storage"]);
             });
         });
+        if hide_card {
+            self.helper_hidden.insert(card_key);
+            if let Some(dir) = super::config_dir() {
+                let text: String = self.helper_hidden.iter().map(|k| format!("{}\n", k)).collect();
+                let _ = std::fs::create_dir_all(&dir);
+                let _ = std::fs::write(dir.join("helper-hidden.txt"), text);
+            }
+        }
     }
 }
 
@@ -933,11 +988,16 @@ fn store_row(ui: &mut Ui, pal: &Pal, d: &PoolData, x: &SrInfo, aside: &str, trou
         None => (format!("{} of {}", fmt_bytes(x.used), fmt_bytes(x.size)), tone.unwrap_or(pal.ink_soft)),
     };
     let v = p.text(pos2(right, top), Align2::RIGHT_CENTER, &value, FontId::proportional(13.0), col);
-    // the pool's default storage says so after its name
+    // after its name: shared by the pool's servers, the pool's default storage
     let default = d.default_sr.as_deref() == Some(x.rref.as_str());
-    let (g, cut) = fit(&p, &x.name, FontId::proportional(14.0), pal.ink, (v.min.x - tx - 14.0 - if default { 70.0 } else { 0.0 }).max(30.0));
+    let pill_w = |t: &str| p.layout_no_wrap(t.to_string(), FontId::new(11.0, egui::FontFamily::Name("bold".into())), pal.ink).size().x + 14.0 + 8.0;
+    let pills = if x.shared { pill_w("Shared") } else { 0.0 } + if default { pill_w("Default") } else { 0.0 };
+    let (g, cut) = fit(&p, &x.name, FontId::proportional(14.0), pal.ink, (v.min.x - tx - 14.0 - pills).max(30.0));
     let mut end = tx + g.size().x;
     p.galley(pos2(tx, top - g.size().y / 2.0), g, pal.ink);
+    if x.shared {
+        end += 8.0 + pill(&p, pal, pos2(end + 8.0, top), "Shared", pal.accent);
+    }
     if default {
         end += 8.0 + pill(&p, pal, pos2(end + 8.0, top), "Default", pal.green);
     }

@@ -1,0 +1,666 @@
+#!/usr/bin/env python3
+# Server Helper for Simple VM Manager (https://github.com/jpaferreira-git/simple-vm-manager)
+#
+# An optional add-on for XenServer (and XCP-ng) servers. It is free software under the MIT license,
+# given as it is, with no warranty: read it before you install it.
+#
+# It is one file, installed on each server of a pool as a XAPI plugin
+# (/etc/xapi.d/plugins/svm-helper), and run every minute by cron (/etc/cron.d/svm-helper, with
+# --tick). Only the pool's coordinator does the work; the others wait, ready to take over if
+# they become the coordinator. Its settings are the pool's other_config "svm-helper" (JSON),
+# which Simple VM Manager edits; it keeps a little state in /var/lib/svm-helper and writes what it
+# does to /var/log/svm-helper.log.
+#
+# Each minute, on the coordinator, it:
+#  - starts the VMs on its list in order, with a wait between them, once after the pool starts;
+#  - mounts shared storage again on a server that started before the NAS was there;
+#  - raises an alert when a storage is fuller than its limit (for the kinds of storage that
+#    can't tell XenServer's own monitor how full they are);
+#  - makes up a snapshot schedule's run that was missed (XenServer's plugin never does);
+#  - sends the pool's new alerts to Telegram, ntfy, Discord, Home Assistant or any webhook.
+#
+# Simple VM Manager calls it through host.call_plugin: version, status, tick, test, uninstall.
+
+import calendar
+import datetime
+import fcntl
+import json
+import os
+import socket
+import sys
+import time
+import traceback
+import urllib.parse
+import urllib.request
+import xmlrpc.client
+
+VERSION = "1.0"
+CONF_KEY = "svm-helper"
+STATE_DIR = "/var/lib/svm-helper"
+STATE = STATE_DIR + "/state.json"
+LOG = "/var/log/svm-helper.log"
+LOCK = "/var/lock/svm-helper.lock"
+CRON = "/etc/cron.d/svm-helper"
+PLUGIN = "/etc/xapi.d/plugins/svm-helper"
+INVENTORY = "/etc/xensource-inventory"
+
+PRIORITY_WORDS = {1: "Critical", 2: "Major", 3: "Warning", 4: "Minor", 5: "Info"}
+
+
+# ---------------------------------------------------------------- small things
+
+def log(text):
+    """One line in the log, which is cut to its newer half past half a megabyte."""
+    try:
+        line = "%s %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), text)
+        with open(LOG, "a") as f:
+            f.write(line)
+        if os.path.getsize(LOG) > 512 * 1024:
+            with open(LOG) as f:
+                lines = f.readlines()
+            with open(LOG, "w") as f:
+                f.writelines(lines[len(lines) // 2:])
+    except Exception:
+        pass
+
+
+def log_tail(n=30):
+    try:
+        with open(LOG) as f:
+            return [l.rstrip("\n") for l in f.readlines()[-n:]]
+    except Exception:
+        return []
+
+
+def load_state():
+    try:
+        with open(STATE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_state(state):
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        tmp = STATE + ".new"
+        with open(tmp, "w") as f:
+            json.dump(state, f)
+        os.replace(tmp, STATE)
+    except Exception as e:
+        log("couldn't save its state: %s" % e)
+
+
+def xen_epoch(value):
+    """A XenAPI date ("20261120T18:43:54Z", UTC) as seconds since 1970; 0 when it can't be read."""
+    try:
+        text = value.value if hasattr(value, "value") else str(value)
+        text = text.strip().rstrip("Z").replace("-", "")
+        return calendar.timegm(time.strptime(text, "%Y%m%dT%H:%M:%S"))
+    except Exception:
+        return 0
+
+
+def xen_date(epoch):
+    return xmlrpc.client.DateTime(time.strftime("%Y%m%dT%H:%M:%SZ", time.gmtime(epoch)))
+
+
+def clock(epoch):
+    return time.strftime("%H:%M", time.localtime(epoch))
+
+
+def gb(n):
+    return "%.0f GB" % (float(n) / 1024 ** 3) if n >= 10 * 1024 ** 3 else "%.1f GB" % (float(n) / 1024 ** 3)
+
+
+def this_host_uuid():
+    try:
+        with open(INVENTORY) as f:
+            for line in f:
+                if line.startswith("INSTALLATION_UUID="):
+                    return line.split("=", 1)[1].strip().strip("'\"")
+    except Exception:
+        pass
+    return ""
+
+
+def local_session():
+    """A session over the server's own socket (as XenServer's own scripts log in)."""
+    import XenAPI
+    session = XenAPI.xapi_local()
+    try:
+        session.xenapi.login_with_password("__dom0__svm-helper", "", "1.0", "svm-helper")
+    except Exception:
+        session.xenapi.login_with_password("root", "", "1.0", "svm-helper")
+    return session
+
+
+def read_config(x, pool):
+    try:
+        return json.loads(x.pool.get_other_config(pool).get(CONF_KEY, "") or "{}")
+    except Exception:
+        return {}
+
+
+def on(cfg, *path, default=False):
+    """A setting's on/off, as a path of keys into the settings."""
+    v = cfg
+    for k in path:
+        if not isinstance(v, dict):
+            return default
+        v = v.get(k)
+    if v is None:
+        return default
+    return bool(v)
+
+
+def create_message(x, name, priority, cls, obj_uuid, body):
+    try:
+        x.message.create(name, str(priority), cls, obj_uuid, body)
+    except Exception as e:
+        log("couldn't raise the alert '%s': %s" % (body, e))
+
+
+# ---------------------------------------------------------------- sending alerts
+
+def post(url, payload, headers=None, timeout=10):
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method="POST")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("User-Agent", "svm-helper/" + VERSION)
+    for k, v in (headers or {}).items():
+        req.add_header(k, v)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.status
+
+
+def send(cfg, title, text, priority, pool_name, extra=None):
+    """Sends one alert to every channel that's on; what each said back ("ok" or why not)."""
+    channels = cfg.get("channels", {}) or {}
+    results = {}
+    words = PRIORITY_WORDS.get(priority, "Info")
+    payload = {"title": title, "message": text, "severity": words.lower(), "priority": priority, "pool": pool_name, "source": "svm-helper"}
+    payload.update(extra or {})
+
+    def attempt(name, fn):
+        try:
+            fn()
+            results[name] = "ok"
+        except Exception as e:
+            results[name] = str(e)
+            log("couldn't send to %s: %s" % (name, e))
+
+    t = channels.get("telegram") or {}
+    if t.get("on") and t.get("token") and t.get("chat"):
+        body = "%s\n%s\n— %s" % (title, text, pool_name) if text else "%s\n— %s" % (title, pool_name)
+        attempt("telegram", lambda: post("https://api.telegram.org/bot%s/sendMessage" % t["token"].strip(), {"chat_id": t["chat"].strip(), "text": body, "disable_web_page_preview": True}))
+    n = channels.get("ntfy") or {}
+    if n.get("on") and n.get("url"):
+        u = urllib.parse.urlsplit(n["url"].strip())
+        topic = u.path.strip("/")
+        server = "%s://%s" % (u.scheme or "https", u.netloc)
+        level = {1: 5, 2: 4, 3: 4, 4: 3, 5: 2}.get(priority, 3)
+        headers = {"Authorization": "Bearer " + n["token"].strip()} if n.get("token") else {}
+        attempt("ntfy", lambda: post(server, {"topic": topic, "title": title, "message": "%s\n— %s" % (text, pool_name) if text else pool_name, "priority": level}, headers))
+    d = channels.get("discord") or {}
+    if d.get("on") and d.get("url"):
+        attempt("discord", lambda: post(d["url"].strip(), {"content": "**%s**\n%s\n— %s" % (title, text, pool_name) if text else "**%s**\n— %s" % (title, pool_name)}))
+    h = channels.get("homeassistant") or {}
+    if h.get("on") and h.get("url"):
+        attempt("homeassistant", lambda: post(h["url"].strip(), payload))
+    w = channels.get("webhook") or {}
+    if w.get("on") and w.get("url"):
+        attempt("webhook", lambda: post(w["url"].strip(), dict(payload, time=int(time.time()))))
+    return results
+
+
+def in_quiet_hours(cfg, now):
+    q = cfg.get("quiet") or {}
+    if not q.get("on"):
+        return False
+    try:
+        start = [int(p) for p in q.get("from", "23:00").split(":")]
+        end = [int(p) for p in q.get("to", "07:00").split(":")]
+    except Exception:
+        return False
+    lt = time.localtime(now)
+    m, a, b = lt.tm_hour * 60 + lt.tm_min, start[0] * 60 + start[1], end[0] * 60 + end[1]
+    return (a <= m < b) if a <= b else (m >= a or m < b)
+
+
+# ---------------------------------------------------------------- alerts in words
+
+VARIABLES = {
+    "cpu_usage": "CPU",
+    "memory_free_kib": "free memory",
+    "network_usage": "network",
+    "disk_usage": "disks",
+    "physical_utilisation": "how full it is",
+}
+
+
+def object_name(x, cls, uuid):
+    try:
+        if cls == "VM":
+            return x.VM.get_name_label(x.VM.get_by_uuid(uuid))
+        if cls == "Host":
+            return x.host.get_name_label(x.host.get_by_uuid(uuid))
+        if cls == "SR":
+            return x.SR.get_name_label(x.SR.get_by_uuid(uuid))
+        if cls == "VMSS":
+            return x.VMSS.get_name_label(x.VMSS.get_by_uuid(uuid))
+        if cls == "Pool":
+            return x.pool.get_name_label(x.pool.get_by_uuid(uuid))
+    except Exception:
+        pass
+    return ""
+
+
+def describe(name, body, obj):
+    """An alert's title and text, in words, from what the server said."""
+    it = obj or "The pool"
+    body = (body or "").strip()
+    if name.startswith("SVM_"):
+        return body, ""
+    if name == "ALARM":
+        var, value = "", ""
+        for line in body.splitlines():
+            if line.startswith("value:"):
+                value = line.split(":", 1)[1].strip()
+            if 'name value="' in line:
+                var = line.split('name value="', 1)[1].split('"', 1)[0]
+        what = VARIABLES.get(var, "storage traffic" if var.startswith("sr_io_throughput") else var or "a limit")
+        try:
+            v = float(value)
+            figure = "%.0f%%" % (v * 100) if var in ("cpu_usage", "physical_utilisation") else value
+        except Exception:
+            figure = value
+        return "%s: %s passed your limit" % (it, what), ("now %s" % figure) if figure else ""
+    if name == "VMSS_SNAPSHOT_FAILED":
+        detail = body.split("Details:", 1)[-1].strip() if "Details:" in body else body
+        return "Snapshot schedule '%s' couldn't take its snapshots" % (obj or "?"), detail[:300]
+    if name == "VMSS_SNAPSHOT_SUCCEEDED":
+        return "Snapshot schedule '%s' took its snapshots" % (obj or "?"), ""
+    if name.startswith("HOST_SERVER_CERTIFICATE_EXPIRING") or name.startswith("HOST_INTERNAL_CERTIFICATE_EXPIRING"):
+        days = name.rsplit("_", 1)[-1]
+        return "%s's certificate expires in %s days" % (it, days.lstrip("0") or "0"), ""
+    if name.endswith("CERTIFICATE_EXPIRED"):
+        return "%s's certificate has expired" % it, ""
+    if name == "PBD_PLUG_FAILED_ON_SERVER_START":
+        return "%s couldn't mount a storage when it started" % it, ""
+    if name == "VM_CRASHED":
+        return "%s crashed" % it, ""
+    if name == "HOST_CLOCK_SKEW_DETECTED":
+        return "%s's clock differs from the coordinator's" % it, ""
+    if name in ("LICENSE_EXPIRES_SOON", "LICENSE_EXPIRED"):
+        return "%s's license %s" % (it, "runs out soon" if name.endswith("SOON") else "has run out"), ""
+    words = name.replace("_", " ").lower()
+    return ("%s: %s" % (obj, words)) if obj else words.capitalize(), body[:300]
+
+
+# ---------------------------------------------------------------- what it does each minute
+
+def last_expected(frequency, schedule, now):
+    """When a snapshot schedule should last have run, by this server's clock (as XenServer's
+    vmss plugin works it out), as seconds since 1970; None when it can't be read."""
+    try:
+        minute = int(schedule.get("min", "0"))
+        t = datetime.datetime.fromtimestamp(now)
+        if frequency == "hourly":
+            cand = t.replace(minute=minute, second=0, microsecond=0)
+            if cand > t:
+                cand -= datetime.timedelta(hours=1)
+            return time.mktime(cand.timetuple())
+        hour = int(schedule.get("hour", "0"))
+        cand = t.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if frequency == "daily":
+            if cand > t:
+                cand -= datetime.timedelta(days=1)
+            return time.mktime(cand.timetuple())
+        if frequency == "weekly":
+            days = set(d.strip() for d in schedule.get("days", "").split(",") if d.strip())
+            for back in range(0, 8):
+                c = cand - datetime.timedelta(days=back)
+                if c <= t and c.strftime("%A") in days:
+                    return time.mktime(c.timetuple())
+    except Exception:
+        pass
+    return None
+
+
+def boot_info():
+    """This boot's id, and how long since it (seconds)."""
+    try:
+        with open("/proc/sys/kernel/random/boot_id") as f:
+            boot = f.read().strip()
+        with open("/proc/uptime") as f:
+            return boot, float(f.read().split()[0])
+    except Exception:
+        return "", 0.0
+
+
+def start_in_order(x, cfg, state, master, now):
+    """Once after the pool starts (the coordinator's boot): the VMs on its list, in order."""
+    done = []
+    so = cfg.get("start_order") or {}
+    if not so.get("on") or not so.get("vms"):
+        return done
+    boot, up = boot_info()
+    if not boot:
+        return done
+    if state.get("order_boot") == boot:
+        return done
+    state["order_boot"] = boot
+    save_state(state)
+    if up > 30 * 60:
+        return done  # (installed, or turned on, long after the pool started)
+    # wait for the coordinator to take VMs (five minutes at most)
+    for _ in range(60):
+        try:
+            if x.host.get_enabled(master):
+                break
+        except Exception:
+            pass
+        time.sleep(5)
+    started, failed = [], []
+    for item in so.get("vms", []):
+        try:
+            vm = x.VM.get_by_uuid(item.get("uuid", ""))
+            name = x.VM.get_name_label(vm)
+        except Exception:
+            continue
+        try:
+            if x.VM.get_power_state(vm) == "Halted":
+                x.VM.start(vm, False, False)
+                started.append(name)
+                log("started '%s' (in order)" % name)
+                time.sleep(max(0, min(int(item.get("wait", 30)), 3600)))
+        except Exception as e:
+            failed.append("%s (%s)" % (name, e))
+            log("couldn't start '%s': %s" % (name, e))
+    pool = x.pool.get_all()[0]
+    pool_uuid = x.pool.get_uuid(pool)
+    if started:
+        create_message(x, "SVM_STARTED_IN_ORDER", 5, "Pool", pool_uuid, "Started in order: %s" % ", ".join(started))
+        done.append("started %d VMs in order" % len(started))
+    if failed:
+        create_message(x, "SVM_START_FAILED", 2, "Pool", pool_uuid, "Couldn't start in order: %s" % "; ".join(failed))
+    return done
+
+
+def remount(x, cfg, state, now):
+    """Shared storage that a server had mounted before it last started, and couldn't mount
+    when it did (it started before the NAS): mounted again, every two minutes for a day."""
+    done = []
+    if not on(cfg, "remount", default=True):
+        return done
+    seen = state.setdefault("attached", {})
+    tries = state.setdefault("remount_try", {})
+    srs = x.SR.get_all_records()
+    hosts = x.host.get_all_records()
+    for ref, p in x.PBD.get_all_records().items():
+        uuid = p["uuid"]
+        sr = srs.get(p["SR"])
+        if not sr or not sr.get("shared"):
+            continue
+        if p["currently_attached"]:
+            seen[uuid] = now
+            continue
+        host = hosts.get(p["host"])
+        if not host or not host.get("enabled"):
+            continue
+        try:
+            booted = float((host.get("other_config") or {}).get("boot_time", "0"))
+        except Exception:
+            booted = 0
+        last = seen.get(uuid)
+        if not last or not booted or last > booted or now - booted > 86400:
+            continue
+        if now - tries.get(uuid, 0) < 120:
+            continue
+        tries[uuid] = now
+        try:
+            x.PBD.plug(ref)
+            seen[uuid] = now
+            text = "Mounted '%s' again on %s" % (sr["name_label"], host["name_label"])
+            create_message(x, "SVM_STORAGE_MOUNTED", 5, "SR", sr["uuid"], text)
+            done.append(text)
+        except Exception as e:
+            log("couldn't mount '%s' on %s yet: %s" % (sr["name_label"], host["name_label"], e))
+    return done
+
+
+def storage(x, cfg, state, now):
+    """Storage fuller than its limit: the one set on it (its Alerts), else the helper's."""
+    done = []
+    if not on(cfg, "watch", "storage", "on", default=True):
+        return done
+    try:
+        level = float(((cfg.get("watch") or {}).get("storage") or {}).get("level", 90)) / 100.0
+    except Exception:
+        level = 0.9
+    marks = state.setdefault("full", {})
+    stats = set()
+    try:
+        for sm in x.SM.get_all_records().values():
+            caps = list(sm.get("capabilities") or []) + list((sm.get("features") or {}).keys())
+            if "SR_STATS" in caps:
+                stats.add(sm.get("type"))
+    except Exception:
+        pass
+    pbds = x.PBD.get_all_records()
+    hosts = x.host.get_all_records()
+    for ref, sr in x.SR.get_all_records().items():
+        size, used = int(sr.get("physical_size", 0) or 0), int(sr.get("physical_utilisation", 0) or 0)
+        if size <= 0 or used < 0 or sr.get("type") in ("udev", "iso") or sr.get("content_type") == "iso" or sr.get("type") in stats:
+            continue
+        limit = level
+        perfmon = (sr.get("other_config") or {}).get("perfmon", "")
+        if 'name value="physical_utilisation"' in perfmon and "alarm_trigger_level" in perfmon:
+            try:
+                limit = float(perfmon.split('physical_utilisation"', 1)[1].split('alarm_trigger_level value="', 1)[1].split('"', 1)[0])
+            except Exception:
+                pass
+        full = float(used) / size
+        uuid = sr["uuid"]
+        if full > limit:
+            if now - marks.get(uuid, 0) < 86400:
+                continue
+            marks[uuid] = now
+            name = sr["name_label"]
+            if not sr.get("shared"):
+                owners = [hosts[p["host"]]["name_label"] for p in pbds.values() if p["SR"] == ref and p["host"] in hosts]
+                if owners:
+                    name = "%s on %s" % (name, owners[0])
+            text = "%s is %.0f%% full (your limit: %.0f%%); %s left" % (name, full * 100, limit * 100, gb(size - used))
+            create_message(x, "SVM_STORAGE_FULL", 3, "SR", uuid, text)
+            done.append(text)
+        elif full < limit - 0.02:
+            marks.pop(uuid, None)
+    return done
+
+
+def schedules(x, cfg, state, master, now):
+    """A snapshot schedule's time that went by without a run (the server off then, or the
+    schedule changed after it): its run made up, once, within a day."""
+    done = []
+    if not on(cfg, "watch", "schedules", default=True):
+        return done
+    made = state.setdefault("madeup", {})
+    try:
+        all_vmss = x.VMSS.get_all_records()
+    except Exception:
+        return done
+    for ref, v in all_vmss.items():
+        if not v.get("enabled") or not v.get("VMs"):
+            continue
+        last_run = xen_epoch(v.get("last_run_time"))
+        if last_run <= 0:
+            continue  # never run: XenServer's plugin runs it at its first look
+        expected = last_expected(v.get("frequency", ""), v.get("schedule") or {}, now)
+        if expected is None or last_run >= expected - 60:
+            continue
+        if now - expected < 16 * 60 or now - expected > 86400:
+            continue  # its own look (every 15 minutes) comes first; a day later, it's let go
+        if made.get(v["uuid"]) == expected:
+            continue
+        made[v["uuid"]] = expected
+        save_state(state)
+        try:
+            said = x.host.call_plugin(master, "vmss", "snapshot_now", {"vmss_uuid": v["uuid"]})
+        except Exception as e:
+            said = str(e)
+        text = "Made up the missed %s run of '%s'" % (clock(expected), v["name_label"])
+        if said != "True":
+            text += " (it said: %s)" % said
+        create_message(x, "SVM_SCHEDULE_MADE_UP", 5, "VMSS", v["uuid"], text)
+        done.append(text)
+    return done
+
+
+def forward(x, cfg, state, pool, now):
+    """The pool's new alerts, as bad as asked or worse, to the channels that are on."""
+    done = []
+    since = state.get("fwd_since")
+    if since is None:
+        state["fwd_since"] = now  # (from now on: nothing old is sent)
+        return done
+    channels = cfg.get("channels", {}) or {}
+    if not any((c or {}).get("on") for c in channels.values()):
+        state["fwd_since"] = now
+        return done
+    try:
+        worst = int(cfg.get("min_priority", 3))
+    except Exception:
+        worst = 3
+    try:
+        msgs = x.message.get_since(xen_date(since))
+    except Exception as e:
+        log("couldn't read the pool's alerts: %s" % e)
+        return done
+    pool_name = x.pool.get_name_label(pool) or "pool"
+    quiet = in_quiet_hours(cfg, now)
+    newest = since
+    rows = sorted(msgs.values(), key=lambda m: xen_epoch(m.get("timestamp")))
+    sent = 0
+    held = 0
+    for m in rows:
+        t = xen_epoch(m.get("timestamp"))
+        newest = max(newest, t)
+        if t <= since:
+            continue
+        try:
+            priority = int(m.get("priority", 5))
+        except Exception:
+            priority = 5
+        if priority > worst:
+            continue
+        if quiet and priority > 1:
+            continue
+        if sent >= 10:
+            held += 1
+            continue
+        obj = object_name(x, m.get("cls", ""), m.get("obj_uuid", ""))
+        title, text = describe(m.get("name", ""), m.get("body", ""), obj)
+        send(cfg, title, text, priority, pool_name, {"name": m.get("name", ""), "object": obj})
+        sent += 1
+    if held:
+        send(cfg, "%d more alerts" % held, "See them in Simple VM Manager or XenCenter.", 3, pool_name)
+    state["fwd_since"] = newest
+    if sent:
+        done.append("sent %d alert%s" % (sent, "" if sent == 1 else "s"))
+    return done
+
+
+def tick(x):
+    """One look, under a lock (a look still going when the next is due is left to finish)."""
+    os.makedirs(STATE_DIR, exist_ok=True)
+    lock = open(LOCK, "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return ["still busy with the last look"]
+    try:
+        now = time.time()
+        state = load_state()
+        state["last_tick"] = now
+        state["version"] = VERSION
+        pool = x.pool.get_all()[0]
+        master = x.pool.get_master(pool)
+        me = this_host_uuid()
+        if not me or x.host.get_uuid(master) != me:
+            save_state(state)
+            return ["not the pool's coordinator: it waits"]
+        cfg = read_config(x, pool)
+        done = []
+        for step in (
+            lambda: start_in_order(x, cfg, state, master, now),
+            lambda: remount(x, cfg, state, now),
+            lambda: storage(x, cfg, state, now),
+            lambda: schedules(x, cfg, state, master, now),
+            lambda: forward(x, cfg, state, pool, now),
+        ):
+            try:
+                done += step()
+            except Exception as e:
+                log("a step failed: %s" % e)
+                log(traceback.format_exc().strip().replace("\n", " | "))
+        save_state(state)
+        for line in done:
+            log(line)
+        return done or ["all well"]
+    finally:
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        lock.close()
+
+
+# ---------------------------------------------------------------- what Simple VM Manager calls
+
+def version(session, args):
+    return json.dumps({"version": VERSION, "host": socket.gethostname()})
+
+
+def status(session, args):
+    state = load_state()
+    return json.dumps({"version": VERSION, "host": socket.gethostname(), "last_tick": state.get("last_tick", 0), "log": log_tail(int(args.get("lines", "30")))})
+
+
+def run_now(session, args):
+    return json.dumps(tick(session.xenapi))
+
+
+def test(session, args):
+    x = session.xenapi
+    pool = x.pool.get_all()[0]
+    cfg = json.loads(args["config"]) if args.get("config") else read_config(x, pool)
+    name = x.pool.get_name_label(pool) or "pool"
+    results = send(cfg, "A test from the Server Helper", "If you see this, alerts reach you here.", 3, name)
+    return json.dumps(results)
+
+
+def uninstall(session, args):
+    for path in (CRON, STATE, LOG, PLUGIN):
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+    try:
+        os.rmdir(STATE_DIR)
+    except OSError:
+        pass
+    return "removed"
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--tick":
+        try:
+            s = local_session()
+            try:
+                tick(s.xenapi)
+            finally:
+                s.xenapi.session.logout()
+        except Exception as e:
+            log("its look failed: %s" % e)
+        sys.exit(0)
+    import XenAPIPlugin
+    XenAPIPlugin.dispatch({"version": version, "status": status, "tick": run_now, "test": test, "uninstall": uninstall})

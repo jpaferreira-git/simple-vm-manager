@@ -28,6 +28,7 @@ affiliated with or endorsed by the makers of XenServer or XCP-ng.
 | ![Adding NFS storage for VMs](docs/screenshot-dark-new-storage.png) | ![Moving a VM](docs/screenshot-dark-move-vm.png) |
 | ![Exporting a running VM to a file](docs/screenshot-dark-export.png) | ![A new VM from a .xva file](docs/screenshot-dark-import.png) |
 | ![Your networks](docs/screenshot-dark-networks.png) | ![Adding a network on a VLAN](docs/screenshot-dark-new-network.png) |
+| ![The Server Helper: alerts on your phone, and what it does by itself](docs/screenshot-dark-helper.png) | ![A server's Actions](docs/screenshot-dark-server-actions.png) |
 
 ## Features
 
@@ -36,7 +37,7 @@ affiliated with or endorsed by the makers of XenServer or XCP-ng.
   password in your system's keychain (GNOME Keyring, KWallet or KeePassXC on Linux; Credential Manager
   on Windows; Keychain on macOS; never in the app's own files): the app then reconnects to that server
   each time it starts. Right-click a server to *Forget saved password*.
-- **Disconnect** — at the end of a pool's (or a lone server's) tabs, or on its right-click menu;
+- **Disconnect** — in a pool's (or a lone server's) *Actions*, at the end of its tabs, or on its right-click menu;
   the app doesn't reconnect to it at the next start.
 - **Resource tree** — *Infrastructure* view (pool → servers → their VMs and storage; shared storage in
   a folder; templates and networks have their own pages on the toolbar) or *Objects* view (grouped
@@ -57,17 +58,53 @@ affiliated with or endorsed by the makers of XenServer or XCP-ng.
   each a little graph); and four cards: **CPUs and memory** (steppers, applied while it's off),
   **Startup** (starts with its server, the boot order of a BIOS VM), **Disks** (add one, grow one,
   remove one; the ISO in its DVD drive, or none) and **Network** (another network for a card, add
-  or remove a card). What can be done while it runs can be; the rest says to shut it down first.
-  In a narrow window the graphs go two by two and the cards one under another.
+  or remove a card); under them **USB** (see below). What can be done while it runs can be; the
+  rest says to shut it down first. In a narrow window the graphs go two by two and the cards one
+  under another.
+- **USB devices** — a USB device plugged into a server can be passed to a VM: a Zigbee or Z-Wave
+  stick for Home Assistant, a UPS's cable, a licence dongle. *Add USB device* on the VM's USB card
+  lists the pool's devices (those another VM has, or on a server it can't run on, greyed out); the
+  VM gets it when it next starts, and from then on starts on that device's server only (it can't
+  move to another server while it has it). Its row says which server it's on; its menu takes it
+  off (unplugged first while the VM runs). A server's Overview lists its USB devices and the VM
+  each is passed to. The VM must be HVM, and a pool whose license leaves this out says so.
 - **A server's Overview** — how it's doing (state, time up, address, role, version, CPUs, memory,
   VMs running), its load over the last ten minutes, live (CPU, memory, its VMs' disks, its network
   cards), and four cards: **Capacity** (its memory as a bar: what the server keeps, what its VMs
   have, what's free; the virtual CPUs given out against the real ones), **VMs on this server** (the
   busiest first, each with its CPU's last ten minutes, its CPU now and its memory; a click shows
-  it), **Storage** (each one it uses, how full) and **Network** (each card: its traffic now, its
-  network, address and speed, the management card marked, an unplugged one said so). Near a limit
-  (memory almost all taken, CPUs busy, more virtual CPUs than real ones, storage nearly full) the
-  card turns amber, then red, saying what that means.
+  it), **Storage** (each one it uses, how full; the shared ones and the pool's default marked so) and **Network** (each card: its traffic now, its
+  network, address and speed, the management card marked, an unplugged one said so); and **USB
+  devices**, when it has any. Near a limit (memory almost all taken, CPUs busy, more virtual CPUs
+  than real ones, storage nearly full) the card turns amber, then red, saying what that means.
+- **A server's tools** — in a server's *Actions*:
+  - *Restart Toolstack…* starts its management (xapi) again, for when it misbehaves (tasks that
+    never end, VMs that won't start or stop); its VMs keep running, and the app connects again
+    by itself when it's the coordinator.
+  - *Back Up…* saves its system (XenServer as installed there, its settings, the pool's database
+    as it has it; not its VMs) in a .xbk file on this computer, under Activities with how far it
+    is. *Restore From Backup…* puts one back on its backup partition; started from the XenServer
+    installer, it then restores it (the app says how).
+  - *Server Status Report…* (also in a pool's *Actions*) gathers each chosen server's logs and settings
+    into a .tar.bz2 file, as XenServer's support asks for them, or to look into a problem
+    yourself (a snapshot schedule that didn't run, say).
+- **Server Helper** (optional) — a pool's *Helper* tab sets up a small open-source add-on on its
+  servers ([helper/](helper/): one XAPI plugin and a cron line), so they do more while the app is
+  closed:
+  - the pool's alerts on your phone: Telegram, ntfy, Discord, Home Assistant or any webhook, as
+    bad as you choose, with quiet hours (only critical ones then);
+  - any storage fuller than a limit (EXT, XFS, NFS and SMB can't tell XenServer's own monitor);
+  - a snapshot schedule's missed time made up (XenServer's plugin never does it);
+  - shared storage mounted again on a server that started before the NAS;
+  - VMs started in order, with a wait between them, when the pool starts.
+
+  Each server gets it from its Console: *Type in its console* types the install command there
+  (or copy it, for SSH). The command fetches it from this repository, for this app's version, and
+  checks its SHA-256 first. Its settings live in the pool; *Remove* takes it off every server.
+  It's given as it is, with no warranty: read it before you install it, as the tab asks.
+- **Change Root Password** — in a pool's *Actions*: the root password of every
+  server of the pool, after the current one; the app goes on with the new one, and keeps it in the
+  keychain when the old one was kept there.
 - **Performance** — a VM's or a server's tab with its load over the last **10 minutes, 2 hours,
   week or year**, as its server keeps it (a point every 5 seconds, every minute, every hour, every
   day; nothing is stored on your computer): CPU, memory, disk and network as four charts, each with
@@ -104,14 +141,17 @@ affiliated with or endorsed by the makers of XenServer or XCP-ng.
   (references shown by name, sizes in GB too), read again while the tab is open. A search finds
   any of them (marked where found), a value's click copies it, and *Export* saves it all as a CSV
   spreadsheet or a PDF. Pools and servers have Overview, Storage, Logs and Details, and servers
-  Performance too. At the tab row's right end: the
-  **Console** button, then the actions (power, snapshot, move, copy, delete; a server's
-  maintenance mode, restart and shut down). In a window too narrow for them, they all fold into
-  one **Actions** menu.
+  Performance too. At the tab row's right end, two buttons: **Console**, and **Actions**, a menu
+  of everything it can do, each with its icon (a VM's power actions with their shortcuts, then Take
+  Snapshot, Move, Copy VM, Make Template, Export to a File, and Delete VM in red; a server's
+  Restart, Shut Down and Maintenance Mode, then its tools, or Power On while it's off). What can't
+  be done now is greyed out, saying why. In a window too narrow, Console goes into the Actions
+  too. A pool's Actions hold Change Root Password, the status report and Disconnect.
 - **Console** — the blue **Console** button by the tabs shows a running VM's screen, to use with
   your keyboard and mouse (the keyboard goes to the VM while the mouse is over its screen), always
-  scaled to fit; clicked again, it goes back where you were. A keyboard button beside it sends
-  Ctrl+Alt+Del and the combinations your desktop keeps for itself (the Windows key, Alt+Tab…). It
+  scaled to fit; clicked again, it goes back where you were. While it's shown, *Send keys* in the
+  Actions sends Ctrl+Alt+Del and the combinations your desktop keeps for itself (the Windows key,
+  Alt+Tab…). It
   reconnects by itself after the VM reboots. A server has a Console too: its own text console (the
   control domain's, as in XenCenter), where you log in as root.
 - **ISO libraries** — *ISO Library* on the toolbar opens a page with every ISO file of every pool:
@@ -175,8 +215,7 @@ affiliated with or endorsed by the makers of XenServer or XCP-ng.
   password and/or SSH keys; or user-data you write yourself. It goes on a small disk labelled
   CIDATA (cloud-init's NoCloud source, as Xen Orchestra does it), "cloud-init config", attached to
   the new VM: delete it once the VM is set up, as it holds the password.
-- **Templates** — the copy button next to a VM's camera (or its right-click menu) has *Make
-  Template…*: a template from the VM, which stays as it is, its disks copied in an instant on their
+- **Templates** — a VM's *Actions* (or its right-click menu) have *Make Template…*: a template from the VM, which stays as it is, its disks copied in an instant on their
   own storage. A snapshot has it too, over the Snapshots tab's list (from a snapshot of the disks
   only), so a VM that's on needn't stop; otherwise the VM has to be off, as a copy of a running one is like one after a power
   cut (said when a snapshot was taken while it ran). The dialog reminds you to generalize it first:
@@ -200,7 +239,7 @@ affiliated with or endorsed by the makers of XenServer or XCP-ng.
   where they are, or in full onto other storage) and new network addresses. Each storage says
   whether it's *thin* (a disk takes only what's written on it: EXT, NFS, SMB…) or *thick* (LVM,
   iSCSI: its whole size), and the dialog says how much the copy takes there.
-- **Export and import (.xva)** — *Export to a File…*, in the same menu (and the right-click menu),
+- **Export and import (.xva)** — *Export to a File…*, in a VM's *Actions* (and its right-click menu),
   saves a VM in one file on this computer, as XenServer and XenCenter write it: its settings and its
   disks, compressed on the server if you like. A running VM keeps running: the app takes a snapshot,
   saves that and deletes it (its disks are then as after a power cut, which it says first). A
@@ -209,10 +248,10 @@ affiliated with or endorsed by the makers of XenServer or XCP-ng.
   cards), then its name, server, storage and network are yours to choose, and it can start once
   it's in; a template comes in as a template. Both go under Activities with how much and how fast,
   and *Stop* in their details; a stopped one leaves nothing behind.
-- **Delete VM** — the bin next to a VM's tabs, or on its right-click menu. It asks first, and its disks go too unless unticked (a disk another VM also uses stays);
+- **Delete VM** — last in a VM's *Actions*, or on its right-click menu. It asks first, and its disks go too unless unticked (a disk another VM also uses stays);
   its snapshots go with it, and ISO files in its DVD drive aren't touched. A VM that's on is
   turned off first, the button saying so ("Shut down and delete").
-- **Snapshots** — the camera next to a VM's power buttons (or on its right-click menu) takes one:
+- **Snapshots** — *Take Snapshot…* in a VM's *Actions* (or its right-click menu) takes one:
   its disks as they are now, named with the date and time unless you name it, and, for a running VM,
   its memory too if you tick it, so that reverting resumes it right where it was. The VM's
   *Snapshots* tab lists them, the newest first: when each was taken, what it holds, a description
@@ -230,17 +269,21 @@ affiliated with or endorsed by the makers of XenServer or XCP-ng.
   (with snapshots, without, on a schedule), a search, and every column sorts. A click opens a VM's
   Snapshots tab; tick several to take a snapshot of each at once, or to put them on a schedule.
   Its tabs are *VMs* (this list) and *Schedules*, which lists each pool's snapshot schedules (XenServer's VMSS): each takes
-  its VMs' snapshots by itself, every hour, day or chosen days of the week (on the server's clock:
-  the server looks every 15 minutes), keeps the last 1 to 10 it took (deleting the oldest), with
+  its VMs' snapshots by itself, every hour, day or chosen days of the week, keeps the last 1 to 10
+  it took (deleting the oldest), with
   their memory or not; turn one on or off, run it now (the camera), edit it, pick its VMs, delete
   it. Each says when it last ran and, when its last run failed, why, as the server's alert said
-  (also under Alerts: "Snapshot schedule 'Nightly' couldn't take its snapshots"). A VM's Snapshots
+  (also under Alerts: "Snapshot schedule 'Nightly' couldn't take its snapshots"). Times are
+  shown and chosen in this computer's time: the servers run them on their own clock (often UTC),
+  which the app reads, and the editor says what the time is there ("your time · 19:45 on the
+  servers"). The pool's coordinator looks every 15 minutes; a time missed (it was off then, or the
+  schedule was changed after it) waits for the next one. A VM's Snapshots
   tab shows its schedule in a box over the list: blue while it runs, orange when it's paused or its
   last run failed, grey on none (with *Schedule…*), and at its end Run now, Edit and Remove (off
   it) as icons; the snapshots a schedule took have a clock, and the name the server gives them
   ("20261120-1843", its date and time in UTC) shows as the date and time here, as the snapshots you
   take are named. A pool whose license doesn't include schedules says so.
-- **Move a VM** — the Move button next to a VM's tabs, *Move…* on its right-click menu, or drag it
+- **Move a VM** — *Move…* in a VM's *Actions* or on its right-click menu, or drag it
   onto a server in the tree: one dialog for the server it goes to (each with its free memory, or
   why it can't take it) and the storage of each of its disks (where it is when that server sees
   it, else that server's own, or the roomiest it sees). Under *After the move*, bars show what's
@@ -249,8 +292,7 @@ affiliated with or endorsed by the makers of XenServer or XCP-ng.
   its disks copied as it runs when they change storage (also on the same server); off, its disks
   are copied and swapped in, and it starts on that server from then on. Its DVD drive is emptied
   first when its disc's library isn't seen where it goes. Progress in Activities.
-- **Shut down or restart a server** — the red power icon and the green restart icon at the end of a
-  server's tabs. Each asks first, saying which VMs move to the pool's other servers and which are
+- **Shut down or restart a server** — *Restart…* and *Shut Down…* in a server's *Actions*. Each asks first, saying which VMs move to the pool's other servers and which are
   shut down (their disks on that server's own storage), and warns when it's the pool's coordinator.
   Then it goes the way the pool expects: no new VMs sent to it, those VMs shut down, the rest moved,
   then the server; if a step fails it takes VMs again. A restarting server turns green and ringed
@@ -258,17 +300,17 @@ affiliated with or endorsed by the makers of XenServer or XCP-ng.
   yellow note on its Overview (what may be wrong: stuck while starting, or off the network) and is
   listed in Alerts. A server that's on but not taking VMs (as one
   left disabled) says so on its Overview, with *Take VMs again*, and in its pool's Details.
-- **Power On** — a server that's off gets a green power button at the end of its tabs (and
+- **Power On** — a server that's off has *Power On* in its *Actions* (and
   *Power On* by its state). The pool's coordinator sends it a Wake-on-LAN signal (set up for it the
   first time), and so does this computer when it's on the same network: that also turns on the
   coordinator itself, or a lone server, whose address the app remembers from the last time it
   answered (even after the app restarts). Activities shows it till it answers; after ten minutes
   its Overview says what may be wrong (Wake-on-LAN off in its firmware or for its network card).
   The server's firmware and network card must have Wake-on-LAN on.
-- **Maintenance mode** — the orange spanner at the end of a server's tabs: it stops taking VMs
+- **Maintenance mode** — *Maintenance Mode…* in a server's *Actions*: it stops taking VMs
   (and, on servers that allow it, stays so across restarts), its VMs move to the pool's other
   servers (those that can't are shut down, said first), and it's marked as XenCenter marks it, so
-  both show the same. *Exit maintenance* (by its state, or the spanner) offers to bring its VMs
+  both show the same. *Exit maintenance* (by its state, or in its Actions) offers to bring its VMs
   back: moved back live, and the ones shut down started on it again.
 - **IP address and DNS** — a server's Overview lists its network cards: the one it's managed
   through, its address and whether it's fixed or from DHCP (the gateway and DNS servers on
@@ -277,11 +319,9 @@ affiliated with or endorsed by the makers of XenServer or XCP-ng.
   its network), and it warns before changing the address it's reached at: for the pool coordinator
   the app follows it to the new address by itself.
 - **VM power actions** — Start, Shut Down, Reboot, Suspend, Resume, Force Shut Down, Force Reboot,
-  enabled only when the server allows them, with confirmations for the disruptive ones. They're
-  all behind one button at the right end of a VM's tabs: the power symbol in the colour of the
-  VM's state (a ring turning while an action runs) and an arrow, opening a menu of the actions with
-  their coloured icons and shortcuts (on the name's line when the window is narrow). They're on
-  its right-click menu too.
+  enabled only when the server allows them, with confirmations for the disruptive ones. They come
+  first in a VM's *Actions*, with their coloured icons and shortcuts, the Force ones after a line.
+  They're on its right-click menu too.
 - **Keyboard shortcuts** — Ctrl+B start · Ctrl+E shut down · Ctrl+R reboot · Ctrl+Y suspend/resume ·
   F5 refresh.
 - **Alerts** — the bell on the toolbar, with how many need your attention (red when one is
@@ -289,12 +329,16 @@ affiliated with or endorsed by the makers of XenServer or XCP-ng.
   certificate or license running out, a limit you set passed) and what the app finds itself (a
   connection lost, a server off or not answering, storage not mounted). *Needs attention* or
   *Everything*, by pool when there are several, and a search. A click opens one: what it says,
-  and a way to what it's about (or its Performance tab). Its X dismisses it on its server, so
+  and a way to what it's about (or its Performance tab). A server's certificate running out has
+  *Renew*: the server makes itself a new one (and the alert goes). Its X dismisses it on its server, so
   XenCenter stops showing it too; *Dismiss all* does it for those shown. A VM's or a server's page
-  shows its own at the top. **Alerts…** in a VM's or a server's Performance tab, and on a
+  shows its own at the top (three, then how many more), with *Dismiss all* under them when there
+  are several. **Alerts…** in a VM's or a server's Performance tab, and on a
   storage's page, sets limits the pool watches by itself, also while the app is closed (CPU,
   network, disks, free memory, how full a storage is, each for so many minutes), and can have the
-  pool email its alerts.
+  pool email its alerts. Most kinds of storage (EXT, XFS, NFS, LVM) don't tell the pool how full
+  they are, so the pool can't raise that one: the dialog says so, and the app raises it itself
+  while it's open ("Local storage on tico is 34% full", found by this app).
 - **Activities** — next to the gear: what's under way (a ring turning, with how many), each with its
   server, how long it's been and how far it is (for disks moved or copied, and uploads, how much
   of how much and how fast: "11.7 GB of 20 GB · 110 MB/s"), and the last few that ended. A server
@@ -316,6 +360,8 @@ affiliated with or endorsed by the makers of XenServer or XCP-ng.
   when something would be left half done (the app takes it through several steps: a new VM, a
   shut-down VM's disks moved, a revert, a pool's update, a server shut down, a VM deleted, an
   upload) it asks first, with a yellow note for each saying what would be left.
+- **Closing the app** — it logs out of each server as it closes, rather than leaving its sessions
+  for the servers to drop a day later.
 - **Settings** — the gear at the far left of the toolbar: the theme (light, dark, or the same as
   your desktop), the size of everything (90–125%; Ctrl + and Ctrl - too), and the saved passwords,
   each with *Forget* (deleted from the keychain; the app stops connecting there as it starts), even

@@ -207,9 +207,9 @@ pub fn describe(m: &XenMessage, obj: &str) -> Said {
             let what = if n.starts_with("POOL_CA") {
                 "A certificate the pool trusts"
             } else if n.starts_with("HOST_INTERNAL") {
-                "The one its pool's servers use among themselves: the pool renews it"
+                "The one its pool's servers use among themselves: Renew makes a new one"
             } else {
-                "The one it answers HTTPS with. A new one: xe host-refresh-server-certificate on it"
+                "The one it answers HTTPS with: Renew makes a new one"
             };
             match days_in(n) {
                 Some(d) => said(format!("{} certificate expires in {} days", its, d), what),

@@ -1183,6 +1183,13 @@ impl ConsoleView {
         }
     }
 
+    /// Types `text` on its keyboard, a key for each character (no Enter at the end).
+    pub fn type_text(&self, text: &str) {
+        for ch in text.chars() {
+            self.tap(char_keysym(ch), 0);
+        }
+    }
+
     fn tap(&self, keysym: u32, scancode: u32) {
         self.send_key(true, keysym, scancode);
         self.send_key(false, keysym, scancode);

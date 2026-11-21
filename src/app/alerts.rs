@@ -67,6 +67,9 @@ pub(super) struct AlertRow {
     pub dismiss: Option<String>,
     /// Its Performance tab shows what passed the limit.
     pub perf: bool,
+    /// A server's certificate running out: which server, and whether it's the one for the pool
+    /// (Renew makes a new one).
+    pub renew: Option<(String, bool)>,
 }
 
 /// The Alerts page: everything or only what needs attention, which pool (None: all), what's
@@ -95,6 +98,9 @@ pub(super) struct RulesDialog {
     pub mail_via: String,
     pub saving: bool,
     pub error: Option<String>,
+    /// A storage whose kind doesn't tell the pool how full it is: the pool can't raise its
+    /// "fuller than" alert; this app does, while it's open.
+    pub app_watches: bool,
 }
 
 /// What the Alerts dialog asks for.
@@ -237,7 +243,7 @@ impl App {
             let sid = key.split(':').nth(1).and_then(|x| x.parse().ok()).unwrap_or(0);
             let pool = self.server(sid).map(|s| s.name()).unwrap_or_default();
             let time = self.app_alerts_since.get(&text).copied().unwrap_or_else(unix_now);
-            out.push(AlertRow { key: format!("app:{}", text), sid, sev: Severity::Warning, title: text, detail, body: String::new(), raw: String::new(), source: Source::App, node: Some(key), obj: String::new(), pool, time, dismiss: None, perf: false });
+            out.push(AlertRow { key: format!("app:{}", text), sid, sev: Severity::Warning, title: text, detail, body: String::new(), raw: String::new(), source: Source::App, node: Some(key), obj: String::new(), pool, time, dismiss: None, perf: false, renew: None });
         }
         for s in &self.servers {
             let (Some(d), Some(c)) = (&s.data, self.messages.get(&s.id)) else { continue };
@@ -265,6 +271,12 @@ impl App {
                 };
                 let said = describe(m, &obj);
                 let perf = said.limit && node.as_deref().map_or(false, |n| n.starts_with("vm:") || n.starts_with("host:"));
+                // a server's own certificate running out (or run out): Renew
+                let cert = |p: &str| m.name.starts_with(&format!("{}EXPIR", p));
+                let renew = match (m.cls.as_str(), cert("HOST_SERVER_CERTIFICATE_"), cert("HOST_INTERNAL_CERTIFICATE_")) {
+                    ("Host", true, _) | ("Host", _, true) => d.hosts.iter().find(|h| h.uuid == m.obj_uuid).map(|h| (h.rref.clone(), cert("HOST_INTERNAL_CERTIFICATE_"))),
+                    _ => None,
+                };
                 out.push(AlertRow {
                     key: format!("msg:{}", m.rref),
                     sid: s.id,
@@ -281,6 +293,7 @@ impl App {
                     time: m.time,
                     dismiss: Some(m.rref.clone()),
                     perf,
+                    renew,
                 });
             }
         }
@@ -379,7 +392,7 @@ impl App {
                                 }
                             });
                         }
-                        ui.add(egui::TextEdit::singleline(&mut v.search).hint_text("Search alerts").desired_width(240.0).margin(vec2(8.0, 6.0)));
+                        search_box(ui, &pal, &mut v.search, "Search alerts", 240.0);
                     });
                     ui.add_space(6.0);
                     let q = v.search.trim().to_lowercase();
@@ -470,7 +483,8 @@ impl App {
     /// Opens the Alerts dialog for a VM, a server or a storage, and asks its server for what's set.
     pub(super) fn open_alert_rules(&mut self, sid: u32, cls: &'static str, obj: String, name: String, watched: Watched, ctx: &egui::Context) {
         let Some(conn) = self.server(sid).map(|s| s.conn.clone()) else { return };
-        self.dialog = Dialog::AlertRules(Box::new(RulesDialog { sid, cls, obj: obj.clone(), name, watched, read: None, rules: rules_of(watched, ""), mail_on: false, mail_to: String::new(), mail_via: String::new(), saving: false, error: None }));
+        let app_watches = watched == Watched::Sr && self.server(sid).and_then(|s| s.data.as_ref()).and_then(|d| d.sr(&obj)).map_or(false, |x| !x.stats);
+        self.dialog = Dialog::AlertRules(Box::new(RulesDialog { sid, cls, obj: obj.clone(), name, watched, read: None, rules: rules_of(watched, ""), mail_on: false, mail_to: String::new(), mail_via: String::new(), saving: false, error: None, app_watches }));
         let (tx, ctx) = (self.tx.clone(), ctx.clone());
         std::thread::spawn(move || {
             let result = conn.alert_settings(cls, &obj);
@@ -631,6 +645,11 @@ fn opened(ui: &mut Ui, pal: &Pal, r: &AlertRow, out: &mut Vec<Intent>) {
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing = vec2(18.0, 6.0);
                 let link = |ui: &mut Ui, text: &str| ui.add(egui::Label::new(egui::RichText::new(text).size(13.0).color(pal.link)).sense(Sense::click())).on_hover_cursor(egui::CursorIcon::PointingHand).clicked();
+                if let Some((h, internal)) = &r.renew {
+                    if link(ui, "Renew it  ›") {
+                        out.push(Intent::AskRenewCert(r.sid, h.clone(), *internal, r.dismiss.clone()));
+                    }
+                }
                 if r.perf {
                     if let Some(n) = &r.node {
                         if link(ui, "See it in Performance  ›") {
@@ -674,9 +693,10 @@ pub(super) fn alert_strip(ui: &mut Ui, pal: &Pal, rows: &[AlertRow], out: &mut V
             let w = ui.available_width();
             let p = ui.painter().clone();
             let when = p.layout_no_wrap(fmt_when(r.time, unix_now(), local_offset(r.time)), FontId::proportional(12.5), soft);
-            let link = if r.perf { "See it  ›" } else { "" };
+            let linked = r.perf || r.renew.is_some();
+            let link = if r.renew.is_some() { "Renew  ›" } else if r.perf { "See it  ›" } else { "" };
             let link_g = p.layout_no_wrap(link.to_string(), FontId::proportional(13.0), pal.link);
-            let right = when.size().x + 14.0 + if r.perf { link_g.size().x + 14.0 } else { 0.0 } + 34.0;
+            let right = when.size().x + 14.0 + if linked { link_g.size().x + 14.0 } else { 0.0 } + 34.0;
             let mut job = egui::text::LayoutJob::default();
             job.append(&r.title, 0.0, egui::TextFormat { font_id: FontId::new(13.5, FontFamily::Name("bold".into())), color: pal.ink, ..Default::default() });
             if !r.detail.is_empty() {
@@ -704,25 +724,39 @@ pub(super) fn alert_strip(ui: &mut Ui, pal: &Pal, rows: &[AlertRow], out: &mut V
                     out.push(Intent::DismissAlerts(vec![(r.sid, m.clone())]));
                 }
             }
-            if r.perf {
+            if linked {
                 x -= 10.0 + link_g.size().x;
                 let lr = Rect::from_min_size(pos2(x, cy - link_g.size().y / 2.0), link_g.size());
                 p.galley(lr.min, link_g, pal.link);
                 let lresp = ui.interact(lr, ui.id().with(("strip-perf", &r.key)), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
                 if lresp.clicked() {
-                    out.push(Intent::Tab(Tab::Performance));
+                    match &r.renew {
+                        Some((h, internal)) => out.push(Intent::AskRenewCert(r.sid, h.clone(), *internal, r.dismiss.clone())),
+                        None => out.push(Intent::Tab(Tab::Performance)),
+                    }
                 }
             }
             x -= 14.0 + when.size().x;
             p.galley(pos2(x, cy - when.size().y / 2.0), when, soft);
         }
-        if rows.len() > 3 {
-            let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::click());
-            let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
-            ui.painter().line_segment([rect.left_top(), rect.right_top()], Stroke::new(1.0_f32, edge.gamma_multiply(0.6)));
-            ui.painter().text(pos2(rect.min.x + 28.0, rect.center().y), Align2::LEFT_CENTER, format!("{} more in Alerts  ›", rows.len() - 3), FontId::proportional(13.0), pal.link);
-            if resp.clicked() {
+        // under them: the rest in Alerts, and Dismiss all (every one of this page's, shown or not)
+        let all: Vec<(u32, String)> = rows.iter().filter_map(|r| r.dismiss.clone().map(|m| (r.sid, m))).collect();
+        if rows.len() > 3 || all.len() > 1 {
+            let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::hover());
+            let p = ui.painter().clone();
+            p.line_segment([rect.left_top(), rect.right_top()], Stroke::new(1.0_f32, edge.gamma_multiply(0.6)));
+            let link = |text: String, left: bool, key: &str| -> bool {
+                let g = p.layout_no_wrap(text, FontId::proportional(13.0), pal.link);
+                let at = if left { pos2(rect.min.x + 28.0, rect.center().y - g.size().y / 2.0) } else { pos2(rect.max.x - 16.0 - g.size().x, rect.center().y - g.size().y / 2.0) };
+                let lr = Rect::from_min_size(at, g.size()).expand(4.0);
+                p.galley(at, g, pal.link);
+                ui.interact(lr, ui.id().with(("strip-footer", key)), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
+            };
+            if rows.len() > 3 && link(format!("{} more in Alerts  ›", rows.len() - 3), true, "more") {
                 out.push(Intent::Alerts);
+            }
+            if all.len() > 1 && link(format!("Dismiss all {}", all.len()), false, "all") {
+                out.push(Intent::DismissAlerts(all));
             }
         }
     });
@@ -772,6 +806,14 @@ pub(super) fn rules_window(ctx: &egui::Context, pal: &Pal, d: &mut RulesDialog) 
                     Watched::Host => "Its network: all its cards. Its free memory: what's left for more VMs.",
                     Watched::Sr => "How full it is: what its disks take of all it has.",
                 });
+                if d.app_watches {
+                    ui.add_space(8.0);
+                    let text = "This kind of storage doesn't tell the pool how full it is, so the pool can't raise this alert itself, nor email it. This app checks it instead while it's open, and shows it in Alerts.";
+                    egui::Frame::none().fill(pal.orange.gamma_multiply(if pal.dark { 0.16 } else { 0.10 })).rounding(Rounding::same(8.0)).inner_margin(egui::Margin::symmetric(12.0, 9.0)).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.add(egui::Label::new(egui::RichText::new(text).size(12.5).color(pal.ink)).wrap());
+                    });
+                }
                 ui.add_space(14.0);
                 ui.label(egui::RichText::new("EMAIL").size(11.0).color(pal.ink_faint));
                 ui.add_space(6.0);

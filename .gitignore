@@ -18,3 +18,6 @@
 /.venv/
 /__pycache__/
 /SimpleVMManager.exe
+
+# Python bytecode (the Server Helper's tests)
+__pycache__/

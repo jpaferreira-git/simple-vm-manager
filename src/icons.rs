@@ -654,6 +654,35 @@ pub fn paint_glyph_on(p: &Painter, rect: Rect, name: &str, col: Color32, bg: Col
             p.rect_stroke(Rect::from_min_max(c + vec2(-2.5, -2.5), c + vec2(5.5, 5.5)), Rounding::same(1.5), s);
             line(p, c, &[(-5.5, 2.5), (-5.5, -4.0), (-4.0, -5.5), (2.5, -5.5)], s);
         }
+        "usb" => {
+            // a USB plug: its metal end with two holes, its grip, the cable out of it
+            p.rect_stroke(Rect::from_min_max(c + vec2(-3.2, -7.5), c + vec2(3.2, -3.0)), Rounding::same(0.6), s);
+            p.rect_filled(Rect::from_min_size(c + vec2(-1.9, -6.0), vec2(1.3, 1.4)), Rounding::ZERO, col);
+            p.rect_filled(Rect::from_min_size(c + vec2(0.6, -6.0), vec2(1.3, 1.4)), Rounding::ZERO, col);
+            p.rect_stroke(Rect::from_min_max(c + vec2(-5.0, -3.0), c + vec2(5.0, 4.0)), Rounding::same(1.5), s);
+            line(p, c, &[(0.0, 4.0), (0.0, 7.5)], s);
+        }
+        "key" => {
+            // a key lying down: its ring on the left, its shaft to the right, two teeth below
+            p.circle_stroke(c + vec2(-4.0, 0.0), 3.4, s);
+            line(p, c, &[(-0.6, 0.0), (7.5, 0.0)], s);
+            line(p, c, &[(4.2, 0.0), (4.2, 3.2)], s);
+            line(p, c, &[(6.8, 0.0), (6.8, 2.6)], s);
+        }
+        "report" => {
+            // a page with a corner folded down and lines of writing
+            line(p, c, &[(-5.0, -7.0), (1.8, -7.0), (5.0, -3.8), (5.0, 7.0), (-5.0, 7.0), (-5.0, -7.0)], s);
+            line(p, c, &[(1.8, -7.0), (1.8, -3.8), (5.0, -3.8)], s);
+            for y in [-0.5f32, 2.2, 4.9] {
+                line(p, c, &[(-2.6, y), (2.6, y)], Stroke::new(1.2_f32, col));
+            }
+        }
+        "archive" => {
+            // a box with its lid on and a handle (a backup)
+            p.rect_stroke(Rect::from_min_max(c + vec2(-7.0, -6.0), c + vec2(7.0, -2.5)), Rounding::same(1.0), s);
+            line(p, c, &[(-6.0, -2.5), (-6.0, 6.5), (6.0, 6.5), (6.0, -2.5)], s);
+            line(p, c, &[(-2.2, 1.0), (2.2, 1.0)], s);
+        }
         "lock" => {
             // a padlock (Ctrl+Alt+Del brings up Windows' lock screen)
             p.rect_stroke(Rect::from_min_max(c + vec2(-5.0, -1.0), c + vec2(5.0, 6.0)), Rounding::same(1.5), s);

@@ -34,7 +34,9 @@ mod details;
 mod host_overview;
 mod overview;
 mod performance;
+mod helper_page;
 mod snapshots;
+mod tools;
 use alerts::{AlertsView, MessageCache, RulesAct, RulesDialog};
 use overview::{OverviewEdit, Thumb};
 
@@ -106,6 +108,14 @@ impl ServerEntry {
 
 enum Msg {
     Fetched(u32, Result<PoolData, ApiError>),
+    /// The Server Helper (helper_page.rs): each server's, its settings and log read, a job done.
+    HelperChecked { sid: u32, result: Vec<(String, crate::helper::Presence)> },
+    HelperRead { sid: u32, result: Result<String, ApiError> },
+    HelperStatus { sid: u32, result: Result<String, ApiError> },
+    HelperDone { sid: u32, log: Option<usize>, what: helper_page::Did, result: Result<String, ApiError> },
+    /// A server's tool's job ended (see tools.rs), and what the system's chooser gave its dialog.
+    ToolDone { sid: u32, key: String, log: usize, failed: String, then: tools::ToolThen, result: Result<String, ApiError> },
+    ToolPicked(Option<PathBuf>),
     /// A Details tab's every field, read (`key`: "vm:<ref>", "host:<ref>", "pool:").
     Records { sid: u32, key: String, result: Result<Vec<(String, serde_json::Value)>, ApiError> },
     /// A network card's address (and hostname) changed, or not.
@@ -379,6 +389,8 @@ enum Tab {
     /// The Templates folder's list.
     Templates,
     Logs,
+    /// A pool's Server Helper (helper_page.rs).
+    Helper,
 }
 
 impl Tab {
@@ -410,6 +422,7 @@ impl Tab {
             Tab::AllSchedules => "Schedules",
             Tab::Templates => "Templates",
             Tab::Logs => "Logs",
+            Tab::Helper => "Helper",
         }
     }
 }
@@ -488,6 +501,15 @@ enum Dialog {
     /// Closing the app while jobs would be left half done: each one's line and what's left; the
     /// dialog that was open, back if the app stays open.
     ConfirmClose { items: Vec<(String, String)>, back: Box<Dialog> },
+    /// A server's tools (see tools.rs): Back Up or Restore From Backup, the Server Status
+    /// Report, a pool's Change Root Password.
+    Backup(Box<crate::hosttools::BackupDialog>),
+    Report(Box<crate::hosttools::ReportDialog>),
+    Password(Box<crate::hosttools::PasswordDialog>),
+    /// Restart a server's toolstack? (`coordinator`: the pool's, which goes quiet with it.)
+    ConfirmToolstack { sid: u32, host: String, name: String, coordinator: bool },
+    /// Renew a server's certificate (`internal`: the one for the pool), from the alert `msg`?
+    ConfirmRenewCert { sid: u32, host: String, name: String, internal: bool, msg: Option<String> },
 }
 
 /// The Update dialog: the release, this copy's file when it can replace itself, the download under
@@ -500,6 +522,14 @@ struct UpdateDialog {
 }
 
 enum Intent {
+    /// A server's tools (tools.rs): Restart Toolstack, Renew Certificate (internal, from the
+    /// alert), Back Up or Restore From Backup, the Server Status Report (of one server, or
+    /// all), a pool's Change Root Password.
+    AskToolstack(u32, String),
+    AskRenewCert(u32, String, bool, Option<String>),
+    BackupHost(u32, String, bool),
+    StatusReport(u32, Option<String>),
+    ChangePassword(u32),
     /// The Alerts page (the toolbar's bell).
     Alerts,
     /// Dismiss these alerts: each its pool and its message.
@@ -734,6 +764,15 @@ pub struct App {
     /// Snapshot schedule work under way: a schedule's reference (turned on or off, deleted), or
     /// "save:<pool>" (saved), or "pick:<pool>" (VMs put on one).
     sched_busy: HashSet<String>,
+    /// Tools' jobs under way: "toolstack:<host>", "backup:<host>", "restore:<host>",
+    /// "report:<host>", "cert:<host>", "password:<pool>".
+    tool_busy: HashSet<String>,
+    /// Each pool's Server Helper tab; and the install command to type in a server's console once
+    /// it's shown (pool, its control domain, the text).
+    helper: HashMap<u32, helper_page::HelperView>,
+    helper_type: Option<(u32, String, String)>,
+    /// The connections whose pool Overview doesn't show the helper's card (helper-hidden.txt).
+    helper_hidden: HashSet<String>,
     /// Snapshots being deleted.
     snap_deleting: HashSet<String>,
     /// The snapshot schedule Delete was clicked for on the Schedules tab, asked about in place.
@@ -861,6 +900,10 @@ impl App {
             snap_saving: HashMap::new(),
             snap_view: SnapView::default(),
             sched_busy: HashSet::new(),
+            tool_busy: HashSet::new(),
+            helper: HashMap::new(),
+            helper_type: None,
+            helper_hidden: config_dir().and_then(|d| std::fs::read_to_string(d.join("helper-hidden.txt")).ok()).map(|t| t.lines().map(|l| l.trim().to_lowercase()).filter(|l| !l.is_empty()).collect()).unwrap_or_default(),
             sched_asking: None,
             snap_deleting: HashSet::new(),
             iso_deleting: HashSet::new(),
@@ -1552,10 +1595,15 @@ impl App {
     }
 
     fn save_schedule(&mut self, sid: u32, x: ScheduleInfo, ctx: &egui::Context) {
+        // (said on this computer's clock)
+        let here = match self.server(sid).and_then(|s| s.data.as_ref()) {
+            Some(d) => x.here(d).summary(),
+            None => x.summary(),
+        };
         let (doing, done, failed) = if x.rref.is_empty() {
-            (format!("Making snapshot schedule '{}'", x.name), format!("Made snapshot schedule '{}': {}", x.name, x.summary()), format!("Couldn't make snapshot schedule '{}'", x.name))
+            (format!("Making snapshot schedule '{}'", x.name), format!("Made snapshot schedule '{}': {}", x.name, here), format!("Couldn't make snapshot schedule '{}'", x.name))
         } else {
-            (format!("Saving snapshot schedule '{}'", x.name), format!("Saved snapshot schedule '{}': {}", x.name, x.summary()), format!("Couldn't save snapshot schedule '{}'", x.name))
+            (format!("Saving snapshot schedule '{}'", x.name), format!("Saved snapshot schedule '{}': {}", x.name, here), format!("Couldn't save snapshot schedule '{}'", x.name))
         };
         self.schedule_job(sid, format!("save:{}", sid), doing, done, failed, move |c| c.save_schedule(&x), ctx);
     }
@@ -3161,6 +3209,12 @@ impl App {
                         Err(e) => t.error = Some(e),
                     }
                 }
+                Msg::ToolDone { sid, key, log, failed, then, result } => self.tool_done(sid, key, log, failed, then, result, ctx),
+                Msg::ToolPicked(path) => self.tool_picked(path),
+                Msg::HelperChecked { sid, result } => self.helper_checked(sid, result),
+                Msg::HelperRead { sid, result } => self.helper_read_done(sid, result),
+                Msg::HelperStatus { sid, result } => self.helper_status_done(sid, result),
+                Msg::HelperDone { sid, log, what, result } => self.helper_done(sid, log, what, result),
                 Msg::ScheduleDone { sid, key, log, done, failed, result } => {
                     self.sched_busy.remove(&key);
                     if let Some(e) = self.log.get_mut(log) {
@@ -3353,7 +3407,7 @@ impl App {
                     if shot && is_demo {
                         match self.shot_show.as_str() {
                             "home" | "iso-library" | "vm-storage" | "new-storage" | "new-storage-inside" | "new-storage-error" => self.select("root".into()),
-                            "storage" | "pool" | "pool-details" | "pool-updates" | "pool-updating" | "pool-update-stopped" => self.select(format!("srv:{}", id)),
+                            "storage" | "pool" | "pool-details" | "pool-updates" | "pool-updating" | "pool-update-stopped" | "status-report" | "root-password" | "pool-actions" | "helper" => self.select(format!("srv:{}", id)),
                             "isos" | "iso-disconnect" | "iso-delete" | "iso-describe" | "iso-upload" | "iso-upload-choose" | "iso-upload-web" | "iso-upload-done" | "sr-unmounted" | "sr-detached" | "sr-auto-repair" | "sr-repair-failed" => {
                                 self.expanded.insert(format!("folder:{}:srs", id));
                                 self.select(format!("sr:{}:sr-iso", id));
@@ -3365,7 +3419,7 @@ impl App {
                                 self.host_rebooting.insert("host-b".into(), crate::pool_update::now() - 14 * 60);
                                 self.select(format!("host:{}:host-b", id));
                             }
-                            "host" | "host-details" | "change-ip" | "host-shutdown" | "host-restart" | "host-maintenance" | "host-performance" => self.select(format!("host:{}:host-a", id)),
+                            "host" | "host-details" | "change-ip" | "host-shutdown" | "host-restart" | "host-maintenance" | "host-performance" | "backup" | "restore" | "toolstack" | "renew-cert" | "host-actions" => self.select(format!("host:{}:host-a", id)),
                             // (with SVM_DEMO_OFF=host-b, or SVM_DEMO_MAINTENANCE=host-b)
                             "host-off" | "host-in-maintenance" | "host-exit-maintenance" => self.select(format!("host:{}:host-b", id)),
                             "host-waking" => {
@@ -3381,7 +3435,9 @@ impl App {
                             // a running VM chosen: it can't be made a template now
                             "new-template" => self.select(format!("vm:{}:vm-web", id)),
                             "make-template" | "copy-vm" | "copy-vm-thin" | "template-made" | "vm-off" | "vm-edited" | "move-vm-off" => self.select(format!("vm:{}:vm-desk", id)),
-                            "move-vm-local" => self.select(format!("vm:{}:vm-mail", id)),
+                            "move-vm-local" | "vm-usb" => self.select(format!("vm:{}:vm-mail", id)),
+                            // (Web Server: running)
+                            "vm-actions" => self.select(format!("vm:{}:vm-web", id)),
                             "sr-shared" => {
                                 self.expanded.insert(format!("folder:{}:srs", id));
                                 self.select(format!("sr:{}:sr-nfs", id));
@@ -3914,6 +3970,7 @@ impl App {
                 Intent::ShowLog(index) => self.dialog = Dialog::LogDetail { index, copied: None },
                 Intent::EditVm(sid, vm, change) => self.edit_vm(sid, vm, change, ctx),
                 Intent::AskEditVm(sid, vm, change, title, text) => self.dialog = Dialog::ConfirmEditVm { sid, vm, change, title, text },
+                i @ (Intent::AskToolstack(..) | Intent::AskRenewCert(..) | Intent::BackupHost(..) | Intent::StatusReport(..) | Intent::ChangePassword(..)) => self.open_tool(i),
                 Intent::NewVmFromSnapshot(sid, snap) => {
                     if let Some(d) = self.server(sid).and_then(|s| s.data.as_ref()) {
                         self.dialog = Dialog::NewVm(Box::new(NewVmDialog::new(sid, d, None).with_snapshot(d, &snap)));
@@ -3996,11 +4053,12 @@ impl App {
                     self.tab = Tab::AllSchedules;
                 }
                 Intent::NewSchedule(sid, vms) => {
-                    self.dialog = Dialog::Schedule(Box::new(ScheduleDialog::new(sid, None, vms)));
+                    let shift = self.server(sid).and_then(|s| s.data.as_ref()).and_then(|d| d.schedule_shift());
+                    self.dialog = Dialog::Schedule(Box::new(ScheduleDialog::new(sid, None, vms, shift)));
                 }
                 Intent::EditSchedule(sid, vmss) => {
-                    if let Some(x) = self.server(sid).and_then(|s| s.data.as_ref()).and_then(|d| d.schedules.iter().find(|x| x.rref == vmss)) {
-                        self.dialog = Dialog::Schedule(Box::new(ScheduleDialog::new(sid, Some(x), vec![])));
+                    if let Some((x, d)) = self.server(sid).and_then(|s| s.data.as_ref()).and_then(|d| d.schedules.iter().find(|x| x.rref == vmss).map(|x| (x, d))) {
+                        self.dialog = Dialog::Schedule(Box::new(ScheduleDialog::new(sid, Some(x), vec![], d.schedule_shift())));
                     }
                 }
                 Intent::DeleteSchedule(sid, vmss) => self.delete_schedule(sid, vmss, ctx),
@@ -4402,6 +4460,21 @@ impl App {
                 };
                 out.push((format!("host:{}:{}", s.id, h.rref), format!("{} {}", h.name, what), detail));
             }
+            // storage past the "fuller than" limit set on it, when the pool can't watch that itself
+            // (nor the Server Helper, when it's on the coordinator: it raises it as the pool's)
+            let helper_watches = self.helper.get(&s.id).map_or(false, |v| d.hosts.iter().any(|h| h.is_master && v.hosts.iter().any(|(r, p)| *r == h.rref && p.installed())));
+            for x in d.srs.iter().filter(|x| !x.stats && x.size > 0 && !helper_watches) {
+                let Some((limit, _)) = x.fill_limit else { continue };
+                let full = x.used as f64 / x.size as f64;
+                if full > limit {
+                    let name = match x.host.as_deref().and_then(|h| d.host(h)) {
+                        Some(h) => format!("{} on {}", x.name, h.name),
+                        None => x.name.clone(),
+                    };
+                    let detail = format!("Your limit: {}%. The pool can't watch how full this kind of storage is, so this app does, while it's open", typed_pct(limit));
+                    out.push((format!("sr:{}:{}", s.id, x.rref), format!("{} is {}% full", name, (full * 100.0).round()), detail));
+                }
+            }
             for x in &d.srs {
                 if let Some(t) = d.sr_trouble(x) {
                     let detail = if t.detached { "The pool has no settings for it: Repair asks where it is".to_string() } else { "Repair, on its page, mounts it again".to_string() };
@@ -4751,6 +4824,10 @@ impl App {
         if resp.clicked() {
             let on_chevron = has_kids && resp.interact_pointer_pos().map_or(false, |pp| pp.x < x0 + 13.0);
             out.push(if on_chevron { Intent::Toggle(node.key.clone()) } else { Intent::Select(node.key.clone()) });
+            // All servers is its Home: from a page the toolbar opened (Snapshots, ISO Library…) too
+            if !on_chevron && node.kind == Kind::Root {
+                out.push(Intent::Tab(Tab::Home));
+            }
         }
         if resp.double_clicked() && has_kids {
             out.push(Intent::Toggle(node.key.clone()));
@@ -4963,23 +5040,14 @@ impl App {
 
     /// How wide the buttons at the right end of the tab row are, as icons (0: none): a VM's power
     /// actions and Delete, a connection's Disconnect, and a console's keyboard.
-    fn tab_actions_width(&self, sel: &Node, current: Tab) -> f32 {
+    fn tab_actions_width(&self, sel: &Node) -> f32 {
         // buttons, each `TOOL_BTN` and a gap
-        let mut n = 0;
-        if self.vm_of(sel).is_some() {
-            n += 5; // power, Take Snapshot, Move, Copy, Delete
+        let mut w = 0.0;
+        if self.vm_of(sel).is_some() || self.host_of(sel).is_some() || self.power_on_of(sel).is_some() {
+            w += ACTIONS_BTN + TOOL_GAP; // its Actions: power, snapshots, move… (the keys too)
         }
-        if self.power_on_of(sel).is_some() {
-            n += 1; // Power On
-        } else if self.host_of(sel).is_some() {
-            n += 3; // Maintenance Mode, Restart, Shut Down
-        }
-        if current == Tab::Console && self.console.is_some() {
-            n += 1; // the keyboard
-        }
-        let mut w = n as f32 * (TOOL_BTN.x + TOOL_GAP);
         if self.root_of(sel).is_some() {
-            w += SQUARE.x + TOOL_GAP; // Disconnect (with its name when there's room)
+            w += ACTIONS_BTN + TOOL_GAP; // its Actions (Disconnect in them)
         }
         if self.tabs_for(sel).contains(&Tab::Console) {
             w += CONSOLE_BTN + TOOL_GAP; // Console, before the separator
@@ -4991,12 +5059,12 @@ impl App {
         }
     }
 
-    /// At the right end of the tab row, after a separator, as buttons all the same size (see
-    /// `paint_tool_btn`): a console's keyboard (its menu has Ctrl+Alt+Del and the other keys the
-    /// desktop keeps), then a VM's power menu, Take Snapshot, Move, Copy (a menu) and Delete; a
-    /// server's Maintenance Mode, Restart and Shut Down, or Power On; before the separator, a VM's
-    /// or a server's Console, lit while it's shown (a click then goes back to the tab before).
-    /// When the row hasn't the `need`ed room, all of it is in one Actions menu instead.
+    /// At the right end of the tab row, after a separator: a VM's or a server's Console, lit while
+    /// it's shown (a click then goes back to the tab before), and its Actions: everything it can
+    /// do, by name (a VM's power actions, snapshots, move, copy, export, delete; a server's
+    /// restart, shut down, maintenance mode and tools, or Power On; the keys the desktop keeps
+    /// while its console's shown). A pool's Actions hold its tools and Disconnect. When the row
+    /// hasn't the `need`ed room, Console goes into the Actions too.
     fn tab_actions(&mut self, ui: &mut Ui, free: Rect, sel: &Node, current: Tab, need: f32, out: &mut Vec<Intent>) {
         let pal = self.pal;
         let console_to = self.tabs_for(sel).contains(&Tab::Console).then(|| if current == Tab::Console { self.before_console } else { Tab::Console });
@@ -5011,18 +5079,7 @@ impl App {
                 .collect(),
             None => vec![],
         };
-        // the power menu: its face (the VM's state, or a ring turning while an action runs), then
-        // its entries (None: a line), the Force ones last
-        let face = self.vm_of(sel).map(|(s, _, v)| match s.busy.get(&v.rref) {
-            Some((_, op)) => Face::Busy(Tone::of_action(op)),
-            None => Face::Tool(match v.power {
-                PowerState::Running => "power-running",
-                PowerState::Suspended => "power-suspended",
-                PowerState::Paused => "power-paused",
-                _ => "power-halted",
-            }),
-        });
-        let state = self.vm_of(sel).map(|x| x.2.power.label()).unwrap_or_default();
+        // the power menu's entries (None: a line), the Force ones last
         let mut entries: Vec<Option<(usize, bool)>> = actions.iter().map(|&(i, ok, _)| Some((i, ok))).collect();
         entries.push(None);
         entries.extend(actions.iter().filter_map(|&(_, _, force)| force).map(Some));
@@ -5048,145 +5105,133 @@ impl App {
             (true, true) => "Take it out of maintenance mode…",
             (true, false) => "Maintenance mode: move its VMs off, take no new ones…",
         };
+        // a server's tools, in its Actions (twice for a check's screenshot, which shows them open)
+        let mut tools = host.as_ref().map(|(sid, href, on, _)| self.host_entries(*sid, href, *on));
+        let shot = self.shot_path.is_some() && matches!(self.shot_show.as_str(), "vm-actions" | "host-actions");
+        let shot_tools = if shot { host.as_ref().map(|(sid, href, on, _)| self.host_entries(*sid, href, *on)) } else { None };
         let mut console = if current == Tab::Console { self.console.as_mut() } else { None };
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(free).layout(egui::Layout::right_to_left(egui::Align::Center)));
         let ui = &mut child;
         ui.spacing_mut().item_spacing.x = TOOL_GAP;
-        // a connection's: Disconnect, with its name when there's room
+        // a connection's Actions: its tools (the pool's, and its server's when it's one on its
+        // own), then Disconnect (Remove, once it's disconnected)
         if let Some((sid, label, name)) = &root {
-            let wide = free.width() >= need - SQUARE.x + flat_button_width(ui, label) + 4.0;
-            let tip = format!("{} {}", if *label == "Remove" { "Remove" } else { "Disconnect from" }, name);
-            if flat_button(ui, "disconnect", label, Some(pal.red), true, !wide, &pal).on_hover_text(tip).clicked() {
-                out.push(Intent::Remove(*sid));
+            let on = *label == "Disconnect" && self.server(*sid).map_or(false, |s| s.data.is_some());
+            let mut entries = self.pool_entries(*sid, on);
+            if let Some((_, h)) = self.host_of(sel) {
+                entries.extend(self.host_entries(*sid, &h.rref, h.is_up()));
+            }
+            let tip = format!("Change the root password, a status report, disconnect from {}…", name);
+            let shot = (self.shot_path.is_some() && self.shot_show == "pool-actions").then(|| self.pool_entries(*sid, on));
+            let r = actions_menu_tip(ui, &pal, &tip, |ui| {
+                tools::tool_entries(ui, &pal, entries, out);
+                ui.separator();
+                tools::red_entry(ui, &pal, "disconnect", label, Intent::Remove(*sid), out);
+            });
+            if let Some(entries) = shot {
+                // the check's screenshot shows it open
+                egui::Area::new(egui::Id::new("pool-actions-shot")).order(egui::Order::Foreground).fixed_pos(pos2(r.max.x - 236.0, r.max.y + 4.0)).show(ui.ctx(), |ui| {
+                    egui::Frame::menu(ui.style()).show(ui, |ui| {
+                        ui.set_max_width(236.0);
+                        tools::tool_entries(ui, &pal, entries, &mut vec![]);
+                        ui.separator();
+                        tools::red_entry(ui, &pal, "disconnect", label, Intent::Remove(*sid), &mut vec![]);
+                    });
+                });
             }
             vsep(ui, &pal);
             return;
         }
-        if free.width() >= need {
-            // right to left: a server's Power On, or its Shut Down, Restart and Maintenance Mode;
-            // a VM's Delete, Copy, Move, Take Snapshot and power menu; the keyboard; then the
-            // separator and Console
-            if let Some((sid, href, tip, ok)) = &wake {
-                if tool_btn(ui, Face::Tool("power_on"), tip, *ok, &pal).clicked() {
-                    out.push(Intent::PowerOn(*sid, href.clone()));
+        // a VM's or a server's Actions: everything it can do, by name (Console in them too when
+        // the row hasn't the room for its own button)
+        let inside = free.width() < need;
+        let (vsid, vref) = vm.clone().unwrap_or_default();
+        let menu = |ui: &mut Ui, out: &mut Vec<Intent>, console: Option<&mut ConsoleView>, tools: Option<Vec<tools::Entry>>| {
+            ui.spacing_mut().item_spacing.y = 1.0;
+            ui.set_min_width(240.0);
+            if inside {
+                if let Some(to) = console_to {
+                    let label = if current == Tab::Console { "Close Console" } else { "Console" };
+                    tools::tool_entries(ui, &pal, vec![("console", label, Intent::Tab(to), true, "")], out);
+                    ui.separator();
                 }
+            }
+            // a server: Power On while it's off; else Restart, Shut Down, Maintenance Mode, then
+            // its tools
+            if let Some((sid, href, tip, ok)) = &wake {
+                tools::menu_row(ui, &pal, tools::Icon::Tool("power_on"), "Power On", "", *ok, tip, Intent::PowerOn(*sid, href.clone()), out);
             }
             if let Some((sid, href, on, maint)) = &host {
-                if tool_btn(ui, Face::Tool("clean_shutdown"), if *on { "Shut down this server…" } else { "It's off" }, *on, &pal).clicked() {
-                    out.push(Intent::AskShutdownHost(*sid, href.clone(), false));
-                }
-                if tool_btn(ui, Face::Tool("clean_reboot"), if *on { "Restart this server…" } else { "It's off" }, *on, &pal).clicked() {
-                    out.push(Intent::AskShutdownHost(*sid, href.clone(), true));
-                }
-                if tool_btn(ui, Face::Glyph("wrench", pal.orange), maint_tip(*on, *maint), *on, &pal).clicked() {
-                    out.push(Intent::AskMaintenance(*sid, href.clone()));
-                }
-            }
-            if let Some((sid, vref)) = &vm {
-                if tool_btn(ui, Face::Glyph("trash", pal.red), busy.as_deref().unwrap_or("Delete VM…"), !deleting && busy.is_none(), &pal).clicked() {
-                    out.push(Intent::AskDeleteVm(*sid, vref.clone()));
-                }
-                copy_menu(ui, &pal, *sid, vref, off && !deleting, export_ok && !deleting, out);
-                if tool_btn(ui, Face::Glyph("move", pal.accent), "Move to another server or storage…", move_ok && !deleting, &pal).clicked() {
-                    out.push(Intent::MoveVm(*sid, vref.clone(), None));
-                }
-                if tool_btn(ui, Face::Glyph("camera", pal.accent), "Take Snapshot…", snap_ok && !deleting, &pal).clicked() {
-                    out.push(Intent::TakeSnapshot(*sid, vref.clone()));
-                }
-                if let Some(face) = face {
-                    power_menu(ui, &pal, face, state, &entries, out);
+                let why = "It's off, or something's under way on it";
+                tools::menu_row(ui, &pal, tools::Icon::Tool("clean_reboot"), "Restart…", "", *on, why, Intent::AskShutdownHost(*sid, href.clone(), true), out);
+                tools::menu_row(ui, &pal, tools::Icon::Tool("clean_shutdown"), "Shut Down…", "", *on, why, Intent::AskShutdownHost(*sid, href.clone(), false), out);
+                let label = if *maint { "Exit Maintenance Mode…" } else { "Maintenance Mode…" };
+                tools::menu_row(ui, &pal, tools::Icon::Glyph("wrench", pal.orange), label, "", *on, maint_tip(*on, *maint), Intent::AskMaintenance(*sid, href.clone()), out);
+                if let Some(rows) = tools {
+                    ui.separator();
+                    tools::tool_entries(ui, &pal, rows, out);
                 }
             }
-            if let Some(c) = console.as_deref_mut() {
-                keys_button(ui, &pal, c);
+            // a VM: its power actions (the Force ones after a line), Take Snapshot, Move, Copy
+            // VM, Make Template, Export, and Delete last
+            if vm.is_some() {
+                for e in &entries {
+                    match *e {
+                        Some((i, ok)) => power_row(ui, &pal, i, ok, out),
+                        None => {
+                            ui.separator();
+                        }
+                    }
+                }
+                ui.separator();
+                let not_now = "Not now: it's busy, or its server isn't there";
+                let rows: Vec<tools::Entry> = vec![
+                    ("camera", "Take Snapshot…", Intent::TakeSnapshot(vsid, vref.clone()), snap_ok && !deleting, not_now),
+                    ("move", "Move…", Intent::MoveVm(vsid, vref.clone(), None), move_ok && !deleting, not_now),
+                    ("copy", "Copy VM…", Intent::CopyVm(vsid, vref.clone()), off && !deleting, SHUT_DOWN_FIRST),
+                    ("template", "Make Template…", Intent::MakeTemplate(vsid, vref.clone()), off && !deleting, SHUT_DOWN_FIRST),
+                    ("download", "Export to a File…", Intent::ExportVm(vsid, vref.clone()), export_ok && !deleting, CANT_EXPORT),
+                ];
+                tools::tool_entries(ui, &pal, rows, out);
             }
-            vsep(ui, &pal);
+            // the keys the desktop keeps, while its console's shown
+            if let Some(c) = console {
+                ui.separator();
+                ui.add_enabled_ui(c.connected(), |ui| ui.menu_button("Send keys (Ctrl+Alt+Del…)", |ui| c.keys_menu(ui)));
+            }
+            if vm.is_some() {
+                ui.separator();
+                tools::red_entry_if(ui, &pal, "trash", "Delete VM…", Intent::AskDeleteVm(vsid, vref.clone()), !deleting && busy.is_none(), busy.as_deref().unwrap_or(""), out);
+            }
+        };
+        let any = vm.is_some() || host.is_some() || wake.is_some();
+        if any || (inside && console_to.is_some()) {
+            let tip = if vm.is_some() {
+                "Power, snapshots, move, copy, export, delete"
+            } else if host.is_some() {
+                "Restart, shut down, maintenance mode, its toolstack, backups, a status report"
+            } else {
+                "Turn it on, and more"
+            };
+            let r = actions_menu_tip(ui, &pal, tip, |ui| menu(ui, out, console.as_deref_mut(), tools.take()));
+            if shot {
+                // the check's screenshot shows it open
+                egui::Area::new(egui::Id::new("actions-shot")).order(egui::Order::Foreground).fixed_pos(pos2(r.max.x - 256.0, r.max.y + 4.0)).show(ui.ctx(), |ui| {
+                    egui::Frame::menu(ui.style()).show(ui, |ui| {
+                        ui.set_max_width(256.0);
+                        menu(ui, &mut vec![], None, shot_tools);
+                    });
+                });
+            }
+        }
+        if !inside {
             if let Some(to) = console_to {
                 let on = current == Tab::Console;
                 if console_button(ui, &pal, on).on_hover_text(if on { "Back to where you were" } else { "Its screen, to work in it" }).clicked() {
                     out.push(Intent::Tab(to));
                 }
             }
-            return;
         }
-        // no room: one Actions menu with all of it, by name
-        actions_menu(ui, &pal, |ui| {
-            let mut line = false;
-            if let Some(to) = console_to {
-                let label = if current == Tab::Console { "Close Console" } else { "Console" };
-                if ui.button(label).clicked() {
-                    out.push(Intent::Tab(to));
-                    ui.close_menu();
-                }
-                line = true;
-            }
-            if let Some(c) = console.as_deref_mut() {
-                ui.add_enabled_ui(c.connected(), |ui| ui.menu_button("Send keys", |ui| c.keys_menu(ui)));
-            }
-            if let Some((sid, href, tip, ok)) = &wake {
-                if line {
-                    ui.separator();
-                }
-                if ui.add_enabled(*ok, egui::Button::new("Power On")).on_hover_text(tip.as_str()).clicked() {
-                    out.push(Intent::PowerOn(*sid, href.clone()));
-                    ui.close_menu();
-                }
-            }
-            if let Some((sid, href, on, maint)) = &host {
-                if line {
-                    ui.separator();
-                }
-                let label = if *maint { "Exit Maintenance Mode…" } else { "Maintenance Mode…" };
-                for (label, intent) in [
-                    (label, Intent::AskMaintenance(*sid, href.clone())),
-                    ("Restart…", Intent::AskShutdownHost(*sid, href.clone(), true)),
-                    ("Shut Down…", Intent::AskShutdownHost(*sid, href.clone(), false)),
-                ] {
-                    if ui.add_enabled(*on, egui::Button::new(label)).on_disabled_hover_text("It's off, or busy").clicked() {
-                        out.push(intent);
-                        ui.close_menu();
-                    }
-                }
-            }
-            if !actions.is_empty() && line {
-                ui.separator();
-            }
-            for &(i, ok, force) in &actions {
-                for (j, can) in std::iter::once((i, ok)).chain(force) {
-                    let a = &ACTIONS[j];
-                    if ui.add_enabled(can, egui::Button::new(a.label).shortcut_text(a.shortcut.text())).clicked() {
-                        out.push(Intent::Action(j));
-                        ui.close_menu();
-                    }
-                }
-            }
-            if let Some((sid, vref)) = &vm {
-                ui.separator();
-                if ui.add_enabled(move_ok && !deleting, egui::Button::new("Move…")).clicked() {
-                    out.push(Intent::MoveVm(*sid, vref.clone(), None));
-                    ui.close_menu();
-                }
-                if ui.add_enabled(snap_ok && !deleting, egui::Button::new("Take Snapshot…")).clicked() {
-                    out.push(Intent::TakeSnapshot(*sid, vref.clone()));
-                    ui.close_menu();
-                }
-                for (label, intent) in [("Copy VM…", Intent::CopyVm(*sid, vref.clone())), ("Make Template…", Intent::MakeTemplate(*sid, vref.clone()))] {
-                    if ui.add_enabled(off && !deleting, egui::Button::new(label)).on_disabled_hover_text(SHUT_DOWN_FIRST).clicked() {
-                        out.push(intent);
-                        ui.close_menu();
-                    }
-                }
-                if ui.add_enabled(export_ok && !deleting, egui::Button::new("Export to a File…")).on_disabled_hover_text(CANT_EXPORT).clicked() {
-                    out.push(Intent::ExportVm(*sid, vref.clone()));
-                    ui.close_menu();
-                }
-                let del = ui.add_enabled(!deleting && busy.is_none(), egui::Button::new(egui::RichText::new("Delete VM…").color(pal.red)));
-                if del.on_disabled_hover_text(busy.as_deref().unwrap_or("")).clicked() {
-                    out.push(Intent::AskDeleteVm(*sid, vref.clone()));
-                    ui.close_menu();
-                }
-            }
-        });
         vsep(ui, &pal);
     }
 
@@ -5398,7 +5443,7 @@ impl App {
             _ if !has_data => vec![Tab::General, Tab::Logs],
             Kind::Vm => vec![Tab::Overview, Tab::Performance, Tab::Snapshots, Tab::Console, Tab::Logs, Tab::Details],
             Kind::Host => vec![Tab::Overview, Tab::Performance, Tab::Storage, Tab::Console, Tab::Logs, Tab::Details],
-            Kind::Pool => vec![Tab::Overview, Tab::Storage, Tab::Logs, Tab::Details],
+            Kind::Pool => vec![Tab::Overview, Tab::Storage, Tab::Logs, Tab::Details, Tab::Helper],
             _ => vec![Tab::General, Tab::Logs],
         }
     }
@@ -6742,6 +6787,8 @@ impl App {
     /// it's paused or its last run failed; grey on none, with Schedule….
     fn schedule_box(&self, ui: &mut Ui, sid: u32, vm: &str, x: Option<&ScheduleInfo>, others: &[String], off: Option<&str>, out: &mut Vec<Intent>) {
         let pal = self.pal;
+        // its times on this computer's clock
+        let shift = self.server(sid).and_then(|s| s.data.as_ref()).and_then(|d| d.schedule_shift()).unwrap_or(0);
         let news = x.and_then(|x| self.schedule_news(sid).remove(&x.rref));
         let failed = x.and_then(|x| crate::vmss::failure(x, news.as_ref()));
         let warn = x.map_or(false, |x| !x.enabled) || failed.is_some();
@@ -6775,9 +6822,9 @@ impl App {
                     match x {
                         Some(x) => {
                             ui.label(egui::RichText::new(format!("On the schedule '{}'", x.name)).font(bold).color(pal.ink));
-                            let mut line = format!("{}  ·  {}", x.summary(), crate::vmss::last_ran(x));
+                            let mut line = format!("{}  ·  {}", x.shifted(shift).summary(), crate::vmss::last_ran(x));
                             if !x.enabled {
-                                line = format!("Paused: it takes no snapshots  ·  {}", x.summary());
+                                line = format!("Paused: it takes no snapshots  ·  {}", x.shifted(shift).summary());
                             }
                             ui.add(egui::Label::new(egui::RichText::new(line).size(12.5).color(soft)).wrap());
                             if let Some(n) = failed {
@@ -7403,6 +7450,14 @@ impl App {
         if let Some(c) = self.console.as_mut() {
             let allow_keyboard = matches!(self.dialog, Dialog::None);
             c.ui(ui, &pal, allow_keyboard);
+            // the Server Helper's install command, typed once the console's there (Enter is the
+            // person's to press)
+            if let Some((s, vm, text)) = &self.helper_type {
+                if c.sid == *s && c.vm == *vm && c.connected() {
+                    c.type_text(text);
+                    self.helper_type = None;
+                }
+            }
         }
     }
 
@@ -7552,7 +7607,10 @@ impl App {
                 m.set_load(load, own);
             }
         }
+        // a server's tool's dialog (tools.rs)
+        let tool_step = self.tool_dialog(ctx);
         match &mut self.dialog {
+            Dialog::Backup(_) | Dialog::Report(_) | Dialog::Password(_) | Dialog::ConfirmToolstack { .. } | Dialog::ConfirmRenewCert { .. } => {}
             Dialog::MoveVm(d) => {
                 move_action = Some((d.sid, d.ui(ctx, &pal)));
             }
@@ -8597,6 +8655,12 @@ impl App {
         if close {
             self.dialog = Dialog::None;
         }
+        match tool_step {
+            crate::hosttools::ToolAction::None => {}
+            crate::hosttools::ToolAction::Close => self.dialog = Dialog::None,
+            crate::hosttools::ToolAction::Browse => self.tool_browse(ctx),
+            crate::hosttools::ToolAction::Go => self.tool_go(ctx),
+        }
         // from the Close question: stay (the dialog that was open comes back), or go
         match close_app {
             Some(false) => {
@@ -8744,10 +8808,13 @@ impl App {
         match sched_pick {
             Some(PickAction::Close) => self.dialog = Dialog::None,
             Some(PickAction::Set(sid, vms, vmss)) => self.set_vm_schedule(sid, format!("pick:{}", sid), vms, vmss, ctx),
-            Some(PickAction::New(sid, vms)) => self.dialog = Dialog::Schedule(Box::new(ScheduleDialog::new(sid, None, vms))),
+            Some(PickAction::New(sid, vms)) => {
+                let shift = self.server(sid).and_then(|s| s.data.as_ref()).and_then(|d| d.schedule_shift());
+                self.dialog = Dialog::Schedule(Box::new(ScheduleDialog::new(sid, None, vms, shift)));
+            }
             Some(PickAction::Edit(sid, vmss)) => {
-                if let Some(x) = self.server(sid).and_then(|s| s.data.as_ref()).and_then(|d| d.schedules.iter().find(|x| x.rref == vmss)) {
-                    self.dialog = Dialog::Schedule(Box::new(ScheduleDialog::new(sid, Some(x), vec![])));
+                if let Some((x, d)) = self.server(sid).and_then(|s| s.data.as_ref()).and_then(|d| d.schedules.iter().find(|x| x.rref == vmss).map(|x| (x, d))) {
+                    self.dialog = Dialog::Schedule(Box::new(ScheduleDialog::new(sid, Some(x), vec![], d.schedule_shift())));
                 }
             }
             Some(PickAction::None) | None => {}
@@ -8935,6 +9002,21 @@ impl eframe::App for App {
                 "about" => out.push(Intent::About),
                 "sr-detached" | "sr-repair-failed" => out.extend(sel.sid.map(|sid| Intent::RepairSr(sid, "sr-iso".into()))),
                 "snapshots" => out.push(Intent::Tab(Tab::Snapshots)),
+                // the pool's Server Helper tab (with SVM_DEMO_HELPER: installed); the box ticked
+                "helper" => {
+                    out.push(Intent::Tab(Tab::Helper));
+                    if let Some(sid) = sel.sid {
+                        self.helper.entry(sid).or_default().accepted = std::env::var("SVM_SHOT_ACCEPTED").is_ok();
+                    }
+                }
+                // a server's tools' dialogs (demo-host-01's), a pool's
+                "backup" | "restore" => out.extend(sel.sid.map(|sid| Intent::BackupHost(sid, "host-a".into(), self.shot_show == "restore"))),
+                "toolstack" => out.extend(sel.sid.map(|sid| Intent::AskToolstack(sid, "host-a".into()))),
+                "renew-cert" => out.extend(sel.sid.map(|sid| Intent::AskRenewCert(sid, "host-a".into(), false, None))),
+                "status-report" => out.extend(sel.sid.map(|sid| Intent::StatusReport(sid, None))),
+                "root-password" => out.extend(sel.sid.map(Intent::ChangePassword)),
+                // Web Server's Add USB device, open
+                "vm-usb-add" => ctx.data_mut(|d| d.insert_temp(egui::Id::new(overview::SHOT_USB_ADD), true)),
                 // a VM's Snapshots tab whose schedule's last run failed; one on no schedule
                 "snapshots-failed" => out.extend(sel.sid.map(|sid| Intent::OpenVmSnapshots(sid, "vm-db".into()))),
                 "snapshots-unscheduled" => out.extend(sel.sid.map(|sid| Intent::OpenVmSnapshots(sid, "vm-desk".into()))),
@@ -8990,6 +9072,8 @@ impl eframe::App for App {
                     self.alerts_view.open = Some("msg:OpaqueRef:demo-message-2".into());
                 }
                 "alert-rules" => out.extend(sel.sid.map(|sid| Intent::AlertRules(sid, "VM", "vm-web".into(), "Web Server".into(), Watched::Vm))),
+                // demo-host-02's local storage's (with SVM_DEMO_NO_SR_STATS: the app watches it)
+                "sr-alert-rules" => out.extend(sel.sid.map(|sid| Intent::AlertRules(sid, "SR", "sr-local2".into(), "Local storage".into(), Watched::Sr))),
                 // (one dismissed as the window opens: it's gone from the page, the count and the server)
                 "alerts-dismissed" => {
                     out.push(Intent::Alerts);
@@ -9345,7 +9429,7 @@ impl eframe::App for App {
             ui.spacing_mut().item_spacing.y = 0.0;
             let tabs = self.tabs_for(&sel);
             let current = if tabs.contains(&self.tab) { self.tab } else { tabs[0] };
-            let actions = self.tab_actions_width(&sel, current);
+            let actions = self.tab_actions_width(&sel);
             // (a VM's or a server's console is a button at the row's end, not a tab among the others;
             // All servers' pages that the toolbar opens are its buttons only)
             // (All servers: Home alone; a page the toolbar opens, none, but the Snapshots page's
@@ -9472,6 +9556,7 @@ impl eframe::App for App {
                 Tab::AllSchedules => self.schedules_page(ui, &mut out),
                 Tab::Templates => self.templates_tab(ui, &sel, &mut out),
                 Tab::Logs => self.logs(ui, &sel, &mut out),
+                Tab::Helper => self.helper_page(ui, &sel, &mut out),
             });
         });
 
@@ -9491,6 +9576,33 @@ impl eframe::App for App {
         }
         self.screenshot(ctx);
         ctx.request_repaint_after(Duration::from_millis(250));
+    }
+
+    /// Closing: each server's session is ended there (logged out), all at once and for three
+    /// seconds at most, rather than left for the server to drop a day later.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.log_out_all(Duration::from_secs(3));
+    }
+}
+
+impl App {
+    /// Logs out of every server, waiting up to `wait` for them to answer.
+    fn log_out_all(&mut self, wait: Duration) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let n = self.servers.len();
+        for s in &self.servers {
+            let (conn, tx) = (s.conn.clone(), tx.clone());
+            std::thread::spawn(move || {
+                conn.close();
+                let _ = tx.send(());
+            });
+        }
+        let end = Instant::now() + wait;
+        for _ in 0..n {
+            if rx.recv_timeout(end.saturating_duration_since(Instant::now())).is_err() {
+                break;
+            }
+        }
     }
 }
 
@@ -9525,6 +9637,19 @@ pub(crate) fn text_field(ui: &mut Ui, pal: &Pal, text: &mut String, width: f32, 
     edit.rect = edit.rect + pad; // egui reports the box without its margin
     let stroke = Stroke::new(1.0_f32, if edit.has_focus() { pal.accent } else { pal.border_strong });
     ui.painter().set(bg, egui::epaint::RectShape::new(edit.rect, Rounding::same(5.0), pal.input, stroke));
+    edit
+}
+
+/// A search box: a light outline that stays as it is under the mouse (the accent colour while
+/// typing in it), its hint inside while it's empty.
+pub(crate) fn search_box(ui: &mut Ui, pal: &Pal, text: &mut String, hint: &str, width: f32) -> egui::Response {
+    let bg = ui.painter().add(egui::Shape::Noop);
+    let row = ui.text_style_height(&egui::TextStyle::Body);
+    let pad = egui::Margin::symmetric(8.0, 6.0);
+    let mut edit = ui.add_sized([width, row + 12.0], egui::TextEdit::singleline(text).hint_text(hint).frame(false).margin(pad));
+    edit.rect = edit.rect + pad; // egui reports the box without its margin
+    let stroke = Stroke::new(1.0_f32, if edit.has_focus() { pal.accent } else { pal.border_strong });
+    ui.painter().set(bg, egui::epaint::RectShape::new(edit.rect, Rounding::same(6.0), pal.input, stroke));
     edit
 }
 
@@ -10076,124 +10201,20 @@ const SHUT_DOWN_FIRST: &str = "Shut it down first: a copy of a running VM is lik
 /// Why Export waits: the VM is busy, its server is down, or it's in a state it can't be saved in.
 const CANT_EXPORT: &str = "It can't be exported right now (busy, or its server isn't answering)";
 
-/// Copy VM, Make Template and Export to a File: one button (the copy icon and an arrow) opening
-/// them, Copy and Make Template greyed out while the VM is on (`off`), Export while it can't be
-/// (`export`; a running VM is exported from a snapshot).
-fn copy_menu(ui: &mut Ui, pal: &Pal, sid: u32, vm: &str, off: bool, export: bool, out: &mut Vec<Intent>) {
-    let m = egui::menu::menu_custom_button(ui, egui::Button::new("").frame(false).min_size(TOOL_BTN), |ui| {
-        ui.set_min_width(200.0);
-        let entries = [
-            ("copy", "Copy VM…", Intent::CopyVm(sid, vm.to_string()), off, SHUT_DOWN_FIRST),
-            ("template", "Make Template…", Intent::MakeTemplate(sid, vm.to_string()), off, SHUT_DOWN_FIRST),
-            ("download", "Export to a File…", Intent::ExportVm(sid, vm.to_string()), export, CANT_EXPORT),
-        ];
-        for (glyph, label, intent, ok, why) in entries {
-            let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), if ok { Sense::click() } else { Sense::hover() });
-            if ok && resp.hovered() {
-                ui.painter().rect_filled(r, Rounding::same(5.0), pal.hover);
-            }
-            let ink = if ok { pal.ink } else { pal.ink_faint };
-            paint_glyph(ui.painter(), Rect::from_min_size(r.min + vec2(7.0, 7.0), vec2(16.0, 16.0)), glyph, if ok { pal.accent } else { pal.ink_faint });
-            ui.painter().text(pos2(r.min.x + 32.0, r.center().y), Align2::LEFT_CENTER, label, FontId::proportional(13.0), ink);
-            let resp = if ok { resp } else { resp.on_hover_text(why) };
-            if ok && resp.clicked() {
-                out.push(intent);
-                ui.close_menu();
-            }
-        }
-    });
-    let any = off || export;
-    paint_tool_btn(ui.painter(), m.response.rect, &Face::Glyph("copy", pal.accent), any, m.response.hovered() || m.inner.is_some(), true, pal);
-    m.response.on_hover_text(match (off, export) {
-        (true, _) => "Copy VM, make a template from it, or export it to a file",
-        (false, true) => "Export it to a file (Copy VM and Make Template: shut it down first)",
-        _ => "Copy VM, Make Template: shut it down first",
-    });
-}
-
-/// The VM's power menu: one button, the power symbol in the colour of the VM's state (a ring
-/// turning while an action runs), and an arrow; a click opens the actions, each with its coloured icon and
-/// shortcut, greyed out when it can't run (`entries`: action and whether it can run; None is a
-/// line). A click never runs one by itself.
-fn power_menu(ui: &mut Ui, pal: &Pal, face: Face, state: &str, entries: &[Option<(usize, bool)>], out: &mut Vec<Intent>) {
-    let m = egui::menu::menu_custom_button(ui, egui::Button::new("").frame(false).min_size(TOOL_BTN), |ui| {
-        ui.set_min_width(220.0);
-        ui.spacing_mut().item_spacing.y = 1.0;
-        for e in entries {
-            let Some((i, ok)) = *e else {
-                ui.separator();
-                continue;
-            };
-            let a = &ACTIONS[i];
-            let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), if ok { Sense::click() } else { Sense::hover() });
-            if ok && resp.hovered() {
-                ui.painter().rect_filled(r, Rounding::same(5.0), pal.hover);
-            }
-            paint_tool(ui.painter(), Rect::from_min_size(r.min + vec2(4.0, 5.0), vec2(20.0, 20.0)), a.op, ok, pal);
-            let ink = if ok { pal.ink } else { pal.ink_faint };
-            ui.painter().text(pos2(r.min.x + 32.0, r.center().y), Align2::LEFT_CENTER, a.label, FontId::proportional(13.0), ink);
-            ui.painter().text(pos2(r.max.x - 8.0, r.center().y), Align2::RIGHT_CENTER, a.shortcut.text(), FontId::proportional(12.0), pal.ink_faint);
-            if ok && resp.clicked() {
-                out.push(Intent::Action(i));
-                ui.close_menu();
-            }
-        }
-    });
-    paint_tool_btn(ui.painter(), m.response.rect, &face, true, m.response.hovered() || m.inner.is_some(), true, pal);
-    m.response.on_hover_text(format!("Power: {}", state));
-}
-
-/// A console's keyboard button: its menu sends Ctrl+Alt+Del and the keys the desktop keeps.
-fn keys_button(ui: &mut Ui, pal: &Pal, c: &mut ConsoleView) {
-    let on = c.connected();
-    ui.add_enabled_ui(on, |ui| {
-        let m = egui::menu::menu_custom_button(ui, egui::Button::new("").frame(false).min_size(TOOL_BTN), |ui| c.keys_menu(ui));
-        paint_tool_btn(ui.painter(), m.response.rect, &Face::Glyph("keyboard", pal.icon), on, (m.response.hovered() && on) || m.inner.is_some(), true, pal);
-        m.response.on_hover_text("Send keys: Ctrl+Alt+Del, the Windows key, Alt+Tab…");
-    });
-}
-
-/// What a button at the tab row's end shows.
-enum Face<'a> {
-    /// a toolbar glyph (`paint_tool`'s), in its action's colour
-    Tool(&'a str),
-    /// a plain glyph (`paint_glyph`'s), in a colour
-    Glyph(&'a str, Color32),
-    /// a ring turning: an action under way
-    Busy(Tone),
-}
-
-/// The buttons at the tab row's end (power, Take Snapshot, Copy, Delete; a server's Restart and
-/// Shut Down; the keyboard) are all `TOOL_BTN` big: a soft pill in the colour of what it does (a
-/// stronger one under the mouse, a grey one when it can't be used), its face, and a small arrow
-/// when it opens a menu.
-fn paint_tool_btn(p: &egui::Painter, r: Rect, face: &Face, enabled: bool, hot: bool, menu: bool, pal: &Pal) {
-    let col = match face {
-        Face::Tool(op) => tool_color(op, pal),
-        Face::Glyph(_, c) => *c,
-        Face::Busy(_) => pal.ink_soft,
-    };
-    let pill = Rect::from_center_size(r.center(), vec2(r.width() - 2.0, 26.0));
-    let tint = if enabled {
-        col.gamma_multiply(match (pal.dark, hot) {
-            (true, false) => 0.22,
-            (true, true) => 0.36,
-            (false, false) => 0.14,
-            (false, true) => 0.26,
-        })
-    } else {
-        pal.ink_faint.gamma_multiply(0.15)
-    };
-    p.rect_filled(pill, Rounding::same(7.0), tint);
-    let at = if menu { pos2(pill.min.x + 16.0, pill.center().y) } else { pill.center() };
-    match face {
-        Face::Tool(op) => paint_tool_glyph(p, Rect::from_center_size(at, vec2(22.0, 22.0)), op, enabled, pal),
-        Face::Glyph(g, _) => paint_glyph(p, Rect::from_center_size(at, vec2(16.0, 16.0)), g, if enabled { col } else { pal.ink_faint }),
-        Face::Busy(tone) => paint_icon(p, Rect::from_center_size(at, vec2(16.0, 16.0)), IconKind::Busy(*tone), pal, pal.window),
+/// A power action's row in a menu: its coloured icon, its name, its shortcut.
+fn power_row(ui: &mut Ui, pal: &Pal, i: usize, ok: bool, out: &mut Vec<Intent>) {
+    let a = &ACTIONS[i];
+    let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), if ok { Sense::click() } else { Sense::hover() });
+    if ok && resp.hovered() {
+        ui.painter().rect_filled(r, Rounding::same(5.0), pal.hover);
     }
-    if menu {
-        let c = pos2(pill.max.x - 11.0, pill.center().y);
-        p.add(egui::Shape::line(vec![pos2(c.x - 3.5, c.y - 1.5), pos2(c.x, c.y + 2.0), pos2(c.x + 3.5, c.y - 1.5)], Stroke::new(1.4_f32, if enabled { col } else { pal.ink_faint })));
+    paint_tool(ui.painter(), Rect::from_min_size(r.min + vec2(4.0, 5.0), vec2(20.0, 20.0)), a.op, ok, pal);
+    let ink = if ok { pal.ink } else { pal.ink_faint };
+    ui.painter().text(pos2(r.min.x + 32.0, r.center().y), Align2::LEFT_CENTER, a.label, FontId::proportional(13.0), ink);
+    ui.painter().text(pos2(r.max.x - 8.0, r.center().y), Align2::RIGHT_CENTER, a.shortcut.text(), FontId::proportional(12.0), pal.ink_faint);
+    if ok && resp.clicked() {
+        out.push(Intent::Action(i));
+        ui.close_menu();
     }
 }
 
@@ -10234,9 +10255,9 @@ fn console_button(ui: &mut Ui, pal: &Pal, on: bool) -> egui::Response {
 /// How wide the Actions button is.
 const ACTIONS_BTN: f32 = 100.0;
 
-/// In a narrow window, the tab row's buttons all in one: "Actions" on a soft pill, a menu of them
-/// by name under it (`add`).
-fn actions_menu(ui: &mut Ui, pal: &Pal, add: impl FnOnce(&mut Ui)) {
+/// The Actions button at the tab row's end: "Actions" and an arrow on a soft grey pill; a click
+/// opens what `add` puts in its menu. Where it is.
+pub(super) fn actions_menu_tip(ui: &mut Ui, pal: &Pal, tip: &str, add: impl FnOnce(&mut Ui)) -> Rect {
     let slot = ui.painter().add(egui::Shape::Noop);
     let m = egui::menu::menu_custom_button(ui, egui::Button::new("").frame(false).min_size(vec2(ACTIONS_BTN, TOOL_BTN.y)), |ui| {
         ui.set_min_width(210.0);
@@ -10259,14 +10280,18 @@ fn actions_menu(ui: &mut Ui, pal: &Pal, add: impl FnOnce(&mut Ui)) {
     p.galley(pos2(x, pill.center().y - text.size().y / 2.0), text.clone(), pal.ink);
     let c = pos2(x + text.size().x + 10.0, pill.center().y);
     p.add(egui::Shape::line(vec![pos2(c.x - 3.5, c.y - 1.5), pos2(c.x, c.y + 2.0), pos2(c.x + 3.5, c.y - 1.5)], Stroke::new(1.4_f32, pal.ink_soft)));
-    m.response.on_hover_text("Console, power, snapshots and more");
+    m.response.on_hover_text(tip);
+    r
 }
 
-/// A button at the tab row's end (see `paint_tool_btn`); its name is its tip.
-fn tool_btn(ui: &mut Ui, face: Face, tip: &str, enabled: bool, pal: &Pal) -> egui::Response {
-    let (r, resp) = ui.allocate_exact_size(TOOL_BTN, if enabled { Sense::click() } else { Sense::hover() });
-    paint_tool_btn(ui.painter(), r, &face, enabled, enabled && resp.hovered(), false, pal);
-    resp.on_hover_text(tip)
+/// A small borderless glyph button (an X to put something away); whether it was clicked.
+pub(super) fn glyph_button_small(ui: &mut Ui, pal: &Pal, glyph: &str, tip: &str) -> bool {
+    let (r, resp) = ui.allocate_exact_size(vec2(26.0, 26.0), Sense::click());
+    if resp.hovered() {
+        ui.painter().rect_filled(r, Rounding::same(6.0), pal.hover);
+    }
+    paint_glyph(ui.painter(), Rect::from_center_size(r.center(), vec2(13.0, 13.0)), glyph, pal.ink_soft);
+    resp.on_hover_text(tip).clicked()
 }
 
 /// A thin upright line before a group of buttons.
@@ -10423,6 +10448,12 @@ fn short_home(p: &Path) -> String {
         Ok(h) if !h.is_empty() && full.starts_with(&h) => format!("~{}", &full[h.len()..]),
         _ => full,
     }
+}
+
+/// A fraction as a percentage to type or read: "90", "2.5".
+fn typed_pct(f: f64) -> String {
+    let p = (f * 1000.0).round() / 10.0;
+    if p.fract() == 0.0 { format!("{}", p as i64) } else { format!("{}", p) }
 }
 
 /// Why an export or import failed, in words.

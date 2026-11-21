@@ -181,6 +181,11 @@ pub enum VmChange {
     AddNic { net: String },
     MoveNic { vif: String, net: String },
     RemoveNic { vif: String },
+    /// A server's USB device (`pusb`, its `group`) passed to it, at its next start; `enable`: the
+    /// server's to be told first that it can be passed on.
+    AddUsb { pusb: String, group: String, name: String, enable: bool },
+    /// Taken off it (unplugged first while it runs).
+    RemoveUsb { vusb: String, name: String },
 }
 
 impl VmChange {
@@ -201,6 +206,8 @@ impl VmChange {
             VmChange::AddNic { .. } => format!("Adding a network card to VM '{}'", vm),
             VmChange::MoveNic { .. } => format!("Moving a network card of VM '{}' to another network", vm),
             VmChange::RemoveNic { .. } => format!("Removing a network card from VM '{}'", vm),
+            VmChange::AddUsb { name, .. } => format!("Passing USB device '{}' to VM '{}'", name, vm),
+            VmChange::RemoveUsb { name, .. } => format!("Taking USB device '{}' off VM '{}'", name, vm),
         }
     }
 }
@@ -730,6 +737,12 @@ pub struct SrInfo {
     /// (VDI_MIRROR_IN, or VDI_MIRROR): live storage migration. (Taken as yes when not known.)
     pub live_out: bool,
     pub live_in: bool,
+    /// Its kind tells the pool how full it is (its SM's SR_STATS): only then can the pool's own
+    /// monitor raise a "fuller than" alert for it. Most kinds (EXT, XFS, NFS, LVM…) don't.
+    pub stats: bool,
+    /// The "fuller than" limit set on it (its other_config's perfmon): the fraction, and for how
+    /// long (seconds).
+    pub fill_limit: Option<(f64, i64)>,
 }
 
 /// Storage that should be mounted somewhere it isn't.
@@ -852,6 +865,89 @@ pub struct PoolData {
     pub schedules: Vec<ScheduleInfo>,
     /// Why it can't have snapshot schedules, when it can't (its license, or a version without).
     pub schedules_off: Option<String>,
+    /// The USB devices plugged into its servers (PUSBs), and the VMs they're passed to.
+    pub usbs: Vec<UsbInfo>,
+    /// Why its VMs can't have USB devices, when they can't (its license, or a version without).
+    pub usb_off: Option<String>,
+    /// Its coordinator's clock: how far its local time is from UTC (seconds; 0 on a server set to
+    /// UTC), when known. Snapshot schedules run on that clock.
+    pub clock_offset: Option<i64>,
+}
+
+/// A part a server's status report can hold (one of xen-bugtool's capabilities: "xenserver-logs",
+/// "system-logs"…): whether it's in by default, whether it may hold personal data ("yes",
+/// "maybe", "if_customized", "no"), and how big it can be (bytes, -1 when not said).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ReportPart {
+    pub key: String,
+    pub default: bool,
+    pub pii: String,
+    pub max_size: i64,
+}
+
+/// xen-bugtool's capabilities, as the server lists them:
+/// `<capability key="xenserver-logs" default-checked="yes" pii="maybe" max-size="…" …/>`.
+pub fn parse_report_parts(xml: &str) -> Vec<ReportPart> {
+    let attr = |tag: &str, name: &str| -> String {
+        let pat = format!("{}=\"", name);
+        tag.find(&pat).map(|i| &tag[i + pat.len()..]).and_then(|rest| rest.find('"').map(|j| rest[..j].to_string())).unwrap_or_default()
+    };
+    xml.split("<capability")
+        .skip(1)
+        .filter_map(|rest| {
+            let tag = &rest[..rest.find('>').unwrap_or(rest.len())];
+            let key = attr(tag, "key");
+            (!key.is_empty()).then(|| ReportPart { default: attr(tag, "default-checked") == "yes", pii: attr(tag, "pii"), max_size: attr(tag, "max-size").parse().unwrap_or(-1), key })
+        })
+        .collect()
+}
+
+/// A USB device plugged into one of the pool's servers (a PUSB), and the VM it's passed to (its
+/// group's VUSB): a VM gets it when it starts, and then starts on that server only.
+#[derive(Clone, Debug, Default)]
+pub struct UsbInfo {
+    pub rref: String,
+    pub host: String,
+    /// Its USB group (one device each): what a VM is given.
+    pub group: String,
+    /// Where it's plugged in ("1-2": bus 1, port 2).
+    pub path: String,
+    pub vendor: String,
+    pub product: String,
+    pub description: String,
+    /// "0781:5583".
+    pub ids: String,
+    pub serial: String,
+    /// It can be passed to a VM (off: the server keeps it, a USB stick as removable storage).
+    pub passthrough: bool,
+    /// The VM it's passed to, its VUSB, and whether it's plugged into that VM now.
+    pub vm: Option<String>,
+    pub vusb: Option<String>,
+    pub attached: bool,
+}
+
+impl UsbInfo {
+    /// Its product's name alone ("Ultra Fit"), for a row; its full name when it has none.
+    pub fn short(&self) -> String {
+        if self.product.trim().is_empty() {
+            self.name()
+        } else {
+            self.product.trim().to_string()
+        }
+    }
+    /// Its name: maker and product ("SanDisk Corp. Ultra Fit"), as the server read them.
+    pub fn name(&self) -> String {
+        let both = format!("{} {}", self.vendor.trim(), self.product.trim()).trim().to_string();
+        if !both.is_empty() {
+            both
+        } else if !self.description.trim().is_empty() {
+            self.description.trim().replace('_', " ")
+        } else if !self.ids.is_empty() {
+            format!("USB device {}", self.ids)
+        } else {
+            "USB device".into()
+        }
+    }
 }
 
 /// How often a snapshot schedule takes its snapshots.
@@ -931,9 +1027,55 @@ impl ScheduleInfo {
             }
         }
     }
+    /// Its time alone: ":15" (hourly), "03:00", "Mon, Fri 03:00".
+    pub fn at(&self) -> String {
+        match self.every {
+            Every::Hourly => format!(":{:02}", self.min),
+            Every::Daily => format!("{:02}:{:02}", self.hour, self.min),
+            Every::Weekly => {
+                let days: Vec<&str> = WEEK_DAYS.iter().filter(|d| self.days.iter().any(|x| x == *d)).map(|d| &d[..3]).collect();
+                format!("{} {:02}:{:02}", days.join(", "), self.hour, self.min)
+            }
+        }
+    }
     /// When it runs and how many it keeps: "Daily at 03:00 · keeps 7".
     pub fn summary(&self) -> String {
         format!("{}  ·  keeps {}", self.when(), self.keep)
+    }
+    /// The same times on a clock `by` seconds ahead (behind when negative): from the pool's clock
+    /// to this computer's, or back. Hours past midnight move the days of a weekly one too; an
+    /// hourly one moves by the minutes only. (`by` is taken to the nearest quarter of an hour.)
+    pub fn shifted(&self, by: i64) -> ScheduleInfo {
+        let by = (by as f64 / 900.0).round() as i64 * 15; // minutes
+        let mut x = self.clone();
+        if by == 0 {
+            return x;
+        }
+        if self.every == Every::Hourly {
+            x.min = (self.min as i64 + by).rem_euclid(60) as u32;
+            return x;
+        }
+        let total = self.hour as i64 * 60 + self.min as i64 + by;
+        let days = total.div_euclid(1440);
+        let rest = total.rem_euclid(1440);
+        (x.hour, x.min) = ((rest / 60) as u32, (rest % 60) as u32);
+        if days != 0 {
+            x.days = WEEK_DAYS
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| {
+                    let from = WEEK_DAYS[(*i as i64 - days).rem_euclid(7) as usize];
+                    self.days.iter().any(|d| d == from)
+                })
+                .map(|(_, d)| d.to_string())
+                .collect();
+        }
+        x
+    }
+    /// Its times on this computer's clock, in the pool `d` (as they are when the pool's clock
+    /// isn't known).
+    pub fn here(&self, d: &PoolData) -> ScheduleInfo {
+        self.shifted(d.schedule_shift().unwrap_or(0))
     }
     /// What the server takes it as: its schedule's settings for its frequency.
     pub fn schedule_map(&self) -> Vec<(&'static str, String)> {
@@ -1236,6 +1378,12 @@ impl SrInfo {
 }
 
 impl PoolData {
+    /// How far this computer's clock is ahead of the pool's (seconds), when the pool's is known:
+    /// what a snapshot schedule's times move by to show here.
+    pub fn schedule_shift(&self) -> Option<i64> {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+        self.clock_offset.map(|server| local_offset(now) - server)
+    }
     pub fn host(&self, r: &str) -> Option<&HostInfo> {
         self.hosts.iter().find(|h| h.rref == r)
     }
@@ -2396,4 +2544,37 @@ mod iso_tests {
         l.username.clear();
         assert!(!l.device_config().iter().any(|(k, _)| k == "username" || k == "cifspassword"));
     }
+    #[test]
+    fn report_parts_from_bugtool() {
+        let xml = r#"<?xml version="1.0" ?>
+<system-status-inventory>
+  <capability content-type="text/plain" default-checked="yes" key="xenserver-logs" max-size="-1" max-time="-1" min-size="-1" min-time="-1" pii="maybe" />
+  <capability content-type="text/plain" default-checked="no" key="vncterm" max-size="2048" max-time="-1" min-size="-1" min-time="-1" pii="if_customized"/>
+</system-status-inventory>"#;
+        let parts = parse_report_parts(xml);
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0], ReportPart { key: "xenserver-logs".into(), default: true, pii: "maybe".into(), max_size: -1 });
+        assert_eq!((parts[1].key.as_str(), parts[1].default, parts[1].max_size), ("vncterm", false, 2048));
+        assert!(parse_report_parts("").is_empty());
+    }
+
+    #[test]
+    fn schedules_between_clocks() {
+        let x = ScheduleInfo { every: Every::Daily, hour: 19, min: 45, ..Default::default() };
+        // the pool on UTC, this computer three hours behind: 19:45 there is 16:45 here
+        assert_eq!((x.shifted(-3 * 3600).hour, x.shifted(-3 * 3600).min), (16, 45));
+        assert_eq!(x.shifted(-3 * 3600).shifted(3 * 3600).hour, 19);
+        // weekly past midnight: the days move too
+        let w = ScheduleInfo { every: Every::Weekly, hour: 1, min: 30, days: vec!["Monday".into(), "Sunday".into()], ..Default::default() };
+        let back = w.shifted(-3 * 3600);
+        assert_eq!((back.hour, back.min, back.days.clone()), (22, 30, vec!["Saturday".to_string(), "Sunday".to_string()]));
+        assert_eq!(back.shifted(3 * 3600).days, vec!["Monday".to_string(), "Sunday".to_string()]);
+        // hourly: the minutes only, and a clock half an hour off
+        let h = ScheduleInfo { every: Every::Hourly, min: 15, ..Default::default() };
+        assert_eq!(h.shifted(-3 * 3600).min, 15);
+        assert_eq!(h.shifted(5 * 3600 + 1800).min, 45);
+        // the same clock: unchanged
+        assert_eq!(x.shifted(0).hour, 19);
+    }
+
 }

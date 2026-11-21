@@ -156,7 +156,7 @@ impl App {
         let mut left = ui.new_child(egui::UiBuilder::new().max_rect(bar).layout(egui::Layout::left_to_right(egui::Align::Center)));
         left.spacing_mut().item_spacing.x = 8.0;
         let search_w = (w - 150.0).clamp(140.0, 300.0);
-        let resp = left.add(egui::TextEdit::singleline(&mut self.details_search).hint_text("Search details").desired_width(search_w).margin(vec2(8.0, 6.0)));
+        let resp = search_box(&mut left, &pal, &mut self.details_search, "Search details", search_w);
         if resp.has_focus() && left.input(|i| i.key_pressed(Key::Escape)) {
             self.details_search.clear();
         }
