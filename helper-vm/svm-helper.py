@@ -63,7 +63,7 @@ import urllib.parse
 import urllib.request
 import xmlrpc.client
 
-VERSION = "2.0.2"
+VERSION = "2.0.3"
 REPO = "jpaferreira-git/simple-vm-manager"
 CONF_DIR = os.environ.get("SVM_HELPER_CONF", "/etc/svm-helper")
 CONFIG = os.path.join(CONF_DIR, "config.json")
@@ -101,6 +101,11 @@ class UI:
 
     def __init__(self):
         self.color = sys.stdout.isatty() and os.environ.get("TERM") != "dumb" and "NO_COLOR" not in os.environ
+        # The Linux console's fonts (Debian's Lat15 and Uni2) have neither ✓, braille nor half
+        # blocks: plain marks there, and a QR code of full blocks.
+        self.console = os.environ.get("TERM") == "linux"
+        self.tick, self.cross = ("+", "x") if self.console else ("✓", "✗")
+        self.frames = "|/-\\" if self.console else "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
     def c(self, code_, text):
         return "\033[%sm%s\033[0m" % (code_, text) if self.color else text
@@ -139,13 +144,13 @@ class UI:
         print("\n  " + self.blue("[%d/%d]" % (n, total)) + " " + self.bold(title))
 
     def ok(self, text):
-        print("        " + self.green("✓") + " " + text)
+        print("        " + self.green(self.tick) + " " + text)
 
     def warn(self, text):
         print("        " + self.yellow("!") + " " + text)
 
     def fail(self, text):
-        print("        " + self.red("✗") + " " + text)
+        print("        " + self.red(self.cross) + " " + text)
 
     def info(self, text):
         print("        " + self.cyan("›") + " " + text)
@@ -222,11 +227,10 @@ class UI:
 
         t = threading.Thread(target=run, daemon=True)
         t.start()
-        frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
         i = 0
         while t.is_alive():
             if self.color:
-                sys.stdout.write("\r        " + self.cyan(frames[i % len(frames)]) + " " + text + " ")
+                sys.stdout.write("\r        " + self.cyan(self.frames[i % len(self.frames)]) + " " + text + " ")
                 sys.stdout.flush()
             t.join(0.1)
             i += 1
@@ -1951,7 +1955,7 @@ def need_pool():
 
 
 def die(text):
-    print("  " + ui.red("✗") + " " + text)
+    print("  " + ui.red(ui.cross) + " " + text)
     sys.exit(1)
 
 
@@ -2735,7 +2739,6 @@ def let_in(port):
 
 def wait_for_phone(page, timeout=1800):
     """The token, once the phone's sign-in ends with it (a spinner meanwhile)."""
-    frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
     end, shown, i = time.monotonic() + timeout, None, 0
     try:
         while not page.done.wait(0.1):
@@ -2746,7 +2749,7 @@ def wait_for_phone(page, timeout=1800):
             if time.monotonic() > end:
                 raise PoolError("nothing came from the phone in %d minutes" % (timeout // 60))
             if ui.color:
-                sys.stdout.write("\r\033[K        " + ui.cyan(frames[i % len(frames)]) + " " + page.status)
+                sys.stdout.write("\r\033[K        " + ui.cyan(ui.frames[i % len(ui.frames)]) + " " + page.status)
                 sys.stdout.flush()
             elif page.status != shown:
                 ui.info(page.status)
@@ -2787,7 +2790,7 @@ def phone_sign_in(conf):
         close = let_in(page.port)
         url = "http://%s:%d/%s" % (address, page.port, page.key)
         # in capitals, the QR code is smaller (it then takes its letters-and-digits mode)
-        lines = qr_lines(url.upper(), wide=os.environ.get("TERM") == "linux")
+        lines = qr_lines(url.upper(), wide=ui.console)
         print()
         if lines:
             ui.info("Point your phone's camera at this code (the phone on the same network as this VM):")

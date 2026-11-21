@@ -33,6 +33,12 @@ if [[ -t 1 && "${TERM:-dumb}" != dumb && -z "${NO_COLOR:-}" ]]; then
 else
   B=; D=; R=; G=; Y=; BL=; C=; N=; FANCY=
 fi
+# The Linux console's fonts (Debian's Lat15 and Uni2) have neither ✓ nor braille: plain ones there
+if [[ "${TERM:-}" == linux ]]; then
+  TICK="+"; CROSS="x"; FRAMES='|/-\'
+else
+  TICK="✓"; CROSS="✗"; FRAMES='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+fi
 
 banner() {
   local title="$1" sub="$2" w=$(( ${#2} > ${#1} ? ${#2} : ${#1} ))
@@ -45,22 +51,22 @@ banner() {
   echo "  ${BL}╰${line}╯${N}"
 }
 step() { echo; echo "  ${BL}[$1/$TOTAL]${N} ${B}$2${N}"; }
-ok()   { echo "        ${G}✓${N} $*"; }
+ok()   { echo "        ${G}${TICK}${N} $*"; }
 warn() { echo "        ${Y}!${N} $*"; }
-fail() { echo "        ${R}✗${N} $*"; }
+fail() { echo "        ${R}${CROSS}${N} $*"; }
 info() { echo "        ${C}›${N} $*"; }
 note() { echo "$*" | fold -s -w 74 | sed "s/^/          ${D}/; s/\$/${N}/"; }
 die()  { fail "$*"; echo; echo "  ${D}What it did is in $LOG${N}"; echo; exit 1; }
 
-# run "text" command...: a spinner while it works, its output in the log; ✓ or ✗ after
+# run "text" command...: a spinner while it works, its output in the log; ok or fail after
 run() {
   local text="$1"; shift
   echo "--- $(date '+%F %T') $text: $*" >>"$LOG"
   "$@" >>"$LOG" 2>&1 &
-  local pid=$! i=0 frames='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+  local pid=$! i=0
   if [[ -n "$FANCY" ]]; then
     while kill -0 "$pid" 2>/dev/null; do
-      printf "\r        ${C}%s${N} %s " "${frames:i++%10:1}" "$text"
+      printf "\r        ${C}%s${N} %s " "${FRAMES:i++%${#FRAMES}:1}" "$text"
       sleep 0.1
     done
     printf "\r\e[K"
