@@ -67,7 +67,7 @@ import urllib.parse
 import urllib.request
 import xmlrpc.client
 
-VERSION = "2.2.0"
+VERSION = "2.3.0"
 REPO = "jpaferreira-git/simple-vm-manager"
 CONF_DIR = os.environ.get("SVM_HELPER_CONF", "/etc/svm-helper")
 CONFIG = os.path.join(CONF_DIR, "config.json")
@@ -91,7 +91,6 @@ DEFAULT_CONFIG = {
     "language": "en",
     "self_vm": "",
     "watch": {"hosts": True, "clocks": True, "services": []},
-    "backups": {"on": False, "dir": "/srv/svm-backups", "pool_db": True, "vms": [], "at": "02:30", "days": [], "keep": 7, "keep_db": 30, "compress": False},
     "claude": {"auth": "", "model": MODEL, "cli_model": "", "explain": True, "explain_priority": 2, "explain_per_day": 10, "review": {"on": True, "day": "Monday", "at": "08:00"}, "advice": {"on": True, "at": "07:00"}},
 }
 
@@ -595,14 +594,18 @@ class Pool:
                 pass
         self.session = None
 
-    def wait_task(self, task, timeout=120):
-        end = time.time() + timeout
-        while time.time() < end:
-            st = self.x.task.get_status(task)
-            if st != "pending":
-                return st, list(self.x.task.get_error_info(task) or [])
-            time.sleep(1)
-        return "pending", []
+    def get(self, path, query, address=None, timeout=60):
+        """A small HTTP GET of `path` from the coordinator (or `address`): its body."""
+        conn = PinnedConnection(bracket(address or self.address), self.pins, timeout=timeout)
+        try:
+            conn.request("GET", path + "?" + urllib.parse.urlencode(dict(query, session_id=self.sid)), headers={"User-Agent": "svm-helper/" + VERSION})
+            r = conn.getresponse()
+            body = r.read()
+            if r.status != 200:
+                raise PoolError("the server said %d %s" % (r.status, r.reason))
+            return body
+        finally:
+            conn.close()
 
     def upload(self, path, query, src, size, address=None, quiet=900):
         """An HTTP PUT of `size` bytes read from `src` (anything with .read(n)) to `path` on the
@@ -628,54 +631,6 @@ class Pool:
             return size
         finally:
             conn.close()
-
-    def download(self, path, query, dest, task_name="svm-helper", address=None, quiet=900, progress=None):
-        """An HTTP GET of `path` from the coordinator (or `address`) into `dest`: written beside it
-        and renamed once whole, the server's task asked at the end whether all went well (a failure
-        halfway shows only there). The bytes saved."""
-        x = self.x
-        task = x.task.create(task_name, os.path.basename(dest))
-        q = dict(query, session_id=self.sid, task_id=task)
-        part = dest + ".part"
-        conn = PinnedConnection(bracket(address or self.address), self.pins, timeout=quiet)
-        total = 0
-        try:
-            conn.request("GET", path + "?" + urllib.parse.urlencode(q), headers={"User-Agent": "svm-helper/" + VERSION})
-            r = conn.getresponse()
-            if r.status != 200:
-                raise PoolError("the server said %d %s" % (r.status, r.reason))
-            last = time.time()
-            with open(part, "wb") as f:
-                while True:
-                    chunk = r.read(1 << 20)
-                    if not chunk:
-                        break
-                    f.write(chunk)
-                    total += len(chunk)
-                    if progress and time.time() - last > 1:
-                        progress(total)
-                        last = time.time()
-            st, err = self.wait_task(task, 120)
-            if st != "success":
-                raise PoolError("the server said the copy failed: %s" % (" ".join(err) or st))
-            os.replace(part, dest)
-            return total
-        except BaseException:
-            try:
-                os.remove(part)
-            except OSError:
-                pass
-            try:
-                x.task.cancel(task)
-            except Exception:
-                pass
-            raise
-        finally:
-            conn.close()
-            try:
-                x.task.destroy(task)
-            except Exception:
-                pass
 
 
 def read_settings(x, pool_ref):
@@ -1006,21 +961,34 @@ class Claude:
     def advise(self, checks, snapshot):
         """Its words for the Advisor's checklist: JSON, as text (see worded)."""
         system = (
-            "You check a small XenServer pool at someone's home against good practice, for the "
-            "Advisor page of Simple VM Manager, the app they manage it with. You get the checks the "
-            "pool's helper made (JSON: an id, a topic, a status of ok, warn or bad, an English title "
-            "and note, and the objects involved) and a snapshot of the pool. Write in %s, in plain "
-            "words for someone who knows their pool but not every XenServer term. For every check, "
-            "a short title (under 70 characters; keep the names of servers, VMs and storage as they "
-            "are) and, when it isn't ok, a note of one to three sentences: why it matters, and what "
-            "to do about it. You may add up to five findings of your own that the snapshot shows and "
-            "the checks miss, each with a topic (backups, storage, servers, vms or security), a "
-            "status, a title and a note. Keep each status as the helper set it. Use only what the "
-            "JSON shows. Answer with JSON only, no markdown: "
+            "You are an experienced XenServer administrator checking a small pool at someone's home "
+            "against good practice, for the Advisor page of Simple VM Manager, the app they manage it "
+            "with. You get the checks the pool's helper made (JSON: an id, a topic, a status of ok, "
+            "warn or bad, an English title and note, and the objects involved) and a detailed "
+            "snapshot of the pool: its servers, storage, networks and every VM (its system, VM Tools, "
+            "disks and where they are, ISO in its drive, snapshots, schedule, and its processors' and "
+            "memory's use over the last week). Write in %s, in plain words for someone who knows "
+            "their pool but not every XenServer term.\n\n"
+            "1. For every check: a short title (under 70 characters; keep the names of servers, VMs "
+            "and storage as they are) and, when it isn't ok, a note of one to three sentences: why it "
+            "matters here, and what to do. Keep each status as the helper set it.\n"
+            "2. Then look through the snapshot yourself, VM by VM and server by server, and add five "
+            "to ten findings of your own that the checks don't cover. Be specific: name the VM or "
+            "server and give the figures. Good ones: a VM with far more or less memory or vCPUs than "
+            "its week's use calls for; a system near or past its makers' support, or VM Tools much "
+            "older than the others; a VM whose disks sit on storage that's nearly full, or on a "
+            "different server's storage than where it runs; a server much busier than another; "
+            "important VMs (by their names) without a schedule or not starting by themselves; old "
+            "or unused things that take room; a XenServer version near the end of its support. "
+            "Include what you checked and found right too (status ok), so the owner sees it was "
+            "looked at. Each has a topic (backups, storage, servers, vms or security), a status, a "
+            "title and a note (none for ok). Don't repeat the helper's checks, and don't invent what "
+            "the JSON doesn't show.\n\n"
+            "Answer with JSON only, no markdown: "
             '{"checks": {"<id>": {"title": "...", "note": "..."}}, "more": [{"topic": "...", "status": "...", "title": "...", "note": "..."}]}' % self.language
         )
         prompt = "The checks:\n%s\n\nThe pool's snapshot:\n%s" % (json.dumps(checks, ensure_ascii=False, indent=1), json.dumps(snapshot, ensure_ascii=False))
-        return self.write(system, prompt, effort="medium", max_tokens=16000)
+        return self.write(system, prompt, effort="high", max_tokens=16000)
 
 
 # ---------------------------------------------------------------- what it does each minute
@@ -1426,11 +1394,10 @@ def heartbeat(look, started, force=False):
     st = look.state
     adv = load_json(state_path("advice"), {})
     test = load_json(state_path("test"), {})
-    fresh = max(adv.get("at", 0), test.get("at", 0)) > st.get("beat_at", 0)
+    fresh = max(adv.get("at", 0), test.get("at", 0), load_json(state_path("update"), {}).get("at", 0)) > st.get("beat_at", 0) or st.get("beat_version") != VERSION
     if not force and not fresh and look.now - st.get("beat_at", 0) < 300:
         return
-    st["beat_at"] = look.now
-    b = load_json(state_path("backups"), {})
+    st["beat_at"], st["beat_version"] = look.now, VERSION
     r = load_json(state_path("review"), {})
     conf = look.conf
     news = {
@@ -1441,15 +1408,18 @@ def heartbeat(look, started, force=False):
         "since": int(started),
         "last_look": int(look.now),
         "claude": look.claude.ready(),
-        "backups": {"on": on(conf, "backups", "on"), "last": b.get("last_run", 0), "ok": b.get("last_ok", True)},
         "review": {"on": on(conf, "claude", "review", "on", default=True), "last": r.get("at", 0)},
         "watching": len((conf.get("watch") or {}).get("services") or []),
         "advice": {"on": on(conf, "claude", "advice", "on", default=True), "last": adv.get("at", 0), "request": adv.get("request", 0), "bad": adv.get("bad", 0), "warn": adv.get("warn", 0)},
         "copy": 1,
         "requests": 1,  # it answers the app's requests (REQUEST_KEY)
+        "updates": 1 if can_update() else 0,  # it updates itself when asked
     }
     if test:
         news["test"] = test
+    upd = load_json(state_path("update"), {})
+    if upd:
+        news["update"] = upd
     try:
         write_other_config(look.x, "pool", look.pool_ref, STATUS_KEY, json.dumps(news, sort_keys=True))
     except Exception as e:
@@ -1494,161 +1464,75 @@ def start_in_order(pool, settings, boot):
         create_message(x, "SVM_START_FAILED", 2, "Pool", uuid, "Couldn't start in order: %s" % "; ".join(failed))
 
 
-def destroy_snapshot(x, snap):
-    """A snapshot gone, with its own copies of the disks and its saved memory."""
-    vdis = []
-    for vbd in x.VM.get_VBDs(snap):
-        try:
-            r = x.VBD.get_record(vbd)
-            if r.get("type") == "Disk" and r.get("VDI", "OpaqueRef:NULL") != "OpaqueRef:NULL" and x.VDI.get_is_a_snapshot(r["VDI"]):
-                vdis.append(r["VDI"])
-        except Exception:
-            pass
-    try:
-        mem = x.VM.get_suspend_VDI(snap)
-        if mem and mem != "OpaqueRef:NULL":
-            vdis.append(mem)
-    except Exception:
-        pass
-    x.VM.destroy(snap)
-    for v in vdis:
-        try:
-            x.VDI.destroy(v)
-        except Exception as e:
-            log("couldn't delete a disk of the backup's snapshot: %s" % short_error(e))
-
-
-def prune(folder, suffix, keep):
-    files = sorted(f for f in os.listdir(folder) if f.endswith(suffix))
-    for f in files[:-keep] if keep > 0 else []:
-        try:
-            os.remove(os.path.join(folder, f))
-        except OSError as e:
-            log("couldn't delete the old backup %s: %s" % (f, e))
-
-
-def disks_used(x, vm):
-    total = 0
-    for vbd in x.VM.get_VBDs(vm):
-        try:
-            r = x.VBD.get_record(vbd)
-            if r.get("type") == "Disk" and r.get("VDI", "OpaqueRef:NULL") != "OpaqueRef:NULL":
-                total += int(x.VDI.get_physical_utilisation(r["VDI"]) or 0)
-        except Exception:
-            pass
-    return total
-
-
-def backup_vm(pool, vm, dest, keep, compress, progress=None):
-    """One VM saved as a .xva in its own folder of `dest`, from a snapshot taken for it (deleted
-    after); the oldest beyond `keep` deleted. The bytes saved."""
-    x = pool.x
-    name, uuid = x.VM.get_name_label(vm), x.VM.get_uuid(vm)
-    folder = os.path.join(dest, "vms", "%s-%s" % (safe_name(name), uuid[:8]))
-    os.makedirs(folder, exist_ok=True)
-    stamp = time.strftime("%Y-%m-%d_%H%M")
-    path = os.path.join(folder, "%s_%s.xva" % (safe_name(name), stamp))
-    need = disks_used(x, vm) // (2 if compress else 1)
-    free = shutil.disk_usage(folder).free
-    if need > free * 0.95:
-        raise PoolError("not enough room: it needs about %s, the share has %s free" % (gb(need), gb(free)))
-    snap = x.VM.snapshot(vm, "%s (backup %s)" % (name, stamp))
-    try:
-        query = {"uuid": x.VM.get_uuid(snap), "use_compression": "zstd" if compress else "false"}
-        n = pool.download("/export", query, path, "Backup of %s" % name, progress=progress)
-    finally:
-        try:
-            destroy_snapshot(x, snap)
-        except Exception as e:
-            log("couldn't delete the snapshot taken for %s's backup: %s" % (name, short_error(e)))
-    prune(folder, ".xva", keep)
-    return n
-
-
-def run_backups(pool, conf, names=None, say=log, progress=None):
-    """The backups set in the settings (or of the VMs called `names`): the pool's database, then
-    each VM. What happened, kept in backups.json and said in the pool."""
-    b = conf.get("backups") or {}
-    dest = b.get("dir") or ""
-    x = pool.x
-    pool_ref = x.pool.get_all()[0]
-    pool_uuid = x.pool.get_uuid(pool_ref)
-    pool_name = x.pool.get_name_label(pool_ref) or "pool"
-    started = time.time()
-    results = []
-    probe_file = os.path.join(dest, ".svm-helper-write-test")
-    try:
-        with open(probe_file, "w") as f:
-            f.write("ok")
-        os.remove(probe_file)
-    except OSError as e:
-        text = "Backups couldn't start: %s can't be written (%s). Is the NAS share mounted?" % (dest, e.strerror or e)
-        create_message(x, "SVM_BACKUP_FAILED", 2, "Pool", pool_uuid, text)
-        say(text)
-        return {"ok": False, "results": [], "error": text}
-    if b.get("pool_db", True) and not names:
-        folder = os.path.join(dest, "pool-database")
-        os.makedirs(folder, exist_ok=True)
-        path = os.path.join(folder, "%s_%s.xml" % (safe_name(pool_name), time.strftime("%Y-%m-%d_%H%M")))
-        try:
-            n = pool.download("/pool/xmldbdump", {}, path, "Pool database backup")
-            prune(folder, ".xml", int(b.get("keep_db", 30)))
-            results.append({"what": "the pool's database", "ok": True, "bytes": n})
-            say("saved the pool's database (%s)" % gb(n))
-        except Exception as e:
-            results.append({"what": "the pool's database", "ok": False, "error": short_error(e)})
-            say("couldn't save the pool's database: %s" % short_error(e))
-    vms = []
-    if names:
-        wanted = [n.lower() for n in names]
-        for ref, r in x.VM.get_all_records().items():
-            if not r["is_a_template"] and not r["is_a_snapshot"] and not r["is_control_domain"] and r["name_label"].lower() in wanted:
-                vms.append(ref)
-    else:
-        for u in b.get("vms") or []:
-            try:
-                vms.append(x.VM.get_by_uuid(u))
-            except Exception:
-                results.append({"what": "a VM that's gone (%s)" % u[:8], "ok": False, "error": "not in the pool any more"})
-    for vm in vms:
-        name = x.VM.get_name_label(vm)
-        t0 = time.time()
-        say("backing up %s..." % name)
-        try:
-            n = backup_vm(pool, vm, dest, int(b.get("keep", 7)), bool(b.get("compress")), progress and (lambda got, name=name: progress(name, got)))
-            results.append({"what": name, "uuid": x.VM.get_uuid(vm), "ok": True, "bytes": n, "secs": int(time.time() - t0)})
-            say("saved %s: %s in %s" % (name, gb(n), span(time.time() - t0)))
-        except Exception as e:
-            results.append({"what": name, "ok": False, "error": short_error(e)})
-            say("couldn't back up %s: %s" % (name, short_error(e)))
-    bad = [r for r in results if not r["ok"]]
-    good = [r for r in results if r["ok"]]
-    total = sum(r.get("bytes", 0) for r in good)
-    if bad:
-        text = "Backups: %d of %d failed: %s" % (len(bad), len(results), "; ".join("%s (%s)" % (r["what"], r["error"]) for r in bad))
-        create_message(x, "SVM_BACKUP_FAILED", 2, "Pool", pool_uuid, text[:900])
-    elif results:
-        create_message(x, "SVM_BACKUP_DONE", 5, "Pool", pool_uuid, "Backups done: %d saved, %s, in %s" % (len(good), gb(total), span(time.time() - started)))
-    state = load_json(state_path("backups"), {})
-    runs = state.get("runs", [])
-    runs.append({"at": int(started), "secs": int(time.time() - started), "results": results})
-    state["runs"] = runs[-60:]
-    state["last_run"], state["last_ok"] = int(started), not bad
-    for r in good:
-        if r.get("uuid"):
-            state.setdefault("last_by_vm", {})[r["uuid"]] = int(started)
-    try:
-        save_json(state_path("backups"), state)
-    except OSError:
-        pass
-    return {"ok": not bad, "results": results}
-
-
 # ---------------------------------------------------------------- the weekly review
 
-def snapshot_of_pool(x, state):
-    """The pool as it is, and how its week went, for the review (no passwords or keys)."""
+def parse_rrd(body, out):
+    """A server's /rrd_updates (XML: a legend, then a row an hour) into `out`: for each server and
+    VM, its processors' and its memory's (average %, peak %) over those hours."""
+    import xml.etree.ElementTree as ET
+    root = ET.fromstring(body)
+    legend = [e.text or "" for e in root.iter("entry")]
+    rows = []
+    for row in root.iter("row"):
+        vals = []
+        for v in row.findall("v"):
+            try:
+                vals.append(float(v.text))
+            except (TypeError, ValueError):
+                vals.append(float("nan"))
+        rows.append(vals)
+    cols = {}
+    for i, name in enumerate(legend):
+        parts = name.split(":")
+        if len(parts) >= 4 and parts[1] in ("host", "vm"):
+            cols.setdefault((parts[1], parts[2]), {})[":".join(parts[3:])] = i
+
+    def at(r, i):
+        v = r[i] if i < len(r) else float("nan")
+        return v if v == v else None
+
+    def summed(series):
+        series = [v for v in series if v is not None]
+        return (int(round(100 * sum(series) / len(series))), int(round(100 * max(series)))) if series else None
+
+    for (kind, uuid), ds in cols.items():
+        got = {}
+        cpus = [i for d, i in ds.items() if re.fullmatch(r"cpu\d+", d)]
+        if kind == "host" and "cpu_avg" in ds:
+            got["cpu"] = summed(at(r, ds["cpu_avg"]) for r in rows)
+        elif cpus:
+            got["cpu"] = summed((sum(at(r, i) for i in cpus) / len(cpus)) if all(at(r, i) is not None for i in cpus) else None for r in rows)
+        if kind == "host" and "memory_total_kib" in ds and "memory_free_kib" in ds:
+            got["memory"] = summed((1 - at(r, ds["memory_free_kib"]) / at(r, ds["memory_total_kib"])) if at(r, ds["memory_total_kib"]) and at(r, ds["memory_free_kib"]) is not None else None for r in rows)
+        elif kind == "vm" and "memory" in ds and "memory_internal_free" in ds:
+            got["memory"] = summed((1 - at(r, ds["memory_internal_free"]) * 1024 / at(r, ds["memory"])) if at(r, ds["memory"]) and at(r, ds["memory_internal_free"]) is not None else None for r in rows)
+        got = {k: v for k, v in got.items() if v}
+        if got:
+            out[kind][uuid] = got
+    return out
+
+
+def week_load(pool, now=None):
+    """Each server's and each running VM's load over the last week, as the servers keep it (an
+    average an hour): {"host"|"vm": {uuid: {"cpu"|"memory": (average %, peak %)}}}. A server
+    that can't be read is left out."""
+    now = now or time.time()
+    out = {"host": {}, "vm": {}}
+    for h in pool.x.host.get_all_records().values():
+        if not h.get("address"):
+            continue
+        try:
+            parse_rrd(pool.get("/rrd_updates", {"start": int(now - 7 * 86400), "cf": "AVERAGE", "interval": 3600, "host": "true"}, address=h["address"], timeout=30), out)
+        except Exception as e:
+            log("couldn't read %s's load of the week: %s" % (h.get("name_label"), short_error(e)))
+    return out
+
+
+def snapshot_of_pool(x, state, load=None):
+    """The pool as it is, and how its week went (`load`: week_load's), for the review and the
+    Advisor (no passwords or keys)."""
     now = time.time()
+    load = load or {"host": {}, "vm": {}}
     pool_ref = x.pool.get_all()[0]
     pool = x.pool.get_record(pool_ref)
     hosts = x.host.get_all_records()
@@ -1657,7 +1541,17 @@ def snapshot_of_pool(x, state):
     pbds = x.PBD.get_all_records()
     vms = x.VM.get_all_records()
     clock_drift = state.get("clock", {})
-    out = {"pool": pool.get("name_label"), "written": time.strftime("%Y-%m-%d %H:%M"), "servers": [], "storage": [], "vms": [], "schedules": [], "alerts_this_week": {}, "important_alerts": [], "helper_events": [], "backups": {}, "unused_disks": [], "old_snapshots": []}
+    out = {"pool": pool.get("name_label"), "written": time.strftime("%Y-%m-%d %H:%M"), "high_availability": pool.get("ha_enabled"), "default_storage": srs.get(pool.get("default_SR"), {}).get("name_label"), "servers": [], "storage": [], "vms": [], "networks": [], "schedules": [], "alerts_this_week": {}, "important_alerts": [], "helper_events": [], "unused_disks": [], "old_snapshots": []}
+
+    def records(cls):
+        try:
+            return getattr(x, cls).get_all_records()
+        except Exception:
+            return {}
+
+    vdis, vbds, vifs, nets, gms, vmms = records("VDI"), records("VBD"), records("VIF"), records("network"), records("VM_guest_metrics"), records("VM_metrics")
+    vmss = records("VMSS")
+    pct = lambda w, k: ({"average_pct": w[k][0], "peak_pct": w[k][1]} if w.get(k) else None)
     for ref, h in hosts.items():
         m = hm.get(h.get("metrics"), {})
         try:
@@ -1672,6 +1566,12 @@ def snapshot_of_pool(x, state):
             "cpus": int((h.get("cpu_info") or {}).get("cpu_count", 0) or 0),
             "memory_used_pct": round(100 * (total - free) / total) if total else None, "memory_total": gb(total) if total else None,
             "clock_off_seconds": clock_drift.get(h.get("uuid")),
+            "cpu_model": (h.get("cpu_info") or {}).get("modelname"),
+            "updates_waiting": h.get("latest_synced_updates_applied") == "no" if "latest_synced_updates_applied" in h else None,
+            "needs_restart_for_updates": bool(h.get("pending_guidances")),
+            "in_maintenance": not h.get("enabled"),
+            "running_vms": sum(1 for v in vms.values() if v.get("resident_on") == ref and v.get("power_state") == "Running" and not v.get("is_control_domain")),
+            "this_week": {"processors": pct(load["host"].get(h.get("uuid"), {}), "cpu"), "memory": pct(load["host"].get(h.get("uuid"), {}), "memory")},
         })
     for ref, sr in srs.items():
         if sr.get("type") in ("udev",) or sr.get("content_type") == "iso":
@@ -1689,18 +1589,42 @@ def snapshot_of_pool(x, state):
             if age > 30 and not v.get("is_vmss_snapshot"):
                 parent = vms.get(v.get("snapshot_of"), {}).get("name_label", "?")
                 out["old_snapshots"].append({"vm": parent, "name": v.get("name_label"), "days_old": int(age)})
-    backups = load_json(state_path("backups"), {})
-    last_by_vm = backups.get("last_by_vm", {})
     for ref, v in vms.items():
         if v.get("is_a_template") or v.get("is_a_snapshot") or v.get("is_control_domain"):
             continue
         snaps = snaps_by_vm.get(ref, [])
+        disks, iso, networks = [], None, []
+        for b in v.get("VBDs") or []:
+            vbd = vbds.get(b, {})
+            d = vdis.get(vbd.get("VDI"), {})
+            if vbd.get("type") == "CD":
+                iso = d.get("name_label") if not vbd.get("empty") else None
+            elif d:
+                sr = srs.get(d.get("SR"), {})
+                disks.append({"size": gb(int(d.get("virtual_size", 0) or 0)), "used": gb(int(d.get("physical_utilisation", 0) or 0)), "storage": sr.get("name_label"), "shared_storage": bool(sr.get("shared"))})
+        for f in v.get("VIFs") or []:
+            networks.append(nets.get(vifs.get(f, {}).get("network"), {}).get("name_label"))
+        gm = gms.get(v.get("guest_metrics"), {})
+        tools = gm.get("PV_drivers_version") or {}
+        started = xen_epoch(vmms.get(v.get("metrics"), {}).get("start_time"))
+        oldest = min((xen_epoch(x_.get("snapshot_time")) for x_ in snaps), default=0)
+        w = load["vm"].get(v.get("uuid"), {})
         out["vms"].append({
-            "name": v.get("name_label"), "state": v.get("power_state"), "on_server": hosts.get(v.get("resident_on"), {}).get("name_label"),
+            "name": v.get("name_label"), "description": (v.get("name_description") or "")[:120], "state": v.get("power_state"), "on_server": hosts.get(v.get("resident_on"), {}).get("name_label"),
             "starts_with_server": (v.get("other_config") or {}).get("auto_poweron") == "true",
-            "memory": gb(int(v.get("memory_dynamic_max", 0) or 0)), "vcpus": int(v.get("VCPUs_max", 0) or 0),
-            "snapshots": len(snaps), "last_backup": time.strftime("%Y-%m-%d", time.localtime(last_by_vm[v["uuid"]])) if v.get("uuid") in last_by_vm else None,
+            "memory": gb(int(v.get("memory_dynamic_max", 0) or 0)), "memory_min": gb(int(v.get("memory_dynamic_min", 0) or 0)), "vcpus": int(v.get("VCPUs_max", 0) or 0),
+            "boot": "UEFI" if (v.get("HVM_boot_params") or {}).get("firmware") == "uefi" else "BIOS",
+            "system": os_of(gm) or None, "vm_tools": ".".join(str(tools.get(k, "")) for k in ("major", "minor", "micro") if tools.get(k) is not None) or None,
+            "disks": disks, "iso_in_drive": iso, "networks": networks,
+            "running_for_days" if v.get("power_state") == "Running" else "last_started_days_ago": int((now - started) / 86400) if started else None,
+            "snapshots": len(snaps), "oldest_snapshot_days": int((now - oldest) / 86400) if oldest else None,
+            "snapshot_schedule": vmss.get(v.get("snapshot_schedule"), {}).get("name_label"),
+            "this_week": {"processors": pct(w, "cpu"), "memory": pct(w, "memory")} if w else None,
         })
+    for n in nets.values():
+        if n.get("bridge", "").startswith("xapi") and not n.get("PIFs"):
+            continue
+        out["networks"].append({"name": n.get("name_label"), "mtu": n.get("MTU"), "vms": len(n.get("VIFs") or [])})
     try:
         for ref, s in x.VMSS.get_all_records().items():
             out["schedules"].append({"name": s.get("name_label"), "on": s.get("enabled"), "every": s.get("frequency"), "vms": len(s.get("VMs") or []), "keeps": s.get("retained_snapshots"), "last_ran": time.strftime("%Y-%m-%d %H:%M", time.gmtime(xen_epoch(s.get("last_run_time")))) if xen_epoch(s.get("last_run_time")) else None})
@@ -1721,8 +1645,6 @@ def snapshot_of_pool(x, state):
     except Exception:
         pass
     out["helper_events"] = [{"when": time.strftime("%a %H:%M", time.localtime(e["t"])), "what": e["text"]} for e in state.get("events", []) if now - e.get("t", 0) < 7 * 86400][-40:]
-    runs = [r for r in backups.get("runs", []) if now - r.get("at", 0) < 7 * 86400]
-    out["backups"] = {"set_up": bool(runs) or None, "runs_this_week": len(runs), "failed": [x_ for r in runs for x_ in r.get("results", []) if not x_.get("ok")][:10], "saved": gb(sum(x_.get("bytes", 0) for r in runs for x_ in r.get("results", []) if x_.get("ok")))}
     try:
         vdis = x.VDI.get_all_records()
         for ref, d in vdis.items():
@@ -1749,8 +1671,6 @@ def plain_review(snap):
     for st in snap["storage"]:
         if st["used_pct"] >= 85:
             attention.append("%s is %d%% full (%s free)" % (st["name"], st["used_pct"], st["free"]))
-    for f in snap["backups"].get("failed", []):
-        attention.append("backup of %s failed: %s" % (f.get("what"), f.get("error")))
     if snap["unused_disks"]:
         attention.append("%d disks aren't used by any VM" % len(snap["unused_disks"]))
     if snap["old_snapshots"]:
@@ -1762,8 +1682,6 @@ def plain_review(snap):
     lines.append("Servers: %d, %d on · VMs: %d, %d running" % (len(snap["servers"]), sum(1 for s in snap["servers"] if s["on"]), len(snap["vms"]), running))
     alerts = sum(snap["alerts_this_week"].values())
     lines.append("Alerts this week: %d (%d important)" % (alerts, len(snap["important_alerts"])))
-    if snap["backups"].get("runs_this_week"):
-        lines.append("Backups this week: %d rounds, %s saved" % (snap["backups"]["runs_this_week"], snap["backups"]["saved"]))
     return "\n".join(lines)
 
 
@@ -1772,7 +1690,7 @@ def write_review(pool, conf, secrets, send_it=True):
     review.json; its text."""
     x = pool.x
     state = load_json(state_path("state"), {})
-    snap = snapshot_of_pool(x, state)
+    snap = snapshot_of_pool(x, state, week_load(pool))
     claude = Claude(conf, secrets)
     text = claude.review(snap) if claude.ready() else None
     by = "claude" if text else "plain"
@@ -1804,62 +1722,96 @@ def listed(items, most=3):
     return "%s and %d more" % (", ".join(items[:most]), len(items) - most)
 
 
-def advisor_checks(x, conf, state, now=None):
+# Systems past their makers' support (as of late 2026), as the VM Tools report them: (pattern, name).
+UNSUPPORTED_SYSTEMS = [
+    (r"windows (server )?(2000|2003|2008)\b|windows (xp|vista)\b", "Windows"),
+    (r"windows server 2012\b", "Windows Server 2012"),
+    (r"windows (7|8|8\.1|10)\b", "Windows"),
+    (r"centos( linux)?( release)? [5-8]\b", "CentOS"),
+    (r"ubuntu (1[0-9]|20)\.(04|10)\b", "Ubuntu"),
+    (r"debian( gnu/linux)? (8|9|10|11)\b", "Debian"),
+    (r"red hat enterprise linux( server)?( release)? [5-7]\b", "Red Hat Enterprise Linux"),
+]
+
+
+def unsupported(os_name):
+    """Whether a system's name (as its VM Tools give it) is one past its support."""
+    n = (os_name or "").lower()
+    return any(re.search(p, n) for p, _ in UNSUPPORTED_SYSTEMS)
+
+
+def os_of(gm):
+    """A VM's system, from its guest metrics: "Ubuntu 22.04.4 LTS", "Microsoft Windows Server 2019
+    Standard"; "" when its VM Tools don't say."""
+    v = (gm or {}).get("os_version") or {}
+    name = (v.get("name") or "").split("|")[0].strip()
+    if not name and v.get("distro"):
+        name = ("%s %s.%s" % (v.get("distro"), v.get("major", ""), v.get("minor", ""))).strip(" .")
+    return name
+
+
+def advisor_checks(x, conf, state, now=None, load=None):
     """The pool against good practice, as far as the helper can tell by itself: a list of checks,
     each {id, topic, status (ok, warn or bad), title, note, objects}, in English (Claude then
-    words them in the owner's language). A part that can't be read is left out."""
+    words them in the owner's language); one the app can fix also has fix: {action, uuids, names}
+    (see the app's Advisor). `load`: week_load's. A part that can't be read is left out."""
     now = now or time.time()
+    load = load or {"host": {}, "vm": {}}
     out = []
 
-    def check(id_, topic, status, title, note="", objects=()):
-        out.append({"id": id_, "topic": topic, "status": status, "title": title, "note": note if status != "ok" else "", "objects": sorted(set(o for o in objects if o))[:20]})
+    def check(id_, topic, status, title, note="", objects=(), fix=None):
+        c = {"id": id_, "topic": topic, "status": status, "title": title, "note": note if status != "ok" else "", "objects": sorted(set(o for o in objects if o))[:20]}
+        if fix and status != "ok":
+            c["fix"] = {"action": fix[0], "uuids": list(fix[1])[:50], "names": list(fix[2] if len(fix) > 2 else [])[:50]}
+        out.append(c)
+
+    def n_of(items, one, many):
+        """`one` or `many`, by how many `items`, with their number where it says %d."""
+        t = one if len(items) == 1 else many
+        return t % len(items) if "%d" in t else t
 
     pool_ref = x.pool.get_all()[0]
+    pool = x.pool.get_record(pool_ref)
     hosts = x.host.get_all_records()
     hm = x.host_metrics.get_all_records()
     srs = x.SR.get_all_records()
     vms = x.VM.get_all_records()
     settings = read_settings(x, pool_ref)
+
+    def records(cls):
+        try:
+            return getattr(x, cls).get_all_records()
+        except Exception:
+            return {}
+
+    vdis, vbds, gms, vmms = records("VDI"), records("VBD"), records("VM_guest_metrics"), records("VM_metrics")
     self_vm = conf.get("self_vm", "")
     real = {r: v for r, v in vms.items() if not (v.get("is_a_template") or v.get("is_a_snapshot") or v.get("is_control_domain"))}
     mine = {r: v for r, v in real.items() if v.get("uuid") != self_vm}  # (the helper's own VM aside)
-    running = {r: v for r, v in real.items() if v.get("power_state") == "Running"}
+    running = {r: v for r, v in mine.items() if v.get("power_state") == "Running"}
+    live = [r for r, h in hosts.items() if hm.get(h.get("metrics"), {}).get("live")]
+
+    def disks_of(ref):
+        """A VM's disks: (VDI record, its SR's record)."""
+        got = []
+        for b in vms.get(ref, {}).get("VBDs") or []:
+            vbd = vbds.get(b, {})
+            d = vdis.get(vbd.get("VDI"))
+            if vbd.get("type") == "Disk" and d:
+                got.append((d, srs.get(d.get("SR"), {})))
+        return got
 
     def part(fn):
         try:
             fn()
         except Exception as e:
-            log("an Advisor check failed: %s" % short_error(e))
-
-    def backups():
-        b = conf.get("backups") or {}
-        bs = load_json(state_path("backups"), {})
-        if not b.get("on"):
-            check("backups_vms", "backups", "warn", "No VM is backed up", "Snapshots are kept on the same storage as their VM: if that disk fails, they go with it. The Helper VM can keep backups of your VMs on a NAS: run 'sudo svm-helper setup' on it.")
-            check("backups_pool_db", "backups", "warn", "The pool's database isn't saved", "It holds every VM's settings and the pool's own. A copy of it, with the backups, rebuilds the pool after a disaster.")
-            return
-        last = bs.get("last_by_vm", {})
-        missing = [v.get("name_label") for v in mine.values() if now - last.get(v.get("uuid"), 0) > 8 * 86400]
-        if missing:
-            check("backups_vms", "backups", "warn", "%d VM%s had no backup this week" % (len(missing), "" if len(missing) == 1 else "s"), "Without a recent backup, a failed disk or a bad change can't be undone. Add them to the Helper VM's backups ('sudo svm-helper setup').", missing)
-        else:
-            check("backups_vms", "backups", "ok", "Every VM had a backup this week")
-        runs = bs.get("runs") or []
-        failed = [r.get("what") for r in (runs[-1].get("results") or [] if runs else []) if not r.get("ok")]
-        if failed:
-            check("backups_failed", "backups", "bad", "The last backups failed for %s" % listed(failed), "Look at 'svm-helper status' on the Helper VM: the share may be full or unmounted.", failed)
-        elif runs:
-            check("backups_failed", "backups", "ok", "The last backups went well")
-        if b.get("pool_db", True):
-            check("backups_pool_db", "backups", "ok", "The pool's database is saved with the backups")
-        else:
-            check("backups_pool_db", "backups", "warn", "The pool's database isn't saved", "It holds every VM's settings and the pool's own: turn it on in the Helper VM's backups.")
+            log("an Advisor check failed (%s): %s" % (fn.__name__, short_error(e)))
 
     def schedules():
         null = ("", "OpaqueRef:NULL")
-        loose = [v.get("name_label") for v in mine.values() if v.get("snapshot_schedule", "") in null]
+        loose = [(v.get("uuid"), v.get("name_label")) for v in mine.values() if v.get("snapshot_schedule", "") in null]
         if loose:
-            check("snapshot_schedules", "backups", "warn", "%d VM%s have no snapshot schedule" % (len(loose), "" if len(loose) == 1 else "s"), "A schedule takes snapshots by itself, so there's always a recent one to go back to after a bad update (Snapshots, then Schedules, in Simple VM Manager).", loose)
+            check("snapshot_schedules", "backups", "warn", n_of(loose, "%d VM has no snapshot schedule", "%d VMs have no snapshot schedule"), "A schedule takes snapshots by itself, so there's always a recent one to go back to after a bad update.", [n for _, n in loose], ("schedule", [u for u, _ in loose], [n for _, n in loose]))
         else:
             check("snapshot_schedules", "backups", "ok", "Every VM has a snapshot schedule")
 
@@ -1880,38 +1832,43 @@ def advisor_checks(x, conf, state, now=None):
             check("storage_space", "storage", "warn", "Storage filling up: %s" % listed(nearly), "Over 80% full: keep an eye on it, and delete old snapshots or unused disks.", nearly)
         else:
             check("storage_space", "storage", "ok", "Every storage has room to spare")
-        vdis = x.VDI.get_all_records()
         unused, size = [], 0
         for d in vdis.values():
             sr = srs.get(d.get("SR"), {})
             if d.get("type") != "user" or d.get("is_a_snapshot") or d.get("VBDs") or not d.get("managed") or sr.get("content_type") == "iso" or d.get("is_tools_iso"):
                 continue
-            unused.append(d.get("name_label") or "(no name)")
+            unused.append((d.get("uuid"), "%s (%s, on %s)" % (d.get("name_label") or "no name", gb(int(d.get("virtual_size", 0) or 0)), sr.get("name_label", "?"))))
             size += int(d.get("virtual_size", 0) or 0)
         if unused:
-            check("unused_disks", "storage", "warn", "%d disk%s not used by any VM (%s)" % (len(unused), "" if len(unused) == 1 else "s", gb(size)), "They take space and nothing uses them. Look in VM Storage, and delete the ones you don't need.", unused)
+            check("unused_disks", "storage", "warn", "%s not used by any VM (%s)" % (n_of(unused, "%d disk", "%d disks"), gb(size)), "They take space and nothing uses them: delete the ones you don't need.", [n for _, n in unused], ("delete_disks", [u for u, _ in unused], [n for _, n in unused]))
         else:
             check("unused_disks", "storage", "ok", "No forgotten disks")
-        old, many = [], []
+        old, old_snaps, many = [], [], []
         for v in mine.values():
             snaps = [vms.get(s, {}) for s in v.get("snapshots") or []]
-            if any(not s.get("is_vmss_snapshot") and now - xen_epoch(s.get("snapshot_time")) > 30 * 86400 for s in snaps):
-                old.append(v.get("name_label"))
+            for s in snaps:
+                age = (now - xen_epoch(s.get("snapshot_time"))) / 86400.0
+                if not s.get("is_vmss_snapshot") and age > 30:
+                    old.append(v.get("name_label"))
+                    old_snaps.append((s.get("uuid"), "%s: %s (%d days old)" % (v.get("name_label"), s.get("name_label"), age)))
             if len(snaps) > 10:
                 many.append(v.get("name_label"))
-        if old:
-            check("old_snapshots", "storage", "warn", "%d VM%s have snapshots over a month old" % (len(old), "" if len(old) == 1 else "s"), "A snapshot isn't a backup, and old ones keep growing as the disk changes. Delete the ones you no longer need.", old)
+        if old_snaps:
+            check("old_snapshots", "storage", "warn", n_of(old_snaps, "%d snapshot over a month old", "%d snapshots over a month old"), "A snapshot isn't a backup, and an old one keeps growing as the disk changes: delete the ones you no longer need.", old, ("delete_snapshots", [u for u, _ in old_snaps], [n for _, n in old_snaps]))
         else:
             check("old_snapshots", "storage", "ok", "No snapshots left over from long ago")
         if many:
-            check("many_snapshots", "storage", "warn", "%d VM%s have more than 10 snapshots" % (len(many), "" if len(many) == 1 else "s"), "A long chain of snapshots slows the disk down. Keep fewer: a schedule's 'keep' does it by itself.", many)
+            check("many_snapshots", "storage", "warn", n_of(many, "%d VM has more than 10 snapshots", "%d VMs have more than 10 snapshots"), "A long chain of snapshots slows the disk down. Keep fewer: a schedule's 'keep' does it by itself.", many)
+        default = pool.get("default_SR", "")
+        if default in ("", "OpaqueRef:NULL") or default not in srs:
+            check("default_storage", "storage", "warn", "The pool has no default storage", "New VMs, and suspended ones, need a place to go: choose a default storage in VM Storage.", fix=("vm_storage", []))
 
     def servers():
-        down = [h.get("name_label") for h in hosts.values() if not hm.get(h.get("metrics"), {}).get("live")]
+        down = [h.get("name_label") for r, h in hosts.items() if r not in live]
         if down:
             check("servers_answering", "servers", "bad", "Not answering: %s" % listed(down), "The pool can't use it: its VMs aren't running. See whether it's on, and on the network.", down)
         else:
-            check("servers_answering", "servers", "ok", "Every server answers")
+            check("servers_answering", "servers", "ok", n_of(hosts, "The server answers", "Every server answers"))
         drift = state.get("clock") or {}
         off = ["%s (%s)" % (h.get("name_label"), span(abs(drift[h.get("uuid")]))) for h in hosts.values() if abs(drift.get(h.get("uuid"), 0) or 0) > 60]
         if off:
@@ -1921,12 +1878,12 @@ def advisor_checks(x, conf, state, now=None):
         waiting = [h.get("name_label") for h in hosts.values() if h.get("latest_synced_updates_applied") == "no"]
         restart = [h.get("name_label") for h in hosts.values() if h.get("pending_guidances")]
         if waiting or restart:
-            check("updates", "servers", "warn", "Updates waiting on %s" % listed(waiting + restart), "Updates fix security holes and bugs. Install them from Updates in Simple VM Manager (a server may need a restart after).", waiting + restart)
+            check("updates", "servers", "warn", "Updates waiting on %s" % listed(waiting + restart), "Updates fix security holes and bugs. Install them (a server may need a restart after).", waiting + restart, ("updates", []))
         elif any("latest_synced_updates_applied" in h for h in hosts.values()):
             check("updates", "servers", "ok", "Every server is up to date")
         versions = set("%s %s" % (h.get("software_version", {}).get("product_brand", ""), h.get("software_version", {}).get("product_version", "")) for h in hosts.values())
         if len(versions) > 1:
-            check("same_version", "servers", "warn", "The servers run different versions", "A pool works best with every server on the same version: bring them all up to date.", [h.get("name_label") for h in hosts.values()])
+            check("same_version", "servers", "warn", "The servers run different versions", "A pool works best with every server on the same version: bring them all up to date.", [h.get("name_label") for h in hosts.values()], ("updates", []))
         disabled = [h.get("name_label") for h in hosts.values() if not h.get("enabled")]
         if disabled:
             check("maintenance", "servers", "warn", "In maintenance mode: %s" % listed(disabled), "No VM starts there until it's taken out of maintenance mode.", disabled)
@@ -1939,24 +1896,81 @@ def advisor_checks(x, conf, state, now=None):
         if full:
             check("memory", "servers", "warn", "Memory nearly all used on %s" % listed(full), "No room left to start another VM there, or to move one over during maintenance.", full)
         else:
-            check("memory", "servers", "ok", "Every server has memory to spare")
+            check("memory", "servers", "ok", n_of(hosts, "The server has memory to spare", "Every server has memory to spare"))
+        busy = ["%s (%d%% on average)" % (hosts[r].get("name_label"), load["host"][hosts[r].get("uuid")]["cpu"][0]) for r in live if (load["host"].get(hosts[r].get("uuid")) or {}).get("cpu", (0, 0))[0] >= 75]
+        if busy:
+            check("server_load", "servers", "warn", "Busy all week: %s" % listed(busy), "Its processors were busy most of the time: its VMs get slower. Move a VM to a quieter server.", busy)
+        elif load["host"]:
+            check("server_load", "servers", "ok", "The servers had processor to spare this week")
+        # all the VMs on one server, the others idle: if it stops, everything stops
+        if len(live) > 1 and len(running) > 1:
+            where = set(v.get("resident_on") for v in running.values())
+            if len(where) == 1:
+                h = hosts.get(where.pop(), {})
+                check("one_server", "servers", "warn", "Every running VM is on %s" % h.get("name_label", "one server"), "If that server stops, they all stop, while the others sit idle. Spread them over the servers.", [h.get("name_label")])
 
-    def vm_tools():
-        try:
-            gms = x.VM_guest_metrics.get_all_records()
-        except Exception:
-            gms = {}
+    def vm_care():
         none = [v.get("name_label") for v in running.values() if not gms.get(v.get("guest_metrics"), {}).get("PV_drivers_detected")]
         if none:
-            check("vm_tools", "vms", "warn", "%d running VM%s without VM Tools" % (len(none), "" if len(none) == 1 else "s"), "Without them a VM's disks and network are slower, it can't be shut down cleanly from outside, and its memory and IP address don't show. Install the XenServer VM Tools in it.", none)
+            check("vm_tools", "vms", "warn", n_of(none, "%d running VM without VM Tools", "%d running VMs without VM Tools"), "Without them a VM's disks and network are slower, it can't be shut down cleanly from outside, and its memory and IP address don't show. Install the XenServer VM Tools in it.", none)
         else:
             check("vm_tools", "vms", "ok", "Every running VM has its VM Tools")
         ordered = set(i.get("uuid") for i in ((settings.get("start_order") or {}).get("vms") or []) if (settings.get("start_order") or {}).get("on"))
-        manual = [v.get("name_label") for v in running.values() if v.get("uuid") != self_vm and v.get("uuid") not in ordered and (v.get("other_config") or {}).get("auto_poweron") != "true"]
+        manual = [(v.get("uuid"), v.get("name_label")) for v in running.values() if v.get("uuid") not in ordered and (v.get("other_config") or {}).get("auto_poweron") != "true"]
         if manual:
-            check("autostart", "vms", "warn", "%d running VM%s don't start by themselves" % (len(manual), "" if len(manual) == 1 else "s"), "After a power cut they stay off until someone starts them. Turn on 'Start with the server' for those that should always run.", manual)
+            check("autostart", "vms", "warn", n_of(manual, "%d running VM doesn't start by itself", "%d running VMs don't start by themselves"), "After a power cut it stays off until someone starts it. Turn on 'Start with the server' for the VMs that should always run.", [n for _, n in manual], ("autostart", [u for u, _ in manual], [n for _, n in manual]))
         else:
             check("autostart", "vms", "ok", "The running VMs start by themselves after a power cut")
+        # an ISO left in the drive: the VM can't move to a server that doesn't see that library
+        isos = []
+        for r, v in mine.items():
+            for b in v.get("VBDs") or []:
+                vbd = vbds.get(b, {})
+                if vbd.get("type") == "CD" and not vbd.get("empty") and vbd.get("VDI") in vdis:
+                    isos.append((v.get("uuid"), "%s (%s)" % (v.get("name_label"), vdis[vbd["VDI"]].get("name_label"))))
+        if isos:
+            check("iso_in_drive", "vms", "warn", n_of(isos, "%d VM has an ISO left in its drive", "%d VMs have an ISO left in their drive"), "It ties the VM to that library: it can't move to a server that doesn't see it, and the library can't be taken away. Eject the ones that aren't in use.", [n for _, n in isos], ("eject", [u for u, _ in isos], [n for _, n in isos]))
+        else:
+            check("iso_in_drive", "vms", "ok", "No ISO left in a VM's drive")
+        # on a server's own storage: it can't move to another server while it runs
+        if len(hosts) > 1:
+            local = [v.get("name_label") for r, v in running.items() if any(not sr.get("shared") and sr.get("content_type") != "iso" for _, sr in disks_of(r))]
+            if local:
+                check("local_storage", "vms", "warn", n_of(local, "%d running VM can't move to another server", "%d running VMs can't move to another server"), "Their disks are on a server's own storage: for that server's updates or maintenance they have to be shut down. Moving their disks to shared storage lets them move while they run.", local)
+            elif running:
+                check("local_storage", "vms", "ok", "Every running VM can move to another server")
+        old_os = ["%s (%s)" % (v.get("name_label"), os_of(gms.get(v.get("guest_metrics")))) for v in mine.values() if unsupported(os_of(gms.get(v.get("guest_metrics"))))]
+        if old_os:
+            check("os_support", "vms", "warn", n_of(old_os, "%d VM runs a system past its support", "%d VMs run a system past their support"), "It gets no more security updates from its makers. Plan to move what it does to a supported version.", old_os)
+        elif any(os_of(gms.get(v.get("guest_metrics"))) for v in running.values()):
+            check("os_support", "vms", "ok", "The VMs' systems are still supported")
+        # off for months, still taking disk
+        idle, size = [], 0
+        for r, v in mine.items():
+            if v.get("power_state") != "Halted":
+                continue
+            started = xen_epoch(vmms.get(v.get("metrics"), {}).get("start_time"))
+            if started and now - started > 90 * 86400:
+                idle.append("%s (started %d days ago)" % (v.get("name_label"), (now - started) / 86400))
+                size += sum(int(d.get("physical_utilisation", 0) or 0) for d, _ in disks_of(r))
+        if idle:
+            check("vms_off_long", "vms", "warn", "%s for months (%s of disk)" % (n_of(idle, "%d VM off", "%d VMs off"), gb(size)), "Their disks still take room. Export them to a file and delete them if they're not needed, or keep them if they're spares.", idle)
+        # the week's load
+        hot, big = [], []
+        for v in running.values():
+            w = load["vm"].get(v.get("uuid")) or {}
+            cpu, mem = w.get("cpu"), w.get("memory")
+            if (cpu and cpu[0] >= 80) or (mem and mem[0] >= 90):
+                hot.append("%s (%s)" % (v.get("name_label"), ", ".join(t for t in [("processors %d%%" % cpu[0]) if cpu and cpu[0] >= 80 else "", ("memory %d%%" % mem[0]) if mem and mem[0] >= 90 else ""] if t)))
+            vcpus = int(v.get("VCPUs_max", 0) or 0)
+            if cpu and vcpus >= 4 and cpu[1] < 15:
+                big.append("%s (%d vCPUs, at most %d%% busy)" % (v.get("name_label"), vcpus, cpu[1]))
+        if hot:
+            check("vm_busy", "vms", "warn", n_of(hot, "%d VM at its limit all week", "%d VMs at their limit all week"), "On average over the week, it used nearly all its processors or memory: it's slower than it should be. Give it more (it has to be shut down for that).", hot)
+        elif load["vm"]:
+            check("vm_busy", "vms", "ok", "No VM at its limit this week")
+        if big:
+            check("vm_idle_cpus", "vms", "warn", n_of(big, "%d VM has more vCPUs than it uses", "%d VMs have more vCPUs than they use"), "Its processors stayed nearly idle all week. Fewer vCPUs leave more for the other VMs, and it won't be slower.", big)
 
     def security():
         try:
@@ -1965,24 +1979,27 @@ def advisor_checks(x, conf, state, now=None):
             certs = {}
         soon, expiring = [], []
         for c in certs.values():
+            if not xen_epoch(c.get("not_after")):
+                continue
             left = (xen_epoch(c.get("not_after")) - now) / 86400.0
-            name = hosts.get(c.get("host"), {}).get("name_label") or c.get("name") or "?"
-            if xen_epoch(c.get("not_after")) and left < 30:
-                soon.append(name)
-            elif xen_epoch(c.get("not_after")) and left < 90:
-                expiring.append(name)
+            h = hosts.get(c.get("host"), {})
+            who = (h.get("uuid"), h.get("name_label") or c.get("name") or "?")
+            if left < 30:
+                soon.append(who)
+            elif left < 90:
+                expiring.append(who)
         if soon:
-            check("certificates", "security", "bad", "Certificates expire within a month: %s" % listed(soon), "After that, apps can't connect to the server safely. Renew it (the server's Actions, in Simple VM Manager), then run 'sudo svm-helper trust' on the Helper VM.", soon)
+            check("certificates", "security", "bad", "Certificates expire within a month: %s" % listed([n for _, n in soon]), "After that, apps can't connect to the server safely. Renew it, then run 'sudo svm-helper trust' on the Helper VM.", [n for _, n in soon], ("renew_cert", [u for u, _ in soon if u], [n for _, n in soon]))
         elif expiring:
-            check("certificates", "security", "warn", "Certificates expire within three months: %s" % listed(expiring), "Plan to renew them (the server's Actions, in Simple VM Manager).", expiring)
+            check("certificates", "security", "warn", "Certificates expire within three months: %s" % listed([n for _, n in expiring]), "Plan to renew them, then run 'sudo svm-helper trust' on the Helper VM.", [n for _, n in expiring], ("renew_cert", [u for u, _ in expiring if u], [n for _, n in expiring]))
         elif certs:
             check("certificates", "security", "ok", "The servers' certificates are valid for months")
         if sends(settings):
             check("alerts_sent", "security", "ok", "Alerts reach your phone")
         else:
-            check("alerts_sent", "security", "warn", "Alerts don't reach your phone", "A failing disk or a server down would go unnoticed. Choose where alerts go in the pool's Helper tab.")
+            check("alerts_sent", "security", "warn", "Alerts don't reach your phone", "A failing disk or a server down would go unnoticed. Choose where alerts go in the pool's Helper tab.", fix=("helper_tab", []))
 
-    for fn in (backups, schedules, storage, servers, vm_tools, security):
+    for fn in (schedules, storage, servers, vm_care, security):
         part(fn)
     return out
 
@@ -2003,7 +2020,7 @@ def json_answer(text):
 
 def worded(checks, words):
     """The checks with Claude's words: each one's title and note in the owner's language, and
-    up to five findings of its own (by: claude)."""
+    up to ten findings of its own (by: claude)."""
     out = [dict(c) for c in checks]
     w = words.get("checks") if isinstance(words.get("checks"), dict) else {}
     for c in out:
@@ -2017,7 +2034,7 @@ def worded(checks, words):
     more = words.get("more") if isinstance(words.get("more"), list) else []
     n = 0
     for m in more:
-        if n >= 5 or not isinstance(m, dict) or m.get("topic") not in TOPICS or m.get("status") not in ("ok", "warn", "bad"):
+        if n >= 10 or not isinstance(m, dict) or m.get("topic") not in TOPICS or m.get("status") not in ("ok", "warn", "bad"):
             continue
         if not isinstance(m.get("title"), str) or not m["title"].strip():
             continue
@@ -2031,13 +2048,14 @@ def write_advice(pool, conf, secrets, request=0):
     (ADVICE_KEY) for the app, and its outline in advice.json. The checklist."""
     x = pool.x
     state = load_json(state_path("state"), {})
-    checks = advisor_checks(x, conf, state)
+    load = week_load(pool)
+    checks = advisor_checks(x, conf, state, load=load)
     claude = Claude(conf, secrets)
     by = "plain"
     if claude.ready():
         words = None
         try:
-            words = json_answer(claude.advise(checks, snapshot_of_pool(x, state)))
+            words = json_answer(claude.advise(checks, snapshot_of_pool(x, state, load)))
         except Exception as e:
             log("Claude couldn't look at the Advisor's checklist: %s" % short_error(e))
         if words:
@@ -2055,12 +2073,36 @@ def write_advice(pool, conf, secrets, request=0):
 
 
 def requests_of(pool_rec):
-    """What the app asked the helper for, in the pool: {"advice": when, "test": when}."""
+    """What the app asked the helper for, in the pool: {"advice"|"test"|"update": when}."""
+    v = request_record(pool_rec)
+    return {k: float(t) for k, t in v.items() if isinstance(t, (int, float)) and not isinstance(t, bool)}
+
+
+def request_record(pool_rec):
     try:
         v = json.loads((pool_rec.get("other_config") or {}).get(REQUEST_KEY, "") or "{}")
     except ValueError:
         return {}
-    return {k: float(t) for k, t in v.items() if isinstance(t, (int, float))} if isinstance(v, dict) else {}
+    return v if isinstance(v, dict) else {}
+
+
+UPDATE_REF = re.compile(r"main|v\d+\.\d+\.\d+")
+UPDATER = os.path.join(APP_DIR, "update.sh")  # run as root by svm-helper-update.service
+
+
+def can_update():
+    """Whether this install updates itself when the app asks (setup.sh from 2.3 puts it there)."""
+    return os.access(UPDATER, os.X_OK)
+
+
+def ask_update(ref):
+    """Leaves the update the app asked for, for svm-helper-update.path to start (as root: the
+    helper can't install anything itself). Whether it could."""
+    if not UPDATE_REF.fullmatch(ref or "") or not can_update():
+        return False
+    with open(state_path("update").replace(".json", ".request"), "w") as f:
+        f.write(ref + "\n")
+    return True
 
 
 def send_test(pool, settings, pool_name, asked):
@@ -2176,13 +2218,6 @@ class Helper:
                 settings = dict(look.settings)
                 self.spawn("start order", lambda p: start_in_order(p, settings, boot))
                 done.append("starting the VMs in order")
-        b = self.conf.get("backups") or {}
-        bs = load_json(state_path("backups"), {})
-        if self.run_jobs and b.get("on") and due(b.get("at", "02:30"), b.get("days") or [], max(bs.get("last_run", 0), state.get("backups_kicked", 0)), now):
-            state["backups_kicked"] = now
-            conf = self.conf
-            if self.spawn("backups", lambda p: locked_backups(p, conf)):
-                done.append("backups started")
         rv = (self.conf.get("claude") or {}).get("review") or {}
         rs = load_json(state_path("review"), {})
         if self.run_jobs and rv.get("on", True) and due(rv.get("at", "08:00"), [rv.get("day", "Monday")], max(rs.get("at", 0), state.get("review_kicked", 0)), now):
@@ -2209,6 +2244,13 @@ class Helper:
             t, settings, name = asked["test"], dict(look.settings), look.pool_name
             if self.spawn("test alert", lambda p, t=t: send_test(p, settings, name, t)):
                 answered["test"] = t
+        if self.run_jobs and asked.get("update", 0) > answered.get("update", 0):
+            answered["update"] = asked["update"]
+            ref = str(request_record(look.pool_rec).get("update_ref") or "")
+            if ask_update(ref):
+                done.append("updating to %s, as the app asked" % ref)
+            else:
+                log("the app asked for an update to '%s', which can't be done here" % ref)
         state["last_look"] = now
         heartbeat(look, self.started)
         look.save()
@@ -2430,40 +2472,12 @@ def copies(helper):
         pool.close()
 
 
-def locked_backups(pool, conf):
-    try:
-        with JobLock("backups"):
-            run_backups(pool, conf)
-    except PoolError as e:
-        log("backups: %s" % e)
-
-
 class TickLock:
     """One look at a time (the service's, or 'svm-helper check')."""
 
     def __enter__(self):
         self.f = open(os.path.join(STATE_DIR, "look.lock"), "w")
         fcntl.flock(self.f, fcntl.LOCK_EX)
-        return self
-
-    def __exit__(self, *a):
-        fcntl.flock(self.f, fcntl.LOCK_UN)
-        self.f.close()
-
-
-class JobLock:
-    """A job that mustn't run twice at once (backups), across the service and the command line."""
-
-    def __init__(self, name):
-        self.path = os.path.join(STATE_DIR, name + ".lock")
-
-    def __enter__(self):
-        self.f = open(self.path, "w")
-        try:
-            fcntl.flock(self.f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            self.f.close()
-            raise PoolError("it's already running")
         return self
 
     def __exit__(self, *a):
@@ -2491,7 +2505,6 @@ def die(text):
 def cmd_status(args):
     conf = load_config()
     state = load_json(state_path("state"), {})
-    b = load_json(state_path("backups"), {})
     r = load_json(state_path("review"), {})
     active = subprocess.run(["systemctl", "is-active", SERVICE], capture_output=True, text=True).stdout.strip() or "unknown"
     ui.banner("Helper VM %s" % VERSION, "looking after the pool '%s'" % state.get("pool_name", "?"))
@@ -2504,12 +2517,6 @@ def cmd_status(args):
     print("  %s Alerts go to: %s" % (ui.green("●") if ch else ui.yellow("●"), ", ".join(ch) or "nowhere yet (sudo svm-helper setup)"))
     cl = Claude(conf, load_secrets()) if os.access(SECRETS, os.R_OK) or not os.path.exists(SECRETS) else None
     print("  %s Claude: %s" % (ui.green("●") if cl and cl.ready() else ui.dim("●"), ("on, through " + cl.how()) if cl and cl.ready() else ("off" if cl and cl.mode == "off" else "not working (sudo svm-helper setup)" if cl else "?")))
-    bk = conf.get("backups") or {}
-    if bk.get("on"):
-        last_b = b.get("last_run")
-        print("  %s Backups: %d VMs%s at %s, to %s; last %s" % (ui.green("●") if b.get("last_ok", True) else ui.red("●"), len(bk.get("vms") or []), " + the pool's database" if bk.get("pool_db") else "", bk.get("at"), bk.get("dir"), ("%s ago, %s" % (span(time.time() - last_b), "fine" if b.get("last_ok", True) else "with failures")) if last_b else "never"))
-    else:
-        print("  %s Backups: off" % ui.dim("●"))
     rv = (conf.get("claude") or {}).get("review") or {}
     print("  %s Weekly review: %s" % (ui.green("●") if rv.get("on", True) else ui.dim("●"), ("%ss at %s; last %s" % (rv.get("day", "Monday"), rv.get("at", "08:00"), ("%s ago" % span(time.time() - r["at"])) if r.get("at") else "never")) if rv.get("on", True) else "off"))
     ad = load_json(state_path("advice"), {})
@@ -2579,29 +2586,6 @@ def cmd_advise(args):
     ui.note("Left in the pool too: Simple VM Manager's Advisor page shows it.")
 
 
-def cmd_backup(args):
-    pool, conf, sec = need_pool()
-    if not args and not (conf.get("backups") or {}).get("on"):
-        die("Backups aren't set up: run 'sudo svm-helper setup', or name the VMs (svm-helper backup \"Home Assistant\").")
-    def progress(name, got):
-        if ui.color:
-            sys.stdout.write("\r        %s %s: %s so far \033[K" % (ui.cyan("↓"), name, gb(got)))
-            sys.stdout.flush()
-
-    def say(text):
-        if ui.color:
-            sys.stdout.write("\r\033[K")
-        ui.info(text)
-
-    try:
-        with JobLock("backups"):
-            res = run_backups(pool, conf, args or None, say=say, progress=progress)
-    except PoolError as e:
-        die("Backups: %s" % e)
-    (ui.ok if res["ok"] else ui.fail)("done" if res["ok"] else "done, with failures")
-    pool.close()
-
-
 def cmd_xapi(args):
     """One Python expression on the pool's API (x is session.xenapi): its result as JSON."""
     if not args:
@@ -2661,6 +2645,15 @@ def chown_conf(path):
         os.chown(path, 0, grp.getgrnam(USER).gr_gid)
     except (KeyError, OSError):
         pass
+
+
+def asked(conf, key, prompt, default=True):
+    """A yes or no that's asked again at each setup: Enter keeps the last answer (`default` the
+    first time)."""
+    answers = conf.setdefault("answers", {})
+    said = ui.yes(prompt, answers.get(key, default))
+    answers[key] = said
+    return said
 
 
 def save_conf(conf, secrets_):
@@ -2761,7 +2754,7 @@ def setup_pool(n, total, conf, sec):
         ui.ok("This machine is the VM %s, on %s" % (ui.bold(v["name_label"]), where))
         if (v.get("other_config") or {}).get("auto_poweron") != "true":
             ui.note("After a power cut, the helper should be up early: it's the one that starts the other VMs in order and tells you what's wrong.")
-            if ui.yes("Start this VM whenever its server starts?", True):
+            if asked(conf, "self_autostart", "Start this VM whenever its server starts?"):
                 write_other_config(x, "VM", ref, "auto_poweron", "true")
                 write_other_config(x, "pool", pool_ref, "auto_poweron", "true")
                 ui.ok("It starts with its server now")
@@ -2864,95 +2857,29 @@ def setup_alerts(n, total, x, pool_ref, pool_name):
     return settings
 
 
-def mounted_at(path):
+def forget_backups(conf):
+    """The backups to a NAS that earlier versions kept, gone: their settings, and the share's line
+    in /etc/fstab (unmounted). What's on the NAS stays."""
+    conf.pop("backups", None)
+    mark = "# Helper VM backups (svm-helper setup)\n"
     try:
-        with open("/proc/mounts") as f:
-            for line in f:
-                parts = line.split()
-                if len(parts) > 2 and parts[1] == path:
-                    return parts[0], parts[2]
+        with open("/etc/fstab") as f:
+            lines = f.readlines()
+    except OSError:
+        return
+    if mark not in lines:
+        return
+    i = lines.index(mark)
+    folder = lines[i + 1].split()[1] if i + 1 < len(lines) and len(lines[i + 1].split()) > 1 else "/srv/svm-backups"
+    with open("/etc/fstab", "w") as f:
+        f.writelines(lines[:i] + lines[i + 2:])
+    subprocess.run(["umount", "-l", folder], capture_output=True)
+    subprocess.run(["systemctl", "daemon-reload"], capture_output=True)
+    try:
+        os.rmdir(folder)
     except OSError:
         pass
-    return None
-
-
-def can_write_as(user, folder):
-    test = os.path.join(folder, ".svm-helper-write-test")
-    r = subprocess.run(["runuser", "-u", user, "--", "sh", "-c", 'echo ok > "$1" && rm -f "$1"', "sh", test], capture_output=True, text=True)
-    return r.returncode == 0, (r.stderr or "").strip()
-
-
-def setup_backups(n, total, conf, x, vms):
-    ui.step(n, total, "Backups to your NAS")
-    b = conf["backups"]
-    ui.note("Snapshots live on the same storage as the VMs: a backup is a copy elsewhere. Each night (or on the days you choose) this helper saves the VMs you pick as .xva files on an NFS share, keeping the last few, and the pool's own database too.")
-    if not ui.yes("Set up backups?", True):
-        b["on"] = False
-        return
-    folder = b.get("dir") or "/srv/svm-backups"
-    m = mounted_at(folder)
-    if m:
-        ui.ok("%s is mounted from %s" % (folder, m[0]))
-        change = not ui.yes("Keep using it?", True)
-    else:
-        change = True
-    if change:
-        share = ui.ask("NFS share (like truenas.local:/mnt/tank/backups/xen)", "", check=lambda v: None if re.fullmatch(r"[A-Za-z0-9.\-_\[\]:]+:/\S*", v) else "type it as server:/path")
-        os.makedirs(folder, exist_ok=True)
-        line = "%s %s nfs defaults,_netdev,nofail,x-systemd.automount,x-systemd.mount-timeout=30 0 0\n" % (share, folder)
-        mark = "# Helper VM backups (svm-helper setup)\n"
-        with open("/etc/fstab") as f:
-            fstab = [l for l in f.readlines() if l != mark and not (len(l.split()) > 1 and l.split()[1] == folder)]
-        fstab += [mark, line]
-        with open("/etc/fstab", "w") as f:
-            f.writelines(fstab)
-        subprocess.run(["systemctl", "daemon-reload"], capture_output=True)
-
-        def mount():
-            subprocess.run(["umount", folder], capture_output=True)
-            r = subprocess.run(["mount", folder], capture_output=True, text=True, timeout=60)
-            if r.returncode != 0 and not mounted_at(folder):
-                raise PoolError((r.stderr or r.stdout).strip() or "mount failed")
-            os.listdir(folder)  # (an automount mounts on first use)
-
-        try:
-            ui.spin("Mounting %s" % share, mount)
-        except Exception:
-            ui.note("Check the share's address, and that the NAS lets this machine's address use it (TrueNAS: Shares → NFS → the share's Networks/Hosts). Run 'sudo svm-helper setup' again after.")
-            b["on"] = False
-            return
-    ok, why = can_write_as(USER, folder)
-    if ok:
-        ui.ok("The helper can write there")
-    else:
-        ui.fail("The helper (user %s) can't write in %s: %s" % (USER, folder, why or "permission denied"))
-        ui.note("On TrueNAS: edit the NFS share → Advanced Options → Mapall User: a user that owns that dataset (or root). Then run 'sudo svm-helper setup' again.")
-        b["on"] = False
-        return
-    b["dir"] = folder
-    b["pool_db"] = ui.yes("Save the pool's database too (small, and it can rebuild the pool's settings)?", b.get("pool_db", True))
-    me = conf.get("self_vm", "")
-    choices = sorted(((v["name_label"], v["uuid"], r) for r, v in vms.items() if v["uuid"] != me), key=lambda t: t[0].lower())
-    size = {}
-    for name, uuid, ref in choices:
-        try:
-            size[uuid] = disks_used(x, ref)
-        except Exception:
-            size[uuid] = 0
-    labels = ["%s  %s" % (name.ljust(28), ui.dim(gb(size[uuid]))) for name, uuid, _ in choices]
-    picked = ui.picks("Which VMs? (like 1 3 5, all, or none)", labels, [i for i, c in enumerate(choices) if c[1] in (b.get("vms") or [])])
-    b["vms"] = [choices[i][1] for i in picked]
-    b["at"] = ui.ask("At what time (this machine's clock, %s)" % time.strftime("%Z"), b.get("at") or "02:30", check=lambda v: None if re.fullmatch(r"([01]?\d|2[0-3]):[0-5]\d", v) else "type it like 02:30")
-    days = ui.ask("Which days (every, or like sat sun)", " ".join(d[:3].lower() for d in b.get("days") or []) or "every", check=lambda v: None if v in ("every", "all", "daily") or all(p[:3].title() in [d[:3] for d in DAYS] for p in v.split()) else "type every, or days like mon thu")
-    b["days"] = [] if days in ("every", "all", "daily") else [next(d for d in DAYS if d[:3] == p[:3].title()) for p in days.split()]
-    b["keep"] = int(ui.ask("How many of each to keep", str(b.get("keep", 7)), check=lambda v: None if v.isdigit() and 1 <= int(v) <= 365 else "a number from 1 to 365"))
-    total_size = sum(size[c[1]] for c in [choices[i] for i in picked])
-    free = shutil.disk_usage(folder).free
-    b["on"] = bool(b["vms"] or b["pool_db"])
-    if b["vms"]:
-        ui.ok("%d VMs, about %s a round; %d kept: up to %s. The share has %s free." % (len(b["vms"]), gb(total_size), b["keep"], gb(total_size * b["keep"]), gb(free)))
-        if total_size * b["keep"] > free:
-            ui.warn("That's more than the share has free: keep fewer, or the oldest go when it's full (and a round that doesn't fit is skipped).")
+    ui.ok("Backups to the NAS are no longer done here: its share is unmounted (what's on the NAS stays)")
 
 
 # ---------------------------------------------------------------- signing in to Claude from a phone
@@ -3447,13 +3374,13 @@ def setup_claude(n, total, conf, sec):
         rv["at"] = ui.ask("At what time", rv.get("at", "08:00"), check=lambda v: None if re.fullmatch(r"([01]?\d|2[0-3]):[0-5]\d", v) else "type it like 08:00")
 
 
-def setup_claude_code(user, pool_name, hosts):
+def setup_claude_code(conf, user, pool_name, hosts):
     """Claude Code for the person who ran setup, with a CLAUDE.md that tells it about this machine."""
     if not user or user == "root":
         ui.info("Claude Code: run setup with sudo from your own user to have it installed for you.")
         return
-    ui.note("Claude Code is Anthropic's assistant for the terminal. Here it can look after the pool with you: 'how full is the NAS?', 'which VMs have no backup?', 'restart servARR'. It asks before it runs anything, and logs in with your Claude account the first time.")
-    if not ui.yes("Install Claude Code for %s?" % user, True):
+    ui.note("Claude Code is Anthropic's assistant for the terminal. Here it can look after the pool with you: 'how full is the NAS?', 'which VMs have no snapshot schedule?', 'restart servARR'. It asks before it runs anything, and logs in with your Claude account the first time.")
+    if not asked(conf, "claude_code", "Install Claude Code for %s?" % user):
         return
     home = pwd.getpwnam(user).pw_dir
     if not os.path.exists(os.path.join(home, ".local", "bin", "claude")):
@@ -3480,7 +3407,7 @@ def setup_claude_code(user, pool_name, hosts):
     in_group = user in grp.getgrnam(USER).gr_mem
     if not in_group:
         ui.note("For Claude Code (and you) to use 'svm-helper' without sudo, %s can join the group %s. That lets %s read the pool's password in /etc/svm-helper: fine on a machine that's only for this." % (user, USER, user))
-        if ui.yes("Add %s to the group %s?" % (user, USER), True):
+        if asked(conf, "claude_code_group", "Add %s to the group %s?" % (user, USER)):
             subprocess.run(["usermod", "-aG", USER, user], capture_output=True)
             ui.ok("Done (it takes effect at %s's next login)" % user)
     ui.ok("To start: %s" % ui.bold("cd ~/pool && claude"))
@@ -3491,7 +3418,7 @@ def cmd_setup(args):
         die("Run it as root: sudo svm-helper setup")
     from_installer = "--from-installer" in args
     base = 2 if from_installer else 0
-    total = base + 5
+    total = base + 4
     if not from_installer:
         ui.banner("Helper VM %s · setup" % VERSION, "Simple VM Manager's helper for your XenServer pool")
         ui.note("Enter keeps what's in brackets. Run it again any time to change an answer.")
@@ -3501,12 +3428,13 @@ def cmd_setup(args):
         session, x, pool_ref, pool_name, hosts, vms = setup_pool(base + 1, total, conf, sec)
         save_conf(conf, sec)
         setup_alerts(base + 2, total, x, pool_ref, pool_name)
-        setup_backups(base + 3, total, conf, x, vms)
+        forget_backups(conf)
         save_conf(conf, sec)
-        setup_claude(base + 4, total, conf, sec)
+        setup_claude(base + 3, total, conf, sec)
         save_conf(conf, sec)
-        setup_claude_code(os.environ.get("SUDO_USER", ""), pool_name, hosts)
-        ui.step(base + 5, total, "Starting it")
+        setup_claude_code(conf, os.environ.get("SUDO_USER", ""), pool_name, hosts)
+        save_conf(conf, sec)
+        ui.step(base + 4, total, "Starting it")
         os.makedirs(STATE_DIR, exist_ok=True)
         subprocess.run(["systemctl", "enable", SERVICE], capture_output=True)
         t0 = time.time()
@@ -3543,12 +3471,10 @@ def cmd_setup(args):
                 session.xenapi.session.logout()
             except Exception:
                 pass
-    b = conf["backups"]
     rv = conf["claude"].get("review") or {}
     lines = [
         ui.bold("The helper looks after '%s' now." % pool_name),
         "",
-        "Backups:  " + (("%d VMs%s, %s at %s" % (len(b["vms"]), " + the pool's database" if b.get("pool_db") else "", "every day" if not b["days"] else ", ".join(d[:3] for d in b["days"]), b["at"])) if b.get("on") else "off"),
         "Claude:   " + (Claude(conf, sec).how() if Claude(conf, sec).ready() else "off"),
         "Review:   " + (("%ss at %s, %s" % (rv.get("day"), rv.get("at"), "by Claude" if Claude(conf, sec).ready() else "a plain summary")) if rv.get("on") else "off"),
         "",
@@ -3556,7 +3482,7 @@ def cmd_setup(args):
         ui.cyan("svm-helper check") + "         one look now",
         ui.cyan("svm-helper test") + "          a test alert to your phone",
         ui.cyan("svm-helper review") + "        this week's review, now",
-        ui.cyan("svm-helper backup") + "        the backups, now",
+        ui.cyan("svm-helper advise") + "        the Advisor's checklist, now",
         ui.cyan("sudo svm-helper setup") + "    change these answers",
         ui.cyan("journalctl -u svm-helper -f") + "  its log, live",
     ]
@@ -3573,7 +3499,6 @@ COMMANDS = {
     "test": (cmd_test, "a test alert to your channels"),
     "review": (cmd_review, "the weekly review now (--send sends it too)"),
     "advise": (cmd_advise, "the Advisor's checklist of good practice, now"),
-    "backup": (cmd_backup, "the backups now (or of the VMs named)"),
     "xapi": (cmd_xapi, "one Python expression on the pool's API (x = session.xenapi)"),
     "shell": (cmd_shell, "a Python shell on the pool's API"),
     "trust": (cmd_trust, "read and pin the servers' certificates again"),

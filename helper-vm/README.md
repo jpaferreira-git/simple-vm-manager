@@ -28,16 +28,19 @@ comes from the app for each copy, in a XenAPI secret, and isn't kept).
 **Every hour**: compares each server's clock with the right time (NTP).
 
 **Every day**: checks the pool against good practice for Simple VM Manager's **Advisor** page:
-backups, room on the storage, forgotten disks and old snapshots, the servers' clocks, updates and
-memory, VM Tools, VMs that don't start by themselves after a power cut, certificates, and whether
-alerts reach you. Claude says why each thing matters and what to do, and adds what else it notices.
-The app's *Check now* has it check at once, and its *Send a test* has it send a test alert.
+snapshot schedules, room on the storage, forgotten disks and old snapshots, the servers' clocks,
+updates, memory and week's load, VM Tools, ISOs left in DVD drives, VMs that can't move to another
+server, systems past their support, VMs off for months or at their limit all week, VMs that don't
+start by themselves after a power cut, certificates, and whether alerts reach you. It reads each
+server's and each VM's load over the week for it. Claude, given all of it, says why each thing
+matters and what to do, and adds five to ten findings of its own. The app's *Check now* has it
+check at once, and its *Send a test* has it send a test alert.
 
-**On its schedule**
-- **Backups** to an NFS share: the VMs you pick, as `.xva` files taken from a snapshot. It
-  keeps the last few of each, plus the pool's database.
-- A **weekly health review** of the pool, written by Claude (or a plain summary without it).
-  It covers servers, storage, alerts, backups, unused disks and old snapshots.
+**When the app asks**: it updates itself to the version that app comes with (the Advisor's and the
+Helper tab's *Update it*).
+
+**Every week**: a **health review** of the pool, written by Claude (or a plain summary without
+it). It covers servers, storage, alerts, unused disks and old snapshots.
 
 It also adds two things for you:
 - The `svm-helper` command (see below).
@@ -55,10 +58,11 @@ It also adds two things for you:
    sudo bash setup.sh
    ```
 3. Answer its questions: your pool (any server's address, the root user), where alerts go,
-   backups and Claude.
+   and Claude.
 
-Run `setup.sh` again to update the helper; your answers stay. `sudo svm-helper setup` asks the
-questions again.
+Run `setup.sh` again to update the helper; your answers stay. From version 2.3 on, Simple VM
+Manager can update it too: *Update it*, on the Advisor or the pool's Helper tab. `sudo svm-helper
+setup` asks the questions again.
 
 ## Claude
 
@@ -84,7 +88,6 @@ Setup offers three ways for the helper to use Claude:
 | `svm-helper test` | a test alert to your channels |
 | `svm-helper review [--send]` | this week's review, now |
 | `svm-helper advise` | the Advisor's checklist, now (the app shows it too) |
-| `svm-helper backup ["VM" …]` | the backups now, or just the VMs named |
 | `svm-helper xapi 'expr'` | one Python expression on the pool's API (`x` = `session.xenapi`) |
 | `svm-helper shell` | a Python shell on the pool's API |
 | `sudo svm-helper trust` | pin the servers' certificates again, after you renew one |
@@ -97,7 +100,10 @@ Setup offers three ways for the helper to use Claude:
 - It never uses SSH to the pool's servers, and nothing runs in their dom0. (It uses SSH only to
   read a Proxmox VM's disks that you convert, while it copies them.)
 - The service runs as the unprivileged user `svm-helper`, in a systemd sandbox. It can write
-  only to its own folder and to the backups share.
+  only to its own folder.
+- It can't install anything itself. When the app asks for an update, it leaves the version in its
+  folder, and `svm-helper-update.service` (`update.sh`, as root) installs it: only a released
+  version of this repository, through the same `setup.sh`.
 - While you sign in to Claude, setup serves that one page, at a random link, and stops when
   you're done. The token stays on the VM: the page only says whether it worked.
 - The pool's password, and Claude's token or API key, are in `/etc/svm-helper/secrets.json`,

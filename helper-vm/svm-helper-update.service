@@ -1,0 +1,10 @@
+# Simple VM Manager's Helper VM: brings it up to date, as root (see update.sh).
+[Unit]
+Description=Simple VM Manager's Helper VM: bring it up to date
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/svm-helper/update.sh
+TimeoutStartSec=900

@@ -578,6 +578,10 @@ enum Intent {
     Advisor,
     /// The Advisor's Check now, of pool `sid`'s Helper VM.
     AdvisorCheck(u32),
+    /// The Helper VM of pool `sid` updated to the version this app comes with.
+    HelperUpdate(u32),
+    /// One of the Advisor's fixes, done on pool `sid` (the check's id, what to do).
+    AdvisorFix(u32, String, crate::helper::Fix),
     /// A VM's Snapshots tab: pool, VM.
     OpenVmSnapshots(u32, String),
     /// The snapshot schedules (the Snapshots page's Schedules tab).
@@ -4079,6 +4083,8 @@ impl App {
                     self.tab = Tab::Advisor;
                 }
                 Intent::AdvisorCheck(sid) => self.helper_ask(sid, "advice", ctx),
+                Intent::HelperUpdate(sid) => self.helper_ask(sid, "update", ctx),
+                Intent::AdvisorFix(sid, id, fix) => self.advisor_fix(sid, id, fix, ctx),
                 Intent::Convert => {
                     self.select("root".into());
                     if !matches!(self.tab, Tab::Convert | Tab::Conversions) {
@@ -9073,11 +9079,16 @@ impl eframe::App for App {
                 "snapshots" => out.push(Intent::Tab(Tab::Snapshots)),
                 // the pool's Helper tab (with SVM_DEMO_HELPER: it has a Helper VM)
                 "helper" => out.push(Intent::Tab(Tab::Helper)),
-                // the Advisor (with SVM_DEMO_HELPER), its first check opened
+                // the Advisor (with SVM_DEMO_HELPER), its first check opened (or SVM_SHOT_CHECK's,
+                // its fix asked about with SVM_SHOT_CONFIRM)
                 "advisor" => {
                     out.push(Intent::Advisor);
                     if let Some(sid) = sel.sid.or(self.servers.first().map(|s| s.id)) {
-                        ctx.data_mut(|d| d.insert_temp(egui::Id::new(("advisor-open", sid, "backups_vms")), true));
+                        let id = std::env::var("SVM_SHOT_CHECK").unwrap_or_else(|_| "snapshot_schedules".into());
+                        ctx.data_mut(|d| d.insert_temp(egui::Id::new(("advisor-open", sid, id.as_str())), true));
+                        if std::env::var("SVM_SHOT_CONFIRM").is_ok() {
+                            ctx.data_mut(|d| d.insert_temp(egui::Id::new(("advisor-confirm", sid, id.as_str())), true));
+                        }
                     }
                 }
                 // a server's tools' dialogs (demo-host-01's), a pool's

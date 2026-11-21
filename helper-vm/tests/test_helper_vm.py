@@ -271,8 +271,22 @@ class Logic(unittest.TestCase):
         self.assertEqual(h.describe("SVM_HOST_BACK", "tico answers again", "tico")[0], "tico answers again")
         self.assertEqual(h.bracket("fe80::1"), "[fe80::1]")
         self.assertEqual(h.bracket("10.0.0.1:8443"), "10.0.0.1:8443")
-        conf = h.merged(h.DEFAULT_CONFIG, {"backups": {"vms": ["a"]}, "new": 1})
-        self.assertEqual((conf["backups"]["vms"], conf["backups"]["keep"], conf["new"]), (["a"], 7, 1))
+        conf = h.merged(h.DEFAULT_CONFIG, {"claude": {"review": {"day": "Friday"}}, "new": 1})
+        self.assertEqual((conf["claude"]["review"]["day"], conf["claude"]["review"]["at"], conf["new"]), ("Friday", "08:00", 1))
+
+    def test_setup_remembers_a_no(self):
+        """A yes or no asked again at the next setup offers the last answer (Enter keeps it)."""
+        offered = []
+        real = h.ui.yes
+        h.ui.yes = lambda prompt, default: offered.append(default) or default
+        try:
+            conf = {}
+            self.assertTrue(h.asked(conf, "claude_code", "Install Claude Code?"))
+            conf["answers"]["claude_code"] = False  # (said no that time)
+            self.assertFalse(h.asked(conf, "claude_code", "Install Claude Code?"))
+            self.assertEqual(offered, [True, False])
+        finally:
+            h.ui.yes = real
 
     def test_storage_remount_and_made_up_run(self):
         fp = FakePool()
@@ -323,14 +337,14 @@ class Logic(unittest.TestCase):
         conn = FakeConn(fp.x)
         conn.close = lambda: None
         helper = h.Helper(jobs=False)
-        helper.conf = h.merged(h.DEFAULT_CONFIG, {"backups": {"on": True, "at": time.strftime("%H:%M", time.localtime(time.time() - 60))}, "watch": {"clocks": False}})
+        helper.conf = h.merged(h.DEFAULT_CONFIG, {"claude": {"advice": {"at": time.strftime("%H:%M", time.localtime(time.time() - 60))}}, "watch": {"clocks": False}})
         helper.pool = conn
         done = helper.tick()
         self.assertTrue(any("Local storage on tico is 95% full" in d for d in done), done)
         st = h.load_json(h.state_path("state"), {})
         self.assertEqual((st["pool_name"], st["hosts_seen"]["127.0.0.2"]), ("home", "godofredo"))
         self.assertIn(h.STATUS_KEY, fp.other_config)
-        self.assertNotIn("backups started", done)
+        self.assertNotIn("checking the pool for the Advisor", done)  # (jobs left alone)
         self.assertEqual(helper.jobs, {})
 
     @unittest.skipUnless(HAVE_ANTHROPIC, "needs Anthropic's SDK")
@@ -419,17 +433,28 @@ def advisor_pool():
     x = fp.x
     now = time.time()
     fp.vms = {
-        "A": {"uuid": "u-a", "name_label": "Plex", "is_a_template": False, "is_a_snapshot": False, "is_control_domain": False, "power_state": "Running", "resident_on": "H1", "other_config": {}, "guest_metrics": "G1", "snapshot_schedule": "OpaqueRef:NULL", "snapshots": ["SA"], "memory_dynamic_max": str(2 * 1024 ** 3), "VCPUs_max": "2"},
-        "B": {"uuid": "u-b", "name_label": "dc01", "is_a_template": False, "is_a_snapshot": False, "is_control_domain": False, "power_state": "Running", "resident_on": "H1", "other_config": {"auto_poweron": "true"}, "guest_metrics": "OpaqueRef:NULL", "snapshot_schedule": "V1", "snapshots": [], "memory_dynamic_max": str(4 * 1024 ** 3), "VCPUs_max": "2"},
+        "A": {"uuid": "u-a", "name_label": "Plex", "is_a_template": False, "is_a_snapshot": False, "is_control_domain": False, "power_state": "Running", "resident_on": "H1", "other_config": {}, "guest_metrics": "G1", "snapshot_schedule": "OpaqueRef:NULL", "snapshots": ["SA"], "memory_dynamic_max": str(2 * 1024 ** 3), "VCPUs_max": "8", "VBDs": ["VB1", "VB2"]},
+        "B": {"uuid": "u-b", "name_label": "dc01", "is_a_template": False, "is_a_snapshot": False, "is_control_domain": False, "power_state": "Running", "resident_on": "H1", "other_config": {"auto_poweron": "true"}, "guest_metrics": "OpaqueRef:NULL", "snapshot_schedule": "V1", "snapshots": [], "memory_dynamic_max": str(4 * 1024 ** 3), "VCPUs_max": "2", "VBDs": ["VB3"]},
+        "O": {"uuid": "u-o", "name_label": "old-test", "is_a_template": False, "is_a_snapshot": False, "is_control_domain": False, "power_state": "Halted", "resident_on": "OpaqueRef:NULL", "other_config": {}, "guest_metrics": "G2", "metrics": "M-O", "snapshot_schedule": "V1", "snapshots": [], "memory_dynamic_max": str(1024 ** 3), "VCPUs_max": "1", "VBDs": []},
         "H": {"uuid": "u-helper", "name_label": "svm-helper", "is_a_template": False, "is_a_snapshot": False, "is_control_domain": False, "power_state": "Running", "resident_on": "H1", "other_config": {}, "guest_metrics": "G1", "snapshot_schedule": "OpaqueRef:NULL", "snapshots": [], "memory_dynamic_max": str(1024 ** 3), "VCPUs_max": "1"},
         "SA": {"uuid": "u-sa", "name_label": "before the update", "is_a_template": False, "is_a_snapshot": True, "is_control_domain": False, "snapshot_of": "A", "snapshot_time": xmlrpc.client.DateTime(xd(now - 40 * 86400)), "is_vmss_snapshot": False, "power_state": "Halted", "other_config": {}},
     }
     x.VM = NS()
     x.VM.get_all_records = lambda: fp.vms
     x.VM_guest_metrics = NS()
-    x.VM_guest_metrics.get_all_records = lambda: {"G1": {"PV_drivers_detected": True}}
+    x.VM_guest_metrics.get_all_records = lambda: {"G1": {"PV_drivers_detected": True, "os_version": {"name": "Ubuntu 24.04.1 LTS"}}, "G2": {"PV_drivers_detected": True, "os_version": {"name": "CentOS Linux release 7.9.2009 (Core)"}}}
+    x.VM_metrics = NS()
+    x.VM_metrics.get_all_records = lambda: {"M-O": {"start_time": xmlrpc.client.DateTime(xd(now - 200 * 86400))}}
     x.VDI = NS()
-    x.VDI.get_all_records = lambda: {"D": {"type": "user", "is_a_snapshot": False, "VBDs": [], "managed": True, "SR": "S2", "name_label": "old disk", "virtual_size": str(20 * 1024 ** 3)}}
+    x.VDI.get_all_records = lambda: {
+        "D": {"uuid": "u-d", "type": "user", "is_a_snapshot": False, "VBDs": [], "managed": True, "SR": "S2", "name_label": "old disk", "virtual_size": str(20 * 1024 ** 3)},
+        "DA": {"uuid": "u-da", "type": "user", "is_a_snapshot": False, "VBDs": ["VB1"], "managed": True, "SR": "S1", "name_label": "Plex disk", "virtual_size": str(40 * 1024 ** 3)},
+        "DB": {"uuid": "u-db", "type": "user", "is_a_snapshot": False, "VBDs": ["VB3"], "managed": True, "SR": "S2", "name_label": "dc01 disk", "virtual_size": str(40 * 1024 ** 3)},
+        "ISO": {"uuid": "u-iso", "type": "user", "is_a_snapshot": False, "VBDs": ["VB2"], "managed": True, "SR": "S-iso", "name_label": "ubuntu.iso", "virtual_size": "1"},
+    }
+    x.VBD = NS()
+    x.VBD.get_all_records = lambda: {"VB1": {"type": "Disk", "VDI": "DA", "empty": False}, "VB2": {"type": "CD", "VDI": "ISO", "empty": False}, "VB3": {"type": "Disk", "VDI": "DB", "empty": False}}
+    fp.srs["S-iso"] = {"uuid": "u-siso", "name_label": "ISOs", "type": "iso", "content_type": "iso", "shared": True, "physical_size": "0", "physical_utilisation": "0", "other_config": {}}
     x.Certificate = NS()
     x.Certificate.get_all_records = lambda: {"C1": {"host": "H1", "not_after": xmlrpc.client.DateTime(xd(now + 10 * 86400)), "name": ""}, "C2": {"host": "H2", "not_after": xmlrpc.client.DateTime(xd(now + 900 * 86400)), "name": ""}}
     fp.hosts["H2"]["latest_synced_updates_applied"] = "no"
@@ -442,19 +467,37 @@ class Advisor(unittest.TestCase):
 
     def test_the_checks(self):
         fp = advisor_pool()
-        checks = h.advisor_checks(fp.x, h.merged(h.DEFAULT_CONFIG, {"self_vm": "u-helper"}), {"clock": {"u-h1": 1, "u-h2": 250}})
+        load = {"host": {"u-h1": {"cpu": (85, 99)}, "u-h2": {"cpu": (3, 10)}}, "vm": {"u-a": {"cpu": (4, 9), "memory": (95, 99)}, "u-b": {"cpu": (20, 50)}}}
+        checks = h.advisor_checks(fp.x, h.merged(h.DEFAULT_CONFIG, {"self_vm": "u-helper"}), {"clock": {"u-h1": 1, "u-h2": 250}}, load=load)
         by = {c["id"]: c for c in checks}
+        # the new ones, and what the app can fix
+        self.assertEqual((by["iso_in_drive"]["objects"], by["iso_in_drive"]["fix"]), (["Plex (ubuntu.iso)"], {"action": "eject", "uuids": ["u-a"], "names": ["Plex (ubuntu.iso)"]}))
+        self.assertEqual(by["local_storage"]["objects"], ["Plex"])  # its disk is on Local storage
+        self.assertEqual(by["os_support"]["objects"], ["old-test (CentOS Linux release 7.9.2009 (Core))"])
+        self.assertEqual(by["vms_off_long"]["objects"], ["old-test (started 200 days ago)"])
+        self.assertEqual(by["vm_busy"]["objects"], ["Plex (memory 95%)"])
+        self.assertEqual(by["vm_idle_cpus"]["objects"], ["Plex (8 vCPUs, at most 9% busy)"])
+        self.assertEqual(by["server_load"]["objects"], ["tico (85% on average)"])
+        self.assertEqual(by["one_server"]["objects"], ["tico"])
+        self.assertEqual(by["default_storage"]["fix"]["action"], "vm_storage")
+        self.assertEqual((by["autostart"]["fix"]["action"], by["autostart"]["fix"]["uuids"]), ("autostart", ["u-a"]))
+        self.assertEqual(by["old_snapshots"]["fix"], {"action": "delete_snapshots", "uuids": ["u-sa"], "names": ["Plex: before the update (40 days old)"]})
+        self.assertEqual(by["unused_disks"]["fix"]["uuids"], ["u-d"])
+        self.assertEqual(by["snapshot_schedules"]["fix"]["action"], "schedule")
+        self.assertEqual(by["certificates"]["fix"], {"action": "renew_cert", "uuids": ["u-h1"], "names": ["tico"]})
+        self.assertNotIn("fix", by["vm_tools"])  # (nothing to do from the app)
+        self.assertTrue(all("fix" not in c for c in checks if c["status"] == "ok"))
         self.assertTrue(all(c["topic"] in h.TOPICS and c["status"] in ("ok", "warn", "bad") for c in checks))
-        self.assertEqual(by["backups_vms"]["status"], "warn")  # (backups are off)
         self.assertEqual((by["snapshot_schedules"]["status"], by["snapshot_schedules"]["objects"]), ("warn", ["Plex"]))  # not the helper's own VM
         self.assertEqual((by["storage_space"]["status"], by["storage_space"]["objects"]), ("bad", ["Local storage (95%)"]))
-        self.assertEqual(by["unused_disks"]["objects"], ["old disk"])
-        self.assertEqual(by["old_snapshots"]["objects"], ["Plex"])
+        self.assertEqual(by["unused_disks"]["objects"], ["old disk (20 GB, on TrueNAS)"])
+        self.assertEqual(by["old_snapshots"]["title"], "1 snapshot over a month old")
         self.assertEqual((by["clocks"]["status"], by["clocks"]["objects"]), ("bad", ["godofredo (4 min)"]))
         self.assertEqual(by["updates"]["objects"], ["godofredo"])
         self.assertEqual(by["same_version"]["status"], "warn")
         self.assertEqual(by["vm_tools"]["objects"], ["dc01"])
         self.assertEqual(by["autostart"]["objects"], ["Plex"])  # dc01 starts by itself; the helper's VM isn't counted
+        self.assertEqual(by["autostart"]["title"], "1 running VM doesn't start by itself")
         self.assertEqual((by["certificates"]["status"], by["certificates"]["objects"]), ("bad", ["tico"]))
         self.assertEqual(by["alerts_sent"]["status"], "warn")
         self.assertEqual(by["servers_answering"]["status"], "ok")
@@ -465,6 +508,58 @@ class Advisor(unittest.TestCase):
         self.assertEqual(by["autostart"]["status"], "ok")
         self.assertEqual(by["alerts_sent"]["status"], "ok")
         self.assertNotIn("clocks", by)  # not compared yet: nothing said
+
+    def test_the_weeks_load(self):
+        xml = (b"<xport><meta><rows>2</rows><legend><entry>AVERAGE:host:u-h1:cpu_avg</entry><entry>AVERAGE:host:u-h1:memory_total_kib</entry>"
+               b"<entry>AVERAGE:host:u-h1:memory_free_kib</entry><entry>AVERAGE:vm:u-a:cpu0</entry><entry>AVERAGE:vm:u-a:cpu1</entry>"
+               b"<entry>AVERAGE:vm:u-a:memory</entry><entry>AVERAGE:vm:u-a:memory_internal_free</entry></legend></meta><data>"
+               b"<row><t>3600</t><v>0.5</v><v>1000</v><v>500</v><v>0.1</v><v>0.3</v><v>2048</v><v>1</v></row>"
+               b"<row><t>7200</t><v>0.7</v><v>1000</v><v>250</v><v>NaN</v><v>0.5</v><v>2048</v><v>1</v></row></data></xport>")
+        out = h.parse_rrd(xml, {"host": {}, "vm": {}})
+        self.assertEqual(out["host"]["u-h1"], {"cpu": (60, 70), "memory": (62, 75)})
+        self.assertEqual(out["vm"]["u-a"], {"cpu": (20, 20), "memory": (50, 50)})  # (an hour it didn't say is left out)
+
+    def test_the_snapshot_says_more(self):
+        fp = advisor_pool()
+        snap = h.snapshot_of_pool(fp.x, {}, {"host": {"u-h1": {"cpu": (30, 60)}}, "vm": {"u-a": {"cpu": (4, 9), "memory": (95, 99)}}})
+        plex = [v for v in snap["vms"] if v["name"] == "Plex"][0]
+        self.assertEqual((plex["iso_in_drive"], plex["disks"][0]["storage"], plex["disks"][0]["shared_storage"], plex["system"]), ("ubuntu.iso", "Local storage", False, "Ubuntu 24.04.1 LTS"))
+        self.assertEqual(plex["this_week"]["memory"], {"average_pct": 95, "peak_pct": 99})
+        tico = [x for x in snap["servers"] if x["name"] == "tico"][0]
+        self.assertEqual(tico["this_week"]["processors"], {"average_pct": 30, "peak_pct": 60})
+        old = [v for v in snap["vms"] if v["name"] == "old-test"][0]
+        self.assertEqual(old["last_started_days_ago"], 200)
+        json.dumps(snap)  # (it goes to Claude as JSON)
+
+    def test_an_update_asked_by_the_app(self):
+        fp = advisor_pool()
+        real = h.UPDATER
+        h.UPDATER = os.path.join(TMP, "update.sh")
+        with open(h.UPDATER, "w") as f:
+            f.write("#!/bin/sh\n")
+        os.chmod(h.UPDATER, 0o755)
+        request = h.state_path("update").replace(".json", ".request")
+        try:
+            self.assertFalse(h.ask_update("v1.30.0; rm -rf /"))
+            self.assertFalse(os.path.exists(request))
+            fp.other_config[h.REQUEST_KEY] = json.dumps({"update": 77, "update_ref": "v1.30.0"})
+            record = fp.x.pool.get_record
+            fp.x.pool.get_record = lambda p: dict(record(p), other_config=fp.other_config)
+            helper = h.Helper(jobs=True)
+            helper.spawn = lambda name, fn: True
+            helper.pool = FakeConn(fp.x)
+            state = {}
+            done = helper.look(state, time.time())
+            self.assertIn("updating to v1.30.0, as the app asked", done)
+            self.assertEqual(open(request).read(), "v1.30.0\n")
+            self.assertEqual(json.loads(fp.other_config[h.STATUS_KEY])["updates"], 1)
+            os.remove(request)
+            helper.look(state, time.time())
+            self.assertFalse(os.path.exists(request))  # answered once
+        finally:
+            h.UPDATER = real
+            if os.path.exists(request):
+                os.remove(request)
 
     def test_claude_words_them(self):
         checks = [{"id": "clocks", "topic": "servers", "status": "bad", "title": "Clock off: godofredo (4 min)", "note": "English note", "objects": ["godofredo (4 min)"]}, {"id": "memory", "topic": "servers", "status": "ok", "title": "Every server has memory to spare", "note": "", "objects": []}]
@@ -703,31 +798,6 @@ class Connection(unittest.TestCase):
         self.assertEqual(sec["pool_password"], "secret")
         self.assertEqual(name, "home")
 
-    def test_backups(self):
-        """A round of backups: the pool's database and a VM (from a snapshot that's deleted
-        after), the oldest beyond 'keep' deleted, a VM that's gone said so."""
-        dest = os.path.join(TMP, "backups")
-        old = os.path.join(dest, "vms", "Home-Assistant-u-v1")
-        os.makedirs(old)
-        for d in ("2026-01-01_0230", "2026-01-02_0230"):
-            open(os.path.join(old, "Home-Assistant_%s.xva" % d), "w").close()
-        conf = h.merged(h.DEFAULT_CONFIG, {"backups": {"on": True, "dir": dest, "vms": ["u-v1", "u-gone"], "keep": 2}})
-        p = h.Pool(self.conf(self.caddr), {"pool_password": "secret"}).connect()
-        res = h.run_backups(p, conf, say=lambda t: None)
-        p.close()
-        self.assertFalse(res["ok"])  # (the VM that's gone)
-        self.assertEqual([r["what"] for r in res["results"] if r["ok"]], ["the pool's database", "Home Assistant"])
-        kept = sorted(os.listdir(old))
-        self.assertEqual(len(kept), 2)
-        self.assertEqual(kept[0], "Home-Assistant_2026-01-02_0230.xva")
-        self.assertEqual(os.path.getsize(os.path.join(old, kept[1])), 300000)
-        self.assertEqual(len(os.listdir(os.path.join(dest, "pool-database"))), 1)
-        self.assertEqual(self.coord_api.snapshots, 0)  # the snapshot was deleted
-        self.assertEqual(self.coord_api.messages[-1][0], "SVM_BACKUP_FAILED")
-        self.assertIn("not in the pool any more", self.coord_api.messages[-1][4])
-        st = h.load_json(h.state_path("backups"), {})
-        self.assertEqual((st["last_ok"], list(st["last_by_vm"])), (False, ["u-v1"]))
-
     def test_a_disk_copy_goes_into_its_vdi(self):
         srv, port = serve(Source)
         try:
@@ -740,20 +810,6 @@ class Connection(unittest.TestCase):
             p.close()
         finally:
             srv.shutdown()
-
-    def test_download_kept_only_when_the_server_says_it_went_well(self):
-        p = h.Pool(self.conf(self.caddr), {"pool_password": "secret"}).connect()
-        dest = os.path.join(TMP, "vm.xva")
-        self.assertEqual(p.download("/export", {"uuid": "u-1"}, dest), 300000)
-        self.assertTrue(os.path.exists(dest) and not os.path.exists(dest + ".part"))
-        self.coord_api.export_ok = False
-        bad = os.path.join(TMP, "bad.xva")
-        with self.assertRaises(h.PoolError) as e:
-            p.download("/export", {"uuid": "u-1"}, bad)
-        self.assertIn("VDI_IO_ERROR", str(e.exception))
-        self.assertFalse(os.path.exists(bad) or os.path.exists(bad + ".part"))
-        self.coord_api.export_ok = True
-        p.close()
 
 
 HAVE_SEGNO = importlib.util.find_spec("segno") is not None

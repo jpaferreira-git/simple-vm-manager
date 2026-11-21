@@ -4,7 +4,7 @@
 //! new one.
 
 use super::*;
-use crate::helper::{Check, Status, TOPICS};
+use crate::helper::{Check, Fix, Status, TOPICS};
 
 impl App {
     pub(super) fn advisor_page(&mut self, ui: &mut Ui, out: &mut Vec<Intent>) {
@@ -33,7 +33,8 @@ impl App {
                         if i > 0 {
                             ui.add_space(34.0);
                         }
-                        pool_checklist(ui, &pal, *sid, name, many, this.helper.get(sid), now, out);
+                        let d = this.server(*sid).and_then(|s| s.data.as_ref());
+                        pool_checklist(ui, &pal, *sid, name, many, this.helper.get(sid), d, now, out);
                     }
                     ui.add_space(28.0);
                 });
@@ -62,7 +63,7 @@ fn soft(ui: &mut Ui, pal: &Pal, text: &str) {
 /// A pool's checklist: when it was checked and Check now, then its checks by topic; or why
 /// there's none.
 #[allow(clippy::too_many_arguments)]
-fn pool_checklist(ui: &mut Ui, pal: &Pal, sid: u32, name: &str, many: bool, v: Option<&super::helper_page::HelperView>, now: i64, out: &mut Vec<Intent>) {
+fn pool_checklist(ui: &mut Ui, pal: &Pal, sid: u32, name: &str, many: bool, v: Option<&super::helper_page::HelperView>, d: Option<&PoolData>, now: i64, out: &mut Vec<Intent>) {
     if many {
         ui.label(egui::RichText::new(name).font(FontId::new(17.0, FontFamily::Name("bold".into()))).color(pal.ink));
         ui.add_space(8.0);
@@ -88,6 +89,12 @@ fn pool_checklist(ui: &mut Ui, pal: &Pal, sid: u32, name: &str, many: bool, v: O
     }
     let Some(st) = v.status() else { return };
     let checking = v.asked_advice.is_some();
+    if super::helper_page::update_card(ui, pal, st, v) {
+        out.push(Intent::HelperUpdate(sid));
+    }
+    if crate::helper::older(&st.version, crate::helper::LATEST) || v.asked_update.is_some() || v.update_note.is_some() {
+        ui.add_space(12.0);
+    }
     // when it was checked, how it went, and Check now
     ui.horizontal(|ui| {
         ui.set_min_height(32.0);
@@ -130,10 +137,6 @@ fn pool_checklist(ui: &mut Ui, pal: &Pal, sid: u32, name: &str, many: bool, v: O
         ui.add_space(6.0);
         ui.add(egui::Label::new(egui::RichText::new(n.as_str()).size(12.5).color(pal.red)).wrap());
     }
-    if !st.requests {
-        ui.add_space(6.0);
-        ui.add(egui::Label::new(egui::RichText::new(format!("This pool's Helper VM is version {}: the Advisor comes with 2.2. Run setup.sh on it again to update it (your answers stay).", st.version)).size(12.5).color(pal.ink_soft)).wrap());
-    }
     if !st.fresh(now) {
         ui.add_space(6.0);
         ui.add(egui::Label::new(egui::RichText::new(format!("The Helper VM last looked at the pool {}: is it running?", super::helper_page::ago(now - st.last_look))).size(12.5).color(pal.orange)).wrap());
@@ -152,7 +155,7 @@ fn pool_checklist(ui: &mut Ui, pal: &Pal, sid: u32, name: &str, many: bool, v: O
         super::overview::section(ui, pal, title);
         super::overview::panel(ui, pal, |ui| {
             for (i, c) in checks.iter().enumerate() {
-                check_row(ui, pal, sid, c, i + 1 == checks.len());
+                check_row(ui, pal, sid, c, v, d, out, i + 1 == checks.len());
             }
         });
     }
@@ -197,12 +200,54 @@ fn mark(p: &egui::Painter, c: egui::Pos2, st: Status, pal: &Pal) {
     }
 }
 
+/// What a fix's button says, and (for one this app does itself) what it asks before doing it:
+/// (label, question, deletes something).
+fn fix_words(f: &Fix) -> (&'static str, Option<&'static str>, bool) {
+    match f.action.as_str() {
+        "autostart" => ("Turn on Start with the server", Some("These will start with their server from now on, also after a power cut:"), false),
+        "eject" => ("Eject the ISOs", Some("The ISO comes out of the DVD drive of:"), false),
+        "delete_snapshots" => ("Delete these snapshots…", Some("These snapshots, and their copies of the disks, will be deleted. It can't be undone:"), true),
+        "delete_disks" => ("Delete these disks…", Some("These disks, which no VM uses, will be deleted with what's on them. It can't be undone:"), true),
+        "schedule" => ("Add to a schedule…", None, false),
+        "updates" => ("Install the updates…", None, false),
+        "renew_cert" => ("Renew the certificate…", None, false),
+        "helper_tab" => ("Choose where alerts go…", None, false),
+        "vm_storage" => ("Choose a default storage…", None, false),
+        _ => ("", None, false),
+    }
+}
+
+/// The dialog or page that does a fix this app doesn't do by itself.
+fn fix_opens(sid: u32, f: &Fix, d: Option<&PoolData>, out: &mut Vec<Intent>) {
+    match f.action.as_str() {
+        "schedule" => {
+            let Some(d) = d else { return };
+            let vms: Vec<String> = f.uuids.iter().filter_map(|u| d.vms.iter().find(|v| &v.uuid == u)).map(|v| v.rref.clone()).collect();
+            out.push(if d.schedules.is_empty() { Intent::NewSchedule(sid, vms) } else { Intent::PickSchedule(sid, vms) });
+        }
+        "updates" => out.push(Intent::PoolUpdates(Some(sid))),
+        "renew_cert" => {
+            if let Some(h) = d.and_then(|d| f.uuids.iter().find_map(|u| d.hosts.iter().find(|h| &h.uuid == u))) {
+                out.push(Intent::AskRenewCert(sid, h.rref.clone(), false, None));
+            }
+        }
+        "helper_tab" => {
+            out.push(Intent::Select(format!("srv:{}", sid)));
+            out.push(Intent::Tab(Tab::Helper));
+        }
+        "vm_storage" => out.push(Intent::VmStorage),
+        _ => {}
+    }
+}
+
 /// A check's row: its mark and title (Claude's own findings say so); a click opens why it
-/// matters, what to do, and what it's about.
-fn check_row(ui: &mut Ui, pal: &Pal, sid: u32, c: &Check, last: bool) {
+/// matters, what to do, what it's about, and its fix when this app has one (asked first).
+#[allow(clippy::too_many_arguments)]
+fn check_row(ui: &mut Ui, pal: &Pal, sid: u32, c: &Check, v: &super::helper_page::HelperView, d: Option<&PoolData>, out: &mut Vec<Intent>, last: bool) {
     let id = egui::Id::new(("advisor-open", sid, c.id.as_str()));
     let mut open = ui.data(|d| d.get_temp::<bool>(id)).unwrap_or(false);
-    let more = !c.note.is_empty() || !c.objects.is_empty();
+    let fix = c.fix.as_ref().filter(|f| !fix_words(f).0.is_empty() && c.status != Status::Ok);
+    let more = !c.note.is_empty() || !c.objects.is_empty() || fix.is_some();
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 40.0), if more { Sense::click() } else { Sense::hover() });
     let p = ui.painter();
     if more && resp.hovered() {
@@ -244,6 +289,9 @@ fn check_row(ui: &mut Ui, pal: &Pal, sid: u32, c: &Check, last: bool) {
                 if !c.objects.is_empty() {
                     ui.add(egui::Label::new(egui::RichText::new(format!("About: {}", c.objects.join(", "))).size(12.5).color(pal.ink_faint)).wrap());
                 }
+                if let Some(f) = fix {
+                    fix_ui(ui, pal, sid, c, f, v, d, out);
+                }
             });
         });
         ui.add_space(12.0);
@@ -252,4 +300,64 @@ fn check_row(ui: &mut Ui, pal: &Pal, sid: u32, c: &Check, last: bool) {
         let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
         ui.painter().line_segment([pos2(r.min.x + 44.0, r.center().y), pos2(r.max.x, r.center().y)], Stroke::new(1.0_f32, pal.border.gamma_multiply(0.6)));
     }
+}
+
+/// A check's fix: its button; for one this app does itself, the question and Do it / Cancel once
+/// it's clicked; then the fix under way, or how it went.
+#[allow(clippy::too_many_arguments)]
+fn fix_ui(ui: &mut Ui, pal: &Pal, sid: u32, c: &Check, f: &Fix, v: &super::helper_page::HelperView, d: Option<&PoolData>, out: &mut Vec<Intent>) {
+    let (label, question, deletes) = fix_words(f);
+    let asking_id = egui::Id::new(("advisor-confirm", sid, c.id.as_str()));
+    let asking = ui.data(|x| x.get_temp::<bool>(asking_id)).unwrap_or(false);
+    let busy = v.fixing.is_some();
+    ui.add_space(2.0);
+    if v.fixing.as_deref() == Some(c.id.as_str()) {
+        ui.horizontal(|ui| {
+            ui.add(egui::Spinner::new().size(13.0));
+            ui.label(egui::RichText::new("Doing it…").size(12.5).color(pal.ink_soft));
+        });
+        return;
+    }
+    if let Some((_, ok, text)) = v.fix_note.as_ref().filter(|n| n.0 == c.id) {
+        ui.add(egui::Label::new(egui::RichText::new(text.as_str()).size(12.5).color(if *ok { pal.green } else { pal.red })).wrap());
+        if *ok {
+            return;
+        }
+    }
+    if !asking {
+        ui.horizontal(|ui| {
+            if flat_button(ui, if deletes { "trash" } else { "wrench" }, label, Some(if deletes { pal.red } else { pal.accent }), !busy, false, pal).clicked() {
+                if question.is_some() {
+                    ui.data_mut(|x| x.insert_temp(asking_id, true));
+                } else {
+                    fix_opens(sid, f, d, out);
+                }
+            }
+        });
+        return;
+    }
+    // asked first: what it does, to what
+    egui::Frame::none().fill(pal.surface).stroke(Stroke::new(1.0_f32, if deletes { pal.red.gamma_multiply(0.6) } else { pal.border })).rounding(Rounding::same(10.0)).inner_margin(egui::Margin::symmetric(12.0, 10.0)).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.spacing_mut().item_spacing.y = 4.0;
+        ui.add(egui::Label::new(egui::RichText::new(question.unwrap_or_default()).size(13.0).color(pal.ink)).wrap());
+        let shown = f.names.len().min(12);
+        for n in &f.names[..shown] {
+            ui.label(egui::RichText::new(format!("•  {}", n)).size(12.5).color(pal.ink_soft));
+        }
+        if f.names.len() > shown {
+            ui.label(egui::RichText::new(format!("…and {} more", f.names.len() - shown)).size(12.5).color(pal.ink_soft));
+        }
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            let look = if deletes { Look::Danger } else { Look::Primary };
+            if dialog_button(ui, pal, if deletes { "trash" } else { "check" }, if deletes { "Delete" } else { "Do it" }, look, !busy) {
+                ui.data_mut(|x| x.remove::<bool>(asking_id));
+                out.push(Intent::AdvisorFix(sid, c.id.clone(), f.clone()));
+            }
+            if dialog_button(ui, pal, "close", "Cancel", Look::Plain, true) {
+                ui.data_mut(|x| x.remove::<bool>(asking_id));
+            }
+        });
+    });
 }

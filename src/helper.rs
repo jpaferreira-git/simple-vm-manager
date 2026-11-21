@@ -2,8 +2,8 @@
 //! through the pool's own API, also while this app is closed. It sends the pool's alerts to phones
 //! (Telegram, ntfy, Discord, Home Assistant, any webhook), watches any storage's fullness, makes up
 //! missed snapshot schedule runs, mounts the NAS again after a server started before it, starts
-//! VMs in order when the pool starts, keeps backups, and checks the pool against good practice for
-//! the Advisor page. Nothing of it is on the servers.
+//! VMs in order when the pool starts, and checks the pool against good practice for the Advisor
+//! page. Nothing of it is on the servers.
 //!
 //! It and this app talk through the pool's other_config:
 //! - "svm-helper": its settings, set in a pool's Helper tab (JSON; `Settings`);
@@ -21,6 +21,16 @@ pub const VM_KEY: &str = "svm-helper-vm";
 pub const ADVICE_KEY: &str = "svm-helper-advice";
 /// What this app asks of it.
 pub const REQUEST_KEY: &str = "svm-helper-request";
+
+/// The Helper VM's version this app's own version comes with (helper-vm/svm-helper.py's VERSION, at
+/// this app's tag): an older one is offered an update to it.
+pub const LATEST: &str = "2.3.0";
+
+/// Whether version `a` ("2.0.3") is older than `b`.
+pub fn older(a: &str, b: &str) -> bool {
+    let parts = |v: &str| v.split('.').map(|p| p.trim().parse::<u32>().unwrap_or(0)).collect::<Vec<_>>();
+    parts(a) < parts(b)
+}
 
 /// Where to read about it, and how it's set up.
 pub fn about_url() -> String {
@@ -211,8 +221,6 @@ pub struct VmStatus {
     pub since: i64,
     /// Claude works for it (alerts explained, the review and the Advisor in words).
     pub claude: bool,
-    /// Backups: on, the last round, and whether it went well.
-    pub backups: (bool, i64, bool),
     /// The weekly review: on, the last one.
     pub review: (bool, i64),
     /// The Advisor: on, the last check, the request it answered, how many to fix and to look at.
@@ -221,6 +229,10 @@ pub struct VmStatus {
     pub watching: i64,
     /// It answers this app's requests (Check now, Send a test): 2.2 and later.
     pub requests: bool,
+    /// It updates itself when asked (2.3 and later, set up by its setup.sh).
+    pub updates: bool,
+    /// Its last update, as asked: (the version asked, when, fine, why not).
+    pub update: Option<(String, i64, bool, String)>,
     /// The last test alert sent as asked: the request it answered, and what each channel said.
     pub test: Option<(i64, Vec<(String, String)>)>,
 }
@@ -228,7 +240,6 @@ pub struct VmStatus {
 impl VmStatus {
     pub fn parse(text: &str) -> Option<VmStatus> {
         let j: Value = serde_json::from_str(text).ok()?;
-        let bk = j.get("backups").cloned().unwrap_or(Value::Null);
         let rv = j.get("review").cloned().unwrap_or(Value::Null);
         let ad = j.get("advice").cloned().unwrap_or(Value::Null);
         let test = j.get("test").map(|t| (i(t, "request"), t.get("results").and_then(|x| x.as_object()).map(|o| o.iter().map(|(k, v)| (k.clone(), v.as_str().unwrap_or("?").to_string())).collect()).unwrap_or_default()));
@@ -239,11 +250,12 @@ impl VmStatus {
             last_look: i(&j, "last_look"),
             since: i(&j, "since"),
             claude: b(&j, "claude", false),
-            backups: (b(&bk, "on", false), i(&bk, "last"), b(&bk, "ok", true)),
             review: (b(&rv, "on", false), i(&rv, "last")),
             advice: (b(&ad, "on", false), i(&ad, "last"), i(&ad, "request"), i(&ad, "bad"), i(&ad, "warn")),
             watching: i(&j, "watching"),
             requests: i(&j, "requests") >= 1,
+            updates: i(&j, "updates") >= 1,
+            update: j.get("update").filter(|u| u.is_object()).map(|u| (s(u, "ref"), i(u, "at"), b(u, "ok", false), s(u, "error"))),
             test,
         })
     }
@@ -275,6 +287,17 @@ pub struct Check {
     pub objects: Vec<String>,
     /// A finding of Claude's own, not one of the helper's checks.
     pub by_claude: bool,
+    /// What this app can do about it, when it can.
+    pub fix: Option<Fix>,
+}
+
+/// What can be done about a check from this app (see advisor_page.rs): its action, the objects'
+/// uuids, and their names as the check gives them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Fix {
+    pub action: String,
+    pub uuids: Vec<String>,
+    pub names: Vec<String>,
 }
 
 /// The Advisor's checklist, as the Helper VM left it in the pool.
@@ -314,6 +337,10 @@ impl Advice {
                     note: s(c, "note"),
                     objects: c.get("objects").and_then(|o| o.as_array()).map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default(),
                     by_claude: s(c, "by") == "claude",
+                    fix: c.get("fix").filter(|f| f.is_object()).map(|f| {
+                        let list = |k: &str| f.get(k).and_then(|x| x.as_array()).map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
+                        Fix { action: s(f, "action"), uuids: list("uuids"), names: list("names") }
+                    }),
                 })
             })
             .collect();
@@ -333,6 +360,10 @@ pub fn request(before: &str, what: &str, now: i64) -> String {
         _ => Map::new(),
     };
     m.insert(what.to_string(), json!(now));
+    if what == "update" {
+        // this app's own version's: the Helper VM it comes with
+        m.insert("update_ref".into(), json!(format!("v{}", env!("CARGO_PKG_VERSION"))));
+    }
     Value::Object(m).to_string()
 }
 
@@ -381,8 +412,8 @@ mod tests {
 
     #[test]
     fn the_helper_vm_and_its_advice() {
-        let v = VmStatus::parse(r#"{"version": "2.2.0", "machine": "svm-helper", "address": "192.168.1.13", "last_look": 1000, "claude": true, "backups": {"on": true, "last": 900, "ok": false}, "advice": {"on": true, "last": 950, "request": 940, "bad": 1, "warn": 2}, "requests": 1, "test": {"request": 7, "results": {"ntfy": "ok"}}}"#).unwrap();
-        assert_eq!((v.version.as_str(), v.claude, v.backups, v.advice, v.requests), ("2.2.0", true, (true, 900, false), (true, 950, 940, 1, 2), true));
+        let v = VmStatus::parse(r#"{"version": "2.2.0", "machine": "svm-helper", "address": "192.168.1.13", "last_look": 1000, "claude": true, "advice": {"on": true, "last": 950, "request": 940, "bad": 1, "warn": 2}, "requests": 1, "test": {"request": 7, "results": {"ntfy": "ok"}}}"#).unwrap();
+        assert_eq!((v.version.as_str(), v.claude, v.advice, v.requests), ("2.2.0", true, (true, 950, 940, 1, 2), true));
         assert_eq!(v.test, Some((7, vec![("ntfy".into(), "ok".into())])));
         assert!(v.fresh(1000 + 60) && !v.fresh(1000 + 3600));
         // an older one: no requests answered
@@ -392,5 +423,18 @@ mod tests {
         assert_eq!((a.checks[0].status, a.checks[0].objects.clone(), a.checks[1].by_claude), (Status::Bad, vec!["godofredo".to_string()], true));
         assert_eq!(request(r#"{"test": 5}"#, "advice", 9), r#"{"advice":9,"test":5}"#);
         assert_eq!(request("", "test", 3), r#"{"test":3}"#);
+        assert!(request("", "update", 4).contains(&format!(r#""update_ref":"v{}""#, env!("CARGO_PKG_VERSION"))));
+        // a check the app can fix, and an update as the VM tells it
+        let a = Advice::parse(r#"{"at": 1, "checks": [{"id": "autostart", "topic": "vms", "status": "warn", "title": "x", "fix": {"action": "autostart", "uuids": ["u-1"], "names": ["Plex"]}}]}"#).unwrap();
+        assert_eq!(a.checks[0].fix, Some(Fix { action: "autostart".into(), uuids: vec!["u-1".into()], names: vec!["Plex".into()] }));
+        let v = VmStatus::parse(r#"{"version": "2.3.0", "updates": 1, "update": {"ref": "v1.30.0", "at": 5, "ok": false, "error": "no network"}}"#).unwrap();
+        assert_eq!((v.updates, v.update), (true, Some(("v1.30.0".into(), 5, false, "no network".into()))));
+    }
+
+    #[test]
+    fn latest_is_the_helper_this_version_comes_with() {
+        let helper = include_str!("../helper-vm/svm-helper.py");
+        assert!(helper.contains(&format!("\nVERSION = \"{}\"\n", LATEST)), "helper.rs's LATEST isn't helper-vm/svm-helper.py's VERSION");
+        assert!(older("2.0.3", LATEST) && older("2.2.10", "2.3") && !older(LATEST, LATEST) && !older("2.10.0", "2.9.9"));
     }
 }

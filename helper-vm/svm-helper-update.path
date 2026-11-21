@@ -1,0 +1,9 @@
+# Simple VM Manager's Helper VM: an update the app asked for (see update.sh).
+[Unit]
+Description=Simple VM Manager's Helper VM: an update asked for
+
+[Path]
+PathExists=/var/lib/svm-helper/update.request
+
+[Install]
+WantedBy=multi-user.target

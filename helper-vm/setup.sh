@@ -11,12 +11,13 @@
 #
 # Or from a copy of the repository: sudo bash helper-vm/setup.sh
 #
-# It installs Python and the NFS client from your system's packages, then:
+# It installs Python and the SSH client from your system's packages, then:
 #   /opt/svm-helper/                 the helper (svm-helper.py, its Python packages in venv/)
 #   /usr/local/bin/svm-helper        its command
 #   /etc/svm-helper/                 its settings (config.json, secrets.json: root and the helper only)
 #   /var/lib/svm-helper/             what it keeps (its log, state, last review)
 #   svm-helper.service               the service, as the unprivileged user svm-helper
+#   svm-helper-update.path/.service  updates when the app asks (update.sh, as root)
 # and asks its questions (svm-helper setup). Run it again to update the helper; your answers stay.
 set -euo pipefail
 
@@ -25,7 +26,7 @@ REPO="jpaferreira-git/simple-vm-manager"
 RAW="https://raw.githubusercontent.com/$REPO/$REF/helper-vm"
 APP=/opt/svm-helper
 LOG=/var/log/svm-helper-setup.log
-TOTAL=7
+TOTAL=6
 
 # ---------------------------------------------------------------- looks
 if [[ -t 1 && "${TERM:-dumb}" != dumb && -z "${NO_COLOR:-}" ]]; then
@@ -92,7 +93,7 @@ ask_yes() {  # ask_yes "question" default(y/n)
 trap 'echo; fail "Stopped."; exit 130' INT
 
 banner "Helper VM for Simple VM Manager" "looks after your XenServer pool from this machine"
-note "This prepares this machine: a few packages, the helper and its service. Then it asks about your pool, where alerts go, backups and Claude. Enter takes what's in [brackets]."
+note "This prepares this machine: a few packages, the helper and its service. Then it asks about your pool, where alerts go and Claude. Enter takes what's in [brackets]."
 
 # ---------------------------------------------------------------- 1. this machine
 step 1 "This machine"
@@ -125,8 +126,8 @@ done
 free_kb=$(df -Pk /opt | awk 'NR==2 {print $4}')
 (( free_kb > 600000 )) && ok "$((free_kb / 1024)) MB free" || die "Only $((free_kb / 1024)) MB free on /opt: it needs about 600 MB."
 tz=$(timedatectl show -p Timezone --value 2>/dev/null || echo UTC)
-info "Time zone: ${B}$tz${N}  ${D}(backups and the weekly review go by it)${N}"
-if [[ "$tz" == "UTC" || "$tz" == "Etc/UTC" ]]; then
+info "Time zone: ${B}$tz${N}  ${D}(the weekly review and the daily check go by it)${N}"
+if [[ ( "$tz" == "UTC" || "$tz" == "Etc/UTC" ) && -z "${SVM_HELPER_NO_QUESTIONS:-}" ]]; then
   read -r -p "        ${C}?${N} Your time zone ${D}(like America/Sao_Paulo; Enter keeps UTC)${N}: " newtz </dev/tty || newtz=""
   if [[ -n "$newtz" ]]; then
     timedatectl set-timezone "$newtz" 2>>"$LOG" && ok "Time zone: $newtz" || warn "Couldn't set $newtz (see 'timedatectl list-timezones')"
@@ -139,18 +140,18 @@ case $PM in
   apt)
     export DEBIAN_FRONTEND=noninteractive
     run "Refreshing the package lists" apt-get update -q || die "apt-get update failed."
-    run "Python, the NFS client and the rest" apt-get install -y -q python3 python3-venv nfs-common ca-certificates curl openssh-client || die "The packages couldn't be installed."
+    run "Python and the rest" apt-get install -y -q python3 python3-venv ca-certificates curl openssh-client || die "The packages couldn't be installed."
     if apt-cache show xe-guest-utilities >/dev/null 2>&1; then
       run "XenServer's guest tools (the pool sees this VM's address)" apt-get install -y -q xe-guest-utilities || warn "Skipped the guest tools"
     fi
     systemctl enable --now systemd-timesyncd >>"$LOG" 2>&1 || true
     ;;
   dnf)
-    run "Python, the NFS client and the rest" dnf install -y -q python3 nfs-utils ca-certificates curl openssh-clients || die "The packages couldn't be installed."
+    run "Python and the rest" dnf install -y -q python3 ca-certificates curl openssh-clients || die "The packages couldn't be installed."
     systemctl enable --now chronyd >>"$LOG" 2>&1 || true
     ;;
   pacman)
-    run "Python, the NFS client and the rest" pacman -Sy --noconfirm --needed python nfs-utils ca-certificates curl openssh || die "The packages couldn't be installed."
+    run "Python and the rest" pacman -Sy --noconfirm --needed python ca-certificates curl openssh || die "The packages couldn't be installed."
     systemctl enable --now systemd-timesyncd >>"$LOG" 2>&1 || true
     ;;
 esac
@@ -173,11 +174,10 @@ fi
 install -d -m 0755 "$APP"
 install -d -m 0750 -o root -g svm-helper /etc/svm-helper
 install -d -m 2770 -o svm-helper -g svm-helper /var/lib/svm-helper
-mountpoint -q /srv/svm-backups 2>/dev/null || install -d -m 0770 -o svm-helper -g svm-helper /srv/svm-backups
 
 # its files: from this copy of the repository, or from GitHub
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || echo /nonexistent)"
-for f in svm-helper.py svm-helper.service CLAUDE.md; do
+for f in svm-helper.py svm-helper.service svm-helper-update.service svm-helper-update.path update.sh CLAUDE.md; do
   if [[ -f "$HERE/$f" ]]; then
     install -m 0644 "$HERE/$f" "$APP/$f.new"
   else
@@ -186,7 +186,7 @@ for f in svm-helper.py svm-helper.service CLAUDE.md; do
   mv -f "$APP/$f.new" "$APP/$f"
 done
 [[ -f "$HERE/svm-helper.py" ]] && ok "The helper, from $HERE" || ok "The helper, from GitHub ($REF)"
-chmod 0755 "$APP/svm-helper.py"
+chmod 0755 "$APP/svm-helper.py" "$APP/update.sh"
 
 if [[ ! -x "$APP/venv/bin/python" ]]; then
   run "Its own Python environment" "$PY" -m venv "$APP/venv" || die "Couldn't make the Python environment."
@@ -198,10 +198,13 @@ cat >/usr/local/bin/svm-helper <<EOF
 exec $APP/venv/bin/python $APP/svm-helper.py "\$@"
 EOF
 chmod 0755 /usr/local/bin/svm-helper
-install -m 0644 "$APP/svm-helper.service" /etc/systemd/system/svm-helper.service
+for u in svm-helper.service svm-helper-update.service svm-helper-update.path; do
+  install -m 0644 "$APP/$u" "/etc/systemd/system/$u"
+done
 systemctl daemon-reload
+systemctl enable --now svm-helper-update.path >>"$LOG" 2>&1 || warn "Couldn't turn on its updates from the app"
 systemctl try-restart svm-helper >>"$LOG" 2>&1 || true
-ok "Its command (svm-helper) and its service"
+ok "Its command (svm-helper), its service, and its updates from the app"
 version=$(/usr/local/bin/svm-helper version 2>>"$LOG" || echo "?")
 ok "Helper VM $version"
 

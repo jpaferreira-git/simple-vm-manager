@@ -522,6 +522,10 @@ pub trait Connection: Send + Sync {
     /// Asks the Helper VM for `what` ("advice": the Advisor's check now; "test": a test alert),
     /// as asked at `now`: it answers within its next minute.
     fn helper_ask(&self, what: &str, now: i64) -> Result<(), ApiError>;
+    /// One of the Advisor's fixes (see advisor_page.rs) on the objects with those uuids: "autostart"
+    /// (VMs start with their server), "eject" (their DVD drive emptied), "delete_snapshots",
+    /// "delete_disks" (disks no VM uses). Each object is checked again first. What was done.
+    fn advisor_fix(&self, action: &str, uuids: &[String]) -> Result<String, ApiError>;
     /// The Helper VM's settings, as the pool keeps them ("" when there are none).
     fn helper_settings(&self) -> Result<String, ApiError>;
     /// Saves them; then each VM (`autostart`: VM, on) starts with its server by itself or not:
@@ -4158,6 +4162,47 @@ impl Connection for RealConnection {
         Ok((s(&oc, crate::helper::VM_KEY), s(&oc, crate::helper::ADVICE_KEY)))
     }
 
+    fn advisor_fix(&self, action: &str, uuids: &[String]) -> Result<String, ApiError> {
+        let t = 30_000;
+        let mut done = 0;
+        for u in uuids {
+            match action {
+                "autostart" => {
+                    let vm = val_str(&self.call("VM.get_by_uuid", vec![json!(u)], t)?);
+                    self.edit_vm(&vm, &VmChange::AutoPowerOn(true))?;
+                }
+                "eject" => {
+                    let vm = val_str(&self.call("VM.get_by_uuid", vec![json!(u)], t)?);
+                    for vbd in self.call("VM.get_VBDs", vec![json!(vm)], t)?.as_array().cloned().unwrap_or_default() {
+                        if val_str(&self.call("VBD.get_type", vec![vbd.clone()], t)?) == "CD" && !self.call("VBD.get_empty", vec![vbd.clone()], t)?.as_bool().unwrap_or(true) {
+                            self.call("VBD.eject", vec![vbd], 120_000)?;
+                        }
+                    }
+                }
+                "delete_snapshots" => {
+                    let snap = val_str(&self.call("VM.get_by_uuid", vec![json!(u)], t)?);
+                    // (a snapshot, and nothing else, whatever the uuid)
+                    if !self.call("VM.get_is_a_snapshot", vec![json!(snap)], t)?.as_bool().unwrap_or(false) {
+                        continue;
+                    }
+                    self.delete_snapshot(&snap)?;
+                }
+                "delete_disks" => {
+                    let vdi = val_str(&self.call("VDI.get_by_uuid", vec![json!(u)], t)?);
+                    // (only while no VM uses it, and it isn't a snapshot's)
+                    let used = self.call("VDI.get_VBDs", vec![json!(vdi)], t)?.as_array().map_or(0, |a| a.len()) > 0;
+                    if used || self.call("VDI.get_is_a_snapshot", vec![json!(vdi)], t)?.as_bool().unwrap_or(true) {
+                        continue;
+                    }
+                    self.call("VDI.destroy", vec![json!(vdi)], 300_000)?;
+                }
+                _ => return Err(ApiError::other(format!("Not something this app can fix: {}", action))),
+            }
+            done += 1;
+        }
+        Ok(format!("{} of {}", done, uuids.len()))
+    }
+
     fn helper_ask(&self, what: &str, now: i64) -> Result<(), ApiError> {
         let t = 30_000;
         let pool = self.all("pool", t)?.keys().next().cloned().unwrap_or_default();
@@ -4271,6 +4316,7 @@ fn demo_uuid() -> String {
 /// settings, the Advisor's checklist, and the last test alert asked of it.
 struct DemoHelper {
     vm: bool,
+    version: String,
     settings: String,
     advice: String,
     test: Option<i64>,
@@ -4286,9 +4332,9 @@ fn demo_heartbeat(h: &DemoHelper) -> String {
     let advice = crate::helper::Advice::parse(&h.advice).unwrap_or_default();
     let (bad, warn) = advice.counts();
     let mut j = json!({
-        "version": "2.2.0", "machine": "svm-helper", "address": "10.20.0.30", "vm": "", "since": now - 3 * 86400, "last_look": now - 30,
-        "claude": true, "backups": { "on": true, "last": now - 6 * 3600, "ok": true }, "review": { "on": true, "last": now - 2 * 86400 },
-        "advice": { "on": true, "last": advice.at, "request": advice.request, "bad": bad, "warn": warn }, "watching": 2, "copy": 1, "requests": 1,
+        "version": h.version, "machine": "svm-helper", "address": "10.20.0.30", "vm": "", "since": now - 3 * 86400, "last_look": now - 30,
+        "claude": true, "review": { "on": true, "last": now - 2 * 86400 },
+        "advice": { "on": true, "last": advice.at, "request": advice.request, "bad": bad, "warn": warn }, "watching": 2, "copy": 1, "requests": 1, "updates": 1,
     });
     if let Some(t) = h.test {
         j["test"] = json!({ "request": t, "at": now, "results": { "telegram": "ok", "ntfy": "ok" } });
@@ -4296,29 +4342,47 @@ fn demo_heartbeat(h: &DemoHelper) -> String {
     j.to_string()
 }
 
-/// The demo's Advisor checklist, as Claude words it (`request`: the Check now it answers).
-fn demo_advice(request: i64) -> String {
+/// The demo's Advisor checklist, as Claude words it (`request`: the Check now it answers), with
+/// what the app can fix.
+fn demo_advice(d: &PoolData, request: i64) -> String {
+    let uuid = |r: &str| d.vm(r).map(|v| v.uuid.clone()).unwrap_or_default();
     let c = |id: &str, topic: &str, status: &str, title: &str, note: &str, objects: &[&str]| json!({ "id": id, "topic": topic, "status": status, "title": title, "note": note, "objects": objects });
+    let fix = |mut c: Value, action: &str, uuids: Vec<String>, names: &[&str]| {
+        c["fix"] = json!({ "action": action, "uuids": uuids, "names": names });
+        c
+    };
+    let old_snap = d.vm("vm-db").and_then(|v| v.snapshots.iter().min_by_key(|s| s.time.unwrap_or(0))).map(|s| s.rref.clone()).unwrap_or_default();
     let mut checks = vec![
-        c("backups_vms", "backups", "warn", "2 VMs had no backup this week", "Without a recent backup, a failed disk or a bad change can't be undone. Add Test Desktop and Build Agent to the Helper VM's backups, or tell it they don't need any.", &["Build Agent", "Test Desktop"]),
-        c("backups_failed", "backups", "ok", "Last night's backups went well", "", &[]),
-        c("backups_pool_db", "backups", "ok", "The pool's database is saved with the backups", "", &[]),
-        c("snapshot_schedules", "backups", "warn", "Mail Relay has no snapshot schedule", "A schedule takes snapshots by itself, so there's always a recent one to go back to after a bad update. Add Mail Relay to Nightly, under Snapshots, then Schedules.", &["Mail Relay"]),
+        fix(c("snapshot_schedules", "backups", "warn", "Mail Relay has no snapshot schedule", "A schedule takes snapshots by itself, so there's always a recent one to go back to after a bad update. Nightly would suit it.", &["Mail Relay"]), "schedule", vec![uuid("vm-mail")], &["Mail Relay"]),
         c("storage_space", "storage", "ok", "Every storage has room to spare", "", &[]),
         c("unused_disks", "storage", "ok", "No forgotten disks", "", &[]),
-        c("old_snapshots", "storage", "warn", "Database has a snapshot over a month old", "\"Before the upgrade\" is 41 days old. A snapshot isn't a backup, and an old one keeps growing as the disk changes: delete it if the upgrade went well.", &["Database"]),
+        fix(c("old_snapshots", "storage", "warn", "Database has a snapshot over a month old", "\"Before the upgrade\" is 41 days old. A snapshot isn't a backup, and an old one keeps growing as the disk changes: delete it if the upgrade went well.", &["Database"]), "delete_snapshots", vec![old_snap], &["Database: Before the upgrade (41 days old)"]),
         c("servers_answering", "servers", "ok", "Both servers answer", "", &[]),
-        c("clocks", "servers", "bad", "demo-host-02's clock is 4 minutes behind", "A wrong clock puts the wrong time on alerts and snapshots, and can upset the pool's certificates. Turn NTP on for demo-host-02 (its Details, Time).", &["demo-host-02"]),
-        c("updates", "servers", "warn", "Updates are waiting on both servers", "They fix security holes and bugs. Install them from Updates; each server restarts in turn, and its VMs move to the other one meanwhile.", &["demo-host-01", "demo-host-02"]),
+        c("clocks", "servers", "bad", "demo-host-02's clock is 4 minutes behind", "A wrong clock puts the wrong time on alerts and snapshots, and can upset the pool's certificates. Turn NTP on for demo-host-02.", &["demo-host-02"]),
+        fix(c("updates", "servers", "warn", "Updates are waiting on both servers", "They fix security holes and bugs. Each server restarts in turn, and its VMs move to the other one meanwhile.", &["demo-host-01", "demo-host-02"]), "updates", vec![], &[]),
         c("memory", "servers", "ok", "Both servers have memory to spare", "", &[]),
+        c("server_load", "servers", "ok", "The servers had processor to spare this week", "", &[]),
         c("vm_tools", "vms", "ok", "Every running VM has its VM Tools", "", &[]),
-        c("autostart", "vms", "warn", "Mail Relay doesn't start by itself", "After a power cut it stays off until someone starts it. Turn on Start with the server in its Overview, if it should always run.", &["Mail Relay"]),
+        fix(c("autostart", "vms", "warn", "Mail Relay doesn't start by itself", "After a power cut it stays off until someone starts it: outgoing mail would wait.", &["Mail Relay"]), "autostart", vec![uuid("vm-mail")], &["Mail Relay"]),
+        c("iso_in_drive", "vms", "ok", "No ISO left in a VM's drive", "", &[]),
+        c("vm_busy", "vms", "ok", "No VM at its limit this week", "", &[]),
         c("certificates", "security", "ok", "The servers' certificates are valid for months", "", &[]),
         c("alerts_sent", "security", "ok", "Alerts reach your phone", "", &[]),
     ];
-    let mut mine = c("claude_1", "vms", "warn", "Database runs on the same server as Web Server", "Both are on demo-host-01: if it stops, the website and the shop stop together. Moving one of them to demo-host-02 spreads the risk.", &["Database", "Web Server"]);
-    mine["by"] = json!("claude");
-    checks.push(mine);
+    for (i, (topic, status, title, note)) in [
+        ("vms", "warn", "Database runs on the same server as Web Server", "Both are on demo-host-01: if it stops, the website and the shop stop together. Moving one of them to demo-host-02 spreads the risk."),
+        ("vms", "warn", "Database used only 2 of its 8 vCPUs all week", "Its busiest hour reached 24%. Four vCPUs would do, and leave more for the other VMs on demo-host-01."),
+        ("backups", "warn", "Backup Appliance has been off for 50 days", "If it's what keeps your backups, nothing has been backed up since. Start it, or delete it if another tool took over."),
+        ("storage", "ok", "Most disks are on the shared NFS storage", ""),
+        ("security", "ok", "XenServer 8.4 is the current release, with support for years", ""),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut x = c(&format!("claude_{}", i + 1), topic, status, title, note, &[]);
+        x["by"] = json!("claude");
+        checks.push(x);
+    }
     json!({ "version": 1, "at": demo_now() - if request == 0 { 5 * 3600 } else { 0 }, "by": "claude", "language": "en", "request": request, "checks": checks }).to_string()
 }
 
@@ -4673,8 +4737,9 @@ impl DemoConnection {
             x.order.sort_by_key(|o| o.1 == 30);
             x.to_json()
         };
-        let advice = if helped { demo_advice(0) } else { String::new() };
-        let helper = DemoHelper { vm: helped, settings: helper_settings, advice, test: None };
+        let advice = if helped { demo_advice(&d, 0) } else { String::new() };
+        let version = if std::env::var("SVM_DEMO_HELPER_OLD").is_ok() { "2.2.0".to_string() } else { crate::helper::LATEST.to_string() };
+        let helper = DemoHelper { vm: helped, version, settings: helper_settings, advice, test: None };
         DemoConnection { data: Mutex::new(d), helper: Mutex::new(helper), updates: Mutex::new(found), alerts: Mutex::new(alerts), copies: Mutex::new(HashMap::new()) }
     }
 
@@ -6568,11 +6633,35 @@ impl Connection for DemoConnection {
         }
         // (its answer comes a moment later, as the real one's comes within its next minute)
         match what {
-            "advice" => h.advice = demo_advice(now),
+            "advice" => {
+                let d = self.data.lock().unwrap();
+                h.advice = demo_advice(&d, now);
+            }
             "test" => h.test = Some(now),
+            "update" => h.version = crate::helper::LATEST.to_string(),
             _ => {}
         }
         Ok(())
+    }
+    fn advisor_fix(&self, action: &str, uuids: &[String]) -> Result<String, ApiError> {
+        said(&format!("advisor fix: {}", action), &uuids.iter().map(|u| json!(u)).collect::<Vec<_>>());
+        demo_work(600);
+        let mut d = self.data.lock().unwrap();
+        match action {
+            "autostart" => {
+                for v in d.vms.iter_mut().filter(|v| uuids.contains(&v.uuid)) {
+                    v.auto_power_on = true;
+                }
+            }
+            "delete_snapshots" => {
+                for v in d.vms.iter_mut() {
+                    v.snapshots.retain(|s| !uuids.contains(&s.rref));
+                }
+            }
+            "eject" | "delete_disks" => {}
+            _ => return Err(ApiError::other(format!("Not something this app can fix: {}", action))),
+        }
+        Ok(format!("{} of {}", uuids.len(), uuids.len()))
     }
     fn helper_settings(&self) -> Result<String, ApiError> {
         std::thread::sleep(Duration::from_millis(100));

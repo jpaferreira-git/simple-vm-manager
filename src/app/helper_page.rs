@@ -9,8 +9,10 @@ use crate::helper::{Advice, Channel, Settings, VmStatus};
 #[derive(Clone, Copy, PartialEq)]
 pub(super) enum Did {
     Saved,
-    /// A request left for the Helper VM (Check now, Send a test).
+    /// A request left for the Helper VM (Check now, Send a test, an update).
     Asked,
+    /// One of the Advisor's fixes.
+    Fixed,
 }
 
 /// A pool's Helper VM, as this app knows it: its heartbeat and the Advisor's checklist as last
@@ -28,6 +30,14 @@ pub(super) struct HelperView {
     pub asked_test: Option<i64>,
     /// What the Advisor page should say about its last Check now, when it didn't work.
     pub advice_note: Option<String>,
+    /// The update asked of it: when, while unanswered; and how it went (fine, what).
+    pub asked_update: Option<i64>,
+    pub update_note: Option<(bool, String)>,
+    /// The Advisor's check being fixed, and how the last fix went: (check, fine, what).
+    pub fixing: Option<String>,
+    pub fix_note: Option<(String, bool, String)>,
+    /// A fix was done: the Helper VM's to check the pool again.
+    pub recheck: bool,
     pub saved: Option<Result<Settings, String>>,
     pub reading: bool,
     pub draft: Option<Settings>,
@@ -48,8 +58,9 @@ impl HelperView {
     }
 }
 
-/// How long an answer to a request is waited for.
+/// How long an answer to a request is waited for (an update, longer).
 const ANSWER_WITHIN: i64 = 300;
+const UPDATE_WITHIN: i64 = 900;
 
 impl App {
     /// Reads pool `sid`'s Helper VM heartbeat and Advisor checklist, when that's due: every
@@ -61,8 +72,12 @@ impl App {
         }
         let conn = s.conn.clone();
         let now = unix_now();
+        // after a fix, the Helper VM looks again (its checklist then says so)
+        if std::mem::take(&mut self.helper.entry(sid).or_default().recheck) {
+            self.helper_ask(sid, "advice", ctx);
+        }
         let v = self.helper.entry(sid).or_default();
-        let waiting = [v.asked_advice, v.asked_test].iter().flatten().any(|t| now - t < ANSWER_WITHIN);
+        let waiting = [v.asked_advice, v.asked_test].iter().flatten().any(|t| now - t < ANSWER_WITHIN) || v.asked_update.is_some_and(|t| now - t < UPDATE_WITHIN);
         let every = Duration::from_secs(if waiting { 5 } else { 60 });
         if v.polling || v.polled.is_some_and(|t| t.elapsed() < every) {
             return;
@@ -97,6 +112,19 @@ impl App {
             } else if now - t >= ANSWER_WITHIN {
                 v.asked_advice = None;
                 v.advice_note = Some("The Helper VM didn't answer in five minutes: is it running? ('svm-helper status' on it tells.)".into());
+            }
+        }
+        if let Some(t) = v.asked_update {
+            let st = v.status().cloned();
+            if let Some(st) = st.filter(|st| !crate::helper::older(&st.version, crate::helper::LATEST)) {
+                v.asked_update = None;
+                v.update_note = Some((true, format!("Updated: the Helper VM is version {} now.", st.version)));
+            } else if let Some((_, _, false, why)) = v.status().and_then(|st| st.update.clone()).filter(|u| u.1 >= t - 300) {
+                v.asked_update = None;
+                v.update_note = Some((false, format!("The update didn't work: {}.", if why.is_empty() { "see /var/log/svm-helper-update.log on the Helper VM" } else { why.trim_end_matches('.') })));
+            } else if now - t >= UPDATE_WITHIN {
+                v.asked_update = None;
+                v.update_note = Some((false, "The Helper VM didn't update in fifteen minutes: is it running, and does it reach GitHub?".into()));
             }
         }
         if let Some(t) = v.asked_test {
@@ -146,11 +174,16 @@ impl App {
     pub(super) fn helper_ask(&mut self, sid: u32, what: &'static str, ctx: &egui::Context) {
         let now = unix_now();
         let v = self.helper.entry(sid).or_default();
-        if what == "advice" {
-            v.asked_advice = Some(now);
-            v.advice_note = None;
-        } else {
-            v.asked_test = Some(now);
+        match what {
+            "advice" => {
+                v.asked_advice = Some(now);
+                v.advice_note = None;
+            }
+            "update" => {
+                v.asked_update = Some(now);
+                v.update_note = None;
+            }
+            _ => v.asked_test = Some(now),
         }
         self.helper_job(sid, Did::Asked, None, move |c| c.helper_ask(what, now).map(|_| String::new()), ctx);
     }
@@ -197,11 +230,44 @@ impl App {
             (Did::Asked, Err(e)) => {
                 v.asked_advice = None;
                 v.asked_test = None;
+                v.asked_update = None;
+                v.update_note = Some((false, format!("Couldn't ask the Helper VM: {}", e.message())));
                 v.advice_note = Some(format!("Couldn't ask the Helper VM: {}", e.message()));
                 v.note = Some((false, format!("Couldn't ask the Helper VM: {}", e.message())));
             }
+            (Did::Fixed, result) => {
+                let id = v.fixing.take().unwrap_or_default();
+                v.fix_note = Some(match result {
+                    Ok(_) => (id, true, "Done. The Helper VM checks the pool again: its list follows in a minute or two.".into()),
+                    Err(e) => (id, false, format!("It didn't work: {}", e.message())),
+                });
+                v.recheck = true;
+                self.refresh_soon(sid);
+            }
             (_, Err(e)) => v.note = Some((false, e.message())),
         }
+    }
+
+    /// One of the Advisor's fixes that this app does itself, on pool `sid` (the others open the
+    /// dialog that does it: see advisor_page.rs).
+    pub(super) fn advisor_fix(&mut self, sid: u32, id: String, fix: crate::helper::Fix, ctx: &egui::Context) {
+        let names = match fix.names.len() {
+            0 => String::new(),
+            1..=3 => fix.names.join(", "),
+            n => format!("{} and {} more", fix.names[..2].join(", "), n - 2),
+        };
+        let text = match fix.action.as_str() {
+            "autostart" => format!("Advisor: turning on Start with the server for {}", names),
+            "eject" => format!("Advisor: ejecting the ISO of {}", names),
+            "delete_snapshots" => format!("Advisor: deleting {}", names),
+            "delete_disks" => format!("Advisor: deleting the disks {}", names),
+            _ => return,
+        };
+        let v = self.helper.entry(sid).or_default();
+        v.fixing = Some(id);
+        v.fix_note = None;
+        let (action, uuids) = (fix.action.clone(), fix.uuids.clone());
+        self.helper_job(sid, Did::Fixed, Some(text), move |c| c.advisor_fix(&action, &uuids), ctx);
     }
 
     /// The Helper tab of pool `sel`.
@@ -255,6 +321,7 @@ impl App {
             }
             HelperAct::Test => self.helper_ask(sid, "test", &ctx),
             HelperAct::Advisor => out.push(Intent::Advisor),
+            HelperAct::Update => self.helper_ask(sid, "update", &ctx),
         }
     }
 }
@@ -265,6 +332,68 @@ enum HelperAct {
     Undo,
     Test,
     Advisor,
+    Update,
+}
+
+/// When the Helper VM is older than the one this app comes with: a card that says so, with Update
+/// it (when it can update itself) or the commands for its terminal; and the update under way, or
+/// how it went. Whether Update it was clicked.
+pub(super) fn update_card(ui: &mut Ui, pal: &Pal, st: &VmStatus, v: &HelperView) -> bool {
+    let old = crate::helper::older(&st.version, crate::helper::LATEST);
+    if !old && v.asked_update.is_none() && v.update_note.is_none() {
+        return false;
+    }
+    let mut clicked = false;
+    let (fill, edge, soft) = if pal.dark {
+        (Color32::from_rgb(25, 36, 52), Color32::from_rgb(42, 72, 112), Color32::from_rgb(150, 170, 198))
+    } else {
+        (Color32::from_rgb(237, 244, 254), Color32::from_rgb(176, 204, 240), Color32::from_rgb(68, 96, 138))
+    };
+    egui::Frame::none().fill(fill).stroke(Stroke::new(1.0_f32, edge)).rounding(Rounding::same(12.0)).inner_margin(egui::Margin::symmetric(14.0, 10.0)).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.spacing_mut().item_spacing.y = 4.0;
+        ui.horizontal(|ui| {
+            let (r, _) = ui.allocate_exact_size(vec2(20.0, 20.0), Sense::hover());
+            paint_glyph(ui.painter(), r, "download", pal.accent);
+            ui.add_space(4.0);
+            let room = (ui.available_width() - 170.0).max(160.0);
+            ui.vertical(|ui| {
+                ui.set_max_width(room);
+                ui.spacing_mut().item_spacing.y = 2.0;
+                let title = if old { format!("A new version of the Helper VM: {}", crate::helper::LATEST) } else { "The Helper VM is up to date".to_string() };
+                ui.label(egui::RichText::new(title).font(FontId::new(13.5, FontFamily::Name("bold".into()))).color(pal.ink));
+                let said = if v.asked_update.is_some() {
+                    "It's downloading it from GitHub and installing it: a minute or two.".to_string()
+                } else if old && st.updates {
+                    format!("It has {}. This version of Simple VM Manager comes with {}: Update it has the VM install it by itself.", st.version, crate::helper::LATEST)
+                } else if old {
+                    format!("It has {}. This once, run setup.sh on it again (your answers stay): from then on, it updates from here.", st.version)
+                } else {
+                    String::new()
+                };
+                if !said.is_empty() {
+                    ui.add(egui::Label::new(egui::RichText::new(said).size(12.5).color(soft)).wrap());
+                }
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if v.asked_update.is_some() {
+                    ui.add(egui::Spinner::new().size(14.0));
+                } else if old && st.updates && dialog_button(ui, pal, "download", "Update it", Look::Primary, true) {
+                    clicked = true;
+                }
+            });
+        });
+        if let Some((ok, text)) = &v.update_note {
+            ui.add(egui::Label::new(egui::RichText::new(text.as_str()).size(12.5).color(if *ok { pal.green } else { pal.red })).wrap());
+        }
+        if old && !st.updates && v.asked_update.is_none() {
+            ui.add_space(4.0);
+            for c in crate::helper::setup_commands() {
+                command_row(ui, pal, &c);
+            }
+        }
+    });
+    clicked
 }
 
 /// What a test alert's answer says: (fine, what).
@@ -388,7 +517,7 @@ fn vm_card(ui: &mut Ui, pal: &Pal, v: &HelperView, now: i64, act: &mut Option<He
         }
         Some(Ok(Some(st))) => st,
         Some(Ok(None)) => {
-            soft(ui, pal, "A small Linux VM in this pool that looks after it, also while this app is closed: the pool's alerts on your phone (Telegram, ntfy, Discord, Home Assistant or any webhook), any storage nearly full, missed snapshot schedule runs made up, the NAS mounted again after a server started before it, VMs started in order, backups to a NAS, and a daily check of good practice for the Advisor, in Claude's words. Nothing is installed on the servers.");
+            soft(ui, pal, "A small Linux VM in this pool that looks after it, also while this app is closed: the pool's alerts on your phone (Telegram, ntfy, Discord, Home Assistant or any webhook), any storage nearly full, missed snapshot schedule runs made up, the NAS mounted again after a server started before it, VMs started in order, a weekly review of the pool, and a daily check of good practice for the Advisor, in Claude's words. Nothing is installed on the servers.");
             ui.add_space(14.0);
             boxed(ui, pal, |ui| {
                 ui.label(egui::RichText::new("Set it up").font(FontId::new(14.0, FontFamily::Name("bold".into()))).color(pal.ink));
@@ -402,7 +531,7 @@ fn vm_card(ui: &mut Ui, pal: &Pal, v: &HelperView, now: i64, act: &mut Option<He
                     ui.add_space(4.0);
                 }
                 ui.add_space(4.0);
-                soft_small(ui, pal, "3.  Answer its questions: this pool's address and root password, where alerts go, backups, and Claude (your Claude subscription, at no extra cost, by scanning a QR code with your phone).");
+                soft_small(ui, pal, "3.  Answer its questions: this pool's address and root password, where alerts go, and Claude (your Claude subscription, at no extra cost, by scanning a QR code with your phone).");
                 ui.add_space(10.0);
                 ui.horizontal_wrapped(|ui| {
                     ui.label(egui::RichText::new("It's free software (MIT), like this app, given as it is, with no warranty: read it before you run it.").size(12.5).color(pal.ink_soft));
@@ -424,12 +553,6 @@ fn vm_card(ui: &mut Ui, pal: &Pal, v: &HelperView, now: i64, act: &mut Option<He
         status_row(ui, pal, if st.fresh(now) { green } else { orange }, "Machine", &format!("{}{}, version {}: {}", st.machine, at, st.version, looked), None, false);
         let claude = if st.claude { "On: it explains serious alerts, writes the weekly review, and words the Advisor's checks" } else { "Off: its review and checks are in plain words ('sudo svm-helper setup' on the VM turns Claude on)" };
         status_row(ui, pal, if st.claude { green } else { grey }, "Claude", claude, None, false);
-        let backups = match st.backups {
-            (false, _, _) => ("Off: 'sudo svm-helper setup' on the VM sets them up, to a NAS".to_string(), grey),
-            (true, 0, _) => ("On: none made yet".to_string(), green),
-            (true, last, ok) => (format!("On: the last round {}, {}", ago(now - last), if ok { "fine" } else { "with failures" }), if ok { green } else { pal.red }),
-        };
-        status_row(ui, pal, backups.1, "Backups", &backups.0, None, false);
         let review = match st.review {
             (false, _) => "Off".to_string(),
             (true, 0) => "On: none written yet".to_string(),
@@ -453,9 +576,9 @@ fn vm_card(ui: &mut Ui, pal: &Pal, v: &HelperView, now: i64, act: &mut Option<He
             status_row(ui, pal, green, "Watching", &format!("{} service{} of yours", st.watching, if st.watching == 1 { "" } else { "s" }), None, true);
         }
     });
-    if !st.requests {
-        ui.add_space(8.0);
-        soft_small(ui, pal, "This Helper VM is an older version. Run setup.sh on it again (your answers stay) for Send a test and the Advisor.");
+    ui.add_space(10.0);
+    if update_card(ui, pal, st, v) {
+        *act = Some(HelperAct::Update);
     }
 }
 
@@ -716,7 +839,7 @@ pub(super) fn helper_card(ui: &mut Ui, pal: &Pal) -> Option<bool> {
                 ui.set_max_width(room);
                 ui.spacing_mut().item_spacing.y = 2.0;
                 ui.label(egui::RichText::new("No Helper VM looks after this pool").font(FontId::new(13.5, FontFamily::Name("bold".into()))).color(pal.ink));
-                ui.add(egui::Label::new(egui::RichText::new("Alerts on your phone, backups to a NAS, the Advisor's daily check of good practice: also while this app is closed. A small VM in the pool does it; nothing goes on the servers.").size(12.5).color(soft)).wrap());
+                ui.add(egui::Label::new(egui::RichText::new("Alerts on your phone, a weekly review, the Advisor's daily check of good practice: also while this app is closed. A small VM in the pool does it; nothing goes on the servers.").size(12.5).color(soft)).wrap());
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if super::glyph_button_small(ui, pal, "close", "Don't show this again") {

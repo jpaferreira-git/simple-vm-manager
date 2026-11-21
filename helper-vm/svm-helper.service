@@ -22,7 +22,7 @@ Environment=PYTHONUNBUFFERED=1
 # It needs the network and its own folders; nothing else of the system.
 NoNewPrivileges=yes
 ProtectSystem=strict
-ReadWritePaths=/var/lib/svm-helper -/srv/svm-backups
+ReadWritePaths=/var/lib/svm-helper
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes

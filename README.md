@@ -106,7 +106,6 @@ to XenCenter, feature by feature: [Simple VM Manager and XenCenter](docs/xencent
   - makes up a snapshot schedule's missed time (XenServer's plugin never does it), mounts shared
     storage again on a server that started before the NAS, and starts VMs in order, with a wait
     between them, when the pool starts;
-  - backs up the VMs you pick, and the pool's database, to a NAS share each night;
   - sends a weekly health review of the pool, and checks it every day for the Advisor.
 
   Claude explains serious alerts, writes the review and words the Advisor's checks. It uses your
@@ -114,11 +113,15 @@ to XenCenter, feature by feature: [Simple VM Manager and XenCenter](docs/xencent
   your phone), or an API key. Claude Code can be installed on the VM, ready to look after the
   pool with you from its terminal.
 - **Advisor** — the toolbar's checklist of good practice for each pool, from its Helper VM:
-  backups (every VM, the pool's database, snapshot schedules), storage (room left, forgotten
-  disks, old snapshots), servers (answering, clocks, updates, memory), VMs (VM Tools, starting by
+  backups (every VM on a snapshot schedule), storage (room left, forgotten disks, old
+  snapshots), servers (answering, clocks, updates, memory), VMs (VM Tools, starting by
   themselves after a power cut) and security (certificates, alerts reaching you). Each check
   says how it went; a click shows why it matters and what to do, in Claude's words, and Claude
-  adds what else it notices. It's checked once a day; *Check now* asks for it at once.
+  adds five to ten findings of its own, from each VM's and server's details and week's load. Where
+  the app can, a button fixes it: turn on *Start with the server*, eject ISOs left in drives,
+  delete old snapshots or unused disks (each asked first), or open the dialog that does it (a
+  schedule, the updates, a certificate). It's checked once a day; *Check now* asks for it at once.
+  When the Helper VM is older than the app, *Update it* has it install the app's version itself.
 - **Change Root Password** — in a pool's *Actions*: the root password of every
   server of the pool, after the current one; the app goes on with the new one, and keeps it in the
   keychain when the old one was kept there.

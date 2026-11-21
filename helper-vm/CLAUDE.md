@@ -8,7 +8,7 @@ what they ask.
 
 ## Tools
 
-- `svm-helper status`: how the helper is doing, where alerts go, backups, and its recent log.
+- `svm-helper status`: how the helper is doing, where alerts go, and its recent log.
 - `svm-helper xapi '<python expression>'`: one expression on the pool's API, printed as JSON.
   `x` is `session.xenapi`, the full XenAPI (the same calls `xe` and XenCenter use). Examples:
   - `svm-helper xapi '[v["name_label"] for v in x.VM.get_all_records().values() if not v["is_a_template"] and not v["is_control_domain"] and not v["is_a_snapshot"]]'`
@@ -21,11 +21,9 @@ what they ask.
 - `svm-helper review`: writes this week's health review now (`--send` sends it too).
 - `svm-helper advise`: checks the pool against good practice now, for Simple VM Manager's
   Advisor page (it also runs once a day).
-- `svm-helper backup ["VM name" ...]`: the configured backups now, or just the VMs named.
 - `journalctl -u svm-helper`: the service's log.
 - Settings: `/etc/svm-helper/config.json` (the secrets are in `secrets.json`).
   `sudo svm-helper setup` asks the setup questions again.
-- Backups: `/srv/svm-backups` (an NFS share): `vms/<name>-<uuid>/*.xva` and `pool-database/*.xml`.
 
 The XenAPI reference: https://xapi-project.github.io/xen-api/ (classes VM, host, SR, VDI,
 VBD, VIF, network, pool, VMSS, message, task).
