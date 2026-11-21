@@ -186,7 +186,7 @@ impl StorageDialog {
 
                 ui.horizontal(|ui| {
                     ui.add_space(LABEL_WIDTH + ui.spacing().item_spacing.x);
-                    if ui.checkbox(&mut self.make_default, "Make it the pool's default storage").changed() {
+                    if crate::app::tick(ui, pal, &mut self.make_default, "Make it the pool's default storage").changed() {
                         self.default_chosen = true;
                     }
                 });

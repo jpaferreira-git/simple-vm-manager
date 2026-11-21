@@ -1092,9 +1092,9 @@ impl NewVmDialog {
                     ui.add(egui::Label::new(egui::RichText::new(p.as_str()).size(12.5).color(pal.red)).wrap());
                 }
                 if !self.from_file {
-                    ui.checkbox(&mut self.start, "Start it and open the console");
+                    crate::app::tick(ui, pal, &mut self.start, "Start it and open the console");
                 } else if self.xva().map_or(false, |x| !x.template) {
-                    ui.checkbox(&mut self.start, "Start it once it's imported");
+                    crate::app::tick(ui, pal, &mut self.start, "Start it once it's imported");
                 }
             }
             if self.busy.is_some() {

@@ -1,0 +1,39 @@
+# The Helper VM of Simple VM Manager: it looks after a XenServer pool through its API.
+# Installed by helper-vm/setup.sh; settings in /etc/svm-helper (sudo svm-helper setup).
+[Unit]
+Description=Helper VM for Simple VM Manager (looks after a XenServer pool)
+Documentation=https://github.com/jpaferreira-git/simple-vm-manager/tree/main/helper-vm
+Wants=network-online.target
+After=network-online.target time-sync.target remote-fs.target
+
+[Service]
+Type=simple
+User=svm-helper
+Group=svm-helper
+ExecStart=/opt/svm-helper/venv/bin/python /opt/svm-helper/svm-helper.py run
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=20
+StateDirectory=svm-helper
+StateDirectoryMode=2770
+UMask=0007
+Environment=PYTHONUNBUFFERED=1
+
+# It needs the network and its own folders; nothing else of the system.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/svm-helper -/srv/svm-backups
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictRealtime=yes
+CapabilityBoundingSet=
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

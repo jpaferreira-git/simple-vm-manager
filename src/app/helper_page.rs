@@ -264,7 +264,7 @@ impl App {
                             None,
                         );
                         ui.add_space(10.0);
-                        ui.checkbox(&mut v.accepted, "I've read this, and I take responsibility for installing it on my servers.");
+                        crate::app::tick(ui, &pal, &mut v.accepted, "I've read this, and I take responsibility for installing it on my servers.");
                         ui.add_space(20.0);
                     }
                     // its servers

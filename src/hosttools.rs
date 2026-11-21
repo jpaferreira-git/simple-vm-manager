@@ -245,7 +245,7 @@ impl ReportDialog {
                     for h in self.hosts.iter_mut() {
                         ui.add_enabled_ui(h.up, |ui| {
                             let label = if h.up { h.name.clone() } else { format!("{}  (off, or not answering)", h.name) };
-                            ui.checkbox(&mut h.ticked, label);
+                            crate::app::tick(ui, pal, &mut h.ticked, label);
                         });
                     }
                 });

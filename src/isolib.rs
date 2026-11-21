@@ -221,7 +221,7 @@ impl IsoDialog {
                         });
                         ui.horizontal(|ui| {
                             ui.add_space(LABEL_WIDTH + ui.spacing().item_spacing.x);
-                            ui.checkbox(&mut self.shared, "Available to every server in the pool");
+                            crate::app::tick(ui, pal, &mut self.shared, "Available to every server in the pool");
                         });
                     }
                 }

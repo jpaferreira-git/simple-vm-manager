@@ -744,6 +744,8 @@ pub struct App {
     sr_busy: HashSet<String>,
     /// Mount storage again by itself on finding it unmounted (Settings).
     auto_repair: bool,
+    /// The consoles share the clipboard (Settings).
+    share_clipboard: bool,
     /// Storage it has done that for while it stays unmounted (once each), and what to do next.
     auto_tried: HashSet<(u32, String)>,
     auto_queue: Vec<(u32, String)>,
@@ -890,6 +892,7 @@ impl App {
             saved: HashMap::new(),
             sr_busy: HashSet::new(),
             auto_repair: saved.repair,
+            share_clipboard: saved.clipboard,
             auto_tried: HashSet::new(),
             auto_queue: vec![],
             sr_checking: HashSet::new(),
@@ -998,7 +1001,7 @@ impl App {
 
     fn save_settings(&self) {
         if self.shot_path.is_none() {
-            save_settings(&Settings { theme: self.theme_mode, sidebar_open: self.sidebar_open, zoom: self.zoom, updates: self.check_updates, repair: self.auto_repair });
+            save_settings(&Settings { theme: self.theme_mode, sidebar_open: self.sidebar_open, zoom: self.zoom, updates: self.check_updates, repair: self.auto_repair, clipboard: self.share_clipboard });
         }
     }
 
@@ -7449,6 +7452,7 @@ impl App {
         }
         if let Some(c) = self.console.as_mut() {
             let allow_keyboard = matches!(self.dialog, Dialog::None);
+            c.share_clipboard = self.share_clipboard;
             c.ui(ui, &pal, allow_keyboard);
             // the Server Helper's install command, typed once the console's there (Enter is the
             // person's to press)
@@ -7541,6 +7545,7 @@ impl App {
         // from Settings and the Update dialog
         let mut updates_on = self.check_updates;
         let mut repair_on = self.auto_repair;
+        let mut clipboard_on = self.share_clipboard;
         let mut check_now = false;
         let mut start_update = false;
         let (update_checking, update_note, blocked) = (self.update_checking, self.update_note.clone(), self.update_blocked());
@@ -7655,7 +7660,7 @@ impl App {
                         ui.horizontal(|ui| {
                             ui.add_space(LABEL_WIDTH + ui.spacing().item_spacing.x);
                             let label = if running == n { "Include their memory".to_string() } else { format!("Include the memory of the {} running", running) };
-                            ui.checkbox(memory, label);
+                            tick(ui, &pal, memory, label);
                         });
                         ui.horizontal(|ui| {
                             ui.add_space(LABEL_WIDTH + ui.spacing().item_spacing.x + 2.0);
@@ -7742,7 +7747,7 @@ impl App {
                     let can_save = keychain != Some(false);
                     ui.horizontal(|ui| {
                         ui.add_space(GROUP_INSET);
-                        ui.add_enabled(can_save, egui::Checkbox::new(remember, "Remember password"));
+                        ui.add_enabled_ui(can_save, |ui| tick(ui, &pal, remember, "Remember password"));
                     });
                     let note = if can_save {
                         "Saved in your system's keychain. The app connects to this server again each time it starts."
@@ -7902,7 +7907,7 @@ impl App {
                             [_] => format!("Delete its disk too ({})", size),
                             many => format!("Delete its {} disks too ({} in all)", many.len(), size),
                         };
-                        ui.checkbox(delete_disks, text);
+                        tick(ui, &pal, delete_disks, text);
                     }
                     ui.add_space(8.0);
                     let mut rest = vec![];
@@ -7945,7 +7950,7 @@ impl App {
                     if *can_memory {
                         ui.horizontal(|ui| {
                             ui.add_space(LABEL_WIDTH + ui.spacing().item_spacing.x);
-                            ui.checkbox(memory, "Include its memory");
+                            tick(ui, &pal, memory, "Include its memory");
                         });
                         ui.horizontal(|ui| {
                             ui.add_space(LABEL_WIDTH + ui.spacing().item_spacing.x + 2.0);
@@ -7973,7 +7978,7 @@ impl App {
                     ui.add_space(8.0);
                     ui.add(egui::Label::new(egui::RichText::new(text.as_str()).color(pal.ink_soft)).wrap());
                     ui.add_space(8.0);
-                    ui.checkbox(first, "Take a snapshot of now first, to be able to come back");
+                    tick(ui, &pal, first, "Take a snapshot of now first, to be able to come back");
                     ui.add_space(12.0);
                     dialog_buttons(ui, |ui| {
                         if dialog_button(ui, &pal, "close", "Cancel", Look::Plain, true) || ui.input(|i| i.key_pressed(Key::Escape)) {
@@ -8287,7 +8292,7 @@ impl App {
                     if !moved.is_empty() || !stopped.is_empty() {
                         ui.add_space(8.0);
                         let n = moved.len() + stopped.len();
-                        ui.checkbox(back, if n == 1 { "Bring back the VM it had".to_string() } else { format!("Bring back the {} VMs it had", n) });
+                        tick(ui, &pal, back, if n == 1 { "Bring back the VM it had".to_string() } else { format!("Bring back the {} VMs it had", n) });
                         ui.horizontal(|ui| {
                             ui.add_space(24.0);
                             ui.vertical(|ui| {
@@ -8469,13 +8474,19 @@ impl App {
                     ui.add_space(18.0);
 
                     heading(ui, "Storage");
-                    ui.checkbox(&mut repair_on, "Mount storage again when it's found unmounted");
+                    tick(ui, &pal, &mut repair_on, "Mount storage again when it's found unmounted");
                     ui.add_space(2.0);
                     ui.add(egui::Label::new(egui::RichText::new("As after a server started while the share was off. Each is tried once while it stays so; Logs says how it went.").size(12.0).color(pal.ink_soft)).wrap());
                     ui.add_space(18.0);
 
+                    heading(ui, "Console");
+                    tick(ui, &pal, &mut clipboard_on, "Share the clipboard with the consoles");
+                    ui.add_space(2.0);
+                    ui.add(egui::Label::new(egui::RichText::new("Text copied in a console comes onto this computer's clipboard, and a Windows VM with XenServer VM Tools gets this computer's (Ctrl+V pastes it there). Off, Ctrl+V goes to the console as a key. Type the clipboard (Ctrl+Shift+V) works either way.").size(12.0).color(pal.ink_soft)).wrap());
+                    ui.add_space(18.0);
+
                     heading(ui, "Updates");
-                    ui.checkbox(&mut updates_on, "Look for a new version when the app starts");
+                    tick(ui, &pal, &mut updates_on, "Look for a new version when the app starts");
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
                         let label = if update_checking { "Looking…" } else { "Check now" };
@@ -8747,6 +8758,10 @@ impl App {
         if repair_on != self.auto_repair {
             self.auto_repair = repair_on;
             self.auto_tried.clear();
+            self.save_settings();
+        }
+        if clipboard_on != self.share_clipboard {
+            self.share_clipboard = clipboard_on;
             self.save_settings();
         }
         if check_now {
@@ -9580,6 +9595,20 @@ impl eframe::App for App {
 
     /// Closing: each server's session is ended there (logged out), all at once and for three
     /// seconds at most, rather than left for the server to drop a day later.
+    /// For --screenshot with SVM_SHOT_WHEEL: the mouse over the middle of the window and a turn of
+    /// its wheel every half second (the console's wheel, checked against a VNC server).
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
+        if self.shot_path.is_none() || std::env::var("SVM_SHOT_WHEEL").is_err() {
+            return;
+        }
+        let at = raw.screen_rect.map_or(pos2(700.0, 420.0), |r| pos2(r.center().x + 120.0, r.center().y));
+        raw.events.push(egui::Event::PointerMoved(at));
+        if self.frames % 30 == 15 {
+            let up = (self.frames / 30) % 2 == 0;
+            raw.events.push(egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Line, delta: vec2(0.0, if up { 1.0 } else { -1.0 }), modifiers: Modifiers::NONE });
+        }
+    }
+
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.log_out_all(Duration::from_secs(3));
     }
@@ -9638,6 +9667,46 @@ pub(crate) fn text_field(ui: &mut Ui, pal: &Pal, text: &mut String, width: f32, 
     let stroke = Stroke::new(1.0_f32, if edit.has_focus() { pal.accent } else { pal.border_strong });
     ui.painter().set(bg, egui::epaint::RectShape::new(edit.rect, Rounding::same(5.0), pal.input, stroke));
     edit
+}
+
+/// A tick box that reads clearly: ticked, it's filled with the accent colour and a white tick;
+/// unticked, an empty box with a visible outline (the accent colour under the mouse). egui's own
+/// is grey on grey either way, and looks switched off.
+pub(crate) fn tick(ui: &mut Ui, pal: &Pal, on: &mut bool, text: impl Into<egui::WidgetText>) -> egui::Response {
+    const SIZE: f32 = 16.0;
+    const GAP: f32 = 8.0;
+    let text: egui::WidgetText = text.into();
+    let galley = (!text.is_empty()).then(|| text.into_galley(ui, None, ui.available_width() - SIZE - GAP, egui::TextStyle::Button));
+    let mut want = vec2(SIZE, ui.spacing().interact_size.y);
+    if let Some(g) = &galley {
+        want.x += GAP + g.size().x;
+        want.y = want.y.max(g.size().y);
+    }
+    let (rect, mut resp) = ui.allocate_exact_size(want, Sense::click());
+    if resp.clicked() {
+        *on = !*on;
+        resp.mark_changed();
+    }
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Checkbox, ui.is_enabled(), *on, galley.as_ref().map_or("", |g| g.text())));
+    if ui.is_rect_visible(rect) {
+        let p = ui.painter();
+        let b = Rect::from_center_size(pos2(rect.left() + SIZE / 2.0, rect.center().y), vec2(SIZE, SIZE));
+        let hovered = resp.hovered() && ui.is_enabled();
+        if *on {
+            // a touch lighter under the mouse
+            let fill = if hovered { pal.accent.lerp_to_gamma(Color32::WHITE, 0.15) } else { pal.accent };
+            p.rect(b, Rounding::same(4.0), fill, Stroke::NONE);
+            let at = |x: f32, y: f32| pos2(b.left() + x * SIZE, b.top() + y * SIZE);
+            p.add(egui::Shape::line(vec![at(0.25, 0.52), at(0.43, 0.70), at(0.76, 0.31)], Stroke::new(2.0_f32, pal.on_accent)));
+        } else {
+            let line = if hovered { pal.accent } else { pal.grey };
+            p.rect(b.shrink(0.75), Rounding::same(4.0), pal.input, Stroke::new(1.5_f32, line));
+        }
+        if let Some(g) = galley {
+            p.galley(pos2(b.right() + GAP, rect.center().y - g.size().y / 2.0), g, pal.ink);
+        }
+    }
+    resp
 }
 
 /// A search box: a light outline that stays as it is under the mouse (the accent colour while
@@ -10520,11 +10589,14 @@ struct Settings {
     updates: bool,
     /// Mount storage again on finding it unmounted.
     repair: bool,
+    /// The consoles share the clipboard with this computer (copies come here; a Windows VM gets
+    /// this computer's).
+    clipboard: bool,
 }
 
 impl Default for Settings {
     fn default() -> Settings {
-        Settings { theme: ThemeMode::System, sidebar_open: true, zoom: 1.0, updates: true, repair: true }
+        Settings { theme: ThemeMode::System, sidebar_open: true, zoom: 1.0, updates: true, repair: true, clipboard: true }
     }
 }
 
@@ -10538,6 +10610,7 @@ fn load_settings() -> Settings {
                 "sidebar" => s.sidebar_open = v.trim() != "folded",
                 "updates" => s.updates = v.trim() != "off",
                 "repair" => s.repair = v.trim() != "off",
+                "clipboard" => s.clipboard = v.trim() != "off",
                 "zoom" => s.zoom = v.trim().parse::<f32>().ok().filter(|z| (0.5..=3.0).contains(z)).unwrap_or(1.0),
                 _ => {}
             }
@@ -10550,7 +10623,7 @@ fn save_settings(s: &Settings) {
     let Some(dir) = config_dir() else { return };
     let _ = std::fs::create_dir_all(&dir);
     let on = |b: bool| if b { "on" } else { "off" };
-    let text = format!("theme={}\nsidebar={}\nzoom={:.2}\nupdates={}\nrepair={}\n", s.theme.as_str(), if s.sidebar_open { "open" } else { "folded" }, s.zoom, on(s.updates), on(s.repair));
+    let text = format!("theme={}\nsidebar={}\nzoom={:.2}\nupdates={}\nrepair={}\nclipboard={}\n", s.theme.as_str(), if s.sidebar_open { "open" } else { "folded" }, s.zoom, on(s.updates), on(s.repair), on(s.clipboard));
     let _ = std::fs::write(dir.join("settings.txt"), text);
 }
 

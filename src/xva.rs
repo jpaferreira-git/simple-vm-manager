@@ -566,7 +566,7 @@ impl ExportDialog {
             let indent = LABEL_WIDTH + ui.spacing().item_spacing.x;
             ui.horizontal(|ui| {
                 ui.add_space(indent);
-                ui.checkbox(&mut self.compress, "Compress it");
+                crate::app::tick(ui, pal, &mut self.compress, "Compress it");
                 ui.label(egui::RichText::new("smaller, made on the server as it goes").size(12.0).color(pal.ink_soft));
             });
             let mut facts = vec![format!("Its disks: {} (the file holds only what's written on them)", fmt_bytes(self.disks))];

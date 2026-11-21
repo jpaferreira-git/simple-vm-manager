@@ -103,6 +103,20 @@ to XenCenter, feature by feature: [Simple VM Manager and XenCenter](docs/xencent
   (or copy it, for SSH). The command fetches it from this repository, for this app's version, and
   checks its SHA-256 first. Its settings live in the pool; *Remove* takes it off every server.
   It's given as it is, with no warranty: read it before you install it, as the tab asks.
+- **Helper VM** (optional, new) — the same work, and more, done from a small Linux VM instead
+  of the servers ([helper-vm/](helper-vm/)). It goes through the pool's API, with the servers'
+  certificates pinned: nothing is installed on them, and it never uses SSH. One script,
+  `helper-vm/setup.sh`, prepares the VM and asks its questions step by step. On top of the
+  Server Helper's work, it:
+  - tells you when a server stops answering, or the whole pool can't be reached (that one
+    straight to your phone);
+  - watches services you name (Home Assistant, the NAS…) and the servers' clocks;
+  - backs up the VMs you pick, and the pool's database, to a NAS share each night;
+  - sends a weekly health review of the pool.
+
+  Claude explains serious alerts and writes the review. It uses your Claude subscription through
+  Claude Code (no extra cost), or an API key. Claude Code can be installed on the VM, ready to
+  look after the pool with you from its terminal.
 - **Change Root Password** — in a pool's *Actions*: the root password of every
   server of the pool, after the current one; the app goes on with the new one, and keeps it in the
   keychain when the old one was kept there.
@@ -155,6 +169,15 @@ to XenCenter, feature by feature: [Simple VM Manager and XenCenter](docs/xencent
   Alt+Tab…). It
   reconnects by itself after the VM reboots. A server has a Console too: its own text console (the
   control domain's, as in XenCenter), where you log in as root.
+- **The console's clipboard** — *Type the clipboard*, first in *Send keys* (or Ctrl+Shift+V over
+  the screen), types the text on your computer's clipboard there, a key for each character, with
+  how far it is and *Stop*: for a Linux console, an installer, a login screen (plain letters,
+  digits and symbols, as on a US keyboard). A Windows VM with XenServer VM Tools shares its
+  clipboard, as with XenCenter: Ctrl+V there pastes yours, and what you copy there comes onto your
+  computer's. On a server's console Ctrl+V types the clipboard, text selected with the mouse is
+  copied, and the mouse wheel scrolls back through what went by. (A Linux VM's text console keeps
+  nothing that went by: the wheel scrolls only what runs in it, a desktop or a terminal program.)
+  Settings → Console turns the sharing off; typing the clipboard still works.
 - **ISO libraries** — *ISO Library* on the toolbar opens a page with every ISO file of every pool:
   each library as a card (where it is, how many files it has, or that it isn't mounted; a click
   opens it), then all the files by name, with their library when there's more than one, each with
@@ -364,7 +387,8 @@ to XenCenter, feature by feature: [Simple VM Manager and XenCenter](docs/xencent
 - **Closing the app** — it logs out of each server as it closes, rather than leaving its sessions
   for the servers to drop a day later.
 - **Settings** — the gear at the far left of the toolbar: the theme (light, dark, or the same as
-  your desktop), the size of everything (90–125%; Ctrl + and Ctrl - too), and the saved passwords,
+  your desktop), the size of everything (90–125%; Ctrl + and Ctrl - too), whether the consoles
+  share the clipboard, and the saved passwords,
   each with *Forget* (deleted from the keychain; the app stops connecting there as it starts), even
   for a server no longer in the tree. Your choices are remembered.
 - **Updates** — as it starts, the app asks GitHub whether there's a newer release (Settings can turn

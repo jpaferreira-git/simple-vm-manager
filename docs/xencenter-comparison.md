@@ -1,7 +1,7 @@
 # Simple VM Manager and XenCenter
 
 What Simple VM Manager does next to XenCenter, the official Windows console for XenServer, as of
-Simple VM Manager **1.27.0** (November 2026). Simple VM Manager covers what a small or home pool
+Simple VM Manager **1.27.3** (November 2026). Simple VM Manager covers what a small or home pool
 uses most, and adds a few things XenCenter doesn't do; the big-pool features (high availability,
 Workload Balancing, Active Directory…) are left to XenCenter. The XenCenter column follows the
 XenCenter 2026.6.0 manual.
@@ -71,6 +71,8 @@ Spotted a mistake? [Open an issue](https://github.com/jpaferreira-git/simple-vm-
 | New VM set up by cloud-init | ✅ | ❌ |
 | Start, shut down, reboot, suspend, resume, force | ✅ | ✅ |
 | Its console, with Ctrl+Alt+Del | ✅ | ✅ |
+| Clipboard shared with Windows VMs (with VM Tools) | ✅ | ✅ |
+| Type the clipboard into any console (Linux, installers, login screens) | ✅ | ❌ |
 | Console in a window of its own | ❌ | ✅ |
 | Remote Desktop to Windows VMs | ❌ | ✅ |
 | CPUs, memory, boot order, start with its server | ✅ | ✅ |

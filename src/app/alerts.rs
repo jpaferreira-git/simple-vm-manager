@@ -789,7 +789,7 @@ pub(super) fn rules_window(ctx: &egui::Context, pal: &Pal, d: &mut RulesDialog) 
                 for r in d.rules.iter_mut() {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 6.0;
-                        ui.checkbox(&mut r.on, "");
+                        crate::app::tick(ui, pal, &mut r.on, "");
                         let ink = if r.on { pal.ink } else { pal.ink_soft };
                         ui.label(egui::RichText::new(r.def.before).color(ink));
                         ui.add_enabled(r.on, egui::TextEdit::singleline(&mut r.figure).desired_width(52.0).horizontal_align(egui::Align::Center));
@@ -817,7 +817,7 @@ pub(super) fn rules_window(ctx: &egui::Context, pal: &Pal, d: &mut RulesDialog) 
                 ui.add_space(14.0);
                 ui.label(egui::RichText::new("EMAIL").size(11.0).color(pal.ink_faint));
                 ui.add_space(6.0);
-                ui.checkbox(&mut d.mail_on, "Email the pool's alerts too");
+                crate::app::tick(ui, pal, &mut d.mail_on, "Email the pool's alerts too");
                 if d.mail_on {
                     ui.add_space(4.0);
                     egui::Grid::new("alert-mail").num_columns(2).spacing(vec2(12.0, 8.0)).show(ui, |ui| {

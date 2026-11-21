@@ -756,7 +756,7 @@ impl PoolUpdateDialog {
         ui.add_space(4.0);
         let needs = found.hosts.iter().any(|h| h.needs_restart()) || v.hosts.iter().any(|h| h.3);
         if needs {
-            ui.checkbox(&mut self.restart, "Restart the servers that need it, one at a time, the coordinator first");
+            crate::app::tick(ui, pal, &mut self.restart, "Restart the servers that need it, one at a time, the coordinator first");
             if self.restart {
                 ui.indent("stuck", |ui| {
                     ui.spacing_mut().item_spacing.y = 4.0;

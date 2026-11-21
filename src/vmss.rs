@@ -351,16 +351,17 @@ impl ScheduleDialog {
                 field_label(ui, "Description:", LABEL_WIDTH);
                 text_field(ui, pal, &mut x.description, ui.available_width() - 4.0, false);
             });
+            ui.add_space(6.0);
             ui.horizontal(|ui| {
                 ui.add_space(LABEL_WIDTH + ui.spacing().item_spacing.x);
-                ui.checkbox(&mut x.enabled, "On: it takes its snapshots (untick to pause it)");
+                crate::app::tick(ui, pal, &mut x.enabled, "On: it takes its snapshots (untick to pause it)");
             });
             // its VMs: ticked to be on it (one on another schedule moves here)
             if let Some(pool) = pool {
                 let d = pool.data;
                 let mut vms: Vec<&VmInfo> = d.vms.iter().collect();
                 vms.sort_by_key(|v| v.name.to_lowercase());
-                ui.add_space(4.0);
+                ui.add_space(14.0);
                 ui.horizontal(|ui| {
                     let on = vms.iter().filter(|v| x.vms.contains(&v.rref)).count();
                     ui.label(egui::RichText::new(format!("VMS  ·  {} OF {} ON IT", on, vms.len())).size(11.0).color(pal.ink_faint));
@@ -369,10 +370,11 @@ impl ScheduleDialog {
                     });
                 });
                 let q = self.search.trim().to_lowercase();
+                ui.add_space(4.0);
                 egui::Frame::none().stroke(Stroke::new(1.0_f32, pal.border)).rounding(Rounding::same(8.0)).inner_margin(egui::Margin::symmetric(8.0, 6.0)).show(ui, |ui| {
                     ui.set_width(ui.available_width());
-                    egui::ScrollArea::vertical().max_height(170.0).auto_shrink([false, true]).show(ui, |ui| {
-                        ui.spacing_mut().item_spacing.y = 2.0;
+                    egui::ScrollArea::vertical().max_height(200.0).auto_shrink([false, true]).show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 4.0;
                         let shown: Vec<&&VmInfo> = vms.iter().filter(|v| q.is_empty() || v.name.to_lowercase().contains(&q)).collect();
                         if shown.is_empty() {
                             ui.label(egui::RichText::new(if vms.is_empty() { "The pool has no VMs." } else { "No VMs with those words." }).color(pal.ink_faint));
@@ -380,7 +382,7 @@ impl ScheduleDialog {
                         for v in shown {
                             let mut on = x.vms.contains(&v.rref);
                             ui.horizontal(|ui| {
-                                if ui.checkbox(&mut on, v.name.as_str()).changed() {
+                                if crate::app::tick(ui, pal, &mut on, v.name.as_str()).changed() {
                                     if on {
                                         x.vms.push(v.rref.clone());
                                     } else {
@@ -399,7 +401,7 @@ impl ScheduleDialog {
                 });
             }
             let problem = self.problem();
-            ui.add_space(4.0);
+            ui.add_space(10.0);
             dialog_buttons(ui, |ui| {
                 if dialog_button(ui, pal, "close", "Cancel", Look::Plain, !saving) || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                     action = EditAction::Close;
