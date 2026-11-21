@@ -5,7 +5,8 @@ pools, hosts, virtual machines, storage and networks at a glance, use each VM's 
 console, and start, shut down, reboot, suspend or resume virtual machines — in a light or dark theme, on Linux, Windows or macOS.
 
 It is an independent, simpler take on the classic Windows management console layout. It is not
-affiliated with or endorsed by the makers of XenServer or XCP-ng.
+affiliated with or endorsed by the makers of XenServer or XCP-ng. What it does and doesn't do next
+to XenCenter, feature by feature: [Simple VM Manager and XenCenter](docs/xencenter-comparison.md).
 
 | Light | Dark |
 |---|---|
