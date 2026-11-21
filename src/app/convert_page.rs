@@ -131,6 +131,8 @@ enum NetChoice {
     Existing(String),
     /// A new network: its name, the card (device) and VLAN it's on.
     New(String, String, i64),
+    /// None: the VMs' cards on it are left out (one can be added later, in a VM's Overview).
+    Without,
 }
 
 struct WizNet {
@@ -1049,7 +1051,7 @@ impl App {
             egui::ScrollArea::vertical().max_height(max_h - 140.0).auto_shrink([false, true]).show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 6.0;
                 if w.step == 1 {
-                    self.wizard_where(ui, w, &pool, &pools, &mut new_pool, kind);
+                    self.wizard_where(ui, w, &pool, &pools, &mut new_pool);
                 } else {
                     wizard_prepare(ui, &pal, w, &self.conv, runs, files, kind, &helper, &mut run_prep, &mut mark);
                 }
@@ -1113,7 +1115,7 @@ impl App {
     }
 
     /// Step 1: the pool, server and storage; what each network becomes; each VM's name and template.
-    fn wizard_where(&self, ui: &mut Ui, w: &mut Wizard, pool: &PoolView, pools: &[(u32, String)], new_pool: &mut Option<u32>, kind: &str) {
+    fn wizard_where(&self, ui: &mut Ui, w: &mut Wizard, pool: &PoolView, pools: &[(u32, String)], new_pool: &mut Option<u32>) {
         let pal = self.pal;
         let lw = LABEL_WIDTH;
         ui.label(egui::RichText::new("WHERE").size(11.0).color(pal.ink_faint));
@@ -1129,25 +1131,36 @@ impl App {
                 });
             });
         }
-        // the storage first decides the server when it's one server's own
+        // the server: choosing one moves the storage along, when it was another server's own (to
+        // this one's, or else to shared storage)
         let sr_host = pool.srs.iter().find(|x| x.0 == w.sr).and_then(|x| x.2.clone());
+        let shared = pool.srs.iter().any(|x| x.2.is_none());
+        let best_sr = |host: Option<&String>| -> Option<String> {
+            let most_free = |a: &&(String, String, Option<String>, i64, bool, i64, i64), b: &&(String, String, Option<String>, i64, bool, i64, i64)| a.3.cmp(&b.3);
+            host.and_then(|h| pool.srs.iter().filter(|x| x.2.as_ref() == Some(h)).max_by(most_free)).or_else(|| pool.srs.iter().filter(|x| x.2.is_none()).max_by(most_free)).map(|x| x.0.clone())
+        };
         ui.horizontal(|ui| {
             field_label(ui, "Server:", lw);
             let name = |h: &Option<String>| match h {
                 None => "Any server".to_string(),
                 Some(r) => pool.hosts.iter().find(|x| x.0 == *r).map(|x| format!("{}  ·  {} memory free", x.1, fmt_bytes(x.3))).unwrap_or_else(|| "—".into()),
             };
-            ui.add_enabled_ui(sr_host.is_none(), |ui| {
-                combo("conv-host", name(&w.host), ui.available_width() - 8.0).show_ui(ui, |ui| {
-                    if ui.selectable_label(w.host.is_none(), "Any server").clicked() {
-                        w.host = None;
+            combo("conv-host", name(&w.host), ui.available_width() - 8.0).show_ui(ui, |ui| {
+                // (any server only onto shared storage)
+                if shared && ui.selectable_label(w.host.is_none(), "Any server  ·  on shared storage").clicked() {
+                    w.host = None;
+                    if sr_host.is_some() {
+                        w.sr = best_sr(None).unwrap_or_default();
                     }
-                    for h in &pool.hosts {
-                        if ui.selectable_label(w.host.as_deref() == Some(h.0.as_str()), format!("{}  ·  {} memory free", h.1, fmt_bytes(h.3))).clicked() {
-                            w.host = Some(h.0.clone());
+                }
+                for h in &pool.hosts {
+                    if ui.selectable_label(w.host.as_deref() == Some(h.0.as_str()), format!("{}  ·  {} memory free", h.1, fmt_bytes(h.3))).clicked() {
+                        w.host = Some(h.0.clone());
+                        if sr_host.as_ref().is_some_and(|s| *s != h.0) {
+                            w.sr = best_sr(Some(&h.0)).unwrap_or_default();
                         }
                     }
-                });
+                }
             });
         });
         ui.horizontal(|ui| {
@@ -1159,8 +1172,8 @@ impl App {
             let shown = pool.srs.iter().find(|x| x.0 == w.sr).map(label).unwrap_or_else(|| "Choose…".into());
             combo("conv-sr", shown, ui.available_width() - 8.0).show_ui(ui, |ui| {
                 for x in &pool.srs {
-                    // one server's own storage only when that server's chosen (or any)
-                    if x.2.is_some() && w.host.is_some() && x.2 != w.host && sr_host.is_none() {
+                    // another server's own storage isn't offered once a server's chosen
+                    if x.2.is_some() && w.host.is_some() && x.2 != w.host {
                         continue;
                     }
                     if ui.selectable_label(w.sr == x.0, label(x)).clicked() {
@@ -1201,7 +1214,7 @@ impl App {
         // the networks
         if !w.nets.is_empty() {
             ui.add_space(6.0);
-            ui.label(egui::RichText::new(format!("NETWORKS  ·  WHAT EACH {} NETWORK BECOMES", kind.to_uppercase())).size(11.0).color(pal.ink_faint));
+            ui.label(egui::RichText::new("NETWORKS  ·  WHERE EACH NETWORK CARD GOES IN THE POOL").size(11.0).color(pal.ink_faint));
             egui::Frame::none().stroke(Stroke::new(1.0_f32, pal.border)).rounding(Rounding::same(8.0)).inner_margin(egui::Margin::symmetric(10.0, 6.0)).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 for (k, x) in w.nets.iter_mut().enumerate() {
@@ -1226,6 +1239,7 @@ impl App {
                         let shown = match &x.choice {
                             NetChoice::Existing(r) => pool.nets.iter().find(|n| n.0 == *r).map(|n| net_label(n)).unwrap_or_else(|| "Choose…".into()),
                             NetChoice::New(name, card, v) => format!("New network “{}”  ·  VLAN {} on {}", name, v, card),
+                            NetChoice::Without => "No network card (add one later)".into(),
                         };
                         combo(&format!("conv-net-{}", k), shown, ui.available_width() - 8.0).show_ui(ui, |ui| {
                             for n in &pool.nets {
@@ -1240,6 +1254,10 @@ impl App {
                                     x.choice = new;
                                 }
                             }
+                            ui.separator();
+                            if ui.selectable_label(x.choice == NetChoice::Without, "No network card (add one later)").clicked() {
+                                x.choice = NetChoice::Without;
+                            }
                         });
                     });
                 }
@@ -1253,10 +1271,14 @@ impl App {
                     ui.label(egui::RichText::new(format!("The pool has nothing on VLAN {}: the app makes “{}” on {} first, on every server.", v, name, card)).size(12.0).color(pal.ink_soft));
                 }
             }
+            if w.nets.iter().any(|x| x.choice == NetChoice::Without) {
+                ui.label(egui::RichText::new("A card left out isn't made: the VM starts without it. Add one later in its Overview, under Networking.").size(12.0).color(pal.ink_soft));
+            }
         }
-        // each VM
+        // each VM: its name and template
         ui.add_space(6.0);
-        ui.label(egui::RichText::new("EACH VM").size(11.0).color(pal.ink_faint));
+        let heading = if w.vms.len() == 1 { "THE NEW VM  ·  ITS NAME AND TEMPLATE" } else { "THE NEW VMS  ·  THEIR NAMES AND TEMPLATES" };
+        ui.label(egui::RichText::new(heading).size(11.0).color(pal.ink_faint));
         for (k, v) in w.vms.iter_mut().enumerate() {
             ui.horizontal(|ui| {
                 text_field(ui, &pal, &mut v.name, 150.0, false).on_hover_text("Its name on the pool");
@@ -1277,7 +1299,7 @@ impl App {
                 ui.label(egui::RichText::new(n.as_str()).size(12.0).color(pal.orange));
             }
         }
-        ui.label(egui::RichText::new("Each template is picked from what its source says it runs. CPUs, memory, the boot mode and the order of the disks stay as they were.").size(12.0).color(pal.ink_soft));
+        ui.label(egui::RichText::new("The template gives XenServer the right settings for the VM's system; it's picked from what the source says it runs. Its CPUs, memory, boot mode (UEFI or BIOS) and the order of its disks stay as they were.").size(12.0).color(pal.ink_soft));
     }
 
     /// Makes the jobs and starts them (one after another, in the background), and shows them.
@@ -1300,15 +1322,17 @@ impl App {
         for h in &pool.hosts {
             names.insert(h.0.clone(), h.1.clone());
         }
+        // (a network left out has no plan: its cards aren't made)
         let nets: Vec<NetPlan> = w
             .nets
             .iter()
-            .map(|x| NetPlan {
-                source: x.source.clone(),
-                to: match &x.choice {
+            .filter_map(|x| {
+                let to = match &x.choice {
                     NetChoice::Existing(r) => NetTo::Existing(r.clone()),
                     NetChoice::New(name, card, v) => NetTo::New(NewNetwork { name: name.clone(), description: format!("Made for VMs converted from {}", from), mtu: 1500, vlan: Some((card.clone(), *v)) }),
-                },
+                    NetChoice::Without => return None,
+                };
+                Some(NetPlan { source: x.source.clone(), to })
             })
             .collect();
         let plan = Plan {
@@ -1708,7 +1732,7 @@ fn wizard_problem(w: &Wizard, pool: &PoolView) -> Option<String> {
         return Some("Choose a template for each VM.".into());
     }
     if w.nets.iter().any(|n| matches!(&n.choice, NetChoice::Existing(r) if r.is_empty())) {
-        return Some("Choose a network for each of theirs.".into());
+        return Some("Choose a network for each card (or No network card).".into());
     }
     None
 }

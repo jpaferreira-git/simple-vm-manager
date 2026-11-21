@@ -22,7 +22,8 @@ impl App {
             let w = (ui.available_width() - 2.0 * pad).min(860.0);
             ui.add_space(18.0);
             ui.horizontal(|ui| {
-                ui.add_space(pad);
+                // centred in the window, as wide as it reads well
+                ui.add_space(((ui.available_width() - w) / 2.0).max(pad));
                 ui.vertical(|ui| {
                     ui.set_width(w);
                     ui.spacing_mut().item_spacing.y = 0.0;
@@ -95,26 +96,25 @@ fn pool_checklist(ui: &mut Ui, pal: &Pal, sid: u32, name: &str, many: bool, v: O
     if crate::helper::older(&st.version, crate::helper::LATEST) || v.asked_update.is_some() || v.update_note.is_some() {
         ui.add_space(12.0);
     }
-    // when it was checked, how it went, and Check now
+    // when it was checked, how it went (with the list's own marks), and Check now
     ui.horizontal(|ui| {
         ui.set_min_height(32.0);
-        let (said, tone) = match &v.advice {
+        match &v.advice {
             Some(a) => {
                 let (bad, warn) = a.counts();
-                let how = match (bad, warn) {
-                    (0, 0) => "all fine".to_string(),
-                    (0, w) => format!("{} to look at", w),
-                    (b, 0) => format!("{} to fix", b),
-                    (b, w) => format!("{} to fix, {} to look at", b, w),
-                };
-                (format!("Checked {}{}  ·  {}", when(a.at, now), if a.by_claude { ", in Claude's words" } else { "" }, how), if bad > 0 { pal.red } else if warn > 0 { pal.orange } else { pal.green })
+                let fine = a.checks.len() - bad - warn;
+                ui.label(egui::RichText::new(format!("Checked {}{}", when(a.at, now), if a.by_claude { ", in Claude's words" } else { "" })).size(13.5).color(pal.ink_soft));
+                for (st, n, what) in [(Status::Bad, bad, "to fix"), (Status::Warn, warn, "worth a look"), (Status::Ok, fine, "fine")] {
+                    ui.add_space(12.0);
+                    let (r, _) = ui.allocate_exact_size(vec2(16.0, 18.0), Sense::hover());
+                    mark(ui.painter(), r.center(), st, pal, 7.0);
+                    ui.label(egui::RichText::new(format!("{} {}", n, what)).size(13.5).color(if n == 0 && st != Status::Ok { pal.ink_soft } else { pal.ink }));
+                }
             }
-            None => ("Not checked yet".to_string(), pal.ink_soft),
-        };
-        let (r, _) = ui.allocate_exact_size(vec2(10.0, 18.0), Sense::hover());
-        ui.painter().circle_filled(r.center(), 4.0, tone);
-        ui.add_space(4.0);
-        ui.label(egui::RichText::new(said).size(13.5).color(pal.ink));
+            None => {
+                ui.label(egui::RichText::new("Not checked yet").size(13.5).color(pal.ink_soft));
+            }
+        }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let tip = if !st.requests {
                 "Update its Helper VM first: run setup.sh on it again"
@@ -177,27 +177,44 @@ fn no_helper(ui: &mut Ui, pal: &Pal, sid: u32, out: &mut Vec<Intent>) {
 }
 
 /// A check's mark: a round badge in its colour, a tick, an exclamation mark or a cross.
-fn mark(p: &egui::Painter, c: egui::Pos2, st: Status, pal: &Pal) {
+fn mark(p: &egui::Painter, c: egui::Pos2, st: Status, pal: &Pal, radius: f32) {
     let col = match st {
         Status::Ok => pal.green,
         Status::Warn => pal.orange,
         Status::Bad => pal.red,
     };
-    p.circle_filled(c, 8.5, col);
-    let s = Stroke::new(1.8_f32, Color32::WHITE);
+    p.circle_filled(c, radius, col);
+    // (drawn for a badge of 8.5, and scaled)
+    let k = radius / 8.5;
+    let at = |x: f32, y: f32| c + vec2(x * k, y * k);
+    let s = Stroke::new(1.8_f32 * k.max(0.8), Color32::WHITE);
     match st {
         Status::Ok => {
-            p.add(egui::Shape::line(vec![c + vec2(-3.8, 0.3), c + vec2(-1.1, 2.9), c + vec2(3.9, -2.6)], s));
+            p.add(egui::Shape::line(vec![at(-3.8, 0.3), at(-1.1, 2.9), at(3.9, -2.6)], s));
         }
         Status::Warn => {
-            p.line_segment([c + vec2(0.0, -4.4), c + vec2(0.0, 0.9)], s);
-            p.circle_filled(c + vec2(0.0, 3.9), 1.15, Color32::WHITE);
+            p.line_segment([at(0.0, -4.4), at(0.0, 0.9)], s);
+            p.circle_filled(at(0.0, 3.9), 1.15 * k, Color32::WHITE);
         }
         Status::Bad => {
-            p.line_segment([c + vec2(-3.1, -3.1), c + vec2(3.1, 3.1)], s);
-            p.line_segment([c + vec2(3.1, -3.1), c + vec2(-3.1, 3.1)], s);
+            p.line_segment([at(-3.1, -3.1), at(3.1, 3.1)], s);
+            p.line_segment([at(3.1, -3.1), at(-3.1, 3.1)], s);
         }
     }
+}
+
+/// What a check is about that its note doesn't name already (Claude's notes usually name each,
+/// with its figures): "TrueNAS (4 vCPUs, at most 1% busy)" counts as named when "TrueNAS" is.
+fn unnamed(c: &Check) -> Vec<&str> {
+    let note = c.note.to_lowercase();
+    c.objects
+        .iter()
+        .filter(|o| {
+            let name = o.split(" (").next().unwrap_or(o).split(": ").next().unwrap_or(o).trim().to_lowercase();
+            name.is_empty() || !note.contains(&name)
+        })
+        .map(|o| o.as_str())
+        .collect()
 }
 
 /// What a fix's button says, and (for one this app does itself) what it asks before doing it:
@@ -253,7 +270,7 @@ fn check_row(ui: &mut Ui, pal: &Pal, sid: u32, c: &Check, v: &super::helper_page
     if more && resp.hovered() {
         p.rect_filled(rect.shrink2(vec2(4.0, 1.0)), Rounding::same(8.0), pal.hover);
     }
-    mark(p, pos2(rect.min.x + 25.0, rect.center().y), c.status, pal);
+    mark(p, pos2(rect.min.x + 25.0, rect.center().y), c.status, pal, 8.5);
     let x = rect.min.x + 44.0;
     let room = rect.width() - 44.0 - if more { 44.0 } else { 16.0 } - if c.by_claude { 64.0 } else { 0.0 };
     let (g, cut) = super::overview::fit(p, &c.title, FontId::proportional(14.0), pal.ink, room);
@@ -286,8 +303,9 @@ fn check_row(ui: &mut Ui, pal: &Pal, sid: u32, c: &Check, v: &super::helper_page
                 if !c.note.is_empty() {
                     ui.add(egui::Label::new(egui::RichText::new(c.note.as_str()).size(13.0).color(pal.ink_soft)).wrap());
                 }
-                if !c.objects.is_empty() {
-                    ui.add(egui::Label::new(egui::RichText::new(format!("About: {}", c.objects.join(", "))).size(12.5).color(pal.ink_faint)).wrap());
+                let left = unnamed(c);
+                if !left.is_empty() {
+                    ui.add(egui::Label::new(egui::RichText::new(format!("About: {}", left.join(", "))).size(12.5).color(pal.ink_faint)).wrap());
                 }
                 if let Some(f) = fix {
                     fix_ui(ui, pal, sid, c, f, v, d, out);
@@ -360,4 +378,17 @@ fn fix_ui(ui: &mut Ui, pal: &Pal, sid: u32, c: &Check, f: &Fix, v: &super::helpe
             }
         });
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn about_says_only_what_the_note_doesnt() {
+        let c = |note: &str| Check { id: "vm_idle_cpus".into(), topic: "vms".into(), status: Status::Warn, title: "x".into(), note: note.into(), objects: vec!["Active Directory (4 vCPUs, at most 3% busy)".into(), "TrueNAS (4 vCPUs, at most 1% busy)".into()], by_claude: false, fix: None };
+        assert!(unnamed(&c("Active Directory (4 vCPUs, até 3%) e TrueNAS (4 vCPUs, até 1%) quase não usaram o processador.")).is_empty());
+        assert_eq!(unnamed(&c("O Active Directory quase não usou o processador.")), vec!["TrueNAS (4 vCPUs, at most 1% busy)"]);
+        assert_eq!(unnamed(&c("")).len(), 2);
+    }
 }

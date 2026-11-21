@@ -8,30 +8,10 @@ It is an independent, simpler take on the classic Windows management console lay
 affiliated with or endorsed by the makers of XenServer or XCP-ng. What it does and doesn't do next
 to XenCenter, feature by feature: [Simple VM Manager and XenCenter](docs/xencenter-comparison.md).
 
-| Light | Dark |
+| | |
 |---|---|
-| ![Light theme](docs/screenshot-light-vm.png) | ![Dark theme](docs/screenshot-dark-vm.png) |
-| ![Home page, dark](docs/screenshot-dark-home.png) | ![Folded sidebar](docs/screenshot-folded.png) |
-| ![A VM's console](docs/screenshot-dark-console.png) | ![Connecting to a server](docs/screenshot-dark-connect.png) |
-| ![An ISO library's files](docs/screenshot-dark-isos.png) | ![Uploading an ISO from a link](docs/screenshot-dark-upload.png) |
-| ![Creating a VM](docs/screenshot-dark-new-vm.png) | ![A new VM's advanced options](docs/screenshot-dark-new-vm-advanced.png) |
-| ![A VM's snapshots](docs/screenshot-dark-snapshots.png) | ![Taking a snapshot](docs/screenshot-dark-snapshot-take.png) |
-| ![Every VM's snapshots and schedules](docs/screenshot-dark-snapshots-page.png) | ![A snapshot schedule](docs/screenshot-dark-schedule.png) |
-| ![Your snapshot schedules, with what each one last did](docs/screenshot-dark-schedules.png) | ![A new VM from a snapshot](docs/screenshot-dark-new-vm-snapshot.png) |
-| ![Your templates](docs/screenshot-dark-templates.png) | ![A new VM from a template](docs/screenshot-dark-new-vm-template.png) |
-| ![A server's Overview](docs/screenshot-dark-host.png) | ![A pool's Overview](docs/screenshot-dark-pool.png) |
-| ![Changing a server's IP address](docs/screenshot-dark-change-ip.png) | ![A new VM set up by cloud-init](docs/screenshot-dark-cloud-init.png) |
-| ![Searching every field of a VM, in its Details tab](docs/screenshot-dark-details.png) | ![A server's Details tab](docs/screenshot-dark-host-details.png) |
-| ![A VM's week, in its Performance tab](docs/screenshot-dark-performance.png) | ![A server's Performance tab](docs/screenshot-dark-host-performance.png) |
-| ![Every pool's alerts](docs/screenshot-dark-alerts.png) | ![Alert limits for a VM](docs/screenshot-dark-alert-rules.png) |
-| ![A pool's updates](docs/screenshot-dark-updates.png) | ![Updating a pool](docs/screenshot-dark-updating.png) |
-| ![Every ISO file of every pool](docs/screenshot-dark-iso-library.png) | ![Where your VMs' disks are](docs/screenshot-dark-vm-storage.png) |
-| ![Adding NFS storage for VMs](docs/screenshot-dark-new-storage.png) | ![Moving a VM](docs/screenshot-dark-move-vm.png) |
-| ![Exporting a running VM to a file](docs/screenshot-dark-export.png) | ![A new VM from a .xva file](docs/screenshot-dark-import.png) |
-| ![Your networks](docs/screenshot-dark-networks.png) | ![Adding a network on a VLAN](docs/screenshot-dark-new-network.png) |
-| ![The Advisor: each pool checked against good practice, in Claude's words](docs/screenshot-dark-advisor.png) | ![A pool's Helper VM: how it's doing, and where alerts go](docs/screenshot-dark-helper.png) |
-| ![A server's Actions](docs/screenshot-dark-server-actions.png) | |
-| ![Bringing VMs over from VMware, Proxmox or disk files](docs/screenshot-dark-convert.png) | ![Preparing them, then converting](docs/screenshot-dark-convert-prepare.png) |
+| ![A VM's week, in its Performance tab](docs/screenshot-dark-performance.png) | ![Updating a pool, a server at a time](docs/screenshot-dark-updating.png) |
+| ![Bringing VMs over from VMware or Proxmox](docs/screenshot-dark-convert-prepare.png) | ![The Advisor: each pool checked against good practice, in Claude's words](docs/screenshot-dark-advisor.png) |
 
 ## Features
 

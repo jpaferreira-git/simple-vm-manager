@@ -286,7 +286,8 @@ impl App {
             let w = (ui.available_width() - 2.0 * pad).min(860.0);
             ui.add_space(18.0);
             ui.horizontal(|ui| {
-                ui.add_space(pad);
+                // centred in the window, as wide as it reads well
+                ui.add_space(((ui.available_width() - w) / 2.0).max(pad));
                 ui.vertical(|ui| {
                     ui.set_width(w);
                     ui.spacing_mut().item_spacing.y = 0.0;
@@ -612,7 +613,11 @@ fn settings_ui(ui: &mut Ui, pal: &Pal, v: &mut HelperView, d: &PoolData, can_ask
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 ui.add_space(16.0);
+                let (r, _) = ui.allocate_exact_size(vec2(28.0, 34.0), Sense::hover());
+                channel_logo(ui.painter(), r.center(), name);
+                ui.add_space(8.0);
                 ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 3.0;
                     ui.label(egui::RichText::new(name).size(14.0).color(pal.ink));
                     ui.label(egui::RichText::new(sub).size(12.0).color(pal.ink_soft));
                 });
@@ -629,7 +634,7 @@ fn settings_ui(ui: &mut Ui, pal: &Pal, v: &mut HelperView, d: &PoolData, can_ask
                         continue;
                     }
                     ui.horizontal(|ui| {
-                        ui.add_space(16.0);
+                        ui.add_space(52.0);
                         field_label(ui, label, 170.0);
                         text_field(ui, pal, value, field_w.min(ui.available_width() - 20.0), password);
                     });
@@ -643,42 +648,78 @@ fn settings_ui(ui: &mut Ui, pal: &Pal, v: &mut HelperView, d: &PoolData, can_ask
             }
         }
     });
+    // which alerts, and when not
+    ui.add_space(20.0);
+    super::overview::section(ui, pal, "Which ones, and when");
+    super::overview::panel(ui, pal, |ui| {
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            ui.add_space(16.0);
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 3.0;
+                ui.label(egui::RichText::new("Which alerts").size(14.0).color(pal.ink));
+                ui.label(egui::RichText::new("As bad as these, or worse").size(12.0).color(pal.ink_soft));
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add_space(16.0);
+                let mut at = match x.min_priority {
+                    p if p <= 2 => 0,
+                    3 | 4 => 1,
+                    _ => 2,
+                };
+                if crate::isolib::segmented(ui, pal, &["Critical only", "And warnings", "Everything"], &mut at, 330.0_f32.min(ui.available_width() - 20.0)) {
+                    x.min_priority = [2, 3, 5][at];
+                }
+            });
+        });
+        ui.add_space(8.0);
+        let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
+        ui.painter().line_segment([pos2(r.min.x + 16.0, r.center().y), pos2(r.max.x, r.center().y)], Stroke::new(1.0_f32, pal.border.gamma_multiply(0.6)));
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            ui.add_space(16.0);
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 3.0;
+                ui.label(egui::RichText::new("Quiet hours").size(14.0).color(pal.ink));
+                ui.label(egui::RichText::new("Only critical alerts then").size(12.0).color(pal.ink_soft));
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add_space(16.0);
+                let tip = if x.quiet.0 { "On: only critical alerts in these hours" } else { "Off" };
+                switch(ui, pal, &mut x.quiet.0, tip);
+                ui.add_space(14.0);
+                // (right to left: "from 23:00 to 07:00" reads in the usual order)
+                let on = x.quiet.0;
+                ui.add_enabled_ui(on, |ui| {
+                    text_field(ui, pal, &mut x.quiet.2, 58.0, false);
+                    ui.label(egui::RichText::new("to").size(13.0).color(pal.ink_soft));
+                    text_field(ui, pal, &mut x.quiet.1, 58.0, false);
+                    ui.label(egui::RichText::new("from").size(13.0).color(pal.ink_soft));
+                });
+            });
+        });
+        ui.add_space(8.0);
+    });
+    // a test, of the channels as saved
     ui.add_space(10.0);
-    ui.horizontal(|ui| {
-        field_label(ui, "Send:", 60.0);
-        let mut at = match x.min_priority {
-            p if p <= 2 => 0,
-            3 | 4 => 1,
-            _ => 2,
-        };
-        if crate::isolib::segmented(ui, pal, &["Critical only", "Critical and warnings", "Everything"], &mut at, 420.0_f32.min(ui.available_width() - 4.0)) {
-            x.min_priority = [2, 3, 5][at];
-        }
-    });
-    ui.add_space(8.0);
-    ui.horizontal(|ui| {
-        switch(ui, pal, &mut x.quiet.0, "Quiet hours: only critical alerts then");
-        ui.label(egui::RichText::new("Quiet from").color(pal.ink));
-        text_field(ui, pal, &mut x.quiet.1, 64.0, false);
-        ui.label(egui::RichText::new("to").color(pal.ink));
-        text_field(ui, pal, &mut x.quiet.2, 64.0, false);
-        ui.label(egui::RichText::new("(only critical ones then)").size(12.5).color(pal.ink_soft));
-    });
-    ui.add_space(8.0);
     let changed = v.saved.as_ref().and_then(|r| r.as_ref().ok()) != Some(&*x);
     ui.horizontal(|ui| {
-        let tip = if !can_ask {
-            "Update the Helper VM first (run setup.sh on it again)"
+        let why_not = if testing {
+            Some("The Helper VM sends it within a minute…")
+        } else if !can_ask {
+            Some("Update the Helper VM first to send one from here.")
         } else if changed {
-            "Save first: the Helper VM sends it to the channels as saved"
+            Some("Save first: it sends one to the channels as saved.")
+        } else if !x.sends() {
+            Some("Turn a channel on first.")
         } else {
-            "Has the Helper VM send a test alert to the channels that are on"
+            None
         };
-        if flat_button(ui, "bell", if testing { "Sending…" } else { "Send a test" }, Some(pal.accent), can_ask && !busy && !testing && !changed && x.sends(), false, pal).on_hover_text(tip).clicked() {
+        if dialog_button(ui, pal, "bell", if testing { "Sending…" } else { "Send a test alert" }, Look::Plain, why_not.is_none() && !busy) {
             *act = Some(HelperAct::Test);
         }
-        if testing {
-            ui.label(egui::RichText::new("The Helper VM sends it within a minute…").size(12.5).color(pal.ink_soft));
+        if let Some(w) = why_not {
+            ui.label(egui::RichText::new(w).size(12.5).color(pal.ink_soft));
         }
     });
     // what it watches
@@ -715,7 +756,11 @@ fn settings_ui(ui: &mut Ui, pal: &Pal, v: &mut HelperView, d: &PoolData, can_ask
             ui.label(egui::RichText::new(p.as_str()).size(12.5).color(pal.red));
         }
     });
-    if let Some((ok, text)) = &v.note {
+    // changed since the last save: that, rather than what the save said
+    if changed && v.busy != Some(Did::Saved) {
+        ui.add_space(8.0);
+        ui.add(egui::Label::new(egui::RichText::new("Not saved yet: Save puts these changes in place, Undo changes goes back to what's saved.").size(12.5).color(pal.orange)).wrap());
+    } else if let Some((ok, text)) = &v.note {
         ui.add_space(8.0);
         ui.add(egui::Label::new(egui::RichText::new(text.as_str()).size(12.5).color(if *ok { pal.green } else { pal.red })).wrap());
     }
@@ -728,6 +773,7 @@ fn line_switch(ui: &mut Ui, pal: &Pal, on: &mut bool, title: &str, sub: &str, fi
         ui.add_space(16.0);
         ui.vertical(|ui| {
             ui.set_max_width((ui.available_width() - 200.0).max(200.0));
+            ui.spacing_mut().item_spacing.y = 3.0;
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(title).size(14.0).color(pal.ink));
                 if let Some(f) = figure {
@@ -761,33 +807,45 @@ fn order_ui(ui: &mut Ui, pal: &Pal, x: &mut Settings, d: &PoolData) {
     let mut swap: Option<(usize, usize)> = None;
     let mut drop: Option<usize> = None;
     let n = x.order.len();
+    let bold = FontId::new(12.0, FontFamily::Name("bold".into()));
     for (i, (uuid, wait)) in x.order.iter_mut().enumerate() {
+        let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
+        ui.painter().line_segment([pos2(row.min.x + 52.0, row.center().y), pos2(row.max.x, row.center().y)], Stroke::new(1.0_f32, pal.border.gamma_multiply(0.5)));
         ui.horizontal(|ui| {
-            ui.add_space(30.0);
-            ui.label(egui::RichText::new(format!("{}.", i + 1)).color(pal.ink_soft));
-            ui.label(egui::RichText::new(name_of(uuid)).color(pal.ink));
+            // (as tall as its boxes from the start, so everything sits level)
+            ui.set_min_height(38.0);
+            ui.add_space(16.0);
+            // its place: a number in a round badge
+            let (r, _) = ui.allocate_exact_size(vec2(28.0, 22.0), Sense::hover());
+            ui.painter().circle_filled(r.center(), 11.0, pal.accent.gamma_multiply(0.18));
+            ui.painter().text(r.center(), Align2::CENTER_CENTER, (i + 1).to_string(), bold.clone(), pal.accent);
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new(name_of(uuid)).size(14.0).color(pal.ink));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.add_space(16.0);
-                if flat_button(ui, "close", "Take it off", None, true, true, pal).clicked() {
+                ui.add_space(12.0);
+                if order_button(ui, pal, "×", true, "Take it off the list (it starts by itself again)") {
                     drop = Some(i);
                 }
-                if flat_button(ui, "download", "Later", None, i + 1 < n, true, pal).clicked() {
+                if order_button(ui, pal, "↓", i + 1 < n, "Later") {
                     swap = Some((i, i + 1));
                 }
-                if flat_button(ui, "upload", "Sooner", None, i > 0, true, pal).clicked() {
+                if order_button(ui, pal, "↑", i > 0, "Sooner") {
                     swap = Some((i - 1, i));
                 }
-                ui.label(egui::RichText::new("s after").size(12.5).color(pal.ink_soft));
-                let mut text = wait.to_string();
-                if ui.add(egui::TextEdit::singleline(&mut text).desired_width(40.0).horizontal_align(egui::Align::Center)).changed() {
-                    if let Ok(w) = text.trim().parse::<i64>() {
-                        *wait = w.clamp(0, 3600);
+                ui.add_space(12.0);
+                // the wait before the next one (none after the last)
+                if i + 1 < n {
+                    ui.label(egui::RichText::new("s before the next").size(12.5).color(pal.ink_soft));
+                    let mut text = wait.to_string();
+                    if ui.add(egui::TextEdit::singleline(&mut text).desired_width(38.0).horizontal_align(egui::Align::Center)).on_hover_text("Seconds to wait after this one starts").changed() {
+                        if let Ok(w) = text.trim().parse::<i64>() {
+                            *wait = w.clamp(0, 3600);
+                        }
                     }
+                    ui.label(egui::RichText::new("then").size(12.5).color(pal.ink_soft));
                 }
-                ui.label(egui::RichText::new("wait").size(12.5).color(pal.ink_soft));
             });
         });
-        ui.add_space(4.0);
     }
     if let Some((a, b)) = swap {
         x.order.swap(a, b);
@@ -796,8 +854,13 @@ fn order_ui(ui: &mut Ui, pal: &Pal, x: &mut Settings, d: &PoolData) {
         x.order.remove(i);
     }
     let left: Vec<&VmInfo> = d.vms.iter().filter(|v| !x.order.iter().any(|o| o.0 == v.uuid)).collect();
+    if n > 0 {
+        let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
+        ui.painter().line_segment([pos2(row.min.x + 52.0, row.center().y), pos2(row.max.x, row.center().y)], Stroke::new(1.0_f32, pal.border.gamma_multiply(0.5)));
+    }
+    ui.add_space(8.0);
     ui.horizontal(|ui| {
-        ui.add_space(30.0);
+        ui.add_space(52.0);
         egui::ComboBox::from_id_salt("helper-order-add").selected_text(if x.order.is_empty() { "Add the first VM…" } else { "Add a VM…" }).width(260.0).show_ui(ui, |ui| {
             for v in &left {
                 if ui.selectable_label(false, v.name.as_str()).clicked() {
@@ -806,7 +869,19 @@ fn order_ui(ui: &mut Ui, pal: &Pal, x: &mut Settings, d: &PoolData) {
             }
         });
     });
-    ui.add_space(10.0);
+    ui.add_space(12.0);
+}
+
+/// A small square button with a sign on it (↑, ↓, ×), lit up under the mouse; whether it was
+/// clicked.
+fn order_button(ui: &mut Ui, pal: &Pal, sign: &str, enabled: bool, tip: &str) -> bool {
+    let (r, resp) = ui.allocate_exact_size(vec2(26.0, 26.0), if enabled { Sense::click() } else { Sense::hover() });
+    if enabled && resp.hovered() {
+        ui.painter().rect_filled(r, Rounding::same(6.0), pal.hover);
+    }
+    let col = if enabled { pal.ink_soft } else { pal.ink_faint.gamma_multiply(0.5) };
+    ui.painter().text(r.center(), Align2::CENTER_CENTER, sign, FontId::proportional(15.0), col);
+    enabled && resp.on_hover_text(tip).on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
 }
 
 /// Opens a link in the system's browser.
@@ -852,4 +927,52 @@ pub(super) fn helper_card(ui: &mut Ui, pal: &Pal) -> Option<bool> {
         });
     });
     said
+}
+
+/// A channel's little logo, drawn (no images): Telegram's paper plane, ntfy's message, Discord's
+/// face, Home Assistant's house, a webhook's braces; each on its own colour.
+fn channel_logo(p: &egui::Painter, c: egui::Pos2, name: &str) {
+    let white = Color32::WHITE;
+    let at = |x: f32, y: f32| c + vec2(x, y);
+    let poly = |pts: &[(f32, f32)], col: Color32| egui::Shape::convex_polygon(pts.iter().map(|&(x, y)| at(x, y)).collect(), col, Stroke::NONE);
+    match name {
+        "Telegram" => {
+            p.circle_filled(c, 13.0, Color32::from_rgb(42, 171, 238));
+            p.add(poly(&[(-7.0, -0.4), (6.4, -6.0), (3.4, 6.4), (-0.4, 2.6)], white));
+            p.add(poly(&[(-0.4, 2.6), (3.4, 6.4), (0.8, 2.0)], Color32::from_rgb(200, 226, 242)));
+        }
+        "ntfy" => {
+            let bg = Color32::from_rgb(51, 133, 116);
+            p.rect_filled(egui::Rect::from_center_size(c, vec2(26.0, 26.0)), Rounding::same(7.0), bg);
+            p.rect_filled(egui::Rect::from_min_max(at(-7.5, -6.0), at(7.5, 4.0)), Rounding::same(3.0), white);
+            p.add(poly(&[(-5.5, 3.5), (-1.5, 3.5), (-5.0, 7.5)], white));
+            let s = Stroke::new(1.6_f32, bg);
+            p.line_segment([at(-4.5, -2.6), at(4.5, -2.6)], s);
+            p.line_segment([at(-4.5, 0.6), at(1.5, 0.6)], s);
+        }
+        "Discord" => {
+            let bg = Color32::from_rgb(88, 101, 242);
+            p.rect_filled(egui::Rect::from_center_size(c, vec2(26.0, 26.0)), Rounding::same(7.0), bg);
+            p.rect_filled(egui::Rect::from_min_max(at(-7.5, -4.5), at(7.5, 5.0)), Rounding::same(4.5), white);
+            p.add(poly(&[(-7.5, -1.0), (-5.0, -6.0), (-2.5, -4.5)], white));
+            p.add(poly(&[(7.5, -1.0), (5.0, -6.0), (2.5, -4.5)], white));
+            p.circle_filled(at(-2.7, 0.6), 1.7, bg);
+            p.circle_filled(at(2.7, 0.6), 1.7, bg);
+        }
+        "Home Assistant" => {
+            let bg = Color32::from_rgb(24, 188, 242);
+            p.circle_filled(c, 13.0, bg);
+            p.add(poly(&[(0.0, -8.0), (8.0, -0.5), (-8.0, -0.5)], white));
+            p.rect_filled(egui::Rect::from_min_max(at(-5.5, -1.0), at(5.5, 7.0)), Rounding::same(0.5), white);
+            let s = Stroke::new(1.4_f32, bg);
+            p.line_segment([at(0.0, -0.5), at(0.0, 7.0)], s);
+            p.line_segment([at(0.0, 3.2), at(-2.4, 1.2)], s);
+            p.line_segment([at(0.0, 4.6), at(2.4, 2.6)], s);
+            p.circle_filled(at(0.0, -0.8), 1.5, bg);
+        }
+        _ => {
+            p.rect_filled(egui::Rect::from_center_size(c, vec2(26.0, 26.0)), Rounding::same(7.0), Color32::from_rgb(124, 92, 214));
+            p.text(c + vec2(0.0, -0.5), Align2::CENTER_CENTER, "{ }", FontId::new(13.0, FontFamily::Name("bold".into())), white);
+        }
+    }
 }
