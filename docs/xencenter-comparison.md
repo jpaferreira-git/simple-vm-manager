@@ -3,7 +3,8 @@
 What Simple VM Manager does next to XenCenter, the official Windows console for XenServer, as of
 Simple VM Manager **1.27.0** (November 2026). Simple VM Manager covers what a small or home pool
 uses most, and adds a few things XenCenter doesn't do; the big-pool features (high availability,
-Workload Balancing, Active Directory…) are left to XenCenter.
+Workload Balancing, Active Directory…) are left to XenCenter. The XenCenter column follows the
+XenCenter 2026.6.0 manual.
 
 ✅ it does · ❌ it doesn't · ¹ ² ³ see the [notes](#notes) at the end
 
@@ -37,6 +38,7 @@ Spotted a mistake? [Open an issue](https://github.com/jpaferreira-git/simple-vm-
 | Rolling pool upgrade, to a new major version | ❌ | ✅ |
 | Apply a license | ❌ | ✅ |
 | Active Directory and roles | ❌ | ✅ |
+| Citrix Virtual Apps and Desktops | ❌ | ✅ |
 
 ## Servers
 
@@ -48,6 +50,7 @@ Spotted a mistake? [Open an issue](https://github.com/jpaferreira-git/simple-vm-
 | Restart the toolstack | ✅ | ✅ |
 | Back up and restore | ✅ | ✅ |
 | Its text console | ✅ | ✅ |
+| Turn SSH access on or off | ❌ | ✅ |
 | IP address, DNS and hostname | ✅ | ✅ |
 | Renew its certificate | ✅ | ✅ |
 | Its USB devices, and the VM each is passed to | ✅ | ✅ |
@@ -55,6 +58,8 @@ Spotted a mistake? [Open an issue](https://github.com/jpaferreira-git/simple-vm-
 | Send its logs to a syslog server | ❌ | ✅ |
 | Multipathing | ❌ | ✅ |
 | GPUs | ❌ | ✅ |
+| The control domain's memory | ❌ | ✅ |
+| Supplemental packs and driver disks | ❌ | ✅ |
 
 ## Virtual machines
 
@@ -63,7 +68,7 @@ Spotted a mistake? [Open an issue](https://github.com/jpaferreira-git/simple-vm-
 | New VM from an ISO | ✅ | ✅ |
 | New VM from a template | ✅ | ✅ |
 | New VM from a snapshot | ✅ | ✅ |
-| New VM set up by cloud-init | ✅ | ✅ |
+| New VM set up by cloud-init | ✅ | ❌ |
 | Start, shut down, reboot, suspend, resume, force | ✅ | ✅ |
 | Its console, with Ctrl+Alt+Del | ✅ | ✅ |
 | Console in a window of its own | ❌ | ✅ |
@@ -82,9 +87,17 @@ Spotted a mistake? [Open an issue](https://github.com/jpaferreira-git/simple-vm-
 | Move to another pool | ❌ | ✅ |
 | Make a template | ✅ | ✅ |
 | Delete, with its disks | ✅ | ✅ |
-| Started in order, with a wait between them, when the pool starts | ✅² | ❌ |
+| Started in order, with a wait between them, when the pool starts (XenCenter: only in a vApp, or after a high-availability failure) | ✅² | ❌ |
 | vApps (VMs started together, in order, by hand) | ❌ | ✅ |
+| VM groups (VMs kept on different servers) | ❌ | ✅ |
+
+## Organizing
+
+| | Simple VMM | XenCenter |
+|---|:---:|:---:|
+| A tree of pools, servers, VMs and storage, with a search | ✅ | ✅ |
 | Tags, folders and custom fields | ❌ | ✅ |
+| Saved searches | ❌ | ✅ |
 
 ## Snapshots
 
@@ -137,6 +150,7 @@ Spotted a mistake? [Open an issue](https://github.com/jpaferreira-git/simple-vm-
 | A storage-full alert on EXT, XFS, NFS or SMB storage (XenServer can't raise it there) | ✅³ | ❌ |
 | Alerts on your phone: Telegram, ntfy, Discord, Home Assistant, webhooks | ✅² | ❌ |
 | A log of what was done | ✅ | ✅ |
+| SNMP and NRPE monitoring | ❌ | ✅ |
 
 ## Notes
 
