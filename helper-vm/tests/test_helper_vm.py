@@ -588,6 +588,13 @@ class PhoneSignIn(unittest.TestCase):
             self.assertTrue(all(drawn[-1]))  # the row added to make them even is light
         self.assertLessEqual(len(lines[0]), 40)  # it fits an 80-column console, with room
         self.assertLessEqual(len(lines), 20)
+        # on a Linux console: full blocks only, two to a dot; in capitals, a smaller code
+        url = url.upper()
+        wide = h.qr_lines(url, wide=True)
+        self.assertEqual(set("".join(wide)), {"█", " "})
+        want = [[not m for m in row] for row in segno.make_qr(url, error="m").matrix_iter(scale=1, border=2)]
+        self.assertEqual([[line[i] == "█" for i in range(0, len(line), 2)] for line in wide], want)
+        self.assertEqual(len(wide), 29)
 
     def test_what_the_screen_says(self):
         raw = "\x1b]8;id=x;https://claude.ai/oauth/authorize?Ab-1\x07\x1b[38;5;246mhttps://claude.ai/oauth/authorize?Ab-1\x1b[39m\x1b]8;;\x07\r\n"
@@ -621,6 +628,7 @@ class PhoneSignIn(unittest.TestCase):
 
         try:
             self.assertEqual(fetch("http://127.0.0.1:%d/wrong" % page.port)[0], 404)
+            self.assertEqual(fetch(url.upper().replace("HTTP://", "http://"))[0], 200)  # as the QR code has it
             status, body = fetch()
             self.assertEqual(status, 200)
             self.assertIn("Entrar no Claude", body)

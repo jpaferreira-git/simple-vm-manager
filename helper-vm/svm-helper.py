@@ -63,7 +63,7 @@ import urllib.parse
 import urllib.request
 import xmlrpc.client
 
-VERSION = "2.0.1"
+VERSION = "2.0.2"
 REPO = "jpaferreira-git/simple-vm-manager"
 CONF_DIR = os.environ.get("SVM_HELPER_CONF", "/etc/svm-helper")
 CONFIG = os.path.join(CONF_DIR, "config.json")
@@ -2421,14 +2421,18 @@ def screen_text(raw):
     return re.sub(r"\x1b[()][0-9A-Za-z]|\x1b[78=>]", "", t)
 
 
-def qr_lines(text):
-    """`text` as a QR code for a terminal: two of its rows to a line, in half blocks, light where
-    the code is light (with colours set, it reads the same in a light terminal). [] without segno."""
+def qr_lines(text, wide=False):
+    """`text` as a QR code for a terminal, drawn light where the code is light (with colours set,
+    it reads the same in a light terminal). Two of its rows to a line, in half blocks; or, `wide`,
+    a row to a line and two full blocks to a dot, for a Linux console, whose fonts may lack half
+    blocks. [] without segno."""
     try:
         import segno
     except ImportError:
         return []
     rows = [[bool(m) for m in row] for row in segno.make_qr(text, error="m").matrix_iter(scale=1, border=2)]
+    if wide:
+        return ["".join("  " if m else "██" for m in row) for row in rows]
     if len(rows) % 2:
         rows.append([False] * len(rows[0]))
     glyph = {(False, False): "█", (False, True): "▀", (True, False): "▄", (True, True): " "}
@@ -2668,7 +2672,7 @@ class PhonePage:
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
 
     def serve(self, req, given):
-        if req.path.split("?")[0] != "/" + self.key:
+        if req.path.split("?")[0].lower() != "/" + self.key:  # the QR code has it in capitals
             req.send_response(404)
             req.send_header("Content-Length", "0")
             req.end_headers()
@@ -2782,7 +2786,8 @@ def phone_sign_in(conf):
         page = PhonePage(sign_in, link)
         close = let_in(page.port)
         url = "http://%s:%d/%s" % (address, page.port, page.key)
-        lines = qr_lines(url)
+        # in capitals, the QR code is smaller (it then takes its letters-and-digits mode)
+        lines = qr_lines(url.upper(), wide=os.environ.get("TERM") == "linux")
         print()
         if lines:
             ui.info("Point your phone's camera at this code (the phone on the same network as this VM):")
@@ -2790,6 +2795,8 @@ def phone_sign_in(conf):
             for line in lines:
                 print("        " + ui.c("37;40", line))
             print()
+            if shutil.get_terminal_size().lines < len(lines) + 6:
+                ui.warn("The code may not fit on this screen: if it doesn't scan, type the link below.")
             ui.info("Or open " + ui.bold(url))
         else:
             ui.info("On your phone (on the same network as this VM), open " + ui.bold(url))
