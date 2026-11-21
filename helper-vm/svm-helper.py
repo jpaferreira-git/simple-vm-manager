@@ -31,11 +31,14 @@
 
 import calendar
 import code
+import codecs
 import datetime
 import fcntl
 import getpass
 import hashlib
+import html
 import http.client
+import http.server
 import json
 import os
 import pwd
@@ -46,9 +49,11 @@ import shutil
 import signal
 import socket
 import ssl
+import struct
 import subprocess
 import sys
 import tempfile
+import termios
 import textwrap
 import threading
 import time
@@ -58,7 +63,7 @@ import urllib.parse
 import urllib.request
 import xmlrpc.client
 
-VERSION = "2.0.0"
+VERSION = "2.0.1"
 REPO = "jpaferreira-git/simple-vm-manager"
 CONF_DIR = os.environ.get("SVM_HELPER_CONF", "/etc/svm-helper")
 CONFIG = os.path.join(CONF_DIR, "config.json")
@@ -2397,6 +2402,409 @@ def setup_backups(n, total, conf, x, vms):
             ui.warn("That's more than the share has free: keep fewer, or the oldest go when it's full (and a round that doesn't fit is skipped).")
 
 
+# ---------------------------------------------------------------- signing in to Claude from a phone
+
+# What 'claude setup-token' shows, read from its screen. Each must be followed by something else,
+# so that half of one, still coming in, isn't taken for all of it.
+SIGN_IN_LINK = re.compile(r"https://[^\s\x07\x1b]*oauth[^\s\x07\x1b]*(?=[\s\x07\x1b])")
+OAUTH_TOKEN = re.compile(r"sk-ant-oat[0-9]*-[A-Za-z0-9_-]{20,}(?=[^A-Za-z0-9_-])")
+CODE_REFUSED = re.compile(r"(?i)\b(?:oauth )?error:[ \t]*([^\r\n]+)[\r\n]")
+PAGE_KEY_LETTERS = "abcdefghijkmnpqrstuvwxyz23456789"  # none that look alike, for typing it
+
+
+def screen_text(raw):
+    """A full-screen program's output as plain text: its jumps along a line become spaces, and its
+    other escape codes go."""
+    t = re.sub(r"\x1b\[\d*[GC]", " ", raw)
+    t = re.sub(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)", "", t)
+    t = re.sub(r"\x1b\[[0-9;?<>=]*[ -/]*[@-~]", "", t)
+    return re.sub(r"\x1b[()][0-9A-Za-z]|\x1b[78=>]", "", t)
+
+
+def qr_lines(text):
+    """`text` as a QR code for a terminal: two of its rows to a line, in half blocks, light where
+    the code is light (with colours set, it reads the same in a light terminal). [] without segno."""
+    try:
+        import segno
+    except ImportError:
+        return []
+    rows = [[bool(m) for m in row] for row in segno.make_qr(text, error="m").matrix_iter(scale=1, border=2)]
+    if len(rows) % 2:
+        rows.append([False] * len(rows[0]))
+    glyph = {(False, False): "█", (False, True): "▀", (True, False): "▄", (True, True): " "}
+    return ["".join(glyph[a, b] for a, b in zip(top, bottom)) for top, bottom in zip(rows[::2], rows[1::2])]
+
+
+class SignIn:
+    """'claude setup-token', run unseen in a terminal of its own: the link it gives to sign in,
+    the code that sign-in ends with handed back to it, and the token it then makes."""
+
+    def __init__(self, argv, env=None, cwd=None):
+        self.argv, self.env, self.cwd = argv, env, cwd
+        self.changed = threading.Condition()
+        self.proc = None
+        self.fd = None
+        self.raw = ""
+        self.ended = True
+        self.run = 0
+
+    def start(self, timeout=90):
+        """A new sign-in (any earlier one stopped): its link."""
+        self.stop()
+        master, slave = os.openpty()
+        # wide enough that the link and the token stay on one line each
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 50, 2000, 0, 0))
+        try:
+            proc = subprocess.Popen(self.argv, stdin=slave, stdout=slave, stderr=slave, env=self.env, cwd=self.cwd, start_new_session=True, close_fds=True)
+        except OSError:
+            os.close(master)
+            raise
+        finally:
+            os.close(slave)
+        with self.changed:
+            self.run += 1
+            self.raw, self.ended, self.fd, self.proc = "", False, master, proc
+            run = self.run
+        threading.Thread(target=self._read, args=(master, run), daemon=True).start()
+        found = self._wait(SIGN_IN_LINK.search, timeout)
+        if not found:
+            raise PoolError("Claude Code didn't give a link to sign in" + self._last())
+        return found.group(0)
+
+    def _read(self, fd, run):
+        decode = codecs.getincrementaldecoder("utf-8")("replace").decode
+        while True:
+            try:
+                data = os.read(fd, 65536)
+            except OSError:
+                data = b""
+            with self.changed:
+                if run != self.run:
+                    return
+                if data:
+                    self.raw += decode(data)
+                else:
+                    self.ended = True
+                self.changed.notify_all()
+            if not data:
+                return
+
+    def _wait(self, look, timeout, since=0):
+        """look(text shown since `since`) once it gives something; None if the program ends first,
+        or the time runs out."""
+        end = time.monotonic() + timeout
+        with self.changed:
+            while True:
+                found = look(screen_text(self.raw[since:]) + ("\n" if self.ended else ""))  # nothing more comes
+                left = end - time.monotonic()
+                if found or self.ended or left <= 0:
+                    return found
+                self.changed.wait(left)
+
+    def _last(self):
+        with self.changed:
+            lines = [l.strip() for l in screen_text(self.raw).splitlines()]
+        lines = [l for l in lines if l and not set(l) <= set("─│╭╮╰╯ >")]
+        return ": " + lines[-1][:200] if lines else ""
+
+    def answer(self, given, timeout=90):
+        """Hands the sign-in the code it ended with: ("token", the token), or ("refused", why),
+        after which a new sign-in has to start."""
+        with self.changed:
+            since, fd, ended = len(self.raw), self.fd, self.ended
+        if ended or fd is None:
+            return "refused", "that sign-in had ended"
+        try:
+            os.write(fd, given.encode())
+            time.sleep(0.3)
+            os.write(fd, b"\r")
+        except OSError:
+            return "refused", "Claude Code had stopped"
+
+        def look(t):
+            m = OAUTH_TOKEN.search(t)
+            if m:
+                return "token", m.group(0)
+            m = CODE_REFUSED.search(t)
+            return ("refused", m.group(1).strip()) if m else None
+
+        return self._wait(look, timeout, since) or ("refused", ("Claude Code stopped" if self.ended else "Claude didn't answer in time") + self._last())
+
+    def stop(self):
+        with self.changed:
+            self.run += 1
+            proc, fd = self.proc, self.fd
+            self.proc, self.fd, self.ended = None, None, True
+            self.changed.notify_all()
+        if proc and proc.poll() is None:
+            for sig in (signal.SIGTERM, signal.SIGKILL):
+                try:
+                    os.killpg(proc.pid, sig)
+                    proc.wait(5)
+                    break
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+PAGE_WORDS = {
+    "en": {
+        "title": "Link the Helper VM to Claude",
+        "step1": "1. Sign in to Claude and approve.",
+        "button": "Sign in to Claude",
+        "hint": "It opens in a new tab: come back to this one after.",
+        "step2": "2. Claude then shows a code. Copy it and paste it here:",
+        "send": "Send",
+        "sending": "Checking…",
+        "done": "Done. The Helper VM now uses your Claude subscription. You can close this page.",
+        "refused": "Claude didn't accept that code (it may be incomplete, or from an earlier sign-in). Sign in again with the button below, and paste the new code.",
+        "empty": "Paste the code first.",
+        "broken": "The sign-in couldn't start again. Look at the Helper VM's terminal.",
+    },
+    "pt": {
+        "title": "Ligar a VM helper ao Claude",
+        "step1": "1. Entre no Claude e aprove.",
+        "button": "Entrar no Claude",
+        "hint": "Abre numa aba nova: depois volte para esta.",
+        "step2": "2. Depois o Claude mostra um código. Copie e cole aqui:",
+        "send": "Enviar",
+        "sending": "Conferindo…",
+        "done": "Pronto. A VM helper já usa a sua assinatura do Claude. Pode fechar esta página.",
+        "refused": "O Claude não aceitou esse código (pode estar incompleto, ou ser de um login anterior). Entre de novo pelo botão abaixo e cole o código novo.",
+        "empty": "Cole o código primeiro.",
+        "broken": "Não deu para começar o login de novo. Veja o terminal da VM helper.",
+    },
+    "es": {
+        "title": "Conectar la VM auxiliar a Claude",
+        "step1": "1. Inicia sesión en Claude y aprueba.",
+        "button": "Iniciar sesión en Claude",
+        "hint": "Se abre en una pestaña nueva: luego vuelve a esta.",
+        "step2": "2. Luego Claude muestra un código. Cópialo y pégalo aquí:",
+        "send": "Enviar",
+        "sending": "Comprobando…",
+        "done": "Listo. La VM auxiliar ya usa tu suscripción de Claude. Puedes cerrar esta página.",
+        "refused": "Claude no aceptó ese código (puede estar incompleto, o ser de un inicio de sesión anterior). Vuelve a iniciar sesión con el botón de abajo y pega el código nuevo.",
+        "empty": "Primero pega el código.",
+        "broken": "No se pudo iniciar la sesión de nuevo. Mira la terminal de la VM auxiliar.",
+    },
+}
+
+
+def page_language(accept):
+    """The page's language, from the browser's Accept-Language."""
+    for part in (accept or "").lower().split(","):
+        tag = part.split(";")[0].strip()[:2]
+        if tag in PAGE_WORDS:
+            return tag
+    return "en"
+
+
+def phone_page(lang, link, said):
+    w, e = PAGE_WORDS[lang], html.escape
+    if said == "done":
+        body = '<p class="ok">%s</p>' % e(w["done"])
+    else:
+        body = ('<p class="bad">%s</p>' % e(w[said]) if said in ("refused", "empty", "broken") else "") + (
+            '<p>%s</p><a class="button" href="%s" target="_blank" rel="noopener noreferrer">%s</a><p class="hint">%s</p>'
+            '<form method="post" onsubmit="var b=this.querySelector(\'button\');b.disabled=true;b.textContent=\'%s\'">'
+            '<p>%s</p><input name="code" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" required>'
+            '<button type="submit">%s</button></form>'
+        ) % (e(w["step1"]), e(link), e(w["button"]), e(w["hint"]), e(w["sending"]), e(w["step2"]), e(w["send"]))
+    return """<!doctype html>
+<html lang="%s"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>%s</title><style>
+:root{--bg:#f6f7f9;--card:#fff;--text:#1d2330;--dim:#5d6675;--accent:#2f6fde;--ok:#1f8a4c;--bad:#c2412d;--line:#d9dde4}
+@media (prefers-color-scheme:dark){:root{--bg:#15181e;--card:#1e222a;--text:#e7e9ee;--dim:#9aa3b2;--accent:#5b8ff0;--ok:#4cc27e;--bad:#f07a63;--line:#343a46}}
+body{margin:0;background:var(--bg);color:var(--text);font:17px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:28rem;margin:0 auto;padding:24px 16px}
+h1{font-size:1.3rem;margin:0 0 20px}
+.button,button{display:block;box-sizing:border-box;width:100%%;padding:14px;border:0;border-radius:10px;background:var(--accent);color:#fff;font:inherit;font-weight:600;text-align:center;text-decoration:none}
+button:disabled{opacity:.6}
+input{box-sizing:border-box;width:100%%;padding:12px;margin:0 0 12px;border:1px solid var(--line);border-radius:10px;background:var(--card);color:var(--text);font:15px ui-monospace,monospace}
+.hint{color:var(--dim);font-size:.9rem;margin:8px 0 28px}
+.ok{color:var(--ok);font-weight:600}.bad{color:var(--bad)}
+</style></head><body><main><h1>%s</h1>%s</main></body></html>
+""" % (lang, e(w["title"]), e(w["title"]), body)
+
+
+class PhonePage:
+    """A page this VM serves while setup signs in to Claude, at a link hard to guess, for a phone
+    on the same network: a button to Claude's sign-in, and a box for the code it ends with. The
+    token stays here: the page only says whether it worked."""
+
+    def __init__(self, sign_in, link, address="0.0.0.0", port=0):
+        self.sign_in, self.link = sign_in, link
+        self.key = "".join(pysecrets.choice(PAGE_KEY_LETTERS) for _ in range(8))
+        self.token = ""
+        self.failed = ""
+        self.status = "Waiting for your phone (Ctrl+C stops)"
+        self.notes = []  # what the terminal should say, as it happens
+        self.done = threading.Event()
+        self.lock = threading.Lock()  # one code at a time
+        page = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                page.serve(self, None)
+
+            def do_POST(self):
+                try:
+                    n = max(0, min(int(self.headers.get("Content-Length") or 0), 8192))
+                except ValueError:
+                    n = 0
+                form = urllib.parse.parse_qs(self.rfile.read(n).decode("utf-8", "replace"))
+                page.serve(self, (form.get("code") or [""])[0])
+
+        self.server = http.server.ThreadingHTTPServer((address, port), Handler)
+        self.server.daemon_threads = True
+        self.port = self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def serve(self, req, given):
+        if req.path.split("?")[0] != "/" + self.key:
+            req.send_response(404)
+            req.send_header("Content-Length", "0")
+            req.end_headers()
+            return
+        said = self.take(given.strip()) if given is not None else ("done" if self.token else "")
+        body = phone_page(page_language(req.headers.get("Accept-Language")), self.link, said).encode()
+        req.send_response(200)
+        for name, value in (("Content-Type", "text/html; charset=utf-8"), ("Content-Length", str(len(body))), ("Cache-Control", "no-store"), ("Referrer-Policy", "no-referrer")):
+            req.send_header(name, value)
+        req.end_headers()
+        req.wfile.write(body)
+
+    def take(self, given):
+        """A code from the phone: "done", or what the page should say."""
+        with self.lock:
+            if self.done.is_set():
+                return "done" if self.token else "broken"
+            if not given:
+                return "empty"
+            self.status = "Checking the code from your phone"
+            got, why = self.sign_in.answer(given)
+            if got == "token":
+                self.token = why
+                self.done.set()
+                return "done"
+            self.notes.append("The code from the phone didn't work (Claude: %s) The phone's page has a new sign-in now." % why.rstrip("."))
+            self.status = "Waiting for your phone (Ctrl+C stops)"
+            try:
+                self.link = self.sign_in.start()
+            except Exception as e:
+                self.failed = "the sign-in couldn't start again: " + short_error(e)
+                self.done.set()
+                return "broken"
+            return "refused"
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+def let_in(port):
+    """Lets the phone reach `port` while it signs in, when this VM's firewall would stop it: the
+    function that closes it again."""
+    def run(*argv):
+        try:
+            return subprocess.run(list(argv), capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+
+    r = run("firewall-cmd", "--state") if shutil.which("firewall-cmd") else None
+    if r and r.returncode == 0:
+        run("firewall-cmd", "--add-port=%d/tcp" % port)  # until firewalld reloads, at most
+        return lambda: run("firewall-cmd", "--remove-port=%d/tcp" % port)
+    r = run("ufw", "status") if shutil.which("ufw") else None
+    if r and r.returncode == 0 and "Status: active" in r.stdout:
+        run("ufw", "allow", "%d/tcp" % port)
+        return lambda: run("ufw", "delete", "allow", "%d/tcp" % port)
+    return lambda: None
+
+
+def wait_for_phone(page, timeout=1800):
+    """The token, once the phone's sign-in ends with it (a spinner meanwhile)."""
+    frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+    end, shown, i = time.monotonic() + timeout, None, 0
+    try:
+        while not page.done.wait(0.1):
+            while page.notes:
+                if ui.color:
+                    sys.stdout.write("\r\033[K")
+                ui.warn(page.notes.pop(0))
+            if time.monotonic() > end:
+                raise PoolError("nothing came from the phone in %d minutes" % (timeout // 60))
+            if ui.color:
+                sys.stdout.write("\r\033[K        " + ui.cyan(frames[i % len(frames)]) + " " + page.status)
+                sys.stdout.flush()
+            elif page.status != shown:
+                ui.info(page.status)
+            shown, i = page.status, i + 1
+    finally:
+        if ui.color:
+            sys.stdout.write("\r\033[K")
+            sys.stdout.flush()
+    if not page.token:
+        raise PoolError(page.failed or "the sign-in didn't finish")
+    ui.ok("Signed in to Claude: the helper has its token")
+    return page.token
+
+
+def phone_sign_in(conf):
+    """The subscription's token, from a sign-in done on a phone: a QR code here opens a page this
+    VM serves, with Claude's sign-in; the code that sign-in gives comes back through the page, and
+    Claude Code, run here unseen, turns it into the token."""
+    home = tempfile.mkdtemp(prefix="svm-claude-setup-")
+    no_browser = os.path.join(home, "no-browser")  # nothing to open here: the phone does it
+    os.makedirs(no_browser)
+    for name in ("xdg-open", "sensible-browser", "x-www-browser", "www-browser"):
+        with open(os.path.join(no_browser, name), "w") as f:
+            f.write("#!/bin/sh\nexit 0\n")
+        os.chmod(os.path.join(no_browser, name), 0o755)
+    u = pwd.getpwnam(USER)
+    os.chown(home, u.pw_uid, u.pw_gid)
+    env = ["HOME=" + home, "PATH=%s:/usr/local/bin:/usr/bin:/bin" % no_browser, "TERM=xterm-256color", "LANG=C.UTF-8", "DISABLE_AUTOUPDATER=1"]
+    sign_in = SignIn([shutil.which("runuser") or "/usr/sbin/runuser", "-u", USER, "--", "env", "-i"] + env + [claude_bin(), "setup-token"], cwd=home)
+    page, close = None, None
+    try:
+        link = ui.spin("Starting Claude's sign-in", sign_in.start)
+        towards = split_port(((conf.get("pool") or {}).get("hosts") or ["1.1.1.1"])[0])[0]
+        address = my_address(towards) or my_address("1.1.1.1")
+        if not address:
+            raise PoolError("this VM has no network address for the phone to reach")
+        page = PhonePage(sign_in, link)
+        close = let_in(page.port)
+        url = "http://%s:%d/%s" % (address, page.port, page.key)
+        lines = qr_lines(url)
+        print()
+        if lines:
+            ui.info("Point your phone's camera at this code (the phone on the same network as this VM):")
+            print()
+            for line in lines:
+                print("        " + ui.c("37;40", line))
+            print()
+            ui.info("Or open " + ui.bold(url))
+        else:
+            ui.info("On your phone (on the same network as this VM), open " + ui.bold(url))
+        ui.note("The page has a button to sign in to Claude and approve. Claude then shows a code: copy it into the page's box and send it. The token stays on this VM.")
+        print()
+        return wait_for_phone(page)
+    finally:
+        if page:
+            page.close()
+        if close:
+            close()
+        sign_in.stop()
+        shutil.rmtree(home, ignore_errors=True)
+
+
 def install_claude_code():
     """Claude Code installed (or brought up to date) for the helper's user, in its own folder."""
     os.makedirs(CLAUDE_HOME, exist_ok=True)
@@ -2407,24 +2815,24 @@ def install_claude_code():
         raise PoolError("it installed, but its command isn't where it should be")
 
 
-def subscription_token(sec):
-    """The token that lets the helper use the owner's Claude subscription: kept, or made now
-    with 'claude setup-token' (it shows a link to approve in a browser, then the token), or
-    pasted from another computer."""
+def subscription_token(sec, conf):
+    """The token that lets the helper use the owner's Claude subscription: the one kept, one from a
+    sign-in done on a phone (a QR code here), or one pasted, made with 'claude setup-token' on
+    another computer. "" for none."""
     if sec.get("claude_oauth_token") and ui.yes("Keep the subscription token saved before?", True):
         return sec["claude_oauth_token"]
-    ui.note("'claude setup-token' links the helper to your subscription. It shows a link: open it on your phone or computer, log in to Claude and approve, then paste the code it shows back here. It ends by printing a token (sk-ant-oat...). If you'd rather, run 'claude setup-token' on any computer with Claude Code and paste its token below.")
-    if ui.yes("Run 'claude setup-token' here now?", True):
-        home = tempfile.mkdtemp(prefix="svm-claude-setup-")
-        u = pwd.getpwnam(USER)
-        os.chown(home, u.pw_uid, u.pw_gid)
-        print()
+    ui.note("The helper uses your subscription with a token from Claude Code, made once: you sign in to Claude and approve it. The easy way is your phone: this shows a QR code, your camera opens a page on this VM (only on your own network), and you sign in there. Or make the token on any computer with Claude Code ('claude setup-token') and paste it here.")
+    while True:
+        if ui.pick("How do you want to sign in?", ["With your phone: a QR code (recommended)", "Paste a token from 'claude setup-token' on another computer"], 0) == 1:
+            break
         try:
-            subprocess.run(["runuser", "-u", USER, "--", "env", "HOME=" + home, "PATH=/usr/local/bin:/usr/bin:/bin", "DISABLE_AUTOUPDATER=1", claude_bin(), "setup-token"], cwd=home)
-        finally:
-            shutil.rmtree(home, ignore_errors=True)
-        print()
-    return ui.ask("Paste the token", "", secret=True, check=lambda v: None if v.startswith("sk-ant-") and len(v) > 30 else "the token starts with sk-ant-")
+            return phone_sign_in(conf)
+        except KeyboardInterrupt:
+            print()
+            ui.warn("Stopped.")
+        except Exception as e:
+            ui.fail("The sign-in didn't work: " + short_error(e))
+    return ui.ask("Paste the token (Enter: no Claude for now)", "", secret=True, check=lambda v: None if not v or (v.startswith("sk-ant-") and len(v) > 30) else "the token starts with sk-ant-")
 
 
 def setup_claude(n, total, conf, sec):
@@ -2442,7 +2850,11 @@ def setup_claude(n, total, conf, sec):
             ui.note("Without Claude Code the subscription can't be used: try 'sudo svm-helper setup' again later, or choose the API key.")
             c["auth"] = "off"
     if c["auth"] == "subscription":
-        token = subscription_token(sec)
+        token = subscription_token(sec, conf)
+        if not token:
+            ui.note("Without a token Claude stays off for now: 'sudo svm-helper setup' asks again.")
+            c["auth"] = "off"
+    if c["auth"] == "subscription":
         try:
             ui.spin("Asking Claude a first question", lambda: Claude(conf, {"claude_oauth_token": token}).check())
         except Exception:

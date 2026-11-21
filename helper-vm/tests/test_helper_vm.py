@@ -19,6 +19,9 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.error
+import urllib.parse
+import urllib.request
 import xmlrpc.client
 import xmlrpc.server
 
@@ -533,6 +536,113 @@ class Connection(unittest.TestCase):
         self.assertFalse(os.path.exists(bad) or os.path.exists(bad + ".part"))
         self.coord_api.export_ok = True
         p.close()
+
+
+HAVE_SEGNO = importlib.util.find_spec("segno") is not None
+
+# A pretend 'claude setup-token': its screen as Claude Code draws it (words placed by cursor
+# jumps, the link also as a terminal hyperlink), then the code read in raw mode, as Ink does.
+FAKE_SETUP_TOKEN = r'''
+import os, sys, tty
+link = "https://claude.ai/oauth/authorize?FAKE%d" % os.getpid()
+out = os.fdopen(1, "w", encoding="utf-8")
+out.write("\x1b[2GBrowser\x1b[10Gdidn't\x1b[17Gopen?\r\r\n\r\r\n\x1b]8;id=x;%s\x07\x1b[38;5;246m%s\x1b[39m\x1b]8;;\x07\r\r\n\r\r\n\x1b[2GPaste\x1b[8Gcode\r\r\n\x1b[2G\x1b[38;5;153m╭──╮\x1b[39m\r\r\n" % (link, link))
+out.flush()
+tty.setraw(0)
+given = b""
+while True:
+    c = os.read(0, 1)
+    if not c:
+        sys.exit(1)
+    if c in b"\r\n":
+        break
+    given += c
+if given == b"good#state":
+    out.write("\x1b[32m✓ Long-lived authentication token created successfully!\x1b[39m\r\r\n\r\r\nYour OAuth token (valid for 1 year):\r\r\n\r\r\n\x1b[33m" + sys.argv[1] + "\x1b[39m\r\r\n\r\r\nStore this token securely.\r\r\n")
+    out.flush()
+    sys.exit(0)
+out.write("\x1b[31m✘ OAuth error: That code wasn't accepted.\x1b[39m\r\r\n\r\r\n Press Enter to retry\r\r\n")
+out.flush()
+os.read(0, 100)
+'''
+
+
+class PhoneSignIn(unittest.TestCase):
+    """Signing in to Claude from a phone: the QR code, Claude Code's screen read, and the page."""
+
+    TOKEN = "sk-ant-oat01-" + "Ab1_-cD2" * 12
+
+    @unittest.skipUnless(HAVE_SEGNO, "needs segno")
+    def test_the_qr_code_is_the_text(self):
+        import segno
+        url = "http://192.168.10.57:43127/abcdefgh"
+        lines = h.qr_lines(url)
+        light = {"█": (True, True), "▀": (True, False), "▄": (False, True), " ": (False, False)}
+        drawn = []
+        for line in lines:
+            drawn.append([light[c][0] for c in line])
+            drawn.append([light[c][1] for c in line])
+        want = [[not m for m in row] for row in segno.make_qr(url, error="m").matrix_iter(scale=1, border=2)]
+        self.assertEqual(drawn[:len(want)], want)
+        if len(drawn) > len(want):
+            self.assertTrue(all(drawn[-1]))  # the row added to make them even is light
+        self.assertLessEqual(len(lines[0]), 40)  # it fits an 80-column console, with room
+        self.assertLessEqual(len(lines), 20)
+
+    def test_what_the_screen_says(self):
+        raw = "\x1b]8;id=x;https://claude.ai/oauth/authorize?Ab-1\x07\x1b[38;5;246mhttps://claude.ai/oauth/authorize?Ab-1\x1b[39m\x1b]8;;\x07\r\n"
+        self.assertEqual(h.SIGN_IN_LINK.search(h.screen_text(raw)).group(0), "https://claude.ai/oauth/authorize?Ab-1")
+        self.assertIsNone(h.SIGN_IN_LINK.search(h.screen_text(raw[:30])))  # half a link, still coming
+        self.assertEqual(h.screen_text("\x1b[2GPaste\x1b[8Gcode"), " Paste code")
+        self.assertIsNone(h.OAUTH_TOKEN.search(self.TOKEN[:-3]))
+        self.assertEqual(h.OAUTH_TOKEN.search(h.screen_text("\x1b[33m" + self.TOKEN + "\x1b[39m\r\n")).group(0), self.TOKEN)
+        self.assertEqual(h.page_language("pt-BR,pt;q=0.9,en;q=0.8"), "pt")
+        self.assertEqual(h.page_language("de-DE,es;q=0.5"), "es")
+        self.assertEqual(h.page_language(None), "en")
+
+    def test_signed_in_through_the_page(self):
+        script = os.path.join(TMP, "fake-setup-token.py")
+        with open(script, "w") as f:
+            f.write(FAKE_SETUP_TOKEN)
+        sign_in = h.SignIn([sys.executable, "-I", script, self.TOKEN], cwd=TMP)
+        link = sign_in.start(timeout=20)
+        self.assertTrue(link.startswith("https://claude.ai/oauth/authorize?FAKE"))
+        page = h.PhonePage(sign_in, link, address="127.0.0.1")
+        url = "http://127.0.0.1:%d/%s" % (page.port, page.key)
+
+        def fetch(path=url, given=None, lang="pt-BR,pt;q=0.9"):
+            data = urllib.parse.urlencode({"code": given}).encode() if given is not None else None
+            req = urllib.request.Request(path, data=data, headers={"Accept-Language": lang})
+            try:
+                with urllib.request.urlopen(req, timeout=30) as r:
+                    return r.status, r.read().decode()
+            except urllib.error.HTTPError as e:
+                return e.code, ""
+
+        try:
+            self.assertEqual(fetch("http://127.0.0.1:%d/wrong" % page.port)[0], 404)
+            status, body = fetch()
+            self.assertEqual(status, 200)
+            self.assertIn("Entrar no Claude", body)
+            self.assertIn(link, body)
+            self.assertIn("Cole o código primeiro", fetch(given="  ")[1])
+            status, body = fetch(given="bad#state", lang="en")
+            self.assertIn("accept that code", body)
+            self.assertNotEqual(page.link, link)  # a new sign-in, and its link on the page
+            self.assertIn(page.link, body)
+            self.assertEqual(len(page.notes), 1)
+            self.assertFalse(page.done.is_set())
+            status, body = fetch(given="good#state")
+            self.assertIn("Pronto", body)
+            self.assertTrue(page.done.is_set())
+            self.assertEqual(page.token, self.TOKEN)
+            self.assertNotIn(self.TOKEN, body)  # it never goes to the phone
+            self.assertIn("Pronto", fetch()[1])
+            h.ui.color = False
+            self.assertEqual(h.wait_for_phone(page, timeout=5), self.TOKEN)
+        finally:
+            page.close()
+            sign_in.stop()
 
 
 if __name__ == "__main__":

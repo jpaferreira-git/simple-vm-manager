@@ -55,10 +55,12 @@ Setup offers three ways for the helper to use Claude:
 
 - **Your Claude subscription (Pro or Max), at no extra cost.** This is the recommended way.
   The helper installs Claude Code for its own user and runs it in print mode (`claude -p`, with
-  no tools and no saved sessions). It logs in with a token from `claude setup-token`: setup runs
-  that command and shows a link, you approve it in a browser, and you paste the code back. Its
-  use counts in your plan's usage, like your own chats. It's small: a review a week, and at most
-  10 alert explanations a day.
+  no tools and no saved sessions). It logs in with a token that `claude setup-token` makes. To
+  get one, setup shows a **QR code**. Your phone's camera opens a page on the VM (on your own
+  network), with a button to sign in to Claude and approve, and a box for the code Claude then
+  shows. Nothing has to be typed in the VM's console. Or run `claude setup-token` on any
+  computer with Claude Code and paste its token. Its use counts in your plan's usage, like your
+  own chats. It's small: a review a week, and at most 10 alert explanations a day.
 - **An Anthropic API key**, billed per use on your Anthropic account.
 - **Not at all.** The weekly review is then a plain summary.
 
@@ -83,6 +85,8 @@ Setup offers three ways for the helper to use Claude:
 - It never uses SSH, and nothing runs in the servers' dom0.
 - The service runs as the unprivileged user `svm-helper`, in a systemd sandbox. It can write
   only to its own folder and to the backups share.
+- While you sign in to Claude, setup serves that one page, at a random link, and stops when
+  you're done. The token stays on the VM: the page only says whether it worked.
 - The pool's password, and Claude's token or API key, are in `/etc/svm-helper/secrets.json`,
   readable only by root and the helper. Setup asks before it adds your user to the helper's group.
 - Where alerts go is kept in the pool's `other_config` (`svm-helper`), as before. The helper's

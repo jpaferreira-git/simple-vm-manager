@@ -185,7 +185,7 @@ chmod 0755 "$APP/svm-helper.py"
 if [[ ! -x "$APP/venv/bin/python" ]]; then
   run "Its own Python environment" "$PY" -m venv "$APP/venv" || die "Couldn't make the Python environment."
 fi
-run "Its Python packages (XenAPI, Anthropic's SDK)" "$APP/venv/bin/pip" install -q --upgrade pip XenAPI anthropic || die "Couldn't install the Python packages."
+run "Its Python packages (XenAPI, Anthropic's SDK, a QR code maker)" "$APP/venv/bin/pip" install -q --upgrade pip XenAPI anthropic segno || die "Couldn't install the Python packages."
 
 cat >/usr/local/bin/svm-helper <<EOF
 #!/bin/sh
