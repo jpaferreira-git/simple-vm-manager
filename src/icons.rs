@@ -248,6 +248,8 @@ pub fn tool_color(op: &str, pal: &Pal) -> Color32 {
         "templates" => Color32::from_rgb(214, 102, 160),
         "snapshots" => Color32::from_rgb(98, 120, 238),
         "networks" => Color32::from_rgb(205, 160, 40),
+        "convert" => Color32::from_rgb(40, 180, 196),
+        "advisor" => Color32::from_rgb(64, 168, 108),
         _ => pal.icon,
     }
 }
@@ -337,6 +339,26 @@ pub fn paint_tool_glyph(p: &Painter, rect: Rect, op: &str, enabled: bool, pal: &
             rrect(p, o, 3.0, 7.0, 13.0, 9.5, 2.0, s);
             line(p, o, &[(6.5, 19.5), (12.5, 19.5)], s);
             line(p, o, &[(9.5, 16.5), (9.5, 19.5)], s);
+        }
+        "advisor" => {
+            // a clipboard with a checklist: its board, its clip, two lines ticked
+            let s = Stroke::new(1.8_f32, col);
+            rrect(p, o, 4.0, 4.0, 14.0, 16.0, 2.0, s);
+            p.rect_filled(Rect::from_min_max(o + vec2(8.0, 2.4), o + vec2(14.0, 6.0)), Rounding::same(1.2), col);
+            let t = Stroke::new(1.6_f32, col);
+            line(p, o, &[(6.8, 10.4), (8.2, 11.8), (10.6, 9.2)], t);
+            line(p, o, &[(12.2, 10.6), (15.4, 10.6)], t);
+            line(p, o, &[(6.8, 15.4), (8.2, 16.8), (10.6, 14.2)], t);
+            line(p, o, &[(12.2, 15.6), (15.4, 15.6)], t);
+        }
+        "convert" => {
+            // a VM coming in: an arrow into a machine's box
+            let s = Stroke::new(1.8_f32, col);
+            p.rect_stroke(Rect::from_min_max(o + vec2(12.5, 4.0), o + vec2(19.5, 18.0)), Rounding::same(2.0), s);
+            line(p, o, &[(15.0, 8.0), (17.0, 8.0)], Stroke::new(1.4_f32, col));
+            line(p, o, &[(15.0, 11.0), (17.0, 11.0)], Stroke::new(1.4_f32, col));
+            line(p, o, &[(2.5, 11.0), (10.0, 11.0)], s);
+            line(p, o, &[(7.0, 7.8), (10.2, 11.0), (7.0, 14.2)], s);
         }
         "networks" => {
             // three points joined: one above, two below
@@ -648,6 +670,17 @@ pub fn paint_glyph_on(p: &Painter, rect: Rect, name: &str, col: Color32, bg: Col
             let s = Stroke::new(1.7_f32, col);
             line(p, c, &[(-5.0, 0.0), (5.0, 0.0)], s);
             line(p, c, &[(0.0, -5.0), (0.0, 5.0)], s);
+        }
+        "advisor" => {
+            p.rect_stroke(Rect::from_min_max(c + vec2(-5.5, -5.5), c + vec2(5.5, 7.0)), Rounding::same(1.5), s);
+            line(p, c, &[(-2.0, -7.0), (2.0, -7.0)], s);
+            line(p, c, &[(-3.0, -0.5), (-1.5, 1.0), (1.0, -1.8)], s);
+            line(p, c, &[(-3.0, 3.8), (-1.5, 5.3), (1.0, 2.5)], s);
+        }
+        "convert" => {
+            p.rect_stroke(Rect::from_min_max(c + vec2(1.5, -6.0), c + vec2(7.0, 6.0)), Rounding::same(1.5), s);
+            line(p, c, &[(-7.0, 0.0), (0.0, 0.0)], s);
+            line(p, c, &[(-3.0, -3.2), (0.2, 0.0), (-3.0, 3.2)], s);
         }
         "copy" => {
             // a sheet in front of another

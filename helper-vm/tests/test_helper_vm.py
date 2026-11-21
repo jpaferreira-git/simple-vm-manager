@@ -154,6 +154,90 @@ def serve(handler, context=None):
     return srv, srv.server_address[1]
 
 
+class Source(http.server.BaseHTTPRequestHandler):
+    """An ESXi datastore's flat file, behind basic auth (root:secret)."""
+
+    data = bytes(range(256)) * 4096
+
+    def do_GET(self):
+        if self.headers.get("Authorization") != "Basic cm9vdDpzZWNyZXQ=":
+            self.send_response(401)
+            self.end_headers()
+            return
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(Source.data)))
+        self.end_headers()
+        self.wfile.write(Source.data)
+
+    def log_message(self, *a):
+        pass
+
+
+class Copies(unittest.TestCase):
+    """The disk copies Simple VM Manager hands over (VM Conversion)."""
+
+    def test_an_http_source(self):
+        srv, port = serve(Source)
+        try:
+            job = {"kind": "http", "url": "http://127.0.0.1:%d/folder/dc01/dc01-flat.vmdk?dcPath=ha-datacenter&dsName=datastore1" % port, "user": "root", "size": len(Source.data)}
+            src, size, end = h.open_source(job, "secret")
+            self.assertEqual(size, len(Source.data))
+            self.assertEqual(src.read(size), Source.data)
+            end()
+            with self.assertRaises(h.PoolError) as e:
+                h.open_source(job, "wrong")
+            self.assertIn("401", str(e.exception))
+            with self.assertRaises(h.PoolError) as e:
+                h.open_source(dict(job, size=5), "secret")
+            self.assertIn("for a disk of 5", str(e.exception))
+        finally:
+            srv.shutdown()
+
+    def test_an_ssh_source(self):
+        # a pretend ssh: it asks SSH_ASKPASS for the password, as the real one does, then runs
+        # the command here
+        bin_dir = os.path.join(TMP, "bin")
+        os.makedirs(bin_dir, exist_ok=True)
+        fake = os.path.join(bin_dir, "ssh")
+        with open(fake, "w") as f:
+            f.write('#!/bin/sh\n[ "$("$SSH_ASKPASS")" = secret ] || { echo "root@pve: Permission denied (password)." >&2; exit 255; }\nfor last; do :; done\nexec sh -c "$last"\n')
+        os.chmod(fake, 0o755)
+        old = os.environ["PATH"]
+        os.environ["PATH"] = bin_dir + os.pathsep + old
+        try:
+            job = {"kind": "ssh", "host": "pve.lan", "port": 22, "user": "root", "command": "printf '5\\nhello'", "size": 5}
+            src, size, end = h.open_source(job, "secret")
+            self.assertEqual((size, src.read(5)), (5, b"hello"))
+            end()
+            with self.assertRaises(h.PoolError) as e:
+                h.open_source(job, "wrong")
+            self.assertIn("Permission denied", str(e.exception))
+        finally:
+            os.environ["PATH"] = old
+
+    def test_each_copy_is_claimed_once(self):
+        tasks = {
+            "T1": {"status": "pending", "other_config": {"svm-copy": json.dumps({"kind": "http"})}},
+            "T2": {"status": "pending", "other_config": {"svm-copy": "{}", "svm-copy-claimed": "other"}},
+            "T3": {"status": "success", "other_config": {"svm-copy": "{}"}},
+            "T4": {"status": "pending", "other_config": {}},
+        }
+
+        def add(ref, k, v):
+            if k in tasks[ref]["other_config"]:
+                raise Exception("MAP_DUPLICATE_KEY")
+            tasks[ref]["other_config"][k] = v
+
+        x = NS()
+        x.task = NS()
+        x.task.get_all_records = lambda: tasks
+        x.task.add_to_other_config = add
+        got = h.claim_copies(x, "svm-helper", {})
+        self.assertEqual(got, [("T1", {"kind": "http"})])
+        self.assertEqual(tasks["T1"]["other_config"]["svm-copy-claimed"], "svm-helper")
+        self.assertEqual(h.claim_copies(x, "another", {}), [])
+
+
 class Logic(unittest.TestCase):
     def test_last_expected_on_the_pool_clock(self):
         # a daily run at 19:45 on a pool 3 hours behind UTC is due at 22:45 UTC
@@ -329,6 +413,115 @@ class Logic(unittest.TestCase):
         self.assertIn("VMs: 1, 1 running", text)
 
 
+def advisor_pool():
+    """A pretend pool with something to say for most of the Advisor's checks."""
+    fp = FakePool()
+    x = fp.x
+    now = time.time()
+    fp.vms = {
+        "A": {"uuid": "u-a", "name_label": "Plex", "is_a_template": False, "is_a_snapshot": False, "is_control_domain": False, "power_state": "Running", "resident_on": "H1", "other_config": {}, "guest_metrics": "G1", "snapshot_schedule": "OpaqueRef:NULL", "snapshots": ["SA"], "memory_dynamic_max": str(2 * 1024 ** 3), "VCPUs_max": "2"},
+        "B": {"uuid": "u-b", "name_label": "dc01", "is_a_template": False, "is_a_snapshot": False, "is_control_domain": False, "power_state": "Running", "resident_on": "H1", "other_config": {"auto_poweron": "true"}, "guest_metrics": "OpaqueRef:NULL", "snapshot_schedule": "V1", "snapshots": [], "memory_dynamic_max": str(4 * 1024 ** 3), "VCPUs_max": "2"},
+        "H": {"uuid": "u-helper", "name_label": "svm-helper", "is_a_template": False, "is_a_snapshot": False, "is_control_domain": False, "power_state": "Running", "resident_on": "H1", "other_config": {}, "guest_metrics": "G1", "snapshot_schedule": "OpaqueRef:NULL", "snapshots": [], "memory_dynamic_max": str(1024 ** 3), "VCPUs_max": "1"},
+        "SA": {"uuid": "u-sa", "name_label": "before the update", "is_a_template": False, "is_a_snapshot": True, "is_control_domain": False, "snapshot_of": "A", "snapshot_time": xmlrpc.client.DateTime(xd(now - 40 * 86400)), "is_vmss_snapshot": False, "power_state": "Halted", "other_config": {}},
+    }
+    x.VM = NS()
+    x.VM.get_all_records = lambda: fp.vms
+    x.VM_guest_metrics = NS()
+    x.VM_guest_metrics.get_all_records = lambda: {"G1": {"PV_drivers_detected": True}}
+    x.VDI = NS()
+    x.VDI.get_all_records = lambda: {"D": {"type": "user", "is_a_snapshot": False, "VBDs": [], "managed": True, "SR": "S2", "name_label": "old disk", "virtual_size": str(20 * 1024 ** 3)}}
+    x.Certificate = NS()
+    x.Certificate.get_all_records = lambda: {"C1": {"host": "H1", "not_after": xmlrpc.client.DateTime(xd(now + 10 * 86400)), "name": ""}, "C2": {"host": "H2", "not_after": xmlrpc.client.DateTime(xd(now + 900 * 86400)), "name": ""}}
+    fp.hosts["H2"]["latest_synced_updates_applied"] = "no"
+    fp.hosts["H1"]["latest_synced_updates_applied"] = "yes"
+    return fp
+
+
+class Advisor(unittest.TestCase):
+    """The Advisor: good practice checked, worded by Claude, and what the app asks for."""
+
+    def test_the_checks(self):
+        fp = advisor_pool()
+        checks = h.advisor_checks(fp.x, h.merged(h.DEFAULT_CONFIG, {"self_vm": "u-helper"}), {"clock": {"u-h1": 1, "u-h2": 250}})
+        by = {c["id"]: c for c in checks}
+        self.assertTrue(all(c["topic"] in h.TOPICS and c["status"] in ("ok", "warn", "bad") for c in checks))
+        self.assertEqual(by["backups_vms"]["status"], "warn")  # (backups are off)
+        self.assertEqual((by["snapshot_schedules"]["status"], by["snapshot_schedules"]["objects"]), ("warn", ["Plex"]))  # not the helper's own VM
+        self.assertEqual((by["storage_space"]["status"], by["storage_space"]["objects"]), ("bad", ["Local storage (95%)"]))
+        self.assertEqual(by["unused_disks"]["objects"], ["old disk"])
+        self.assertEqual(by["old_snapshots"]["objects"], ["Plex"])
+        self.assertEqual((by["clocks"]["status"], by["clocks"]["objects"]), ("bad", ["godofredo (4 min)"]))
+        self.assertEqual(by["updates"]["objects"], ["godofredo"])
+        self.assertEqual(by["same_version"]["status"], "warn")
+        self.assertEqual(by["vm_tools"]["objects"], ["dc01"])
+        self.assertEqual(by["autostart"]["objects"], ["Plex"])  # dc01 starts by itself; the helper's VM isn't counted
+        self.assertEqual((by["certificates"]["status"], by["certificates"]["objects"]), ("bad", ["tico"]))
+        self.assertEqual(by["alerts_sent"]["status"], "warn")
+        self.assertEqual(by["servers_answering"]["status"], "ok")
+        self.assertEqual(by["servers_answering"]["note"], "")  # what's fine needs no note
+        # a VM the helper starts in order doesn't need to start by itself
+        fp.other_config[h.SETTINGS_KEY] = json.dumps({"start_order": {"on": True, "vms": [{"uuid": "u-a", "wait": 30}]}, "channels": {"ntfy": {"on": True, "url": "https://ntfy.sh/x"}}})
+        by = {c["id"]: c for c in h.advisor_checks(fp.x, h.merged(h.DEFAULT_CONFIG, {"self_vm": "u-helper"}), {})}
+        self.assertEqual(by["autostart"]["status"], "ok")
+        self.assertEqual(by["alerts_sent"]["status"], "ok")
+        self.assertNotIn("clocks", by)  # not compared yet: nothing said
+
+    def test_claude_words_them(self):
+        checks = [{"id": "clocks", "topic": "servers", "status": "bad", "title": "Clock off: godofredo (4 min)", "note": "English note", "objects": ["godofredo (4 min)"]}, {"id": "memory", "topic": "servers", "status": "ok", "title": "Every server has memory to spare", "note": "", "objects": []}]
+        answer = 'Aqui está:\n```json\n{"checks": {"clocks": {"title": "Relógio errado: godofredo (4 min)", "note": "Ligue o NTP."}, "memory": {"title": "Todos têm memória"}, "nope": {"title": "x"}}, "more": [{"topic": "vms", "status": "warn", "title": "dc01 tem 1 vCPU só", "note": "..."}, {"topic": "elsewhere", "status": "warn", "title": "ignored"}]}\n```'
+        out = h.worded(checks, h.json_answer(answer))
+        self.assertEqual([c["title"] for c in out], ["Relógio errado: godofredo (4 min)", "Todos têm memória", "dc01 tem 1 vCPU só"])
+        self.assertEqual(out[0]["note"], "Ligue o NTP.")
+        self.assertEqual(out[0]["status"], "bad")  # its status stays the helper's
+        self.assertEqual((out[2]["by"], out[2]["topic"], out[2]["id"]), ("claude", "vms", "claude_1"))
+        self.assertIsNone(h.json_answer("no JSON here"))
+
+    def setUp(self):
+        # (its looks save the helper's state: the other tests' is put back after)
+        self.kept = {n: open(h.state_path(n)).read() for n in ("state", "advice", "test") if os.path.exists(h.state_path(n))}
+
+    def tearDown(self):
+        for n in ("state", "advice", "test"):
+            if n in self.kept:
+                with open(h.state_path(n), "w") as f:
+                    f.write(self.kept[n])
+            elif os.path.exists(h.state_path(n)):
+                os.remove(h.state_path(n))
+
+    def test_written_for_the_app_and_asked_by_it(self):
+        fp = advisor_pool()
+        conf = h.merged(h.DEFAULT_CONFIG, {"claude": {"auth": "off"}})
+        advice = h.write_advice(FakeConn(fp.x), conf, {}, request=1234)
+        saved = json.loads(fp.other_config[h.ADVICE_KEY])
+        self.assertEqual((saved["by"], saved["request"], saved["language"]), ("plain", 1234, "en"))
+        self.assertEqual(saved["checks"], advice["checks"])
+        self.assertEqual(h.load_json(h.state_path("advice"), {})["bad"], sum(c["status"] == "bad" for c in advice["checks"]))
+        # the app asks: the next look starts it once, and the heartbeat says it answers requests
+        fp.other_config[h.REQUEST_KEY] = json.dumps({"advice": 5678, "test": 99})
+        record = fp.x.pool.get_record
+        fp.x.pool.get_record = lambda p: dict(record(p), other_config=fp.other_config)
+        self.assertEqual(h.requests_of(fp.x.pool.get_record("POOL")), {"advice": 5678.0, "test": 99.0})
+        helper = h.Helper(jobs=True)
+        helper.conf = conf
+        started = []
+        helper.spawn = lambda name, fn: started.append(name) or True
+        helper.pool = FakeConn(fp.x)
+        state = {}
+        helper.look(state, time.time())
+        self.assertIn("advisor", started)
+        self.assertIn("test alert", started)
+        self.assertEqual(state["answered"], {"advice": 5678.0, "test": 99.0})
+        started.clear()
+        helper.look(state, time.time())
+        self.assertNotIn("test alert", started)  # answered once
+        beat = json.loads(fp.other_config[h.STATUS_KEY])
+        self.assertEqual((beat["requests"], beat["advice"]["request"]), (1, 1234))
+        # a test alert, as asked: what each channel said, in the heartbeat
+        h.send_test(FakeConn(fp.x), {}, "home", 99)
+        beat = json.loads(fp.other_config[h.STATUS_KEY])
+        self.assertEqual((beat["test"]["request"], beat["test"]["results"]), (99, {}))
+
+
 # ---------------------------------------------------------------- a pretend XAPI over HTTPS
 
 def make_cert(folder):
@@ -342,6 +535,7 @@ class FakeXapi:
     """Answers XAPI's XML-RPC (as a coordinator, or a member that sends you to it) and GET /export."""
 
     def __init__(self, coordinator=None, export_ok=True):
+        self.imported = {}
         self.coordinator = coordinator
         self.address = ""
         self.snapshots = 0
@@ -373,6 +567,8 @@ class FakeXapi:
             return ok([] if self.tasks.get(params[1]) == "success" else ["VDI_IO_ERROR", "Device I/O errors"])
         if method in ("task.destroy", "task.cancel"):
             return ok("")
+        if method == "VDI.get_by_uuid":
+            return ok("OpaqueRef:vdi1")
         if method == "pool.get_master":
             return ok("OpaqueRef:h1")
         if method == "host.get_all_records":
@@ -425,6 +621,15 @@ class FakeXapi:
                 self.send_response(200)
                 self.end_headers()
                 self.wfile.write(b"XVA" * 100000)
+
+            def do_PUT(self):
+                q = dict(p.split("=", 1) for p in self.path.split("?", 1)[1].split("&"))
+                assert q["session_id"] == "OpaqueRef%3Asession"
+                body = self.rfile.read(int(self.headers["Content-Length"]))
+                api.imported[urllib.parse.unquote(q["vdi"])] = body
+                api.tasks[urllib.parse.unquote(q["task_id"])] = "success"
+                self.send_response(200)
+                self.end_headers()
 
             def log_message(self, *a):
                 pass
@@ -522,6 +727,19 @@ class Connection(unittest.TestCase):
         self.assertIn("not in the pool any more", self.coord_api.messages[-1][4])
         st = h.load_json(h.state_path("backups"), {})
         self.assertEqual((st["last_ok"], list(st["last_by_vm"])), (False, ["u-v1"]))
+
+    def test_a_disk_copy_goes_into_its_vdi(self):
+        srv, port = serve(Source)
+        try:
+            p = h.Pool(self.conf(self.caddr), {"pool_password": "secret"}).connect()
+            task = p.x.task.create("Write a converted disk", "dc01 disk")
+            job = {"kind": "http", "url": "http://127.0.0.1:%d/folder/x-flat.vmdk" % port, "user": "root", "size": len(Source.data), "vdi": "u-vdi1", "format": "raw"}
+            self.assertEqual(h.copy_disk(p, task, job, "secret"), len(Source.data))
+            self.assertEqual(self.coord_api.imported["OpaqueRef:vdi1"], Source.data)
+            self.assertEqual(p.x.task.get_status(task), "success")
+            p.close()
+        finally:
+            srv.shutdown()
 
     def test_download_kept_only_when_the_server_says_it_went_well(self):
         p = h.Pool(self.conf(self.caddr), {"pool_password": "secret"}).connect()

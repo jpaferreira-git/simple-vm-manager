@@ -88,20 +88,18 @@ struct Around {
     /// The server it can have USB devices from only, by name: the one it runs on, or the one its
     /// disks are on.
     usb_host: Option<String>,
-    /// Its place in the Server Helper's start order (from 1), when the helper starts it.
+    /// Its place in the Helper VM's start order (from 1), when the helper starts it.
     order: Option<usize>,
 }
 
 impl App {
     pub(super) fn overview(&mut self, ui: &mut Ui, sel: &Node, out: &mut Vec<Intent>) {
         let pal = self.pal;
-        // (the Server Helper's start order, to say so on Startup)
+        // (the Helper VM's start order, to say so on Startup)
         if let Some(sid) = sel.sid {
             let ctx = ui.ctx().clone();
             self.helper_poll(sid, &ctx);
-            if let Some(master) = self.server(sid).and_then(|s| s.data.as_ref()).and_then(|d| d.hosts.iter().find(|h| h.is_master)).map(|h| h.rref.clone()) {
-                self.helper_read(sid, &master, false, &ctx);
-            }
+            self.helper_read(sid, &ctx);
         }
         let Some((s, d, v)) = self.vm_of(sel) else { return };
         let v = v.clone();
@@ -1129,9 +1127,9 @@ fn startup(ui: &mut Ui, pal: &Pal, v: &VmInfo, at: &Around, out: &mut Vec<Intent
     let can = free(at);
     panel(ui, pal, |ui| {
         if let Some(n) = at.order {
-            // (the Server Helper starts it, in order: changed on the pool's Helper tab)
+            // (the Helper VM starts it, in order: changed on the pool's Helper tab)
             let (resp, _) = row(ui, pal, Some(Lead::Mark("power")), "Starts with its server", &format!("#{} in the Helper's order", n), Tail::Chevron, true, false);
-            if resp.on_hover_text("The Server Helper starts it, in order, when the pool starts: its list is on the pool's Helper tab").clicked() {
+            if resp.on_hover_text("The Helper VM starts it, in order, when the pool starts: its list is on the pool's Helper tab").clicked() {
                 out.push(Intent::Select(format!("srv:{}", at.sid)));
                 out.push(Intent::Tab(Tab::Helper));
             }

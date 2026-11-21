@@ -34,8 +34,10 @@ mod details;
 mod host_overview;
 mod overview;
 mod performance;
+mod advisor_page;
 mod helper_page;
 mod snapshots;
+mod convert_page;
 mod tools;
 use alerts::{AlertsView, MessageCache, RulesAct, RulesDialog};
 use overview::{OverviewEdit, Thumb};
@@ -108,11 +110,13 @@ impl ServerEntry {
 
 enum Msg {
     Fetched(u32, Result<PoolData, ApiError>),
-    /// The Server Helper (helper_page.rs): each server's, its settings and log read, a job done.
-    HelperChecked { sid: u32, result: Vec<(String, crate::helper::Presence)> },
+    /// A pool's Helper VM (helper_page.rs): its heartbeat and the Advisor's checklist, its
+    /// settings read, a job done.
+    HelperState { sid: u32, result: Result<(String, String), ApiError> },
     HelperRead { sid: u32, result: Result<String, ApiError> },
-    HelperStatus { sid: u32, result: Result<String, ApiError> },
     HelperDone { sid: u32, log: Option<usize>, what: helper_page::Did, result: Result<String, ApiError> },
+    /// VM Conversion's background work (convert_page.rs).
+    Convert(convert_page::ConvMsg),
     /// A server's tool's job ended (see tools.rs), and what the system's chooser gave its dialog.
     ToolDone { sid: u32, key: String, log: usize, failed: String, then: tools::ToolThen, result: Result<String, ApiError> },
     ToolPicked(Option<PathBuf>),
@@ -389,15 +393,22 @@ enum Tab {
     /// The Templates folder's list.
     Templates,
     Logs,
-    /// A pool's Server Helper (helper_page.rs).
+    /// A pool's Helper VM (helper_page.rs).
     Helper,
+    /// Every pool's checklist of good practice, from its Helper VM (the toolbar's Advisor,
+    /// advisor_page.rs).
+    Advisor,
+    /// VM Conversion (the toolbar's Convert, convert_page.rs): a source's VMs to bring over,
+    /// and the conversions under way.
+    Convert,
+    Conversions,
 }
 
 impl Tab {
     /// A page of All servers that a toolbar button opens: not a tab in its row too, the button
     /// shown pressed instead.
     fn on_toolbar(self) -> bool {
-        matches!(self, Tab::IsoLibrary | Tab::VmStorage | Tab::Templates | Tab::AllSnapshots | Tab::AllSchedules | Tab::Networks | Tab::Alerts)
+        matches!(self, Tab::IsoLibrary | Tab::VmStorage | Tab::Templates | Tab::AllSnapshots | Tab::AllSchedules | Tab::Networks | Tab::Alerts | Tab::Convert | Tab::Conversions | Tab::Advisor)
     }
 
     fn label(self) -> &'static str {
@@ -423,6 +434,10 @@ impl Tab {
             Tab::Templates => "Templates",
             Tab::Logs => "Logs",
             Tab::Helper => "Helper",
+            Tab::Advisor => "Advisor",
+            // (under the VM Conversion page's name)
+            Tab::Convert => "VMs",
+            Tab::Conversions => "Conversions",
         }
     }
 }
@@ -557,6 +572,12 @@ enum Intent {
     NewTemplate,
     /// The Snapshots page: every pool's VMs with their snapshots (the toolbar's Snapshots).
     Snapshots,
+    /// The VM Conversion page (the toolbar's Convert).
+    Convert,
+    /// The Advisor page (the toolbar's Advisor).
+    Advisor,
+    /// The Advisor's Check now, of pool `sid`'s Helper VM.
+    AdvisorCheck(u32),
     /// A VM's Snapshots tab: pool, VM.
     OpenVmSnapshots(u32, String),
     /// The snapshot schedules (the Snapshots page's Schedules tab).
@@ -769,10 +790,10 @@ pub struct App {
     /// Tools' jobs under way: "toolstack:<host>", "backup:<host>", "restore:<host>",
     /// "report:<host>", "cert:<host>", "password:<pool>".
     tool_busy: HashSet<String>,
-    /// Each pool's Server Helper tab; and the install command to type in a server's console once
-    /// it's shown (pool, its control domain, the text).
+    /// Each pool's Helper VM: its Helper tab, and the Advisor's checklist.
     helper: HashMap<u32, helper_page::HelperView>,
-    helper_type: Option<(u32, String, String)>,
+    /// The VM Conversion page (convert_page.rs).
+    conv: convert_page::ConvView,
     /// The connections whose pool Overview doesn't show the helper's card (helper-hidden.txt).
     helper_hidden: HashSet<String>,
     /// Snapshots being deleted.
@@ -905,7 +926,7 @@ impl App {
             sched_busy: HashSet::new(),
             tool_busy: HashSet::new(),
             helper: HashMap::new(),
-            helper_type: None,
+            conv: Default::default(),
             helper_hidden: config_dir().and_then(|d| std::fs::read_to_string(d.join("helper-hidden.txt")).ok()).map(|t| t.lines().map(|l| l.trim().to_lowercase()).filter(|l| !l.is_empty()).collect()).unwrap_or_default(),
             sched_asking: None,
             snap_deleting: HashSet::new(),
@@ -2319,6 +2340,7 @@ impl App {
         while let Ok(m) = self.rx.try_recv() {
             match m {
                 Msg::Fetched(id, r) => self.on_fetched(id, r),
+                Msg::Convert(m) => self.on_convert_msg(m, ctx),
                 Msg::IpDone { sid, pif, log, text, result } => {
                     self.ip_busy.remove(&pif);
                     self.refresh_soon(sid);
@@ -3214,9 +3236,8 @@ impl App {
                 }
                 Msg::ToolDone { sid, key, log, failed, then, result } => self.tool_done(sid, key, log, failed, then, result, ctx),
                 Msg::ToolPicked(path) => self.tool_picked(path),
-                Msg::HelperChecked { sid, result } => self.helper_checked(sid, result),
+                Msg::HelperState { sid, result } => self.helper_state_done(sid, result),
                 Msg::HelperRead { sid, result } => self.helper_read_done(sid, result),
-                Msg::HelperStatus { sid, result } => self.helper_status_done(sid, result),
                 Msg::HelperDone { sid, log, what, result } => self.helper_done(sid, log, what, result),
                 Msg::ScheduleDone { sid, key, log, done, failed, result } => {
                     self.sched_busy.remove(&key);
@@ -3998,6 +4019,12 @@ impl App {
                         u.t.cancel.store(true, Ordering::Relaxed);
                     }
                 }
+                // a VM's or a disk's file from another hypervisor: the VM Conversion page
+                Intent::Dropped(paths) if paths.iter().any(|p| crate::convert::files::is_convertible(p)) => {
+                    self.select("root".into());
+                    self.tab = Tab::Convert;
+                    self.convert_files(paths, ctx);
+                }
                 // a .xva dropped on the window: New VM, from that file
                 Intent::Dropped(paths) if paths.iter().any(|p| p.extension().map_or(false, |e| e.eq_ignore_ascii_case("xva"))) => {
                     let p = paths.into_iter().find(|p| p.extension().map_or(false, |e| e.eq_ignore_ascii_case("xva")));
@@ -4046,6 +4073,18 @@ impl App {
                 Intent::Snapshots => {
                     self.select("root".into());
                     self.tab = Tab::AllSnapshots;
+                }
+                Intent::Advisor => {
+                    self.select("root".into());
+                    self.tab = Tab::Advisor;
+                }
+                Intent::AdvisorCheck(sid) => self.helper_ask(sid, "advice", ctx),
+                Intent::Convert => {
+                    self.select("root".into());
+                    if !matches!(self.tab, Tab::Convert | Tab::Conversions) {
+                        self.tab = Tab::Convert;
+                    }
+                    self.convert_open(ctx);
                 }
                 Intent::OpenVmSnapshots(sid, vm) => {
                     self.select(format!("vm:{}:{}", sid, vm));
@@ -4265,18 +4304,22 @@ impl App {
         let pal = self.pal;
         // (A VM's power actions are next to its tabs: see tab_actions; the theme is in Settings.)
         // When the window is too narrow for every label, the app's name in the corner goes first;
-        // then buttons show only their icons (the label becomes a tooltip): New VM, ISO Library,
-        // VM Storage and the rest (rank 2), then Connect too.
+        // then buttons show only their icons (the label becomes a tooltip): Advisor first (rank
+        // 1), then New VM, ISO Library, VM Storage and the rest (rank 2), then Connect too.
         let fits = |level: u8, name: bool| {
             let w = |l: &str, rank: u8| if level >= rank { 32.0 } else { tool_width(ui, l) } + 2.0;
-            let buttons: f32 = w("Connect", 3) + w("New VM", 2) + w("ISO Library", 2) + w("VM Storage", 2) + w("Templates", 2) + w("Snapshots", 2) + w("Networks", 2) + w("Updates", 2) + w("Alerts", 2);
+            let buttons: f32 = w("Connect", 3) + w("New VM", 2) + w("Convert", 2) + w("ISO Library", 2) + w("VM Storage", 2) + w("Templates", 2) + w("Snapshots", 2) + w("Networks", 2) + w("Updates", 2) + w("Advisor", 1) + w("Alerts", 2);
             36.0 + 40.0 + 10.0 + 16.0 + buttons + if name { 160.0 } else { 0.0 } <= ui.available_width() // 160: the app's name
         };
-        let (level, with_name) = [(0, true), (0, false), (2, true), (2, false), (3, true)].into_iter().find(|&(l, n)| fits(l, n)).unwrap_or((3, false));
+        let (level, with_name) = [(0, true), (0, false), (1, false), (2, true), (2, false), (3, true)].into_iter().find(|&(l, n)| fits(l, n)).unwrap_or((3, false));
         let compact = |rank: u8| level >= rank;
         // the All servers page shown, its button pressed
         // (the Snapshots page's two tabs, one button)
-        let page = (sel.kind == Kind::Root && self.tab.on_toolbar()).then_some(if self.tab == Tab::AllSchedules { Tab::AllSnapshots } else { self.tab });
+        let page = (sel.kind == Kind::Root && self.tab.on_toolbar()).then_some(match self.tab {
+            Tab::AllSchedules => Tab::AllSnapshots,
+            Tab::Conversions => Tab::Convert,
+            t => t,
+        });
         let on = |t: Tab| page == Some(t);
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
@@ -4294,6 +4337,9 @@ impl App {
             let has_pool = self.servers.iter().any(|s| s.data.is_some());
             if tool_button(ui, "newvm", "New VM", has_pool, false, compact(2), &pal).on_hover_text("Create a virtual machine that installs from an ISO file").clicked() {
                 out.push(Intent::NewVm(sel.sid, None));
+            }
+            if tool_button(ui, "convert", "Convert", true, on(Tab::Convert), compact(2), &pal).on_hover_text("Bring VMs over from VMware, Proxmox, or disk files (.ova, .vmdk, .vhdx, .qcow2…)").clicked() {
+                out.push(Intent::Convert);
             }
             if tool_button(ui, "iso", "ISO Library", has_pool, on(Tab::IsoLibrary), compact(2), &pal).on_hover_text("Your installation discs (.iso files) in every library, and adding a library").clicked() {
                 out.push(Intent::IsoLibrary);
@@ -4324,6 +4370,21 @@ impl App {
             };
             if resp.on_hover_text(tip).clicked() {
                 out.push(Intent::PoolUpdates(sel.sid));
+            }
+            // the Advisor: a dot as the updates' (red: something to fix; yellow: to look at), from
+            // each pool's Helper VM
+            let worst = self.helper.values().filter_map(|v| v.advice.as_ref()).map(|a| a.counts()).fold((0, 0), |w, c| (w.0 + c.0, w.1 + c.1));
+            let resp = tool_button(ui, "advisor", "Advisor", has_pool, on(Tab::Advisor), compact(1), &pal);
+            if worst != (0, 0) {
+                ui.painter().circle_filled(resp.rect.min + vec2(24.0, 6.0), 4.0, if worst.0 > 0 { pal.red } else { pal.orange });
+            }
+            let tip = match worst {
+                (0, 0) => "Advisor: your pools checked against good practice, by their Helper VM".to_string(),
+                (0, w) => format!("Advisor: {} thing{} to look at", w, if w == 1 { "" } else { "s" }),
+                (b, _) => format!("Advisor: {} thing{} to fix", b, if b == 1 { "" } else { "s" }),
+            };
+            if resp.on_hover_text(tip).clicked() {
+                out.push(Intent::Advisor);
             }
             // alerts: a bell, with how many need attention (red when one's critical)
             let need: Vec<Severity> = self.alert_rows().into_iter().map(|r| r.sev).filter(|s| s.needs_attention()).collect();
@@ -4464,8 +4525,9 @@ impl App {
                 out.push((format!("host:{}:{}", s.id, h.rref), format!("{} {}", h.name, what), detail));
             }
             // storage past the "fuller than" limit set on it, when the pool can't watch that itself
-            // (nor the Server Helper, when it's on the coordinator: it raises it as the pool's)
-            let helper_watches = self.helper.get(&s.id).map_or(false, |v| d.hosts.iter().any(|h| h.is_master && v.hosts.iter().any(|(r, p)| *r == h.rref && p.installed())));
+            // (nor its Helper VM, while it's looking: it raises it as the pool's)
+            let now = unix_now();
+            let helper_watches = self.helper.get(&s.id).and_then(|v| v.status()).is_some_and(|st| st.fresh(now));
             for x in d.srs.iter().filter(|x| !x.stats && x.size > 0 && !helper_watches) {
                 let Some((limit, _)) = x.fill_limit else { continue };
                 let full = x.used as f64 / x.size as f64;
@@ -5436,7 +5498,7 @@ impl App {
         let has_data = sel.sid.and_then(|id| self.server(id)).map_or(false, |s| s.data.is_some());
         match sel.kind {
             // (Logs: from Activities' "All of it in Logs")
-            Kind::Root => vec![Tab::Home, Tab::IsoLibrary, Tab::VmStorage, Tab::Templates, Tab::AllSnapshots, Tab::AllSchedules, Tab::Networks, Tab::Logs, Tab::Alerts],
+            Kind::Root => vec![Tab::Home, Tab::IsoLibrary, Tab::VmStorage, Tab::Templates, Tab::AllSnapshots, Tab::AllSchedules, Tab::Networks, Tab::Logs, Tab::Alerts, Tab::Convert, Tab::Conversions, Tab::Advisor],
             Kind::Category => vec![Tab::Home, Tab::Search, Tab::Logs],
             Kind::Sr if self.sr_of(sel).map_or(false, |(_, x)| x.is_iso()) => vec![Tab::General, Tab::IsoFiles, Tab::Logs],
             Kind::Folder if sel.rref.as_deref() == Some("nets") => vec![Tab::Networking],
@@ -7454,14 +7516,6 @@ impl App {
             let allow_keyboard = matches!(self.dialog, Dialog::None);
             c.share_clipboard = self.share_clipboard;
             c.ui(ui, &pal, allow_keyboard);
-            // the Server Helper's install command, typed once the console's there (Enter is the
-            // person's to press)
-            if let Some((s, vm, text)) = &self.helper_type {
-                if c.sid == *s && c.vm == *vm && c.connected() {
-                    c.type_text(text);
-                    self.helper_type = None;
-                }
-            }
         }
     }
 
@@ -9017,11 +9071,13 @@ impl eframe::App for App {
                 "about" => out.push(Intent::About),
                 "sr-detached" | "sr-repair-failed" => out.extend(sel.sid.map(|sid| Intent::RepairSr(sid, "sr-iso".into()))),
                 "snapshots" => out.push(Intent::Tab(Tab::Snapshots)),
-                // the pool's Server Helper tab (with SVM_DEMO_HELPER: installed); the box ticked
-                "helper" => {
-                    out.push(Intent::Tab(Tab::Helper));
-                    if let Some(sid) = sel.sid {
-                        self.helper.entry(sid).or_default().accepted = std::env::var("SVM_SHOT_ACCEPTED").is_ok();
+                // the pool's Helper tab (with SVM_DEMO_HELPER: it has a Helper VM)
+                "helper" => out.push(Intent::Tab(Tab::Helper)),
+                // the Advisor (with SVM_DEMO_HELPER), its first check opened
+                "advisor" => {
+                    out.push(Intent::Advisor);
+                    if let Some(sid) = sel.sid.or(self.servers.first().map(|s| s.id)) {
+                        ctx.data_mut(|d| d.insert_temp(egui::Id::new(("advisor-open", sid, "backups_vms")), true));
                     }
                 }
                 // a server's tools' dialogs (demo-host-01's), a pool's
@@ -9038,6 +9094,12 @@ impl eframe::App for App {
                 "snapshots-picked" => {
                     out.push(Intent::Tab(Tab::Snapshots));
                     self.snap_pick = Some("vm-web-snap-2".into());
+                }
+                // the VM Conversion page: its VMs (two ticked), the Convert dialog's two steps, and
+                // a conversion under way (with SVM_SHOT_WAIT)
+                "convert" | "convert-wizard" | "convert-prepare" | "conversions" => {
+                    out.push(Intent::Convert);
+                    self.conv.shot = Some(self.shot_show.clone());
                 }
                 // the Snapshots page, and snapshot schedules
                 "snapshots-page" => out.push(Intent::Snapshots),
@@ -9451,6 +9513,7 @@ impl eframe::App for App {
             // two: its VMs' snapshots, and the schedules)
             let shown: Vec<Tab> = match (sel.kind, current) {
                 (Kind::Root, Tab::AllSnapshots | Tab::AllSchedules) => vec![Tab::AllSnapshots, Tab::AllSchedules],
+                (Kind::Root, Tab::Convert | Tab::Conversions) => vec![Tab::Convert, Tab::Conversions],
                 (Kind::Root, Tab::Home) => vec![Tab::Home],
                 (Kind::Root, _) => vec![],
                 _ => tabs.iter().copied().filter(|t| *t != Tab::Console).collect(),
@@ -9458,12 +9521,14 @@ impl eframe::App for App {
             // the least room they take: all in one Actions menu (a connection's, its one button)
             let least = if self.root_of(&sel).is_some() { actions } else { (ACTIONS_BTN + TOOL_GAP + SEP_W + 8.0).min(actions) };
             // (the Alerts page's Dismiss all: room for it, its icon at least)
-            let page = if sel.kind == Kind::Root && matches!(current, Tab::Alerts | Tab::AllSchedules) { SQUARE.x + SEP_W + 12.0 } else { 0.0 };
+            let page = if sel.kind == Kind::Root && matches!(current, Tab::Alerts | Tab::AllSchedules | Tab::Convert | Tab::Conversions) { SQUARE.x + SEP_W + 12.0 } else { 0.0 };
             let free = self.header_and_tabs(ui, &sel, &shown, current, (actions.max(page), least.max(page)), &mut out);
             if sel.kind == Kind::Root && current == Tab::Alerts {
                 self.alerts_actions(ui, free, &mut out);
             } else if sel.kind == Kind::Root && current == Tab::AllSchedules {
                 self.schedules_actions(ui, free, &mut out);
+            } else if sel.kind == Kind::Root && matches!(current, Tab::Convert | Tab::Conversions) {
+                self.convert_actions(ui, free, current == Tab::Conversions);
             } else if actions > 0.0 {
                 self.tab_actions(ui, free, &sel, current, actions, &mut out);
             } else if sel.kind == Kind::Root && current == Tab::IsoLibrary {
@@ -9572,14 +9637,20 @@ impl eframe::App for App {
                 Tab::Templates => self.templates_tab(ui, &sel, &mut out),
                 Tab::Logs => self.logs(ui, &sel, &mut out),
                 Tab::Helper => self.helper_page(ui, &sel, &mut out),
+                Tab::Advisor => self.advisor_page(ui, &mut out),
+                Tab::Convert => self.convert_page(ui, &mut out),
+                Tab::Conversions => self.conversions_page(ui, &mut out),
             });
         });
 
         self.dialogs(ctx);
+        self.convert_dialogs(ctx);
         self.apply(out, &sel, ctx);
         // files dragged over the window: say where they'd go
         if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
+            let convertible = ctx.input(|i| i.raw.hovered_files.iter().any(|f| f.path.as_deref().map_or(false, crate::convert::files::is_convertible)));
             let text = match self.drop_library(&sel) {
+                _ if convertible => "Drop to convert it into a VM (VM Conversion)".to_string(),
                 Some((_, _, name)) => format!("Drop to upload to {}", name),
                 None => "Select an ISO library first, then drop the file on it".to_string(),
             };
@@ -9593,12 +9664,16 @@ impl eframe::App for App {
         ctx.request_repaint_after(Duration::from_millis(250));
     }
 
-    /// Closing: each server's session is ended there (logged out), all at once and for three
-    /// seconds at most, rather than left for the server to drop a day later.
-    /// For --screenshot with SVM_SHOT_WHEEL: the mouse over the middle of the window and a turn of
-    /// its wheel every half second (the console's wheel, checked against a VNC server).
+    /// For --screenshot: no mouse there (one resting where the window opens would leave a row or a
+    /// button lit up in it); with SVM_SHOT_WHEEL, the mouse over the middle of the window and a
+    /// turn of its wheel every half second (the console's wheel, checked against a VNC server).
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
-        if self.shot_path.is_none() || std::env::var("SVM_SHOT_WHEEL").is_err() {
+        if self.shot_path.is_none() {
+            return;
+        }
+        raw.events.retain(|e| !matches!(e, egui::Event::PointerMoved(_) | egui::Event::PointerButton { .. } | egui::Event::MouseWheel { .. }));
+        if std::env::var("SVM_SHOT_WHEEL").is_err() {
+            raw.events.push(egui::Event::PointerGone);
             return;
         }
         let at = raw.screen_rect.map_or(pos2(700.0, 420.0), |r| pos2(r.center().x + 120.0, r.center().y));
@@ -9609,6 +9684,8 @@ impl eframe::App for App {
         }
     }
 
+    /// Closing: each server's session is ended there (logged out), all at once and for three
+    /// seconds at most, rather than left for the server to drop a day later.
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.log_out_all(Duration::from_secs(3));
     }
@@ -10379,6 +10456,8 @@ fn root_page(tab: Tab) -> Option<(&'static str, &'static str)> {
         Tab::Templates => Some(("Templates", "templates")),
         Tab::AllSnapshots | Tab::AllSchedules => Some(("Snapshots", "snapshots")),
         Tab::Networks => Some(("Networks", "networks")),
+        Tab::Convert | Tab::Conversions => Some(("VM Conversion", "convert")),
+        Tab::Advisor => Some(("Advisor", "advisor")),
         Tab::Alerts => Some(("Alerts", "alerts")),
         Tab::Logs => Some(("Logs", "activity")),
         _ => None,

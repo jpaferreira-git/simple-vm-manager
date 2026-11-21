@@ -1,28 +1,35 @@
-//! The Server Helper: an optional add-on on a pool's servers (helper/svm-helper, a XAPI plugin run
-//! every minute by cron) that sends the pool's alerts to phones (Telegram, ntfy, Discord, Home
-//! Assistant, any webhook), watches any storage's fullness, makes up missed snapshot schedule
-//! runs, mounts the NAS again after a server started before it, and starts VMs in order when the
-//! pool starts. Its settings are the pool's other_config "svm-helper", as JSON; this is that
-//! JSON, and the command that installs it.
+//! The Helper VM (helper-vm/ in this repository): a small Linux VM in the pool that looks after it
+//! through the pool's own API, also while this app is closed. It sends the pool's alerts to phones
+//! (Telegram, ntfy, Discord, Home Assistant, any webhook), watches any storage's fullness, makes up
+//! missed snapshot schedule runs, mounts the NAS again after a server started before it, starts
+//! VMs in order when the pool starts, keeps backups, and checks the pool against good practice for
+//! the Advisor page. Nothing of it is on the servers.
+//!
+//! It and this app talk through the pool's other_config:
+//! - "svm-helper": its settings, set in a pool's Helper tab (JSON; `Settings`);
+//! - "svm-helper-vm": its heartbeat, every five minutes (`VmStatus`);
+//! - "svm-helper-advice": the Advisor's checklist (`Advice`);
+//! - "svm-helper-request": what this app asks of it, {"advice": when, "test": when}.
 
 use serde_json::{json, Map, Value};
 
-/// The helper's version this app installs (helper/svm-helper's VERSION).
-pub const VERSION: &str = "1.0";
-
 /// The pool's other_config key its settings are under.
 pub const KEY: &str = "svm-helper";
+/// Its heartbeat's.
+pub const VM_KEY: &str = "svm-helper-vm";
+/// The Advisor's checklist's.
+pub const ADVICE_KEY: &str = "svm-helper-advice";
+/// What this app asks of it.
+pub const REQUEST_KEY: &str = "svm-helper-request";
 
-/// Where its code is, to read before installing it.
-pub fn source_url() -> String {
-    format!("https://github.com/{}/tree/v{}/helper", crate::update::REPO, env!("CARGO_PKG_VERSION"))
+/// Where to read about it, and how it's set up.
+pub fn about_url() -> String {
+    format!("https://github.com/{}/tree/main/helper-vm#readme", crate::update::REPO)
 }
 
-/// The command that installs it (or brings it up to date) on a server, as root: this app's
-/// version's install.sh, which checks svm-helper's SHA-256 before it puts it in place.
-pub fn install_command() -> String {
-    let tag = format!("v{}", env!("CARGO_PKG_VERSION"));
-    format!("curl -fsSL https://raw.githubusercontent.com/{}/{}/helper/install.sh | sh -s {}", crate::update::REPO, tag, tag)
+/// The commands that set it up, in a Linux VM's terminal (Debian, Ubuntu, Fedora, Rocky, Arch).
+pub fn setup_commands() -> [String; 2] {
+    [format!("wget -O setup.sh https://raw.githubusercontent.com/{}/main/helper-vm/setup.sh", crate::update::REPO), "sudo bash setup.sh".to_string()]
 }
 
 /// Where alerts can go: on or off, its address (or Telegram's bot token), and a second field
@@ -188,29 +195,145 @@ fn or(t: String, default: &str) -> String {
     }
 }
 
-/// A server's helper, as last asked.
+fn i(v: &Value, k: &str) -> i64 {
+    v.get(k).and_then(|x| x.as_i64().or_else(|| x.as_f64().map(|f| f as i64))).unwrap_or(0)
+}
+
+/// The Helper VM, from its heartbeat.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct VmStatus {
+    pub version: String,
+    /// Its machine's name, and its address.
+    pub machine: String,
+    pub address: String,
+    /// When it last looked at the pool (seconds since 1970), and since when it runs.
+    pub last_look: i64,
+    pub since: i64,
+    /// Claude works for it (alerts explained, the review and the Advisor in words).
+    pub claude: bool,
+    /// Backups: on, the last round, and whether it went well.
+    pub backups: (bool, i64, bool),
+    /// The weekly review: on, the last one.
+    pub review: (bool, i64),
+    /// The Advisor: on, the last check, the request it answered, how many to fix and to look at.
+    pub advice: (bool, i64, i64, i64, i64),
+    /// How many services it watches.
+    pub watching: i64,
+    /// It answers this app's requests (Check now, Send a test): 2.2 and later.
+    pub requests: bool,
+    /// The last test alert sent as asked: the request it answered, and what each channel said.
+    pub test: Option<(i64, Vec<(String, String)>)>,
+}
+
+impl VmStatus {
+    pub fn parse(text: &str) -> Option<VmStatus> {
+        let j: Value = serde_json::from_str(text).ok()?;
+        let bk = j.get("backups").cloned().unwrap_or(Value::Null);
+        let rv = j.get("review").cloned().unwrap_or(Value::Null);
+        let ad = j.get("advice").cloned().unwrap_or(Value::Null);
+        let test = j.get("test").map(|t| (i(t, "request"), t.get("results").and_then(|x| x.as_object()).map(|o| o.iter().map(|(k, v)| (k.clone(), v.as_str().unwrap_or("?").to_string())).collect()).unwrap_or_default()));
+        Some(VmStatus {
+            version: s(&j, "version"),
+            machine: s(&j, "machine"),
+            address: s(&j, "address"),
+            last_look: i(&j, "last_look"),
+            since: i(&j, "since"),
+            claude: b(&j, "claude", false),
+            backups: (b(&bk, "on", false), i(&bk, "last"), b(&bk, "ok", true)),
+            review: (b(&rv, "on", false), i(&rv, "last")),
+            advice: (b(&ad, "on", false), i(&ad, "last"), i(&ad, "request"), i(&ad, "bad"), i(&ad, "warn")),
+            watching: i(&j, "watching"),
+            requests: i(&j, "requests") >= 1,
+            test,
+        })
+    }
+
+    /// Heard from lately (it looks every minute, and says so every five).
+    pub fn fresh(&self, now: i64) -> bool {
+        now - self.last_look < 15 * 60
+    }
+}
+
+/// How a check went.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Status {
+    Bad,
+    Warn,
+    Ok,
+}
+
+/// One of the Advisor's checks.
 #[derive(Clone, Debug, PartialEq)]
-pub enum Presence {
-    Checking,
-    Installed(String),
-    Missing,
-    /// It couldn't be asked (the server's off, or not answering): why.
-    Unknown(String),
+pub struct Check {
+    pub id: String,
+    pub topic: String,
+    pub status: Status,
+    pub title: String,
+    /// Why it matters and what to do (none when it's fine).
+    pub note: String,
+    /// What it's about: servers, VMs, storage.
+    pub objects: Vec<String>,
+    /// A finding of Claude's own, not one of the helper's checks.
+    pub by_claude: bool,
 }
 
-impl Presence {
-    pub fn installed(&self) -> bool {
-        matches!(self, Presence::Installed(_))
+/// The Advisor's checklist, as the Helper VM left it in the pool.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Advice {
+    /// When it was made (seconds since 1970), and the request it answered (0: its daily one).
+    pub at: i64,
+    pub request: i64,
+    /// Worded by Claude (else the helper's own plain words).
+    pub by_claude: bool,
+    pub checks: Vec<Check>,
+}
+
+/// The Advisor's topics, in order: (key, name).
+pub const TOPICS: [(&str, &str); 5] = [("backups", "Backups"), ("storage", "Storage"), ("servers", "Servers"), ("vms", "VMs"), ("security", "Security")];
+
+impl Advice {
+    pub fn parse(text: &str) -> Option<Advice> {
+        let j: Value = serde_json::from_str(text).ok()?;
+        let checks = j
+            .get("checks")?
+            .as_array()?
+            .iter()
+            .filter_map(|c| {
+                let status = match c.get("status")?.as_str()? {
+                    "ok" => Status::Ok,
+                    "warn" => Status::Warn,
+                    "bad" => Status::Bad,
+                    _ => return None,
+                };
+                let title = s(c, "title");
+                (!title.is_empty()).then(|| Check {
+                    id: s(c, "id"),
+                    topic: s(c, "topic"),
+                    status,
+                    title,
+                    note: s(c, "note"),
+                    objects: c.get("objects").and_then(|o| o.as_array()).map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default(),
+                    by_claude: s(c, "by") == "claude",
+                })
+            })
+            .collect();
+        Some(Advice { at: i(&j, "at"), request: i(&j, "request"), by_claude: s(&j, "by") == "claude", checks })
     }
-    /// Installed, but an older version than this app's.
-    pub fn outdated(&self) -> bool {
-        matches!(self, Presence::Installed(v) if version_less(v, VERSION))
+
+    /// How many to fix, and to look at.
+    pub fn counts(&self) -> (usize, usize) {
+        (self.checks.iter().filter(|c| c.status == Status::Bad).count(), self.checks.iter().filter(|c| c.status == Status::Warn).count())
     }
 }
 
-fn version_less(a: &str, b: &str) -> bool {
-    let parts = |v: &str| v.split('.').map(|p| p.trim().parse::<u32>().unwrap_or(0)).collect::<Vec<_>>();
-    parts(a) < parts(b)
+/// The request to leave in the pool: what was there, with `what` asked at `now`.
+pub fn request(before: &str, what: &str, now: i64) -> String {
+    let mut m = match serde_json::from_str::<Value>(before) {
+        Ok(Value::Object(m)) => m,
+        _ => Map::new(),
+    };
+    m.insert(what.to_string(), json!(now));
+    Value::Object(m).to_string()
 }
 
 #[cfg(test)]
@@ -257,9 +380,17 @@ mod tests {
     }
 
     #[test]
-    fn versions_and_command() {
-        assert!(Presence::Installed("0.9".into()).outdated());
-        assert!(!Presence::Installed(VERSION.into()).outdated());
-        assert!(install_command().contains(&format!("/v{}/helper/install.sh | sh -s v{}", env!("CARGO_PKG_VERSION"), env!("CARGO_PKG_VERSION"))));
+    fn the_helper_vm_and_its_advice() {
+        let v = VmStatus::parse(r#"{"version": "2.2.0", "machine": "svm-helper", "address": "192.168.1.13", "last_look": 1000, "claude": true, "backups": {"on": true, "last": 900, "ok": false}, "advice": {"on": true, "last": 950, "request": 940, "bad": 1, "warn": 2}, "requests": 1, "test": {"request": 7, "results": {"ntfy": "ok"}}}"#).unwrap();
+        assert_eq!((v.version.as_str(), v.claude, v.backups, v.advice, v.requests), ("2.2.0", true, (true, 900, false), (true, 950, 940, 1, 2), true));
+        assert_eq!(v.test, Some((7, vec![("ntfy".into(), "ok".into())])));
+        assert!(v.fresh(1000 + 60) && !v.fresh(1000 + 3600));
+        // an older one: no requests answered
+        assert!(!VmStatus::parse(r#"{"version": "2.0.3", "last_look": 5, "copy": 1}"#).unwrap().requests);
+        let a = Advice::parse(r#"{"at": 950, "request": 940, "by": "claude", "checks": [{"id": "clocks", "topic": "servers", "status": "bad", "title": "Relógio errado", "note": "Ligue o NTP.", "objects": ["godofredo"]}, {"id": "x", "topic": "vms", "status": "odd", "title": "skipped"}, {"id": "claude_1", "topic": "vms", "status": "warn", "title": "dc01", "by": "claude"}]}"#).unwrap();
+        assert_eq!((a.at, a.request, a.by_claude, a.checks.len(), a.counts()), (950, 940, true, 2, (1, 1)));
+        assert_eq!((a.checks[0].status, a.checks[0].objects.clone(), a.checks[1].by_claude), (Status::Bad, vec!["godofredo".to_string()], true));
+        assert_eq!(request(r#"{"test": 5}"#, "advice", 9), r#"{"advice":9,"test":5}"#);
+        assert_eq!(request("", "test", 3), r#"{"test":3}"#);
     }
 }

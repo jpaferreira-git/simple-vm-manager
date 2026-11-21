@@ -19,6 +19,8 @@ what they ask.
 - `svm-helper check`: one look now (alerts, storage, schedules, servers).
 - `svm-helper test`: a test alert to the owner's phone.
 - `svm-helper review`: writes this week's health review now (`--send` sends it too).
+- `svm-helper advise`: checks the pool against good practice now, for Simple VM Manager's
+  Advisor page (it also runs once a day).
 - `svm-helper backup ["VM name" ...]`: the configured backups now, or just the VMs named.
 - `journalctl -u svm-helper`: the service's log.
 - Settings: `/etc/svm-helper/config.json` (the secrets are in `secrets.json`).

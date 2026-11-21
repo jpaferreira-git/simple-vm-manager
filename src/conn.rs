@@ -5,7 +5,7 @@ use crate::alerts::{AlertSettings, XenMessage};
 use crate::history::{demo_host_records, demo_vm_records, read_records, Records, Span};
 use crate::model::*;
 use serde_json::{json, Map, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
@@ -484,6 +484,20 @@ pub trait Connection: Send + Sync {
     /// Brings a .xva file into the pool (see `ImportVm`), then names it, sets its home server and
     /// moves its network cards as asked. The VM (or template) made.
     fn import_vm(&self, imp: &ImportVm, t: &Arc<Transfer>) -> Result<String, ApiError>;
+    /// VM Conversion: a VM made as `t` says (from its template; its disks made empty, its cards,
+    /// its boot mode), not started. On a failure, what was made is taken away again.
+    fn convert_make(&self, t: &crate::convert::Target, tr: &Trace) -> Result<crate::convert::Made, ApiError>;
+    /// A converted disk's bytes written into its VDI: an HTTP PUT of /import_raw_vdi (at
+    /// `address`, the server whose own storage it's on), `len` bytes, as a VHD (`vhd`) or raw.
+    fn convert_write(&self, vdi: &str, address: Option<&str>, body: Box<dyn Read + Send>, len: u64, vhd: bool, t: &Arc<Transfer>) -> Result<(), ApiError>;
+    /// The pool's Helper VM heartbeat (its other_config "svm-helper-vm"), if it has one.
+    fn helper_vm(&self) -> Result<Option<String>, ApiError>;
+    /// Hands a disk copy to the pool's Helper VM: a task (named `label`) carrying the job in its
+    /// other_config, and a XenAPI secret holding the source's password. (task, secret).
+    fn helper_copy_start(&self, vdi: &str, address: Option<&str>, job: &Value, password: &str, label: &str) -> Result<(String, String), ApiError>;
+    fn helper_copy_poll(&self, task: &str) -> Result<crate::convert::HelperPoll, ApiError>;
+    /// Ends it: the task cancelled first when asked, then it and the secret destroyed.
+    fn helper_copy_end(&self, task: &str, secret: &str, cancel: bool);
     /// A server's own system (its control domain, with its settings; not its VMs' disks) saved in
     /// `to`, a .xbk: an HTTP GET of /host_backup on it (at `address`). The bytes saved.
     fn backup_host(&self, address: &str, to: &Path, t: &Arc<Transfer>) -> Result<u64, ApiError>;
@@ -502,12 +516,13 @@ pub trait Connection: Send + Sync {
     /// The pool's root password changed (every server's), once `old` is checked to be the one
     /// this connection logs in with; the new one is used from then on.
     fn change_password(&self, old: &str, new: &str) -> Result<(), ApiError>;
-    /// The Server Helper on a server (see helper.rs): its version, None when it isn't installed
-    /// (no "svm-helper" plugin there).
-    fn helper_version(&self, host: &str) -> Result<Option<String>, ApiError>;
-    /// One of the Server Helper's calls on a server (status, tick, test, uninstall): its answer.
-    fn helper_call(&self, host: &str, func: &str, args: &[(&str, String)]) -> Result<String, ApiError>;
-    /// The Server Helper's settings, as the pool keeps them ("" when there are none).
+    /// The Helper VM (see helper.rs), as the pool's other_config has it: its heartbeat and the
+    /// Advisor's checklist ("" for either it hasn't left).
+    fn helper_state(&self) -> Result<(String, String), ApiError>;
+    /// Asks the Helper VM for `what` ("advice": the Advisor's check now; "test": a test alert),
+    /// as asked at `now`: it answers within its next minute.
+    fn helper_ask(&self, what: &str, now: i64) -> Result<(), ApiError>;
+    /// The Helper VM's settings, as the pool keeps them ("" when there are none).
     fn helper_settings(&self) -> Result<String, ApiError>;
     /// Saves them; then each VM (`autostart`: VM, on) starts with its server by itself or not:
     /// the ones the helper starts in order don't, those taken off its list do again.
@@ -3828,6 +3843,227 @@ impl Connection for RealConnection {
         Ok(vm)
     }
 
+    fn convert_make(&self, x: &crate::convert::Target, tr: &Trace) -> Result<crate::convert::Made, ApiError> {
+        let t = 120_000;
+        let call = |shown: String, method: &str, args: Vec<Value>, timeout: u64| {
+            tr.push(Said::Asked, shown);
+            let started = Instant::now();
+            let r = self.call(method, args, timeout);
+            tr.outcome(&r, started.elapsed());
+            r
+        };
+        let may = |shown: String, method: &str, args: Vec<Value>| {
+            if call(shown, method, args, t).is_err() {
+                tr.push(Said::Note, "(not needed; carrying on)");
+            }
+        };
+        let mut names = x.names.clone();
+        let vm = call(format!("VM.clone  vm={}  new_name=\"{}\"", named(&names, &x.template), x.name), "VM.clone", vec![json!(x.template), json!(x.name)], 300_000)?;
+        let vm = vm.as_str().unwrap_or_default().to_string();
+        names.insert(vm.clone(), x.name.clone());
+        let me = named(&names, &vm);
+        let mut vdis: Vec<String> = vec![];
+        let made = (|| -> Result<(), ApiError> {
+            let tpl = call(format!("VM.get_record  vm={}", named(&names, &x.template)), "VM.get_record", vec![json!(x.template)], t)?;
+            if restriction(&s(&tpl, "recommendations"), "has-vendor-device").as_deref() == Some("true") {
+                let pool = call("pool.get_all".into(), "pool.get_all", vec![], t)?.as_array().and_then(|a| a.first().cloned()).unwrap_or(Value::Null);
+                let refused = call(format!("pool.get_policy_no_vendor_device  pool={}", pool.as_str().unwrap_or_default()), "pool.get_policy_no_vendor_device", vec![pool], t)?.as_bool().unwrap_or(true);
+                if !refused {
+                    may(format!("VM.set_has_vendor_device  vm={}  value=true", me), "VM.set_has_vendor_device", vec![json!(vm), json!(true)]);
+                }
+            }
+            // the disks are made below, not from the template's own list
+            may(format!("VM.remove_from_other_config  vm={}  key=\"disks\"", me), "VM.remove_from_other_config", vec![json!(vm), json!("disks")]);
+            call(format!("VM.provision  vm={}", me), "VM.provision", vec![json!(vm)], 300_000)?;
+            if !x.description.is_empty() {
+                call(format!("VM.set_name_description  vm={}  value=\"{}\"", me, x.description), "VM.set_name_description", vec![json!(vm), json!(x.description)], t)?;
+            }
+            let (max, at_start) = ("VM.set_VCPUs_max", "VM.set_VCPUs_at_startup");
+            let order = if x.vcpus > n(&tpl, "VCPUs_max") { [max, at_start] } else { [at_start, max] };
+            for m in order {
+                call(format!("{}  vm={}  value={}", m, me, x.vcpus), m, vec![json!(vm), json!(x.vcpus)], t)?;
+            }
+            may(format!("VM.remove_from_platform  vm={}  key=\"cores-per-socket\"", me), "VM.remove_from_platform", vec![json!(vm), json!("cores-per-socket")]);
+            call(format!("VM.add_to_platform  vm={}  key=\"cores-per-socket\"  value=\"{}\"", me, x.cores), "VM.add_to_platform", vec![json!(vm), json!("cores-per-socket"), json!(x.cores.max(1).to_string())], t)?;
+            let floor = n(&tpl, "memory_static_min").min(x.memory).max(1);
+            let shown = format!("VM.set_memory_limits  vm={}  static_min={}  dynamic_min={}  dynamic_max={}  static_max={}", me, floor, x.memory, x.memory, x.memory);
+            call(shown, "VM.set_memory_limits", vec![json!(vm), json!(floor), json!(x.memory), json!(x.memory), json!(x.memory)], t)?;
+            // its boot mode, as it had it
+            let firmware = if x.uefi { "uefi" } else { "bios" };
+            may(format!("VM.remove_from_HVM_boot_params  vm={}  key=\"firmware\"", me), "VM.remove_from_HVM_boot_params", vec![json!(vm), json!("firmware")]);
+            call(format!("VM.add_to_HVM_boot_params  vm={}  key=\"firmware\"  value=\"{}\"", me, firmware), "VM.add_to_HVM_boot_params", vec![json!(vm), json!("firmware"), json!(firmware)], t)?;
+            may(format!("VM.remove_from_platform  vm={}  key=\"secureboot\"", me), "VM.remove_from_platform", vec![json!(vm), json!("secureboot")]);
+            if x.uefi {
+                // ("auto": on when the pool has the certificates for it)
+                let secure = if x.secure_boot { "auto" } else { "false" };
+                call(format!("VM.add_to_platform  vm={}  key=\"secureboot\"  value=\"{}\"", me, secure), "VM.add_to_platform", vec![json!(vm), json!("secureboot"), json!(secure)], t)?;
+            }
+            if let Some(h) = &x.host {
+                call(format!("VM.set_affinity  vm={}  host={}", me, named(&names, h)), "VM.set_affinity", vec![json!(vm), json!(h)], t)?;
+            }
+            // its disks, in order (3 is the DVD drive's place)
+            let places = (0..).filter(|i| *i != 3).map(|i: i32| i.to_string());
+            for ((label, size), device) in x.disks.iter().zip(places) {
+                let shown = format!("VDI.create  SR={}  name_label=\"{}\"  virtual_size={}  type=system", named(&names, &x.sr), label, size);
+                let record = json!({
+                    "name_label": label, "name_description": "Converted by Simple VM Manager", "SR": x.sr,
+                    "virtual_size": size.to_string(), "type": "system", "sharable": false, "read_only": false,
+                    "other_config": {}, "xenstore_data": {}, "sm_config": { "vmhint": vm }, "tags": [],
+                });
+                let vdi = call(shown, "VDI.create", vec![record], 300_000)?.as_str().unwrap_or_default().to_string();
+                names.insert(vdi.clone(), label.clone());
+                vdis.push(vdi.clone());
+                let drive = json!({
+                    "VM": vm, "VDI": vdi, "userdevice": device, "bootable": device == "0", "mode": "RW", "type": "Disk", "unpluggable": true,
+                    "empty": false, "other_config": { "owner": "" }, "qos_algorithm_type": "", "qos_algorithm_params": {}, "device": "", "currently_attached": false,
+                });
+                call(format!("VBD.create  VM={}  VDI={}  userdevice={}  type=Disk  mode=RW", me, named(&names, &vdi), device), "VBD.create", vec![drive], t)?;
+            }
+            // an empty DVD drive (one the template brought is emptied)
+            let mut has_cd = false;
+            for vbd in call(format!("VM.get_VBDs  vm={}", me), "VM.get_VBDs", vec![json!(vm)], t)?.as_array().cloned().unwrap_or_default() {
+                let id = vbd.as_str().unwrap_or_default().to_string();
+                let r = call(format!("VBD.get_record  vbd={}", id), "VBD.get_record", vec![vbd.clone()], t)?;
+                if s(&r, "type") == "CD" {
+                    if !b(&r, "empty") {
+                        may(format!("VBD.eject  vbd={}", id), "VBD.eject", vec![vbd.clone()]);
+                    }
+                    has_cd = true;
+                }
+            }
+            if !has_cd {
+                let cd = json!({
+                    "VM": vm, "VDI": "OpaqueRef:NULL", "userdevice": "3", "bootable": false, "mode": "RO", "type": "CD", "unpluggable": true,
+                    "empty": true, "other_config": {}, "qos_algorithm_type": "", "qos_algorithm_params": {}, "device": "", "currently_attached": false,
+                });
+                may(format!("VBD.create  VM={}  userdevice=3  type=CD  empty=true", me), "VBD.create", vec![cd]);
+            }
+            // its cards (any the template brought go), with their MACs
+            for vif in call(format!("VM.get_VIFs  vm={}", me), "VM.get_VIFs", vec![json!(vm)], t)?.as_array().cloned().unwrap_or_default() {
+                call(format!("VIF.destroy  vif={}", vif.as_str().unwrap_or_default()), "VIF.destroy", vec![vif], t)?;
+            }
+            for (i, (net, mac)) in x.nics.iter().enumerate() {
+                let mtu = call(format!("network.get_MTU  network={}", named(&names, net)), "network.get_MTU", vec![json!(net)], t).map(|m| n(&json!({ "m": m }), "m")).unwrap_or(1500);
+                let card = json!({
+                    "device": i.to_string(), "network": net, "VM": vm, "MAC": mac, "MTU": mtu.max(68), "other_config": {},
+                    "qos_algorithm_type": "", "qos_algorithm_params": {}, "locking_mode": "network_default",
+                    "ipv4_allowed": [], "ipv6_allowed": [], "currently_attached": false,
+                });
+                let shown_mac = if mac.is_empty() { "(new)".to_string() } else { mac.clone() };
+                call(format!("VIF.create  VM={}  network={}  device={}  MAC={}", me, named(&names, net), i, shown_mac), "VIF.create", vec![card], t)?;
+            }
+            if x.vtpm && x.uefi {
+                // (needs XenServer 8.3 or later; without it the VM still starts, BitLocker may ask for its key)
+                may(format!("VTPM.create  vm={}  is_unique=false", me), "VTPM.create", vec![json!(vm), json!(false)]);
+            }
+            Ok(())
+        })();
+        if let Err(e) = made {
+            tr.push(Said::Note, "Undoing what was made:");
+            for d in &vdis {
+                let _ = call(format!("VDI.destroy  vdi={}", named(&names, d)), "VDI.destroy", vec![json!(d)], t);
+            }
+            let _ = call(format!("VM.destroy  vm={}", me), "VM.destroy", vec![json!(vm)], t);
+            return Err(e);
+        }
+        Ok(crate::convert::Made { vm, vdis })
+    }
+
+    fn convert_write(&self, vdi: &str, address: Option<&str>, body: Box<dyn Read + Send>, len: u64, vhd: bool, t: &Arc<Transfer>) -> Result<(), ApiError> {
+        t.total.store(len, Ordering::Relaxed);
+        let label = self.call("VDI.get_name_label", vec![json!(vdi)], 30_000).map(|v| val_str(&v)).unwrap_or_default();
+        let task = self.call("task.create", vec![json!("Write a converted disk"), json!(label)], 30_000)?.as_str().unwrap_or_default().to_string();
+        let (base, session) = self.http_base(address);
+        let format = if vhd { "vhd" } else { "raw" };
+        let url = format!("{}/import_raw_vdi?session_id={}&vdi={}&task_id={}&format={}", base, session, vdi, task, format);
+        if let Some(w) = watched() {
+            w.trace.push(Said::Asked, format!("PUT /import_raw_vdi  vdi=\"{}\"  format={}  ({})", label, format, fmt_bytes(len as i64)));
+        }
+        let agent = ureq::AgentBuilder::new()
+            .tls_connector(self.tls.clone())
+            .timeout_connect(Duration::from_secs(30))
+            .timeout_write(Duration::from_secs(600))
+            .timeout_read(Duration::from_secs(3600))
+            .redirects(0)
+            .user_agent(concat!("SimpleVMManager/", env!("CARGO_PKG_VERSION")))
+            .build();
+        let sent = agent.put(&url).set("Content-Length", &len.to_string()).send(Counting { inner: body, t: t.clone() });
+        t.finishing.store(true, Ordering::Relaxed);
+        let cancelled = t.cancel.load(Ordering::Relaxed);
+        let put_error = match sent {
+            Ok(_) => None,
+            Err(ureq::Error::Status(code, _)) => Some(ApiError::other(format!("The server answered the disk's upload with HTTP {}.", code))),
+            Err(e) => Some(ApiError::other(e.to_string())),
+        };
+        if cancelled || put_error.is_some() {
+            let _ = self.call("task.cancel", vec![json!(task)], 30_000);
+        }
+        let wait = if cancelled || put_error.is_some() { 60 } else { 1800 };
+        let verdict = self.task_result(&task, Duration::from_secs(wait));
+        let _ = self.call("task.destroy", vec![json!(task)], 30_000);
+        if cancelled {
+            return Err(ApiError { code: CANCELLED.into(), details: vec![] });
+        }
+        match verdict {
+            Ok(true) => Ok(()),
+            Err(e) if e.code != CANCELLED => Err(e),
+            _ => Err(put_error.unwrap_or_else(|| ApiError::other("The server didn't finish writing the disk in time."))),
+        }
+    }
+
+    fn helper_vm(&self) -> Result<Option<String>, ApiError> {
+        let pool = self.all("pool", 30_000)?.keys().next().cloned().unwrap_or_default();
+        let oc = self.call("pool.get_other_config", vec![json!(pool)], 30_000)?;
+        Ok(Some(s(&oc, crate::convert::HELPER_VM_KEY)).filter(|v| !v.is_empty()))
+    }
+
+    fn helper_copy_start(&self, vdi: &str, address: Option<&str>, job: &Value, password: &str, label: &str) -> Result<(String, String), ApiError> {
+        let t = 30_000;
+        // (said without its value)
+        said("secret.create", &[json!({ "value": "…" })]);
+        let secret = self.call_raw("secret.create", vec![json!({ "value": password, "other_config": {} })], t)?.as_str().unwrap_or_default().to_string();
+        let ok = (|| -> Result<(String, String), ApiError> {
+            let secret_uuid = val_str(&self.call("secret.get_uuid", vec![json!(secret)], t)?);
+            let vdi_uuid = val_str(&self.call("VDI.get_uuid", vec![json!(vdi)], t)?);
+            let task = self.call("task.create", vec![json!(label), json!("A disk copy for the Helper VM (Simple VM Manager)")], t)?.as_str().unwrap_or_default().to_string();
+            let mut j = job.clone();
+            j["v"] = json!(1);
+            j["vdi"] = json!(vdi_uuid);
+            j["secret"] = json!(secret_uuid);
+            j["address"] = json!(address.unwrap_or(""));
+            j["format"] = json!("raw");
+            if let Err(e) = self.call("task.add_to_other_config", vec![json!(task), json!(crate::convert::COPY_JOB), json!(j.to_string())], t) {
+                let _ = self.call("task.destroy", vec![json!(task)], t);
+                return Err(e);
+            }
+            Ok((task, secret.clone()))
+        })();
+        if ok.is_err() {
+            let _ = self.call("secret.destroy", vec![json!(secret)], t);
+        }
+        ok
+    }
+
+    fn helper_copy_poll(&self, task: &str) -> Result<crate::convert::HelperPoll, ApiError> {
+        let r = self.call("task.get_record", vec![json!(task)], 30_000)?;
+        let oc = r.get("other_config").cloned().unwrap_or(Value::Null);
+        let info: Vec<String> = r.get("error_info").and_then(|v| v.as_array()).map(|a| a.iter().map(val_str).collect()).unwrap_or_default();
+        let mut error = s(&oc, crate::convert::COPY_ERROR);
+        if error.is_empty() && !info.is_empty() {
+            error = ApiError { code: info[0].clone(), details: info[1..].to_vec() }.message();
+        }
+        let progress = r.get("progress").and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|x| x.parse().ok()))).unwrap_or(0.0);
+        Ok(crate::convert::HelperPoll { status: s(&r, "status"), progress, claimed: s(&oc, crate::convert::COPY_CLAIMED), error })
+    }
+
+    fn helper_copy_end(&self, task: &str, secret: &str, cancel: bool) {
+        if cancel {
+            let _ = self.call("task.cancel", vec![json!(task)], 30_000);
+        }
+        let _ = self.call("task.destroy", vec![json!(task)], 30_000);
+        let _ = self.call("secret.destroy", vec![json!(secret)], 30_000);
+    }
+
     fn backup_host(&self, address: &str, to: &Path, t: &Arc<Transfer>) -> Result<u64, ApiError> {
         // (the server packs its system as it goes: a while between the bytes is fine)
         self.get_file(Some(address), "/host_backup", "Back up a server", to, Duration::from_secs(900), t)
@@ -3916,22 +4152,20 @@ impl Connection for RealConnection {
         Ok(())
     }
 
-    fn helper_version(&self, host: &str) -> Result<Option<String>, ApiError> {
-        match self.call_raw("host.call_plugin", vec![json!(host), json!(crate::helper::KEY), json!("version"), json!({})], 30_000) {
-            Ok(v) => {
-                let text = val_str(&v);
-                let version = serde_json::from_str::<Value>(&text).ok().map(|j| s(&j, "version")).unwrap_or_default();
-                Ok(Some(if version.is_empty() { "?".into() } else { version }))
-            }
-            Err(e) if e.code == "XENAPI_MISSING_PLUGIN" => Ok(None),
-            Err(e) => Err(e),
-        }
+    fn helper_state(&self) -> Result<(String, String), ApiError> {
+        let pool = self.all("pool", 30_000)?.keys().next().cloned().unwrap_or_default();
+        let oc = self.call("pool.get_other_config", vec![json!(pool)], 30_000)?;
+        Ok((s(&oc, crate::helper::VM_KEY), s(&oc, crate::helper::ADVICE_KEY)))
     }
 
-    fn helper_call(&self, host: &str, func: &str, args: &[(&str, String)]) -> Result<String, ApiError> {
-        let map: Map<String, Value> = args.iter().map(|(k, v)| (k.to_string(), json!(v))).collect();
-        // (its tick may start VMs or mount storage: a few minutes at most)
-        Ok(val_str(&self.call("host.call_plugin", vec![json!(host), json!(crate::helper::KEY), json!(func), Value::Object(map)], 300_000)?))
+    fn helper_ask(&self, what: &str, now: i64) -> Result<(), ApiError> {
+        let t = 30_000;
+        let pool = self.all("pool", t)?.keys().next().cloned().unwrap_or_default();
+        let oc = self.call("pool.get_other_config", vec![json!(pool)], t)?;
+        let text = crate::helper::request(&s(&oc, crate::helper::REQUEST_KEY), what, now);
+        let _ = self.call_raw("pool.remove_from_other_config", vec![json!(pool), json!(crate::helper::REQUEST_KEY)], t);
+        self.call("pool.add_to_other_config", vec![json!(pool), json!(crate::helper::REQUEST_KEY), json!(text)], t)?;
+        Ok(())
     }
 
     fn helper_settings(&self) -> Result<String, ApiError> {
@@ -4033,15 +4267,72 @@ fn demo_uuid() -> String {
     format!("{:08x}-{:04x}-4{:03x}-{:04x}-{:012x}", a >> 32, (a >> 16) & 0xffff, a & 0xfff, 0x8000 | (b >> 48) & 0x3fff, b & 0xffff_ffff_ffff)
 }
 
+/// The demo pool's Helper VM: whether it has one (SVM_DEMO_HELPER, or SVM_DEMO_HELPER_VM), its
+/// settings, the Advisor's checklist, and the last test alert asked of it.
+struct DemoHelper {
+    vm: bool,
+    settings: String,
+    advice: String,
+    test: Option<i64>,
+}
+
+fn demo_now() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|t| t.as_secs() as i64).unwrap_or(0)
+}
+
+/// The demo's Helper VM's heartbeat.
+fn demo_heartbeat(h: &DemoHelper) -> String {
+    let now = demo_now();
+    let advice = crate::helper::Advice::parse(&h.advice).unwrap_or_default();
+    let (bad, warn) = advice.counts();
+    let mut j = json!({
+        "version": "2.2.0", "machine": "svm-helper", "address": "10.20.0.30", "vm": "", "since": now - 3 * 86400, "last_look": now - 30,
+        "claude": true, "backups": { "on": true, "last": now - 6 * 3600, "ok": true }, "review": { "on": true, "last": now - 2 * 86400 },
+        "advice": { "on": true, "last": advice.at, "request": advice.request, "bad": bad, "warn": warn }, "watching": 2, "copy": 1, "requests": 1,
+    });
+    if let Some(t) = h.test {
+        j["test"] = json!({ "request": t, "at": now, "results": { "telegram": "ok", "ntfy": "ok" } });
+    }
+    j.to_string()
+}
+
+/// The demo's Advisor checklist, as Claude words it (`request`: the Check now it answers).
+fn demo_advice(request: i64) -> String {
+    let c = |id: &str, topic: &str, status: &str, title: &str, note: &str, objects: &[&str]| json!({ "id": id, "topic": topic, "status": status, "title": title, "note": note, "objects": objects });
+    let mut checks = vec![
+        c("backups_vms", "backups", "warn", "2 VMs had no backup this week", "Without a recent backup, a failed disk or a bad change can't be undone. Add Test Desktop and Build Agent to the Helper VM's backups, or tell it they don't need any.", &["Build Agent", "Test Desktop"]),
+        c("backups_failed", "backups", "ok", "Last night's backups went well", "", &[]),
+        c("backups_pool_db", "backups", "ok", "The pool's database is saved with the backups", "", &[]),
+        c("snapshot_schedules", "backups", "warn", "Mail Relay has no snapshot schedule", "A schedule takes snapshots by itself, so there's always a recent one to go back to after a bad update. Add Mail Relay to Nightly, under Snapshots, then Schedules.", &["Mail Relay"]),
+        c("storage_space", "storage", "ok", "Every storage has room to spare", "", &[]),
+        c("unused_disks", "storage", "ok", "No forgotten disks", "", &[]),
+        c("old_snapshots", "storage", "warn", "Database has a snapshot over a month old", "\"Before the upgrade\" is 41 days old. A snapshot isn't a backup, and an old one keeps growing as the disk changes: delete it if the upgrade went well.", &["Database"]),
+        c("servers_answering", "servers", "ok", "Both servers answer", "", &[]),
+        c("clocks", "servers", "bad", "demo-host-02's clock is 4 minutes behind", "A wrong clock puts the wrong time on alerts and snapshots, and can upset the pool's certificates. Turn NTP on for demo-host-02 (its Details, Time).", &["demo-host-02"]),
+        c("updates", "servers", "warn", "Updates are waiting on both servers", "They fix security holes and bugs. Install them from Updates; each server restarts in turn, and its VMs move to the other one meanwhile.", &["demo-host-01", "demo-host-02"]),
+        c("memory", "servers", "ok", "Both servers have memory to spare", "", &[]),
+        c("vm_tools", "vms", "ok", "Every running VM has its VM Tools", "", &[]),
+        c("autostart", "vms", "warn", "Mail Relay doesn't start by itself", "After a power cut it stays off until someone starts it. Turn on Start with the server in its Overview, if it should always run.", &["Mail Relay"]),
+        c("certificates", "security", "ok", "The servers' certificates are valid for months", "", &[]),
+        c("alerts_sent", "security", "ok", "Alerts reach your phone", "", &[]),
+    ];
+    let mut mine = c("claude_1", "vms", "warn", "Database runs on the same server as Web Server", "Both are on demo-host-01: if it stops, the website and the shop stop together. Moving one of them to demo-host-02 spreads the risk.", &["Database", "Web Server"]);
+    mine["by"] = json!("claude");
+    checks.push(mine);
+    json!({ "version": 1, "at": demo_now() - if request == 0 { 5 * 3600 } else { 0 }, "by": "claude", "language": "en", "request": request, "checks": checks }).to_string()
+}
+
 pub struct DemoConnection {
     data: Mutex<PoolData>,
-    /// The Server Helper: the servers it's on, its settings, what it did.
-    helper: Mutex<(HashSet<String>, String, Vec<String>)>,
+    /// Its pretend Helper VM.
+    helper: Mutex<DemoHelper>,
     /// What its update channel has for its servers.
     updates: Mutex<PoolUpdates>,
     /// Its messages for people, the limits set on its VMs, servers and storage (by reference),
     /// and its email for alerts.
     alerts: Mutex<(Vec<XenMessage>, HashMap<String, String>, (String, String))>,
+    /// Disk copies handed to its pretend Helper VM, and when.
+    copies: Mutex<HashMap<String, Instant>>,
 }
 
 impl DemoConnection {
@@ -4368,15 +4659,10 @@ impl DemoConnection {
         };
         let found = PoolUpdates { hash: "6f1c0e9a".into(), updates, hosts };
         let alerts = demo_alerts(&d);
-        // SVM_DEMO_HELPER: the Server Helper is on every server
-        let helped: HashSet<String> = if std::env::var("SVM_DEMO_HELPER").is_ok() { d.hosts.iter().map(|h| h.rref.clone()).collect() } else { HashSet::new() };
-        let helper_log = vec![
-            "2026-11-20 08:00:01 sent 1 alert".to_string(),
-            "2026-11-20 16:45:02 Made up the missed 19:45 run of 'Nightly'".to_string(),
-            "2026-11-20 16:46:10 Mounted 'ISO library' again on demo-host-02".to_string(),
-        ];
+        // SVM_DEMO_HELPER (or the conversion's SVM_DEMO_HELPER_VM): the pool has a Helper VM
+        let helped = std::env::var("SVM_DEMO_HELPER").is_ok() || std::env::var("SVM_DEMO_HELPER_VM").is_ok();
         // (with it, some settings: Telegram and ntfy on, two VMs started in order)
-        let helper_settings = if helped.is_empty() {
+        let helper_settings = if !helped {
             String::new()
         } else {
             let mut x = crate::helper::Settings::default();
@@ -4387,7 +4673,9 @@ impl DemoConnection {
             x.order.sort_by_key(|o| o.1 == 30);
             x.to_json()
         };
-        DemoConnection { data: Mutex::new(d), helper: Mutex::new((helped, helper_settings, helper_log)), updates: Mutex::new(found), alerts: Mutex::new(alerts) }
+        let advice = if helped { demo_advice(0) } else { String::new() };
+        let helper = DemoHelper { vm: helped, settings: helper_settings, advice, test: None };
+        DemoConnection { data: Mutex::new(d), helper: Mutex::new(helper), updates: Mutex::new(found), alerts: Mutex::new(alerts), copies: Mutex::new(HashMap::new()) }
     }
 
     /// New VM from one of the user's templates: the calls a real server gets, with made-up answers.
@@ -5349,6 +5637,96 @@ impl Connection for DemoConnection {
         recompute(&mut d);
         Ok(rref)
     }
+    /// Adds a converted VM to the demo pool (its disks as asked, its cards on their networks).
+    fn convert_make(&self, x: &crate::convert::Target, tr: &Trace) -> Result<crate::convert::Made, ApiError> {
+        let rref = format!("vm-conv-{}", self.data.lock().unwrap().vms.len());
+        let me = format!("\"{}\"", x.name);
+        tr.push(Said::Asked, format!("VM.clone  vm={}  new_name={}", named(&x.names, &x.template), me));
+        tr.push(Said::Answer, format!("OpaqueRef:{}  (0.1 s)", rref));
+        for (label, size) in &x.disks {
+            tr.push(Said::Asked, format!("VDI.create  SR={}  name_label=\"{}\"  virtual_size={}  type=system", named(&x.names, &x.sr), label, size));
+            demo_work(120);
+        }
+        let mut d = self.data.lock().unwrap();
+        let template = d.templates.iter().find(|t| t.rref == x.template).map(|t| t.name.clone()).unwrap_or_default();
+        let sr = d.sr(&x.sr).cloned().unwrap_or_default();
+        let mut vm = VmInfo {
+            rref: rref.clone(),
+            uuid: demo_uuid(),
+            name: x.name.clone(),
+            description: x.description.clone(),
+            os: if template == OTHER_MEDIA { String::new() } else { template },
+            power: PowerState::Halted,
+            vcpus: x.vcpus,
+            vcpus_max: x.vcpus,
+            mem_static_max: x.memory,
+            mem_dyn_min: x.memory,
+            mem_dyn_max: x.memory,
+            affinity: x.host.clone(),
+            storage_host: sr.host.clone(),
+            firmware: if x.uefi { "UEFI".into() } else { "BIOS".into() },
+            allowed: vec!["start".into(), "start_on".into()],
+            ..Default::default()
+        };
+        let places = (0..).filter(|i| *i != 3).map(|i: i32| i.to_string());
+        let mut vdis = vec![];
+        for (i, ((label, size), device)) in x.disks.iter().zip(places).enumerate() {
+            let vdi = format!("{}-vdi-{}", rref, i);
+            vdis.push(vdi.clone());
+            vm.disks.push(VmDisk { device, name: label.clone(), vbd: format!("{}-vbd-{}", rref, i), vdi, sr: sr.rref.clone(), sr_name: sr.name.clone(), kind: "Disk".into(), size: *size as i64, ..Default::default() });
+        }
+        vm.disks.push(VmDisk { device: "3".into(), name: String::new(), vbd: format!("{}-vbd-cd", rref), kind: "DVD drive".into(), ..Default::default() });
+        for (i, (net, mac)) in x.nics.iter().enumerate() {
+            let network = d.networks.iter().find(|n| n.rref == *net).map(|n| n.name.clone()).unwrap_or_default();
+            let mac = if mac.is_empty() { format!("aa:16:3e:c0:{:02x}:{:02x}", d.vms.len(), i) } else { mac.clone() };
+            vm.nics.push(VmNic { device: i.to_string(), vif: format!("{}-vif-{}", rref, i), net: net.clone(), mac, network, ip: String::new() });
+        }
+        d.vms.push(vm);
+        recompute(&mut d);
+        Ok(crate::convert::Made { vm: rref, vdis })
+    }
+    /// Reads what it's sent, as fast as it comes (a pretend source's bytes are made on the spot).
+    fn convert_write(&self, _vdi: &str, _address: Option<&str>, mut body: Box<dyn Read + Send>, len: u64, vhd: bool, t: &Arc<Transfer>) -> Result<(), ApiError> {
+        said("PUT /import_raw_vdi", &[json!(if vhd { "vhd" } else { "raw" }), json!(len)]);
+        t.total.store(len, Ordering::Relaxed);
+        let mut buf = vec![0u8; 1 << 20];
+        let mut got = 0u64;
+        loop {
+            if t.cancel.load(Ordering::Relaxed) {
+                return Err(ApiError { code: CANCELLED.into(), details: vec![] });
+            }
+            let n = body.read(&mut buf).map_err(|e| ApiError::other(e.to_string()))?;
+            if n == 0 {
+                break;
+            }
+            got += n as u64;
+            t.sent.store(got, Ordering::Relaxed);
+        }
+        t.finishing.store(true, Ordering::Relaxed);
+        if got != len {
+            return Err(ApiError::other(format!("The upload stopped at {} of {} bytes.", got, len)));
+        }
+        Ok(())
+    }
+    fn helper_vm(&self) -> Result<Option<String>, ApiError> {
+        let h = self.helper.lock().unwrap();
+        Ok(h.vm.then(|| demo_heartbeat(&h)))
+    }
+    fn helper_copy_start(&self, _vdi: &str, _address: Option<&str>, _job: &Value, _password: &str, label: &str) -> Result<(String, String), ApiError> {
+        said("task.create", &[json!(label)]);
+        let mut copies = self.copies.lock().unwrap();
+        let id = format!("demo-copy-{}", copies.len());
+        copies.insert(id.clone(), Instant::now());
+        Ok((id, "demo-secret".into()))
+    }
+    fn helper_copy_poll(&self, task: &str) -> Result<crate::convert::HelperPoll, ApiError> {
+        let started = self.copies.lock().unwrap().get(task).copied().unwrap_or_else(Instant::now);
+        let p = (started.elapsed().as_secs_f64() / 8.0).min(1.0);
+        Ok(crate::convert::HelperPoll { status: if p >= 1.0 { "success".into() } else { "pending".into() }, progress: p, claimed: "svm-helper".into(), error: String::new() })
+    }
+    fn helper_copy_end(&self, task: &str, _secret: &str, _cancel: bool) {
+        self.copies.lock().unwrap().remove(task);
+    }
     /// Adds the VM to the demo pool, started on the server with the most memory free if asked.
     fn create_vm(&self, v: &NewVm, tr: &Trace) -> Result<String, ApiError> {
         for sr in &v.check {
@@ -6176,51 +6554,34 @@ impl Connection for DemoConnection {
         }
         Ok(())
     }
-    fn helper_version(&self, host: &str) -> Result<Option<String>, ApiError> {
+    fn helper_state(&self) -> Result<(String, String), ApiError> {
         std::thread::sleep(Duration::from_millis(120));
-        Ok(self.helper.lock().unwrap().0.contains(host).then(|| crate::helper::VERSION.to_string()))
+        let h = self.helper.lock().unwrap();
+        Ok((if h.vm { demo_heartbeat(&h) } else { String::new() }, h.advice.clone()))
     }
-    fn helper_call(&self, host: &str, func: &str, _args: &[(&str, String)]) -> Result<String, ApiError> {
-        said("host.call_plugin", &[json!(host), json!(crate::helper::KEY), json!(func)]);
-        demo_work(400);
+    fn helper_ask(&self, what: &str, now: i64) -> Result<(), ApiError> {
+        said("pool.add_to_other_config", &[json!(crate::helper::REQUEST_KEY), json!(crate::helper::request("", what, now))]);
+        demo_work(300);
         let mut h = self.helper.lock().unwrap();
-        // (the demo's console types nothing: "demo-install" stands for the command typed there)
-        if func == "demo-install" {
-            h.0.insert(host.to_string());
-            return Ok("installed".into());
+        if !h.vm {
+            return Ok(());
         }
-        if !h.0.contains(host) {
-            return Err(ApiError { code: "XENAPI_MISSING_PLUGIN".into(), details: vec![crate::helper::KEY.into()] });
+        // (its answer comes a moment later, as the real one's comes within its next minute)
+        match what {
+            "advice" => h.advice = demo_advice(now),
+            "test" => h.test = Some(now),
+            _ => {}
         }
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|t| t.as_secs() as i64).unwrap_or(0);
-        Ok(match func {
-            "status" => json!({ "version": crate::helper::VERSION, "host": host, "last_tick": now - 20, "log": h.2 }).to_string(),
-            "tick" => json!(["all well"]).to_string(),
-            "test" => {
-                let x = crate::helper::Settings::parse(&h.1);
-                let mut out = Map::new();
-                for (name, c) in [("telegram", &x.telegram), ("ntfy", &x.ntfy), ("discord", &x.discord), ("homeassistant", &x.homeassistant), ("webhook", &x.webhook)] {
-                    if c.on {
-                        out.insert(name.into(), json!("ok"));
-                    }
-                }
-                Value::Object(out).to_string()
-            }
-            "uninstall" => {
-                h.0.remove(host);
-                "removed".into()
-            }
-            _ => return Err(ApiError { code: "UNKNOWN_XENAPI_PLUGIN_FUNCTION".into(), details: vec![func.into()] }),
-        })
+        Ok(())
     }
     fn helper_settings(&self) -> Result<String, ApiError> {
         std::thread::sleep(Duration::from_millis(100));
-        Ok(self.helper.lock().unwrap().1.clone())
+        Ok(self.helper.lock().unwrap().settings.clone())
     }
     fn save_helper_settings(&self, text: &str, autostart: &[(String, bool)]) -> Result<(), ApiError> {
         said("pool.add_to_other_config", &[json!(crate::helper::KEY), json!("…")]);
         demo_work(400);
-        self.helper.lock().unwrap().1 = text.to_string();
+        self.helper.lock().unwrap().settings = text.to_string();
         let mut d = self.data.lock().unwrap();
         for (vm, on) in autostart {
             if let Some(v) = d.vms.iter_mut().find(|v| v.rref == *vm) {

@@ -1,6 +1,6 @@
 [package]
 name = "simple-vm-manager"
-version = "1.27.3"
+version = "1.29.0"
 edition = "2021"
 description = "A simple desktop console for XenServer / XCP-ng pools and their VMs' screens (Linux, Windows, macOS)"
 license = "MIT"
@@ -26,6 +26,7 @@ rfd = "0.18" # the system's file chooser (an XDG portal on Linux), to pick ISO f
 pollster = "1" # waits for the file chooser on a worker thread
 tar = { version = "0.4", default-features = false } # unpacks a new version's archive (updates)
 ruzstd = "0.7" # reads what a .xva compressed with zstd holds, before it is imported
+roxmltree = "0.21" # reads .ovf descriptors and VMware's SOAP answers (VM Conversion)
 
 # egui's wgpu comes without the DirectX 12 backend; Windows needs it (it also has a software fallback,
 # WARP, for computers without a graphics driver).

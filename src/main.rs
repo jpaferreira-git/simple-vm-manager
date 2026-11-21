@@ -6,6 +6,7 @@ mod alerts;
 mod app;
 mod cloudinit;
 mod conn;
+mod convert;
 mod console;
 mod details;
 mod helper;
@@ -42,6 +43,13 @@ struct Args {
 }
 
 fn main() -> eframe::Result {
+    // asked by ssh for a password (VM Conversion reads Proxmox's disks over SSH): say it, and end
+    if std::env::var_os(convert::proxmox::ASKPASS).is_some() {
+        if let Ok(p) = std::env::var(convert::proxmox::ASKPASS_SECRET) {
+            println!("{}", p);
+        }
+        return Ok(());
+    }
     // --screenshot <file.png>: start with the demo server, draw about 120 frames, save the window, exit.
     // --show home|welcome|objects|networks|storage|isos|search|logs|vm|console|add-server|confirm|about|iso|
     // iso-advanced|iso-error|iso-disconnect|iso-describe|iso-upload|
@@ -51,7 +59,7 @@ fn main() -> eframe::Result {
     // make-template-snapshot|copy-vm|copy-vm-thin|template-made|vm-off|vm-edited|vm-bios|vm-rename|host|host-off|host-waking|
     // host-maintenance|host-in-maintenance|host-exit-maintenance|vm-performance|host-performance|alerts|alerts-all|alerts-dismissed|alert-rules|
     // export|export-off|exporting|new-vm-import|importing|snapshots-page|snapshots-ticked|schedules|schedule-edit|schedule-new|
-    // schedule-pick|take-snapshots|details|details-search|change-ip|new-vm-snapshot|new-vm-copying|new-vm-cloud-init|new-vm-user-data|vm-usb|vm-usb-add|backup|restore|toolstack|renew-cert|status-report|root-password|pool-actions|vm-actions|host-actions|sr-alert-rules|helper|activities|log-detail picks what the screenshot shows (default: a VM's
+    // schedule-pick|take-snapshots|details|details-search|change-ip|new-vm-snapshot|new-vm-copying|new-vm-cloud-init|new-vm-user-data|vm-usb|vm-usb-add|backup|restore|toolstack|renew-cert|status-report|root-password|pool-actions|vm-actions|host-actions|sr-alert-rules|helper|advisor|activities|log-detail picks what the screenshot shows (default: a VM's
     // General tab; welcome is Home with no server; storage, search, logs, console and isos show that
     // tab; iso-describe an ISO's description being typed; iso-upload a demo upload under way, -done its
     // finished card; iso-upload-choose and -web the Upload dialog's two steps; sr-unmounted the ISO

@@ -1,7 +1,7 @@
 # Simple VM Manager and XenCenter
 
 What Simple VM Manager does next to XenCenter, the official Windows console for XenServer, as of
-Simple VM Manager **1.27.3** (November 2026). Simple VM Manager covers what a small or home pool
+Simple VM Manager **1.29.0** (November 2026). Simple VM Manager covers what a small or home pool
 uses most, and adds a few things XenCenter doesn't do; the big-pool features (high availability,
 Workload Balancing, Active Directory…) are left to XenCenter. The XenCenter column follows the
 XenCenter 2026.6.0 manual.
@@ -115,8 +115,12 @@ Spotted a mistake? [Open an issue](https://github.com/jpaferreira-git/simple-vm-
 | | Simple VMM | XenCenter |
 |---|:---:|:---:|
 | .xva files | ✅ | ✅ |
-| OVF and OVA packages, disk images (VHD, VMDK) | ❌ | ✅ |
-| VMs from VMware (Conversion Manager) | ❌ | ✅ |
+| OVF and OVA packages, disk images (VHD, VMDK) | ✅ | ✅ |
+| Disk images from Hyper-V, Proxmox, KVM and VirtualBox (VHDX, QCOW2, VDI), and VMware .vmx | ✅ | ❌ |
+| VMs from VMware ESXi or vCenter (XenCenter: through its Conversion Manager appliance, for Premium Edition) | ✅ | ✅ |
+| VMs from Proxmox | ✅ | ❌ |
+| The networks the converted VMs need, made first (a missing VLAN) | ✅ | ❌ |
+| Disks copied straight from the source into the pool, not through your computer | ✅⁴ | ✅ |
 
 ## Storage
 
@@ -151,6 +155,7 @@ Spotted a mistake? [Open an issue](https://github.com/jpaferreira-git/simple-vm-
 | The pool emails its alerts | ✅ | ✅ |
 | A storage-full alert on EXT, XFS, NFS or SMB storage (XenServer can't raise it there) | ✅³ | ❌ |
 | Alerts on your phone: Telegram, ntfy, Discord, Home Assistant, webhooks | ✅² | ❌ |
+| The pool checked every day against good practice, with why and what to do (the Advisor, in Claude's words) | ✅² | ❌ |
 | A log of what was done | ✅ | ✅ |
 | SNMP and NRPE monitoring | ❌ | ✅ |
 
@@ -158,5 +163,8 @@ Spotted a mistake? [Open an issue](https://github.com/jpaferreira-git/simple-vm-
 
 1. Built from source (`cargo run --release`): only Linux has a ready-made download, and only
    Linux is tested.
-2. With the optional [Server Helper](../helper/), set up from a pool's *Helper* tab.
-3. While the app is open; always, with the Server Helper.
+2. With the optional [Helper VM](../helper-vm/), a small VM in the pool; a pool's *Helper* tab
+   shows it, and how to set it up.
+3. While the app is open; always, with the Helper VM.
+4. With the [Helper VM](../helper-vm/), for disks it can read itself (VMware's, and Proxmox's
+   raw ones); XenCenter's Conversion Manager appliance does it for VMware.

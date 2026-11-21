@@ -29,7 +29,9 @@ to XenCenter, feature by feature: [Simple VM Manager and XenCenter](docs/xencent
 | ![Adding NFS storage for VMs](docs/screenshot-dark-new-storage.png) | ![Moving a VM](docs/screenshot-dark-move-vm.png) |
 | ![Exporting a running VM to a file](docs/screenshot-dark-export.png) | ![A new VM from a .xva file](docs/screenshot-dark-import.png) |
 | ![Your networks](docs/screenshot-dark-networks.png) | ![Adding a network on a VLAN](docs/screenshot-dark-new-network.png) |
-| ![The Server Helper: alerts on your phone, and what it does by itself](docs/screenshot-dark-helper.png) | ![A server's Actions](docs/screenshot-dark-server-actions.png) |
+| ![The Advisor: each pool checked against good practice, in Claude's words](docs/screenshot-dark-advisor.png) | ![A pool's Helper VM: how it's doing, and where alerts go](docs/screenshot-dark-helper.png) |
+| ![A server's Actions](docs/screenshot-dark-server-actions.png) | |
+| ![Bringing VMs over from VMware, Proxmox or disk files](docs/screenshot-dark-convert.png) | ![Preparing them, then converting](docs/screenshot-dark-convert-prepare.png) |
 
 ## Features
 
@@ -89,34 +91,34 @@ to XenCenter, feature by feature: [Simple VM Manager and XenCenter](docs/xencent
   - *Server Status Report…* (also in a pool's *Actions*) gathers each chosen server's logs and settings
     into a .tar.bz2 file, as XenServer's support asks for them, or to look into a problem
     yourself (a snapshot schedule that didn't run, say).
-- **Server Helper** (optional) — a pool's *Helper* tab sets up a small open-source add-on on its
-  servers ([helper/](helper/): one XAPI plugin and a cron line), so they do more while the app is
-  closed:
-  - the pool's alerts on your phone: Telegram, ntfy, Discord, Home Assistant or any webhook, as
-    bad as you choose, with quiet hours (only critical ones then);
-  - any storage fuller than a limit (EXT, XFS, NFS and SMB can't tell XenServer's own monitor);
-  - a snapshot schedule's missed time made up (XenServer's plugin never does it);
-  - shared storage mounted again on a server that started before the NAS;
-  - VMs started in order, with a wait between them, when the pool starts.
-
-  Each server gets it from its Console: *Type in its console* types the install command there
-  (or copy it, for SSH). The command fetches it from this repository, for this app's version, and
-  checks its SHA-256 first. Its settings live in the pool; *Remove* takes it off every server.
-  It's given as it is, with no warranty: read it before you install it, as the tab asks.
-- **Helper VM** (optional, new) — the same work, and more, done from a small Linux VM instead
-  of the servers ([helper-vm/](helper-vm/)). It goes through the pool's API, with the servers'
-  certificates pinned: nothing is installed on them, and it never uses SSH. One script,
-  `helper-vm/setup.sh`, prepares the VM and asks its questions step by step. On top of the
-  Server Helper's work, it:
+- **Helper VM** (optional) — a small Linux VM in the pool that looks after it, also while the
+  app is closed ([helper-vm/](helper-vm/)). It goes through the pool's API, with the servers'
+  certificates pinned: nothing is installed on the servers, and it never uses SSH to them. One
+  script, `helper-vm/setup.sh`, prepares the VM and asks its questions step by step; a pool's
+  *Helper* tab shows how it's doing, and sets where alerts go and what it does by itself. It:
+  - sends the pool's alerts to your phone: Telegram, ntfy, Discord, Home Assistant or any
+    webhook, as bad as you choose, with quiet hours (only critical ones then); *Send a test*
+    has it send one now;
   - tells you when a server stops answering, or the whole pool can't be reached (that one
     straight to your phone);
-  - watches services you name (Home Assistant, the NAS…) and the servers' clocks;
+  - watches any storage's fullness (EXT, XFS, NFS and SMB can't tell XenServer's own monitor),
+    services you name (Home Assistant, the NAS…) and the servers' clocks;
+  - makes up a snapshot schedule's missed time (XenServer's plugin never does it), mounts shared
+    storage again on a server that started before the NAS, and starts VMs in order, with a wait
+    between them, when the pool starts;
   - backs up the VMs you pick, and the pool's database, to a NAS share each night;
-  - sends a weekly health review of the pool.
+  - sends a weekly health review of the pool, and checks it every day for the Advisor.
 
-  Claude explains serious alerts and writes the review. It uses your Claude subscription through
-  Claude Code (no extra cost), or an API key. Claude Code can be installed on the VM, ready to
-  look after the pool with you from its terminal.
+  Claude explains serious alerts, writes the review and words the Advisor's checks. It uses your
+  Claude subscription through Claude Code (no extra cost; you sign in by scanning a QR code with
+  your phone), or an API key. Claude Code can be installed on the VM, ready to look after the
+  pool with you from its terminal.
+- **Advisor** — the toolbar's checklist of good practice for each pool, from its Helper VM:
+  backups (every VM, the pool's database, snapshot schedules), storage (room left, forgotten
+  disks, old snapshots), servers (answering, clocks, updates, memory), VMs (VM Tools, starting by
+  themselves after a power cut) and security (certificates, alerts reaching you). Each check
+  says how it went; a click shows why it matters and what to do, in Claude's words, and Claude
+  adds what else it notices. It's checked once a day; *Check now* asks for it at once.
 - **Change Root Password** — in a pool's *Actions*: the root password of every
   server of the pool, after the current one; the app goes on with the new one, and keeps it in the
   keychain when the old one was kept there.
@@ -272,6 +274,26 @@ to XenCenter, feature by feature: [Simple VM Manager and XenCenter](docs/xencent
   cards), then its name, server, storage and network are yours to choose, and it can start once
   it's in; a template comes in as a template. Both go under Activities with how much and how fast,
   and *Stop* in their details; a stopped one leaves nothing behind.
+- **VM Conversion** — *Convert* on the toolbar brings VMs over from **VMware** (ESXi or vCenter),
+  **Proxmox**, or **disk files** (.ova, .ovf, .vmx, .vmdk, .vhd, .vhdx, .qcow2, .vdi, .img; or drop
+  one on the window), with no appliance to install and no extra license. *Add a Source* connects
+  to a server (its password in your keychain), and its VMs are listed with their system, CPUs,
+  memory, disks, boot mode and whether they're ready. Tick some, then *Convert*:
+  1. **Where and how:** the server and storage, with how much it takes there (only what's
+     written, on thin storage). Each of their networks becomes one of the pool's; a VLAN the pool
+     doesn't have is made first. They keep their MAC addresses, and each one gets the template
+     that fits its system.
+  2. **Prepare and go:** so it starts on XenServer, each VM is prepared while it still runs at its
+     source. Windows gets the disk drivers XenServer shows it turned on, and Linux gets Xen's
+     drivers in its boot image, with its network cards keeping their names. *Run it for me* does
+     it through VMware Tools or Proxmox's guest agent; otherwise *Copy* gives the one-line command
+     to paste in the VM. Then the VMs are shut down at their source, made on the pool, their disks
+     copied (only the parts that hold something), and started.
+
+  The *Conversions* tab follows each one step by step, with its speed and time left, and *Cancel*,
+  *Log* and *Try Again*. One that fails is taken off the pool again, and the originals are never
+  changed. The disks pass through this computer, or, with the [Helper VM](helper-vm/), go straight
+  from VMware or Proxmox into the pool.
 - **Delete VM** — last in a VM's *Actions*, or on its right-click menu. It asks first, and its disks go too unless unticked (a disk another VM also uses stays);
   its snapshots go with it, and ISO files in its DVD drive aren't touched. A VM that's on is
   turned off first, the button saying so ("Shut down and delete").

@@ -419,7 +419,7 @@ impl App {
         let conn = s.conn.clone();
         let want = d.hosts.iter().filter(|h| h.is_up()).map(|h| (h.rref.clone(), h.uuid.clone(), h.address.clone())).collect();
         self.poll_hosts(ui.ctx(), &conn, want);
-        // the Server Helper's card while it's on none of its servers (unless put away)
+        // the Helper VM's card while the pool has none (unless put away)
         let card_key = conn.hostname().to_lowercase();
         if let Some(id) = sel.sid {
             if !self.helper_hidden.contains(&card_key) {
@@ -431,7 +431,7 @@ impl App {
         let Some(s) = sel.sid.and_then(|id| this.server(id)) else { return };
         let Some(d) = s.data.as_ref() else { return };
         let up: Vec<&HostInfo> = d.hosts.iter().filter(|h| h.is_up()).collect();
-        let helper_card = !this.helper_hidden.contains(&card_key) && this.helper.get(&s.id).map_or(false, |v| v.checked.is_some() && !v.hosts.is_empty() && v.hosts.iter().all(|(_, p)| !p.installed()) && v.hosts.iter().any(|(_, p)| *p == crate::helper::Presence::Missing));
+        let helper_card = !this.helper_hidden.contains(&card_key) && this.helper.get(&s.id).is_some_and(|v| v.none());
 
         // one line: its version and its license (the rest, and what's wrong, in its Details)
         let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|t| t.as_secs() as i64).unwrap_or(0);

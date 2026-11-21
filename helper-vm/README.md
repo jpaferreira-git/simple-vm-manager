@@ -2,7 +2,7 @@
 
 A small Linux VM that looks after your XenServer or XCP-ng pool from outside it, through the
 pool's own API. **Nothing is installed on the servers.** It replaces the Server Helper add-on that
-ran in dom0 (`helper/`). If that add-on is on your servers, its setup offers to remove it.
+once ran in dom0: if that add-on is still on your servers, its setup offers to remove it.
 
 ## What it does
 
@@ -20,7 +20,18 @@ ran in dom0 (`helper/`). If that add-on is on your servers, its setup offers to 
 - Mounts shared storage again on a server that started before the NAS was up.
 - Starts the VMs on its list in order, once, after the pool starts.
 
+**When Simple VM Manager converts VMs** (VMware or Proxmox, its Convert page): copies their
+disks straight from the source into the pool, so they don't pass through your computer. It
+reads them over HTTPS from ESXi or vCenter, and over SSH from Proxmox (the source's password
+comes from the app for each copy, in a XenAPI secret, and isn't kept).
+
 **Every hour**: compares each server's clock with the right time (NTP).
+
+**Every day**: checks the pool against good practice for Simple VM Manager's **Advisor** page:
+backups, room on the storage, forgotten disks and old snapshots, the servers' clocks, updates and
+memory, VM Tools, VMs that don't start by themselves after a power cut, certificates, and whether
+alerts reach you. Claude says why each thing matters and what to do, and adds what else it notices.
+The app's *Check now* has it check at once, and its *Send a test* has it send a test alert.
 
 **On its schedule**
 - **Backups** to an NFS share: the VMs you pick, as `.xva` files taken from a snapshot. It
@@ -72,6 +83,7 @@ Setup offers three ways for the helper to use Claude:
 | `svm-helper check` | one look now |
 | `svm-helper test` | a test alert to your channels |
 | `svm-helper review [--send]` | this week's review, now |
+| `svm-helper advise` | the Advisor's checklist, now (the app shows it too) |
 | `svm-helper backup ["VM" …]` | the backups now, or just the VMs named |
 | `svm-helper xapi 'expr'` | one Python expression on the pool's API (`x` = `session.xenapi`) |
 | `svm-helper shell` | a Python shell on the pool's API |
@@ -82,7 +94,8 @@ Setup offers three ways for the helper to use Claude:
 
 - It logs in to the pool with its password, over HTTPS. Setup pins the servers' certificates:
   if a certificate changes, it stops and tells you instead of trusting it.
-- It never uses SSH, and nothing runs in the servers' dom0.
+- It never uses SSH to the pool's servers, and nothing runs in their dom0. (It uses SSH only to
+  read a Proxmox VM's disks that you convert, while it copies them.)
 - The service runs as the unprivileged user `svm-helper`, in a systemd sandbox. It can write
   only to its own folder and to the backups share.
 - While you sign in to Claude, setup serves that one page, at a random link, and stops when
@@ -90,6 +103,7 @@ Setup offers three ways for the helper to use Claude:
 - The pool's password, and Claude's token or API key, are in `/etc/svm-helper/secrets.json`,
   readable only by root and the helper. Setup asks before it adds your user to the helper's group.
 - Where alerts go is kept in the pool's `other_config` (`svm-helper`), as before. The helper's
-  heartbeat goes in `svm-helper-vm`.
+  heartbeat goes in `svm-helper-vm`, the Advisor's checklist in `svm-helper-advice`, and what the
+  app asks of it in `svm-helper-request`.
 
 Free software under the MIT license, given as it is, with no warranty.

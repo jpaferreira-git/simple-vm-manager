@@ -1530,14 +1530,6 @@ impl ConsoleView {
         }
     }
 
-    /// Types `text` on its keyboard, a key for each character (no Enter at the end).
-    pub fn type_text(&self, text: &str) {
-        if let Some(r) = &self.remote {
-            let gap = if self.host { Duration::ZERO } else { Duration::from_millis(12) };
-            r.send(Input::Type { groups: typing_keys(text, self.host).0, gap, shown: false });
-        }
-    }
-
     fn tap(&self, keysym: u32, scancode: u32) {
         self.send_key(true, keysym, scancode);
         self.send_key(false, keysym, scancode);

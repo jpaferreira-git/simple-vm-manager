@@ -139,18 +139,18 @@ case $PM in
   apt)
     export DEBIAN_FRONTEND=noninteractive
     run "Refreshing the package lists" apt-get update -q || die "apt-get update failed."
-    run "Python, the NFS client and the rest" apt-get install -y -q python3 python3-venv nfs-common ca-certificates curl || die "The packages couldn't be installed."
+    run "Python, the NFS client and the rest" apt-get install -y -q python3 python3-venv nfs-common ca-certificates curl openssh-client || die "The packages couldn't be installed."
     if apt-cache show xe-guest-utilities >/dev/null 2>&1; then
       run "XenServer's guest tools (the pool sees this VM's address)" apt-get install -y -q xe-guest-utilities || warn "Skipped the guest tools"
     fi
     systemctl enable --now systemd-timesyncd >>"$LOG" 2>&1 || true
     ;;
   dnf)
-    run "Python, the NFS client and the rest" dnf install -y -q python3 nfs-utils ca-certificates curl || die "The packages couldn't be installed."
+    run "Python, the NFS client and the rest" dnf install -y -q python3 nfs-utils ca-certificates curl openssh-clients || die "The packages couldn't be installed."
     systemctl enable --now chronyd >>"$LOG" 2>&1 || true
     ;;
   pacman)
-    run "Python, the NFS client and the rest" pacman -Sy --noconfirm --needed python nfs-utils ca-certificates curl || die "The packages couldn't be installed."
+    run "Python, the NFS client and the rest" pacman -Sy --noconfirm --needed python nfs-utils ca-certificates curl openssh || die "The packages couldn't be installed."
     systemctl enable --now systemd-timesyncd >>"$LOG" 2>&1 || true
     ;;
 esac
