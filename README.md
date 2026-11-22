@@ -100,7 +100,9 @@ to XenCenter, feature by feature: [Simple VM Manager and XenCenter](docs/xencent
   adds five to ten findings of its own, from each VM's and server's details and week's load. Where
   the app can, a button fixes it: turn on *Start with the server*, eject ISOs left in drives,
   delete old snapshots or unused disks (each asked first), or open the dialog that does it (a
-  schedule, the updates, a certificate). It's checked once a day; *Check now* asks for it at once.
+  schedule, the updates, a certificate). *Dismiss* takes a check off the list, and *Explain to
+  Claude* tells Claude what it can't see ("it's off on purpose"): it looks again with that in mind.
+  It's checked once a day; *Check now* asks for it at once (it shows under Activities meanwhile).
   When the Helper VM is older than the app, *Update it* has it install the app's version itself.
 - **Change Root Password** — in a pool's *Actions*: the root password of every
   server of the pool, after the current one; the app goes on with the new one, and keeps it in the

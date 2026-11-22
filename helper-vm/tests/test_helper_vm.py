@@ -571,6 +571,40 @@ class Advisor(unittest.TestCase):
         self.assertEqual((out[2]["by"], out[2]["topic"], out[2]["id"]), ("claude", "vms", "claude_1"))
         self.assertIsNone(h.json_answer("no JSON here"))
 
+    def test_what_the_owner_said(self):
+        notes = h.notes_of({h.NOTES_KEY: json.dumps({"dismissed": {"ha": {"title": "No HA", "at": 1}, "claude:old one": {"title": "Old one", "at": 2}}, "said": {"clocks": {"title": "Clock off", "text": "godofredo has no NTP on purpose", "at": 3}, "empty": {"title": "x", "text": " "}}})})
+        self.assertEqual(sorted(notes["dismissed"]), ["claude:old one", "ha"])
+        self.assertEqual(list(notes["said"]), ["clocks"])
+        self.assertEqual(h.notes_of({h.NOTES_KEY: "not json"}), {"dismissed": {}, "said": {}})
+        # what Claude gets
+        said = h.owner_words(notes)
+        self.assertEqual(said["dismissed"], ["No HA", "Old one"])
+        self.assertEqual(said["explained"], [{"title": "Clock off", "they_said": "godofredo has no NTP on purpose", "id": "clocks"}])
+        prompts = []
+        claude = h.Claude(h.merged(h.DEFAULT_CONFIG, {"claude": {"auth": "off"}}), {})
+        claude.write = lambda system, prompt, **kw: prompts.append(prompt) or "{}"
+        claude.advise([], {}, notes)
+        self.assertIn("godofredo has no NTP on purpose", prompts[0])
+        claude.advise([], {}, {"dismissed": {}, "said": {}})
+        self.assertNotIn("What the owner said", prompts[1])
+        # Claude may change the status of a check the owner explained, and only of that one
+        checks = [{"id": "clocks", "topic": "servers", "status": "bad", "title": "Clock off", "note": "", "objects": []}, {"id": "ha", "topic": "servers", "status": "warn", "title": "No HA", "note": "", "objects": []}]
+        out = h.worded(checks, {"checks": {"clocks": {"status": "ok", "note": "Como você disse."}, "ha": {"status": "ok"}}}, notes)
+        self.assertEqual([c["status"] for c in out], ["ok", "warn"])
+        self.assertEqual((h.check_key(out[0]), h.check_key({"by": "claude", "title": " Old One "})), ("clocks", "claude:old one"))
+
+    def test_dismissed_ones_marked_and_not_counted(self):
+        fp = advisor_pool()
+        conf = h.merged(h.DEFAULT_CONFIG, {"claude": {"auth": "off"}})
+        first = h.write_advice(FakeConn(fp.x), conf, {})
+        worst = next(c for c in first["checks"] if c["status"] != "ok")
+        fp.other_config[h.NOTES_KEY] = json.dumps({"dismissed": {h.check_key(worst): {"title": worst["title"], "at": 1}}, "said": {}})
+        advice = h.write_advice(FakeConn(fp.x), conf, {})
+        marked = [c for c in advice["checks"] if c.get("dismissed")]
+        self.assertEqual([c["id"] for c in marked], [worst["id"]])
+        kept = h.load_json(h.state_path("advice"), {})
+        self.assertEqual(kept[worst["status"]], sum(c["status"] == worst["status"] for c in first["checks"]) - 1)
+
     def setUp(self):
         # (its looks save the helper's state: the other tests' is put back after)
         self.kept = {n: open(h.state_path(n)).read() for n in ("state", "advice", "test") if os.path.exists(h.state_path(n))}

@@ -291,8 +291,30 @@ pub fn run(conn: &dyn Connection, plan: &Plan, r: &UpdateRun, restarting: &dyn F
         }
         r.end(i, StepState::Done, "");
     }
+    // each server taking VMs before or not: as it is after. (Installing stops a server taking VMs,
+    // as XenServer does it, and nothing starts it again; a restart may.)
+    let took: std::collections::HashMap<String, bool> = plan.hosts.iter().map(|h| (h.rref.clone(), conn.host_enabled(&h.rref).unwrap_or(true))).collect();
     let (mut updated, mut restarted, mut later): (usize, usize, Vec<String>) = (0, 0, vec![]);
     for h in plan.hosts.iter().filter(|h| h.updates > 0 || (h.pending_restart && plan.restart)) {
+        let took = took.get(&h.rref).copied().unwrap_or(true);
+        // it takes VMs again, as it did before (a step only when it doesn't now)
+        let take_again = || {
+            if !took || conn.host_enabled(&h.rref).unwrap_or(false) {
+                return;
+            }
+            let i = r.begin(format!("{}: taking VMs again", h.name));
+            match conn.enable_host(&h.rref) {
+                Ok(()) => r.end(i, StepState::Done, ""),
+                Err(e) if e.code == "HOST_DISABLED_UNTIL_REBOOT" => {
+                    r.end(i, StepState::Failed, "XenServer lets it take VMs again only once it restarts");
+                    r.leave(format!("restart {}: it takes VMs again after that", h.name));
+                }
+                Err(e) => {
+                    r.end(i, StepState::Failed, plan.named(&e.message()));
+                    r.leave(format!("let {} take VMs again (Take VMs again, on its page)", h.name));
+                }
+            }
+        };
         let fail = |i: usize, e: String| -> Result<String, String> {
             let e = plan.named(&e);
             r.end(i, StepState::Failed, e.clone());
@@ -401,12 +423,13 @@ pub fn run(conn: &dyn Connection, plan: &Plan, r: &UpdateRun, restarting: &dyn F
             match conn.apply_updates(&h.rref, &plan.hash) {
                 Ok(said) => r.end(i, StepState::Done, said.join("; ")),
                 Err(e) => {
+                    let out = fail(i, e.message());
+                    take_again();
                     if emptied {
-                        let _ = conn.enable_host(&h.rref);
                         start_again(conn, r, plan, h, &stopped);
                         bring_back(&carried);
                     }
-                    return fail(i, e.message());
+                    return out;
                 }
             }
             updated += 1;
@@ -431,12 +454,15 @@ pub fn run(conn: &dyn Connection, plan: &Plan, r: &UpdateRun, restarting: &dyn F
             restarting(&h.rref, true);
             r.end(i, StepState::Done, "");
             restarted += 1;
-            let i = r.begin(format!("{}: taking VMs again", h.name));
-            match conn.enable_host(&h.rref) {
-                Ok(()) => r.end(i, StepState::Done, ""),
-                Err(e) => {
-                    r.end(i, StepState::Failed, plan.named(&e.message()));
-                    r.leave(format!("let {} take VMs again (XenCenter, or xe host-enable)", h.name));
+            // (one that didn't take VMs before, in maintenance, is left so)
+            if took {
+                let i = r.begin(format!("{}: taking VMs again", h.name));
+                match conn.enable_host(&h.rref) {
+                    Ok(()) => r.end(i, StepState::Done, ""),
+                    Err(e) => {
+                        r.end(i, StepState::Failed, plan.named(&e.message()));
+                        r.leave(format!("let {} take VMs again (Take VMs again, on its page)", h.name));
+                    }
                 }
             }
         } else {
@@ -447,9 +473,7 @@ pub fn run(conn: &dyn Connection, plan: &Plan, r: &UpdateRun, restarting: &dyn F
                     Err(e) => r.end(i, StepState::Failed, e.message()),
                 }
             }
-            if emptied {
-                let _ = conn.enable_host(&h.rref);
-            }
+            take_again();
             if reboot {
                 later.push(h.name.clone());
             }
@@ -920,6 +944,30 @@ pub fn now() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn servers_take_vms_after_as_before() {
+        // (the demo stops a server taking VMs as it installs, as XenServer does)
+        let conn = crate::conn::DemoConnection::new();
+        let found = conn.pool_updates().unwrap();
+        let d = conn.fetch(0).unwrap();
+        let hosts: Vec<PlanHost> = d
+            .hosts
+            .iter()
+            .map(|h| {
+                let lack = found.hosts.iter().find(|x| x.host == h.rref);
+                PlanHost { rref: h.rref.clone(), name: h.name.clone(), updates: lack.map_or(0, |x| x.updates.len()), restart: lack.map_or(false, |x| x.needs_restart()), pending_restart: false }
+            })
+            .collect();
+        assert!(hosts.iter().any(|h| h.updates > 0));
+        let took: Vec<bool> = hosts.iter().map(|h| conn.host_enabled(&h.rref).unwrap()).collect();
+        // installed, no restart now
+        let plan = Plan { hash: found.hash.clone(), restart: false, stuck: Stuck::Keep, hosts: hosts.clone(), vm_names: vec![], vms: vec![], srs: vec![], room: vec![] };
+        let r = UpdateRun::new(Arc::new(Trace::default()));
+        run(&conn, &plan, &r, &|_, _| {}).unwrap();
+        let after: Vec<bool> = hosts.iter().map(|h| conn.host_enabled(&h.rref).unwrap()).collect();
+        assert_eq!(after, took, "{:?}", r.left());
+    }
 
     #[test]
     fn said_with_names() {

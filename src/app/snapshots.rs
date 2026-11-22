@@ -103,8 +103,7 @@ impl App {
         }
         let mut asking = self.sched_asking.take();
         let mut acts = vec![];
-        egui::ScrollArea::vertical().id_salt("schedules").auto_shrink([false; 2]).show(ui, |ui| {
-            ui.set_max_width(ui.available_width().min(900.0));
+        egui::ScrollArea::vertical().id_salt("schedules").auto_shrink([false; 2]).show(ui, |ui| centered(ui, 900.0, 10.0, |ui| {
             ui.spacing_mut().item_spacing.y = 4.0;
             ui.add(egui::Label::new(egui::RichText::new("Each schedule takes a snapshot of its VMs by itself, at its times (shown in your time; the servers keep their own clock), and keeps the last few it took, deleting the oldest. A VM is on one schedule at most. A time missed (the server off then, or the schedule changed after it) is skipped till the next one.").size(12.0).color(pal.ink_faint)).wrap());
             ui.add_space(8.0);
@@ -149,7 +148,7 @@ impl App {
                 }
                 ui.add_space(8.0);
             }
-        });
+        }));
         self.sched_asking = asking;
         out.extend(acts);
     }

@@ -34,7 +34,9 @@ server, systems past their support, VMs off for months or at their limit all wee
 start by themselves after a power cut, certificates, and whether alerts reach you. It reads each
 server's and each VM's load over the week for it. Claude, given all of it, says why each thing
 matters and what to do, and adds five to ten findings of its own. The app's *Check now* has it
-check at once, and its *Send a test* has it send a test alert.
+check at once, and its *Send a test* has it send a test alert. On the Advisor you can dismiss a
+check (it's left out from then on, and Claude doesn't bring it up again), or explain one to
+Claude ("it's off on purpose: it's the spare"): it checks the pool again and goes by what you said.
 
 **When the app asks**: it updates itself to the version that app comes with (the Advisor's and the
 Helper tab's *Update it*).
@@ -109,7 +111,8 @@ Setup offers three ways for the helper to use Claude:
 - The pool's password, and Claude's token or API key, are in `/etc/svm-helper/secrets.json`,
   readable only by root and the helper. Setup asks before it adds your user to the helper's group.
 - Where alerts go is kept in the pool's `other_config` (`svm-helper`), as before. The helper's
-  heartbeat goes in `svm-helper-vm`, the Advisor's checklist in `svm-helper-advice`, and what the
-  app asks of it in `svm-helper-request`.
+  heartbeat goes in `svm-helper-vm`, the Advisor's checklist in `svm-helper-advice`, what the
+  app asks of it in `svm-helper-request`, and what you dismissed or explained on the Advisor in
+  `svm-helper-notes`.
 
 Free software under the MIT license, given as it is, with no warranty.

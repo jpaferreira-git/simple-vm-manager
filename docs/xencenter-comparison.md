@@ -140,7 +140,7 @@ Spotted a mistake? [Open an issue](https://github.com/jpaferreira-git/simple-vm-
 
 | | Simple VMM | XenCenter |
 |---|:---:|:---:|
-| Every network; a new one on a VLAN or private; MTU; delete | ✅ | ✅ |
+| Every network; a new one on a VLAN or private; MTU; edit (name, MTU, VLAN); delete | ✅ | ✅ |
 | Bonds | ❌ | ✅ |
 | SR-IOV | ❌ | ✅ |
 

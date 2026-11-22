@@ -67,7 +67,7 @@ import urllib.parse
 import urllib.request
 import xmlrpc.client
 
-VERSION = "2.3.0"
+VERSION = "2.4.0"
 REPO = "jpaferreira-git/simple-vm-manager"
 CONF_DIR = os.environ.get("SVM_HELPER_CONF", "/etc/svm-helper")
 CONFIG = os.path.join(CONF_DIR, "config.json")
@@ -958,8 +958,9 @@ class Claude:
         prompt = "The pool's snapshot:\n" + json.dumps(snapshot, ensure_ascii=False, indent=1)
         return self.write(system, prompt, effort="medium", max_tokens=16000)
 
-    def advise(self, checks, snapshot):
-        """Its words for the Advisor's checklist: JSON, as text (see worded)."""
+    def advise(self, checks, snapshot, notes=None):
+        """Its words for the Advisor's checklist: JSON, as text (see worded). `notes`: what the
+        owner said about earlier checks (see notes_of)."""
         system = (
             "You are an experienced XenServer administrator checking a small pool at someone's home "
             "against good practice, for the Advisor page of Simple VM Manager, the app they manage it "
@@ -984,10 +985,20 @@ class Claude:
             "looked at. Each has a topic (backups, storage, servers, vms or security), a status, a "
             "title and a note (none for ok). Don't repeat the helper's checks, and don't invent what "
             "the JSON doesn't show.\n\n"
+            "3. The owner may have said something about earlier findings (JSON: dismissed, the "
+            "titles of those they took off the list; explained, a finding's id or title with what "
+            "they told you about it). Don't bring up a dismissed one again, unless something has "
+            "clearly changed for the worse. Go by what they explained: when it settles a finding (it's "
+            "like that on purpose, or taken care of), give it status ok (for one of the checks too: "
+            "put \"status\" in its entry) with a note that says so in a few words; when it doesn't, "
+            "word the finding with what they said in mind.\n\n"
             "Answer with JSON only, no markdown: "
-            '{"checks": {"<id>": {"title": "...", "note": "..."}}, "more": [{"topic": "...", "status": "...", "title": "...", "note": "..."}]}' % self.language
+            '{"checks": {"<id>": {"title": "...", "note": "...", "status": "only if the owner explained it"}}, "more": [{"topic": "...", "status": "...", "title": "...", "note": "..."}]}' % self.language
         )
         prompt = "The checks:\n%s\n\nThe pool's snapshot:\n%s" % (json.dumps(checks, ensure_ascii=False, indent=1), json.dumps(snapshot, ensure_ascii=False))
+        said = owner_words(notes or {})
+        if said["dismissed"] or said["explained"]:
+            prompt += "\n\nWhat the owner said about earlier findings:\n" + json.dumps(said, ensure_ascii=False, indent=1)
         return self.write(system, prompt, effort="high", max_tokens=16000)
 
 
@@ -1711,6 +1722,7 @@ def write_review(pool, conf, secrets, send_it=True):
 
 ADVICE_KEY = "svm-helper-advice"  # the checklist, for the app's Advisor page (JSON in the pool)
 REQUEST_KEY = "svm-helper-request"  # what the app asks for: {"advice": when, "test": when}
+NOTES_KEY = "svm-helper-notes"  # what the owner said about the Advisor's checks (dismissed, explained)
 TOPICS = ["backups", "storage", "servers", "vms", "security"]
 
 
@@ -2018,15 +2030,52 @@ def json_answer(text):
     return v if isinstance(v, dict) else None
 
 
-def worded(checks, words):
-    """The checks with Claude's words: each one's title and note in the owner's language, and
-    up to ten findings of its own (by: claude)."""
+def check_key(c):
+    """What knows a check from one look to the next (as the app's Check::key): the helper's own
+    keep their id; Claude's findings are numbered anew each time, so theirs is their title."""
+    if c.get("by") == "claude":
+        return "claude:" + str(c.get("title", "")).strip().lower()
+    return c.get("id", "")
+
+
+def notes_of(other_config):
+    """What the owner said about the Advisor's checks, as the app left it in the pool (NOTES_KEY):
+    {"dismissed": {key: {"title", "at"}}, "said": {key: {"title", "text", "at"}}}."""
+    try:
+        v = json.loads((other_config or {}).get(NOTES_KEY, "") or "{}")
+    except ValueError:
+        return {"dismissed": {}, "said": {}}
+    v = v if isinstance(v, dict) else {}
+    pick = lambda k: {key: e for key, e in v.get(k).items() if isinstance(e, dict)} if isinstance(v.get(k), dict) else {}
+    return {"dismissed": pick("dismissed"), "said": {k: e for k, e in pick("said").items() if str(e.get("text", "")).strip()}}
+
+
+def owner_words(notes):
+    """The owner's notes as Claude gets them: the titles dismissed, and what they explained
+    (about a check by its id, else by its title)."""
+    dismissed = [str(e.get("title", "")) for e in notes.get("dismissed", {}).values() if e.get("title")]
+    explained = []
+    for key, e in notes.get("said", {}).items():
+        about = {"title": str(e.get("title", "")), "they_said": str(e.get("text", ""))[:600]}
+        if not key.startswith("claude:"):
+            about["id"] = key
+        explained.append(about)
+    return {"dismissed": dismissed[:50], "explained": explained[:50]}
+
+
+def worded(checks, words, notes=None):
+    """The checks with Claude's words: each one's title and note in the owner's language (and,
+    for one the owner explained, the status Claude gave it then), and up to ten findings of its
+    own (by: claude)."""
     out = [dict(c) for c in checks]
     w = words.get("checks") if isinstance(words.get("checks"), dict) else {}
+    explained = (notes or {}).get("said", {})
     for c in out:
         said = w.get(c["id"])
         if not isinstance(said, dict):
             continue
+        if c["id"] in explained and said.get("status") in ("ok", "warn", "bad"):
+            c["status"] = said["status"]
         if isinstance(said.get("title"), str) and said["title"].strip():
             c["title"] = said["title"].strip()[:140]
         if isinstance(said.get("note"), str) and (said["note"].strip() or c["status"] == "ok"):
@@ -2050,25 +2099,33 @@ def write_advice(pool, conf, secrets, request=0):
     state = load_json(state_path("state"), {})
     load = week_load(pool)
     checks = advisor_checks(x, conf, state, load=load)
+    pool_ref = x.pool.get_all()[0]
+    notes = notes_of(x.pool.get_other_config(pool_ref))
     claude = Claude(conf, secrets)
     by = "plain"
     if claude.ready():
         words = None
         try:
-            words = json_answer(claude.advise(checks, snapshot_of_pool(x, state, load)))
+            words = json_answer(claude.advise(checks, snapshot_of_pool(x, state, load), notes))
         except Exception as e:
             log("Claude couldn't look at the Advisor's checklist: %s" % short_error(e))
         if words:
-            checks, by = worded(checks, words), "claude"
+            checks, by = worded(checks, words, notes), "claude"
         else:
             log("Claude's words for the Advisor didn't come: its checklist is plain this time")
+    # (the app leaves out those the owner dismissed; so do the counts)
+    for c in checks:
+        if c["status"] != "ok" and check_key(c) in notes["dismissed"]:
+            c["dismissed"] = True
     advice = {"version": 1, "at": int(time.time()), "by": by, "language": conf.get("language", "en") if by == "claude" else "en", "request": request, "checks": checks}
-    write_other_config(x, "pool", x.pool.get_all()[0], ADVICE_KEY, json.dumps(advice, ensure_ascii=False, sort_keys=True))
+    write_other_config(x, "pool", pool_ref, ADVICE_KEY, json.dumps(advice, ensure_ascii=False, sort_keys=True))
+    shown = [c for c in checks if not c.get("dismissed")]
+    bad, warn = sum(c["status"] == "bad" for c in shown), sum(c["status"] == "warn" for c in shown)
     try:
-        save_json(state_path("advice"), {"at": advice["at"], "by": by, "request": request, "bad": sum(c["status"] == "bad" for c in checks), "warn": sum(c["status"] == "warn" for c in checks)})
+        save_json(state_path("advice"), {"at": advice["at"], "by": by, "request": request, "bad": bad, "warn": warn})
     except OSError:
         pass
-    log("the Advisor's checklist: %d to fix, %d to look at, %d fine" % (sum(c["status"] == "bad" for c in checks), sum(c["status"] == "warn" for c in checks), sum(c["status"] == "ok" for c in checks)))
+    log("the Advisor's checklist: %d to fix, %d to look at, %d fine, %d dismissed" % (bad, warn, sum(c["status"] == "ok" for c in shown), len(checks) - len(shown)))
     return advice
 
 

@@ -1,6 +1,6 @@
 [package]
 name = "simple-vm-manager"
-version = "1.30.3"
+version = "1.31.0"
 edition = "2021"
 description = "A simple desktop console for XenServer / XCP-ng pools and their VMs' screens (Linux, Windows, macOS)"
 license = "MIT"

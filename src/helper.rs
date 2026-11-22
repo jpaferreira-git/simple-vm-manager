@@ -9,7 +9,9 @@
 //! - "svm-helper": its settings, set in a pool's Helper tab (JSON; `Settings`);
 //! - "svm-helper-vm": its heartbeat, every five minutes (`VmStatus`);
 //! - "svm-helper-advice": the Advisor's checklist (`Advice`);
-//! - "svm-helper-request": what this app asks of it, {"advice": when, "test": when}.
+//! - "svm-helper-request": what this app asks of it, {"advice": when, "test": when};
+//! - "svm-helper-notes": what the owner said about the Advisor's checks (`Notes`): those dismissed,
+//!   and what they explained to Claude.
 
 use serde_json::{json, Map, Value};
 
@@ -21,10 +23,12 @@ pub const VM_KEY: &str = "svm-helper-vm";
 pub const ADVICE_KEY: &str = "svm-helper-advice";
 /// What this app asks of it.
 pub const REQUEST_KEY: &str = "svm-helper-request";
+/// What the owner said about the Advisor's checks.
+pub const NOTES_KEY: &str = "svm-helper-notes";
 
 /// The Helper VM's version this app's own version comes with (helper-vm/svm-helper.py's VERSION, at
 /// this app's tag): an older one is offered an update to it.
-pub const LATEST: &str = "2.3.0";
+pub const LATEST: &str = "2.4.0";
 
 /// Whether version `a` ("2.0.3") is older than `b`.
 pub fn older(a: &str, b: &str) -> bool {
@@ -351,6 +355,84 @@ impl Advice {
     pub fn counts(&self) -> (usize, usize) {
         (self.checks.iter().filter(|c| c.status == Status::Bad).count(), self.checks.iter().filter(|c| c.status == Status::Warn).count())
     }
+
+    /// Without the checks the owner dismissed: those shown, and those dismissed.
+    pub fn split(&self, notes: &Notes) -> (Advice, Vec<Check>) {
+        let (gone, kept): (Vec<Check>, Vec<Check>) = self.checks.iter().cloned().partition(|c| c.status != Status::Ok && notes.dismissed.contains_key(&c.key()));
+        (Advice { checks: kept, ..self.clone() }, gone)
+    }
+}
+
+impl Check {
+    /// What knows it from one check to the next: the helper's own checks keep their id; Claude's
+    /// findings are numbered anew each time, so theirs is their title (helper-vm's check_key).
+    pub fn key(&self) -> String {
+        if self.by_claude {
+            format!("claude:{}", self.title.trim().to_lowercase())
+        } else {
+            self.id.clone()
+        }
+    }
+}
+
+/// What the owner said about the Advisor's checks, by check key (`Check::key`), kept in the pool
+/// (NOTES_KEY) for the Helper VM: the checks they dismissed (its title then, and when), which the
+/// Advisor no longer shows and Claude doesn't bring up again; and what they explained to Claude
+/// about one (its title, their words, when), which Claude goes by from its next look.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Notes {
+    pub dismissed: std::collections::BTreeMap<String, (String, i64)>,
+    pub said: std::collections::BTreeMap<String, (String, String, i64)>,
+}
+
+/// A change to the owner's notes on a check.
+#[derive(Clone, Debug, PartialEq)]
+pub enum NoteChange {
+    Dismiss,
+    /// Shown again.
+    Restore,
+    /// What they explain to Claude about it.
+    Explain(String),
+    /// What they explained, taken back.
+    Forget,
+}
+
+impl Notes {
+    pub fn parse(text: &str) -> Notes {
+        let Ok(j) = serde_json::from_str::<Value>(text) else { return Notes::default() };
+        let map = |k: &str| j.get(k).and_then(|m| m.as_object()).cloned().unwrap_or_default();
+        Notes {
+            dismissed: map("dismissed").into_iter().map(|(k, v)| (k, (s(&v, "title"), i(&v, "at")))).collect(),
+            said: map("said").into_iter().map(|(k, v)| (k, (s(&v, "title"), s(&v, "text"), i(&v, "at")))).filter(|(_, v)| !v.1.trim().is_empty()).collect(),
+        }
+    }
+
+    pub fn to_json(&self) -> String {
+        let dismissed: Map<String, Value> = self.dismissed.iter().map(|(k, (title, at))| (k.clone(), json!({"title": title, "at": at}))).collect();
+        let said: Map<String, Value> = self.said.iter().map(|(k, (title, text, at))| (k.clone(), json!({"title": title, "text": text, "at": at}))).collect();
+        json!({"version": 1, "dismissed": dismissed, "said": said}).to_string()
+    }
+
+    /// With `change` made to check `key` (its title `title`) at `now`.
+    pub fn with(mut self, key: &str, title: &str, change: &NoteChange, now: i64) -> Notes {
+        match change {
+            NoteChange::Dismiss => {
+                self.dismissed.insert(key.into(), (title.into(), now));
+            }
+            NoteChange::Restore => {
+                self.dismissed.remove(key);
+            }
+            NoteChange::Explain(text) if !text.trim().is_empty() => {
+                // (as long as a note may be: a few sentences)
+                let text: String = text.trim().chars().take(600).collect();
+                self.said.insert(key.into(), (title.into(), text, now));
+            }
+            NoteChange::Explain(_) | NoteChange::Forget => {
+                self.said.remove(key);
+            }
+        }
+        self
+    }
 }
 
 /// The request to leave in the pool: what was there, with `what` asked at `now`.
@@ -429,6 +511,26 @@ mod tests {
         assert_eq!(a.checks[0].fix, Some(Fix { action: "autostart".into(), uuids: vec!["u-1".into()], names: vec!["Plex".into()] }));
         let v = VmStatus::parse(r#"{"version": "2.3.0", "updates": 1, "update": {"ref": "v1.30.0", "at": 5, "ok": false, "error": "no network"}}"#).unwrap();
         assert_eq!((v.updates, v.update), (true, Some(("v1.30.0".into(), 5, false, "no network".into()))));
+    }
+
+    #[test]
+    fn notes_dismiss_and_explain() {
+        let c = |id: &str, by_claude: bool, title: &str, status: Status| Check { id: id.into(), topic: "vms".into(), status, title: title.into(), note: String::new(), objects: vec![], by_claude, fix: None };
+        let (ha, plex, fine) = (c("ha", false, "No HA", Status::Warn), c("claude_3", true, " Plex has too much memory ", Status::Warn), c("ntp", false, "Clocks agree", Status::Ok));
+        assert_eq!((ha.key(), plex.key()), ("ha".to_string(), "claude:plex has too much memory".to_string()));
+        let n = Notes::default().with(&ha.key(), &ha.title, &NoteChange::Dismiss, 5).with(&plex.key(), &plex.title, &NoteChange::Explain("  It transcodes 4K at night. ".into()), 6).with(&fine.key(), &fine.title, &NoteChange::Dismiss, 7);
+        // through the pool and back
+        let n = Notes::parse(&n.to_json());
+        assert_eq!(n.dismissed.get("ha"), Some(&("No HA".to_string(), 5)));
+        assert_eq!(n.said.get("claude:plex has too much memory").map(|s| s.1.as_str()), Some("It transcodes 4K at night."));
+        // the dismissed ones apart (a fine one can't be: there's nothing to dismiss)
+        let a = Advice { at: 1, request: 0, by_claude: true, checks: vec![ha.clone(), plex.clone(), fine.clone()] };
+        let (shown, gone) = a.split(&n);
+        assert_eq!((shown.checks.len(), gone.len(), gone[0].id.as_str(), shown.counts()), (2, 1, "ha", (0, 1)));
+        // brought back; what was explained, taken back (or emptied)
+        let n = n.with("ha", "", &NoteChange::Restore, 8).with("claude:plex has too much memory", "", &NoteChange::Explain(" ".into()), 9);
+        assert!(!n.dismissed.contains_key("ha") && n.said.is_empty());
+        assert_eq!(Notes::parse("not json"), Notes::default());
     }
 
     #[test]

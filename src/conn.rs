@@ -308,6 +308,8 @@ pub trait Connection: Send + Sync {
     /// Deletes a network: its VLAN first (from every server's card), then the network. One with
     /// cards on it (VMs', templates', snapshots') is refused by the server.
     fn delete_network(&self, net: &str) -> Result<(), ApiError>;
+    /// Changes a network as Edit Network says (see model.rs's NetworkEdit).
+    fn edit_network(&self, e: &NetworkEdit) -> Result<(), ApiError>;
     /// Looks at the storage again for files added or removed (SR.scan).
     fn scan_sr(&self, sr_ref: &str) -> Result<(), ApiError>;
     /// Unplugs the storage from every server and forgets it; nothing on it is deleted.
@@ -433,6 +435,8 @@ pub trait Connection: Send + Sync {
     /// The server takes VMs again: asked till it does (one that's just restarted may not at
     /// once), for up to five minutes.
     fn enable_host(&self, host_ref: &str) -> Result<(), ApiError>;
+    /// Whether it takes new VMs now (not disabled).
+    fn host_enabled(&self, host_ref: &str) -> Result<bool, ApiError>;
     /// Has the pool turn on a server that's off (host.power_on: its coordinator sends it a
     /// Wake-on-LAN signal), set to Wake-on-LAN first when it has no way set. Done once the pool
     /// has sent it; the server takes minutes to answer.
@@ -518,7 +522,10 @@ pub trait Connection: Send + Sync {
     fn change_password(&self, old: &str, new: &str) -> Result<(), ApiError>;
     /// The Helper VM (see helper.rs), as the pool's other_config has it: its heartbeat and the
     /// Advisor's checklist ("" for either it hasn't left).
-    fn helper_state(&self) -> Result<(String, String), ApiError>;
+    fn helper_state(&self) -> Result<(String, String, String), ApiError>;
+    /// Changes what the owner said about the Advisor's check `key` (its title `title`; see
+    /// helper.rs's Notes), as said at `now`. The notes as they are now (JSON).
+    fn helper_note(&self, key: &str, title: &str, change: &crate::helper::NoteChange, now: i64) -> Result<String, ApiError>;
     /// Asks the Helper VM for `what` ("advice": the Advisor's check now; "test": a test alert),
     /// as asked at `now`: it answers within its next minute.
     fn helper_ask(&self, what: &str, now: i64) -> Result<(), ApiError>;
@@ -2438,6 +2445,68 @@ impl Connection for RealConnection {
         Ok(net)
     }
 
+    fn edit_network(&self, e: &NetworkEdit) -> Result<(), ApiError> {
+        let t = 60_000;
+        let net = json!(e.net);
+        self.call("network.set_name_label", vec![net.clone(), json!(e.name)], t)?;
+        self.call("network.set_name_description", vec![net.clone(), json!(e.description)], t)?;
+        if let Some(mtu) = e.mtu {
+            self.call("network.set_MTU", vec![net.clone(), json!(mtu)], t)?;
+        }
+        let pifs: Vec<(Value, Value)> = self
+            .call("network.get_PIFs", vec![net.clone()], t)?
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|pif| self.call("PIF.get_record", vec![pif.clone()], t).map(|r| (pif, r)))
+            .collect::<Result<_, _>>()?;
+        // the coordinator's card of that name, to put a VLAN on (the pool puts it on every server's)
+        let card_of = |device: &str| -> Result<String, ApiError> {
+            let coordinator = self.all("pool", t)?.values().map(|p| s(p, "master")).next().unwrap_or_default();
+            self.all("PIF", t)?
+                .into_iter()
+                .find(|(_, p)| s(p, "host") == coordinator && s(p, "device") == device && n(p, "VLAN") < 0 && matches!(s(p, "bond_slave_of").as_str(), "" | "OpaqueRef:NULL"))
+                .map(|(pif, _)| pif)
+                .ok_or_else(|| ApiError::other(format!("the pool's coordinator has no card called {}", device)))
+        };
+        if let Some((card, tag)) = &e.vlan {
+            // its VLAN made again on the new card or tag: the old one off every server first, and
+            // put back when the new one can't be made
+            let mut old: Option<(String, i64)> = None;
+            for (pif, r) in &pifs {
+                if n(r, "VLAN") < 0 {
+                    return Err(ApiError { code: "NETWORK_CONTAINS_PIF".into(), details: vec![s(r, "device")] });
+                }
+                old = Some((s(r, "device"), n(r, "VLAN")));
+                let vlan = s(r, "VLAN_master_of");
+                if !matches!(vlan.as_str(), "" | "OpaqueRef:NULL") {
+                    self.call("VLAN.destroy", vec![json!(vlan)], 120_000)?;
+                } else {
+                    self.call("PIF.destroy", vec![pif.clone()], 120_000)?;
+                }
+            }
+            let made = card_of(card).and_then(|pif| self.call("pool.create_VLAN_from_PIF", vec![json!(pif), net.clone(), json!(tag)], 300_000));
+            if let Err(err) = made {
+                if let Some((card, tag)) = old {
+                    note("the new VLAN couldn't be made: the old one is put back");
+                    let _ = card_of(&card).and_then(|pif| self.call("pool.create_VLAN_from_PIF", vec![json!(pif), net.clone(), json!(tag)], 300_000));
+                }
+                return Err(err);
+            }
+        } else if e.mtu.is_some() && e.replug {
+            // its VLAN's cards take the new MTU as they're plugged in again (nothing's on them now)
+            for (pif, r) in pifs.iter().filter(|(_, r)| n(r, "VLAN") >= 0 && r["currently_attached"].as_bool() == Some(true)) {
+                if r["management"].as_bool() == Some(true) || r["disallow_unplug"].as_bool() == Some(true) {
+                    continue;
+                }
+                self.call("PIF.unplug", vec![pif.clone()], 120_000)?;
+                self.call("PIF.plug", vec![pif.clone()], 120_000)?;
+            }
+        }
+        Ok(())
+    }
+
     fn delete_network(&self, net: &str) -> Result<(), ApiError> {
         let t = 60_000;
         for pif in self.call("network.get_PIFs", vec![json!(net)], t)?.as_array().cloned().unwrap_or_default() {
@@ -3134,6 +3203,10 @@ impl Connection for RealConnection {
             if began.elapsed() >= Duration::from_secs(300) {
                 return Err(last.unwrap_or_else(|| ApiError::other("it still doesn't take VMs after five minutes")));
             }
+            // (refused till it restarts: no use waiting)
+            if let Some(e) = last.as_ref().filter(|e| e.code == "HOST_DISABLED_UNTIL_REBOOT") {
+                return Err(e.clone());
+            }
             if !said_waiting {
                 note("still starting up: it takes VMs once it's done; waiting…");
                 said_waiting = true;
@@ -3141,6 +3214,10 @@ impl Connection for RealConnection {
             std::thread::sleep(Duration::from_secs(10));
             last = self.call_raw("host.enable", vec![json!(host)], 60_000).err();
         }
+    }
+
+    fn host_enabled(&self, host: &str) -> Result<bool, ApiError> {
+        Ok(self.call("host.get_enabled", vec![json!(host)], 30_000)?.as_bool().unwrap_or(true))
     }
 
     fn power_on_host(&self, host: &str) -> Result<(), ApiError> {
@@ -4156,10 +4233,20 @@ impl Connection for RealConnection {
         Ok(())
     }
 
-    fn helper_state(&self) -> Result<(String, String), ApiError> {
+    fn helper_state(&self) -> Result<(String, String, String), ApiError> {
         let pool = self.all("pool", 30_000)?.keys().next().cloned().unwrap_or_default();
         let oc = self.call("pool.get_other_config", vec![json!(pool)], 30_000)?;
-        Ok((s(&oc, crate::helper::VM_KEY), s(&oc, crate::helper::ADVICE_KEY)))
+        Ok((s(&oc, crate::helper::VM_KEY), s(&oc, crate::helper::ADVICE_KEY), s(&oc, crate::helper::NOTES_KEY)))
+    }
+
+    fn helper_note(&self, key: &str, title: &str, change: &crate::helper::NoteChange, now: i64) -> Result<String, ApiError> {
+        let t = 30_000;
+        let pool = self.all("pool", t)?.keys().next().cloned().unwrap_or_default();
+        let oc = self.call("pool.get_other_config", vec![json!(pool)], t)?;
+        let text = crate::helper::Notes::parse(&s(&oc, crate::helper::NOTES_KEY)).with(key, title, change, now).to_json();
+        let _ = self.call_raw("pool.remove_from_other_config", vec![json!(pool), json!(crate::helper::NOTES_KEY)], t);
+        self.call("pool.add_to_other_config", vec![json!(pool), json!(crate::helper::NOTES_KEY), json!(text)], t)?;
+        Ok(text)
     }
 
     fn advisor_fix(&self, action: &str, uuids: &[String]) -> Result<String, ApiError> {
@@ -4320,6 +4407,10 @@ struct DemoHelper {
     settings: String,
     advice: String,
     test: Option<i64>,
+    /// What the owner said about its checks (helper.rs's Notes, as JSON).
+    notes: String,
+    /// A Check now under way: when it was asked (its answer comes a few seconds later).
+    checking: Option<(i64, Instant)>,
 }
 
 fn demo_now() -> i64 {
@@ -4330,7 +4421,7 @@ fn demo_now() -> i64 {
 fn demo_heartbeat(h: &DemoHelper) -> String {
     let now = demo_now();
     let advice = crate::helper::Advice::parse(&h.advice).unwrap_or_default();
-    let (bad, warn) = advice.counts();
+    let (bad, warn) = advice.split(&crate::helper::Notes::parse(&h.notes)).0.counts();
     let mut j = json!({
         "version": h.version, "machine": "svm-helper", "address": "10.20.0.30", "vm": "", "since": now - 3 * 86400, "last_look": now - 30,
         "claude": true, "review": { "on": true, "last": now - 2 * 86400 },
@@ -4344,7 +4435,7 @@ fn demo_heartbeat(h: &DemoHelper) -> String {
 
 /// The demo's Advisor checklist, as Claude words it (`request`: the Check now it answers), with
 /// what the app can fix.
-fn demo_advice(d: &PoolData, request: i64) -> String {
+fn demo_advice(d: &PoolData, request: i64, notes: &str) -> String {
     let uuid = |r: &str| d.vm(r).map(|v| v.uuid.clone()).unwrap_or_default();
     let c = |id: &str, topic: &str, status: &str, title: &str, note: &str, objects: &[&str]| json!({ "id": id, "topic": topic, "status": status, "title": title, "note": note, "objects": objects });
     let fix = |mut c: Value, action: &str, uuids: Vec<String>, names: &[&str]| {
@@ -4382,6 +4473,15 @@ fn demo_advice(d: &PoolData, request: i64) -> String {
         let mut x = c(&format!("claude_{}", i + 1), topic, status, title, note, &[]);
         x["by"] = json!("claude");
         checks.push(x);
+    }
+    // what the owner explained settles it, as Claude would say
+    let notes = crate::helper::Notes::parse(notes);
+    for x in checks.iter_mut() {
+        let key = if x["by"] == "claude" { format!("claude:{}", x["title"].as_str().unwrap_or("").trim().to_lowercase()) } else { x["id"].as_str().unwrap_or("").to_string() };
+        if let Some((_, said, _)) = notes.said.get(&key) {
+            x["status"] = json!("ok");
+            x["note"] = json!(format!("You said: \u{201c}{}\u{201d} Then it's as it should be.", said));
+        }
     }
     json!({ "version": 1, "at": demo_now() - if request == 0 { 5 * 3600 } else { 0 }, "by": "claude", "language": "en", "request": request, "checks": checks }).to_string()
 }
@@ -4737,9 +4837,9 @@ impl DemoConnection {
             x.order.sort_by_key(|o| o.1 == 30);
             x.to_json()
         };
-        let advice = if helped { demo_advice(&d, 0) } else { String::new() };
+        let advice = if helped { demo_advice(&d, 0, "") } else { String::new() };
         let version = if std::env::var("SVM_DEMO_HELPER_OLD").is_ok() { "2.2.0".to_string() } else { crate::helper::LATEST.to_string() };
-        let helper = DemoHelper { vm: helped, version, settings: helper_settings, advice, test: None };
+        let helper = DemoHelper { vm: helped, version, settings: helper_settings, advice, test: None, notes: String::new(), checking: None };
         DemoConnection { data: Mutex::new(d), helper: Mutex::new(helper), updates: Mutex::new(found), alerts: Mutex::new(alerts), copies: Mutex::new(HashMap::new()) }
     }
 
@@ -5445,6 +5545,35 @@ impl Connection for DemoConnection {
         let (device, vlan) = nw.vlan.clone().unwrap_or((String::new(), -1));
         d.networks.push(NetInfo { rref: rref.clone(), uuid: demo_uuid(), name: nw.name.clone(), description: nw.description.clone(), bridge, mtu: nw.mtu, device, vlan });
         Ok(rref)
+    }
+    /// About a second; VLAN 666 is taken.
+    fn edit_network(&self, e: &NetworkEdit) -> Result<(), ApiError> {
+        said("network.set_name_label", &[json!(e.net), json!(e.name)]);
+        std::thread::sleep(Duration::from_millis(400));
+        if let Some(mtu) = e.mtu {
+            said("network.set_MTU", &[json!(e.net), json!(mtu)]);
+            std::thread::sleep(Duration::from_millis(300));
+        }
+        if let Some((device, tag)) = &e.vlan {
+            said("VLAN.destroy", &[json!(format!("vlan-{}", e.net))]);
+            said("pool.create_VLAN_from_PIF", &[json!(format!("{}-pif-host-a", device)), json!(e.net), json!(tag)]);
+            std::thread::sleep(Duration::from_millis(900));
+            if *tag == 666 {
+                let err = ApiError { code: "PIF_VLAN_EXISTS".into(), details: vec![format!("{}-pif-host-a", device)] };
+                answered(&Err(err.clone()), Duration::from_millis(300));
+                return Err(err);
+            }
+        }
+        let mut d = self.data.lock().unwrap();
+        let Some(n) = d.networks.iter_mut().find(|n| n.rref == e.net) else { return Err(ApiError { code: "HANDLE_INVALID".into(), details: vec!["network".into(), e.net.clone()] }) };
+        (n.name, n.description) = (e.name.clone(), e.description.clone());
+        if let Some(mtu) = e.mtu {
+            n.mtu = mtu;
+        }
+        if let Some((device, tag)) = &e.vlan {
+            (n.device, n.vlan) = (device.clone(), *tag);
+        }
+        Ok(())
     }
     /// About a second; one with a card on it is refused.
     fn delete_network(&self, net: &str) -> Result<(), ApiError> {
@@ -6256,6 +6385,8 @@ impl Connection for DemoConnection {
         *h = HostUpdates { host: host.into(), ..Default::default() };
         let mut d = self.data.lock().unwrap();
         if let Some(h) = d.hosts.iter_mut().find(|h| h.rref == host) {
+            // (as XenServer does: installing stops it taking VMs, and nothing starts it again)
+            h.enabled = false;
             (h.pending_guidance, h.updates_applied) = (pending, "yes".into());
             h.last_update = Some(SystemTime::now().duration_since(UNIX_EPOCH).map(|t| t.as_secs() as i64).unwrap_or(0));
         }
@@ -6345,6 +6476,10 @@ impl Connection for DemoConnection {
             h.enabled = true;
         }
         Ok(())
+    }
+    fn host_enabled(&self, host: &str) -> Result<bool, ApiError> {
+        said("host.get_enabled", &[json!(host)]);
+        Ok(self.data.lock().unwrap().host(host).map_or(true, |h| h.enabled))
     }
     /// The signal sent; the server answers a few seconds later.
     fn power_on_host(&self, host: &str) -> Result<(), ApiError> {
@@ -6619,10 +6754,23 @@ impl Connection for DemoConnection {
         }
         Ok(())
     }
-    fn helper_state(&self) -> Result<(String, String), ApiError> {
+    fn helper_state(&self) -> Result<(String, String, String), ApiError> {
         std::thread::sleep(Duration::from_millis(120));
-        let h = self.helper.lock().unwrap();
-        Ok((if h.vm { demo_heartbeat(&h) } else { String::new() }, h.advice.clone()))
+        let mut h = self.helper.lock().unwrap();
+        // a Check now's answer, once the pretend Helper VM (and Claude) took their time
+        if let Some((asked, _)) = h.checking.filter(|c| c.1.elapsed() >= Duration::from_secs(8)) {
+            let d = self.data.lock().unwrap();
+            h.advice = demo_advice(&d, asked, &h.notes);
+            h.checking = None;
+        }
+        Ok((if h.vm { demo_heartbeat(&h) } else { String::new() }, h.advice.clone(), h.notes.clone()))
+    }
+    fn helper_note(&self, key: &str, title: &str, change: &crate::helper::NoteChange, now: i64) -> Result<String, ApiError> {
+        said("pool.add_to_other_config", &[json!(crate::helper::NOTES_KEY), json!(format!("{:?} {}", change, key))]);
+        demo_work(300);
+        let mut h = self.helper.lock().unwrap();
+        h.notes = crate::helper::Notes::parse(&h.notes).with(key, title, change, now).to_json();
+        Ok(h.notes.clone())
     }
     fn helper_ask(&self, what: &str, now: i64) -> Result<(), ApiError> {
         said("pool.add_to_other_config", &[json!(crate::helper::REQUEST_KEY), json!(crate::helper::request("", what, now))]);
@@ -6633,10 +6781,7 @@ impl Connection for DemoConnection {
         }
         // (its answer comes a moment later, as the real one's comes within its next minute)
         match what {
-            "advice" => {
-                let d = self.data.lock().unwrap();
-                h.advice = demo_advice(&d, now);
-            }
+            "advice" => h.checking = Some((now, Instant::now())),
             "test" => h.test = Some(now),
             "update" => h.version = crate::helper::LATEST.to_string(),
             _ => {}

@@ -2,11 +2,15 @@
 //! server of the pool, on the card of that name) or private (no card: it joins each server's VMs
 //! among themselves). What's needed comes first; the MTU waits under Advanced. A failure is said
 //! in plain words, with what was asked and the server's answer.
+//!
+//! The same dialog changes a network (Edit Network): its name and description; its MTU (not a
+//! card's own network's: that goes with the card); and a VLAN's card and tag, while no running VM
+//! has a card on it (the VLAN is made again on every server).
 
 use crate::app::{dialog_button, dialog_buttons, dialog_window, field_label, text_field, Look, LABEL_WIDTH};
 use crate::conn::ApiError;
 use crate::isolib::{advanced, failure_panel, note, segmented, Failure};
-use crate::model::NewNetwork;
+use crate::model::{NetInfo, NetworkEdit, NewNetwork};
 use crate::theme::Pal;
 use eframe::egui;
 use std::time::Duration;
@@ -16,6 +20,16 @@ pub enum NetworkAction {
     Close,
     /// Make it in the pool with this id.
     Create(u32, NewNetwork),
+    /// Change it, in the pool with this id.
+    Edit(u32, NetworkEdit),
+}
+
+/// The network Edit Network changes, as it is; and the running VMs with a card on it (its VLAN
+/// can't change meanwhile, and a new MTU waits for them to start again).
+#[derive(Clone, Debug)]
+pub struct Editing {
+    pub was: NetInfo,
+    pub running: Vec<String>,
 }
 
 /// A pool's network cards to put a VLAN on: each card's name with what's on it now (as the
@@ -42,6 +56,7 @@ pub struct NetworkDialog {
     busy: Option<String>,
     problem: String,
     failure: Option<Failure>,
+    editing: Option<Editing>,
 }
 
 impl NetworkDialog {
@@ -60,10 +75,62 @@ impl NetworkDialog {
             busy: None,
             problem: String::new(),
             failure: None,
+            editing: None,
         };
         // a pool without cards to tag can only have private ones
         d.vlan = !d.pool_cards().cards.is_empty();
         d
+    }
+
+    /// Edit Network, for network `e.was` of pool `sid`.
+    pub fn edit(sid: u32, pools: Vec<(u32, String)>, cards: Vec<PoolCards>, e: Editing) -> NetworkDialog {
+        let mut d = NetworkDialog::new(sid, pools, cards);
+        let n = &e.was;
+        (d.name, d.description, d.mtu) = (n.name.clone(), n.description.clone(), n.mtu.to_string());
+        d.vlan = n.vlan >= 0;
+        if d.vlan {
+            d.tag = n.vlan.to_string();
+            let pc = d.pool_cards();
+            match pc.cards.iter().position(|c| c.0 == n.device) {
+                Some(i) => d.card = i,
+                // (its card isn't the coordinator's: shown as it is)
+                None => d.cards.iter_mut().filter(|c| c.sid == sid).for_each(|c| c.cards.push((n.device.clone(), n.name.clone()))),
+            }
+            d.card = d.pool_cards().cards.iter().position(|c| c.0 == n.device).unwrap_or(0);
+        }
+        d.editing = Some(e);
+        d
+    }
+
+    /// A card's own network (no VLAN): what it's on, and its MTU, go with the card.
+    fn card_own(&self) -> bool {
+        self.editing.as_ref().is_some_and(|e| !e.was.device.is_empty() && e.was.vlan < 0)
+    }
+
+    /// What Edit Network would change, if it's right: (the change, why not).
+    fn edit_request(&self, e: &Editing) -> Result<NetworkEdit, String> {
+        let nw = self.request();
+        let was = &e.was;
+        let vlan = nw.vlan.clone().filter(|(card, tag)| was.vlan >= 0 && (card != &was.device || *tag != was.vlan));
+        // its own VLAN isn't in the way of itself
+        let taken: Vec<(String, i64, String)> = self.pool_cards().taken.into_iter().filter(|t| !(t.0 == was.device && t.1 == was.vlan)).collect();
+        let check = NewNetwork { vlan: vlan.clone(), ..nw.clone() };
+        if let Some(p) = check.problem(&taken) {
+            return Err(p);
+        }
+        if vlan.is_some() && !e.running.is_empty() {
+            return Err("Shut down the VMs on it first, to change its VLAN.".into());
+        }
+        let mtu = (nw.mtu != was.mtu && !self.card_own()).then_some(nw.mtu);
+        Ok(NetworkEdit { net: was.rref.clone(), name: nw.name, description: nw.description, mtu, vlan, replug: e.running.is_empty() })
+    }
+
+    /// Whether Save has anything to save.
+    fn changed(&self) -> bool {
+        let Some(e) = &self.editing else { return true };
+        let nw = self.request();
+        let w = &e.was;
+        nw.name != w.name || nw.description != w.description || (nw.mtu != w.mtu && !self.card_own()) || nw.vlan.as_ref().is_some_and(|(c, t)| w.vlan >= 0 && (c != &w.device || *t != w.vlan))
     }
 
     /// For the screenshot checks: a VLAN typed in.
@@ -89,6 +156,23 @@ impl NetworkDialog {
 
     /// Checks what was typed; if it's right, the request to send (and the dialog waits).
     pub fn submit(&mut self) -> NetworkAction {
+        if let Some(e) = self.editing.clone() {
+            return match self.edit_request(&e) {
+                Err(p) => {
+                    self.problem = p;
+                    NetworkAction::None
+                }
+                Ok(x) => {
+                    self.problem.clear();
+                    self.failure = None;
+                    self.busy = Some(match &x.vlan {
+                        Some((card, tag)) => format!("Moving it to VLAN {} on {}, on every server…", tag, card),
+                        None => "Saving…".into(),
+                    });
+                    NetworkAction::Edit(self.sid, x)
+                }
+            };
+        }
         let nw = self.request();
         if let Some(p) = nw.problem(&self.pool_cards().taken) {
             self.problem = p;
@@ -102,6 +186,33 @@ impl NetworkDialog {
             None => format!("Making it in {}…", pool),
         });
         NetworkAction::Create(self.sid, nw)
+    }
+
+    /// The server couldn't change it: say why, and show what was asked and what came back.
+    pub fn edit_failed(&mut self, x: &NetworkEdit, e: &ApiError) {
+        self.busy = None;
+        let (title, hint) = match e.code.as_str() {
+            "CONNECTION" => ("Couldn't reach your XenServer".to_string(), e.message()),
+            "RBAC_PERMISSION_DENIED" => ("Your account isn't allowed to change networks".into(), "Sign in with an account that has the Pool Admin role.".into()),
+            "PIF_VLAN_EXISTS" => ("That card has that VLAN already".into(), "Choose another tag. The network is back on its old VLAN.".into()),
+            "VLAN_TAG_INVALID" => ("The server doesn't take that VLAN tag".into(), "A tag goes from 1 to 4094. The network is back on its old VLAN.".into()),
+            "PIF_IN_USE" | "PIF_DOES_NOT_ALLOW_UNPLUG" => ("Its VLAN is in use on a server".into(), "Something on the servers uses it (storage, or their management): it stays as it was.".into()),
+            _ => ("Couldn't change the network".into(), "Your XenServer turned it down. Its answer is below.".into()),
+        };
+        let quote = |v: &str| if v.is_empty() || v.contains(|c: char| c.is_whitespace() || c == '"') { format!("\"{}\"", v.replace('"', "\\\"")) } else { v.to_string() };
+        let mut transcript = format!("$ xe network-param-set uuid=(the network) name-label={} name-description={}\n", quote(&x.name), quote(&x.description));
+        if let Some(mtu) = x.mtu {
+            transcript.push_str(&format!("$ xe network-param-set uuid=(the network) MTU={}\n", mtu));
+        }
+        if let Some((card, tag)) = &x.vlan {
+            transcript.push_str(&format!("$ xe vlan-destroy uuid=(its VLAN on each server)\n$ xe pool-vlan-create network-uuid=(the network) pif-uuid=(the coordinator's {}) vlan={}\n", card, tag));
+        }
+        transcript.push_str(&format!("Error code: {}\n", e.code));
+        for d in e.details.iter().filter(|d| !d.trim().is_empty()) {
+            transcript.push_str(d.trim());
+            transcript.push('\n');
+        }
+        self.failure = Some(Failure { title, hint, transcript: transcript.trim_end().to_string(), copied: None });
     }
 
     /// The server couldn't make it: say why, and show what was asked and what came back.
@@ -131,14 +242,23 @@ impl NetworkDialog {
     pub fn ui(&mut self, ctx: &egui::Context, pal: &Pal) -> NetworkAction {
         let mut action = NetworkAction::None;
         let busy = self.busy.is_some();
-        dialog_window(ctx, "New Network").show(ctx, |ui| {
+        let editing = self.editing.clone();
+        let card_own = self.card_own();
+        // (a VLAN changes only while nothing running is on it)
+        let vlan_fixed = editing.as_ref().is_some_and(|e| !e.running.is_empty());
+        dialog_window(ctx, if editing.is_some() { "Edit Network" } else { "New Network" }).show(ctx, |ui| {
             ui.set_width(480.0);
             ui.spacing_mut().item_spacing.y = 8.0;
-            let intro = "A network for your VMs' cards. On a VLAN of a network card it reaches what that card is plugged into, on every server of the pool; a private one joins only each server's VMs among themselves.";
+            let intro = match &editing {
+                None => "A network for your VMs' cards. On a VLAN of a network card it reaches what that card is plugged into, on every server of the pool; a private one joins only each server's VMs among themselves.".to_string(),
+                Some(e) if card_own => format!("It's {}'s own network: what it's on and its MTU go with the card. Its name and description can change.", e.was.device),
+                Some(e) if e.was.vlan >= 0 => "Change its name and description, its MTU, or the VLAN it's on. The VMs' cards stay on it.".into(),
+                Some(_) => "Change its name, its description or its MTU. The VMs' cards stay on it.".into(),
+            };
             ui.add(egui::Label::new(egui::RichText::new(intro).color(pal.ink_soft)).wrap());
             ui.add_space(2.0);
             ui.add_enabled_ui(!busy, |ui| {
-                if self.pools.len() > 1 {
+                if self.pools.len() > 1 && editing.is_none() {
                     ui.horizontal(|ui| {
                         field_label(ui, "Pool:", LABEL_WIDTH);
                         let current = self.pools.iter().find(|p| p.0 == self.sid).map(|p| p.1.clone()).unwrap_or_default();
@@ -161,37 +281,57 @@ impl NetworkDialog {
                 let pc = self.pool_cards();
                 ui.horizontal(|ui| {
                     field_label(ui, "Kind:", LABEL_WIDTH);
-                    let mut i = if self.vlan { 0 } else { 1 };
-                    ui.add_enabled_ui(!pc.cards.is_empty(), |ui| {
-                        if segmented(ui, pal, &["VLAN on a network card", "Private (no card)"], &mut i, ui.available_width()) {
-                            self.vlan = i == 0;
-                            self.problem.clear();
+                    match &editing {
+                        // (what it is stays: a VLAN, a private one, a card's own)
+                        Some(e) => {
+                            let kind = match (card_own, e.was.vlan >= 0) {
+                                (true, _) => format!("{}'s own network", e.was.device),
+                                (_, true) => "VLAN on a network card".into(),
+                                _ => "Private (no card)".into(),
+                            };
+                            ui.label(egui::RichText::new(kind).color(pal.ink));
                         }
-                    });
+                        None => {
+                            let mut i = if self.vlan { 0 } else { 1 };
+                            ui.add_enabled_ui(!pc.cards.is_empty(), |ui| {
+                                if segmented(ui, pal, &["VLAN on a network card", "Private (no card)"], &mut i, ui.available_width()) {
+                                    self.vlan = i == 0;
+                                    self.problem.clear();
+                                }
+                            });
+                        }
+                    }
                 });
-                if self.vlan {
-                    ui.horizontal(|ui| {
-                        field_label(ui, "Card:", LABEL_WIDTH);
-                        crate::newvm::combo_style(ui, pal);
-                        let shown = pc.cards.get(self.card).map(|c| card_label(c)).unwrap_or_default();
-                        crate::newvm::combo("net-card", shown, ui.available_width()).show_ui(ui, |ui| {
-                            for (i, c) in pc.cards.iter().enumerate() {
-                                ui.selectable_value(&mut self.card, i, card_label(c));
+                if self.vlan && !card_own {
+                    ui.add_enabled_ui(!vlan_fixed, |ui| {
+                        ui.horizontal(|ui| {
+                            field_label(ui, "Card:", LABEL_WIDTH);
+                            crate::newvm::combo_style(ui, pal);
+                            let shown = pc.cards.get(self.card).map(|c| card_label(c)).unwrap_or_default();
+                            crate::newvm::combo("net-card", shown, ui.available_width()).show_ui(ui, |ui| {
+                                for (i, c) in pc.cards.iter().enumerate() {
+                                    ui.selectable_value(&mut self.card, i, card_label(c));
+                                }
+                            });
+                        });
+                        ui.horizontal(|ui| {
+                            field_label(ui, "VLAN:", LABEL_WIDTH);
+                            if text_field(ui, pal, &mut self.tag, 90.0, false).changed() {
+                                self.problem.clear();
                             }
                         });
+                        let card = pc.cards.get(self.card).map(|c| c.0.as_str()).unwrap_or("");
+                        let mine = |t: &(String, i64, String)| editing.as_ref().is_some_and(|e| t.0 == e.was.device && t.1 == e.was.vlan);
+                        let mut on: Vec<String> = pc.taken.iter().filter(|t| t.0 == card && !mine(t)).map(|t| t.1.to_string()).collect();
+                        on.sort_by_key(|t| t.parse::<i64>().unwrap_or(0));
+                        let there = if on.is_empty() { String::new() } else { format!(" On {} already: {}.", card, on.join(", ")) };
+                        note(ui, pal, &format!("1 to 4094; the switch port the card is plugged into must carry it (tagged).{}", there));
                     });
-                    ui.horizontal(|ui| {
-                        field_label(ui, "VLAN:", LABEL_WIDTH);
-                        if text_field(ui, pal, &mut self.tag, 90.0, false).changed() {
-                            self.problem.clear();
-                        }
-                    });
-                    let card = pc.cards.get(self.card).map(|c| c.0.as_str()).unwrap_or("");
-                    let mut on: Vec<String> = pc.taken.iter().filter(|t| t.0 == card).map(|t| t.1.to_string()).collect();
-                    on.sort_by_key(|t| t.parse::<i64>().unwrap_or(0));
-                    let there = if on.is_empty() { String::new() } else { format!(" On {} already: {}.", card, on.join(", ")) };
-                    note(ui, pal, &format!("1 to 4094; the switch port the card is plugged into must carry it (tagged).{}", there));
-                } else {
+                    if let Some(e) = editing.as_ref().filter(|e| !e.running.is_empty()) {
+                        let more = if e.running.len() > 3 { format!(" and {} more", e.running.len() - 3) } else { String::new() };
+                        note(ui, pal, &format!("To change its VLAN, shut down the VMs on it first: {}{}.", e.running.iter().take(3).cloned().collect::<Vec<_>>().join(", "), more));
+                    }
+                } else if !card_own {
                     note(ui, pal, "Its VMs reach each other only on the same server; nothing outside.");
                 }
                 ui.horizontal(|ui| {
@@ -201,13 +341,19 @@ impl NetworkDialog {
                 note(ui, pal, "For example its addresses: 192.168.10.0/24.");
                 advanced(ui, pal, &mut self.advanced, &format!("MTU {}", self.mtu.trim()));
                 if self.advanced {
-                    ui.horizontal(|ui| {
-                        field_label(ui, "MTU:", LABEL_WIDTH);
-                        if text_field(ui, pal, &mut self.mtu, 90.0, false).changed() {
-                            self.problem.clear();
-                        }
+                    ui.add_enabled_ui(!card_own, |ui| {
+                        ui.horizontal(|ui| {
+                            field_label(ui, "MTU:", LABEL_WIDTH);
+                            if text_field(ui, pal, &mut self.mtu, 90.0, false).changed() {
+                                self.problem.clear();
+                            }
+                        });
                     });
-                    note(ui, pal, "1500 usually; 9000 for jumbo frames, when every switch on the way takes them.");
+                    match &editing {
+                        Some(e) if card_own => note(ui, pal, &format!("{}'s MTU is set with the card, on each server.", e.was.device)),
+                        Some(e) if !e.running.is_empty() => note(ui, pal, "1500 usually; 9000 for jumbo frames. The VMs running on it get a new one when they start again."),
+                        _ => note(ui, pal, "1500 usually; 9000 for jumbo frames, when every switch on the way takes them."),
+                    }
                 }
             });
             if !self.problem.is_empty() {
@@ -229,9 +375,10 @@ impl NetworkDialog {
                 if dialog_button(ui, pal, "close", if busy { "Close" } else { "Cancel" }, Look::Plain, true) {
                     action = NetworkAction::Close;
                 }
-                let ready = !busy && !self.name.trim().is_empty() && (!self.vlan || !self.tag.trim().is_empty());
+                let ready = !busy && !self.name.trim().is_empty() && (!self.vlan || !self.tag.trim().is_empty()) && self.changed();
                 let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if dialog_button(ui, pal, "plus", "Create", Look::Primary, ready) || (ready && enter && self.failure.is_none()) {
+                let (glyph, label) = if editing.is_some() { ("check", "Save") } else { ("plus", "Create") };
+                if dialog_button(ui, pal, glyph, label, Look::Primary, ready) || (ready && enter && self.failure.is_none()) {
                     action = self.submit();
                 }
             });
@@ -269,6 +416,37 @@ mod tests {
         d.vlan = false;
         let NetworkAction::Create(_, nw) = d.submit() else { panic!("not sent") };
         assert_eq!(nw.vlan, None);
+    }
+
+    #[test]
+    fn what_an_edit_sends() {
+        let was = NetInfo { rref: "net-1".into(), uuid: "u".into(), name: "Office".into(), description: String::new(), bridge: "xapi0".into(), mtu: 1500, device: "eth0".into(), vlan: 10 };
+        let edit = |running: Vec<String>| NetworkDialog::edit(1, vec![(1, "home".into())], dialog().cards, Editing { was: was.clone(), running });
+        // nothing changed: nothing to save
+        let mut d = edit(vec![]);
+        assert!(!d.changed());
+        // a new name: only that (its own VLAN 10 isn't "taken")
+        d.name = "Office LAN".into();
+        let NetworkAction::Edit(_, x) = d.submit() else { panic!("not sent") };
+        assert_eq!((x.name.as_str(), x.mtu, x.vlan.clone(), x.replug), ("Office LAN", None, None, true));
+        // another tag and MTU
+        let mut d = edit(vec![]);
+        (d.tag, d.mtu) = ("20".into(), "9000".into());
+        let NetworkAction::Edit(_, x) = d.submit() else { panic!("not sent") };
+        assert_eq!((x.mtu, x.vlan), (Some(9000), Some(("eth0".into(), 20))));
+        // not while a VM runs on it; its MTU waits for them
+        let mut d = edit(vec!["dc01".into()]);
+        d.tag = "20".into();
+        assert!(matches!(d.submit(), NetworkAction::None));
+        let mut d = edit(vec!["dc01".into()]);
+        d.mtu = "9000".into();
+        let NetworkAction::Edit(_, x) = d.submit() else { panic!("not sent") };
+        assert_eq!((x.mtu, x.replug), (Some(9000), false));
+        // a card's own network: its MTU stays
+        let own = NetInfo { device: "eth1".into(), vlan: -1, ..was.clone() };
+        let mut d = NetworkDialog::edit(1, vec![(1, "home".into())], dialog().cards, Editing { was: own, running: vec![] });
+        d.mtu = "9000".into();
+        assert!(!d.changed());
     }
 
     #[test]

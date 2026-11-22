@@ -7,7 +7,7 @@ use crate::alerts::{AlertSettings, Severity, Watched, XenMessage};
 use crate::history::{Records, Span};
 use crate::ipconf::{IpAction, IpChange, IpDialog};
 use crate::isolib::{mount_trouble, IsoAction, IsoDialog, MountTrouble};
-use crate::newnet::{NetworkAction, NetworkDialog, PoolCards};
+use crate::newnet::{Editing, NetworkAction, NetworkDialog, PoolCards};
 use crate::newsr::{Guest, StorageAction, StorageDialog};
 use crate::newvm::{NewVmAction, NewVmDialog};
 use crate::movevm::{MoveAction, MoveDialog};
@@ -112,7 +112,7 @@ enum Msg {
     Fetched(u32, Result<PoolData, ApiError>),
     /// A pool's Helper VM (helper_page.rs): its heartbeat and the Advisor's checklist, its
     /// settings read, a job done.
-    HelperState { sid: u32, result: Result<(String, String), ApiError> },
+    HelperState { sid: u32, result: Result<(String, String, String), ApiError> },
     HelperRead { sid: u32, result: Result<String, ApiError> },
     HelperDone { sid: u32, log: Option<usize>, what: helper_page::Did, result: Result<String, ApiError> },
     /// VM Conversion's background work (convert_page.rs).
@@ -137,6 +137,8 @@ enum Msg {
     Exports { server: String, result: Result<Vec<String>, ApiError> },
     /// A new network was made (its reference), or not; `log`: its entry in Activities.
     NetworkMade { sid: u32, nw: NewNetwork, log: usize, result: Result<String, ApiError> },
+    /// A network was changed (Edit Network), or not; `log`: its entry in Activities.
+    NetworkEdited { sid: u32, edit: NetworkEdit, log: usize, result: Result<(), ApiError> },
     /// A network was deleted, or not.
     NetworkDeleted { sid: u32, name: String, log: usize, result: Result<(), ApiError> },
     /// A rescan (forget false) or disconnect (forget true) of a storage ended.
@@ -582,6 +584,8 @@ enum Intent {
     HelperUpdate(u32),
     /// One of the Advisor's fixes, done on pool `sid` (the check's id, what to do).
     AdvisorFix(u32, String, crate::helper::Fix),
+    /// What the owner says about one of the Advisor's checks: (pool, its key, its title, what).
+    AdvisorNote(u32, String, String, crate::helper::NoteChange),
     /// A VM's Snapshots tab: pool, VM.
     OpenVmSnapshots(u32, String),
     /// The snapshot schedules (the Snapshots page's Schedules tab).
@@ -606,6 +610,8 @@ enum Intent {
     Networks,
     /// The New Network dialog.
     NewNetwork,
+    /// Edit Network: pool, network.
+    EditNetwork(u32, String),
     /// Ask before deleting a network: pool, network.
     AskDeleteNetwork(u32, String),
     /// A pool's updates (this pool's, else the first).
@@ -2111,6 +2117,30 @@ impl App {
         });
     }
 
+    /// Asks pool `sid` to change a network as `x` says, in the background.
+    fn start_network_edit(&mut self, sid: u32, x: NetworkEdit, ctx: &egui::Context) {
+        let Some(s) = self.server(sid) else { return };
+        let (conn, server) = (s.conn.clone(), s.name());
+        let was = s.data.as_ref().and_then(|d| d.net(&x.net)).map(|n| n.name.clone()).unwrap_or_else(|| x.name.clone());
+        let what = match (&x.vlan, x.mtu) {
+            (Some((card, tag)), _) => format!(" (to VLAN {} on {})", tag, card),
+            (None, Some(mtu)) => format!(" (MTU {})", mtu),
+            _ => String::new(),
+        };
+        let log = self.add_log(sid, &server, Some(&x.net), &was, &format!("Changing network '{}'{}", was, what), "In progress");
+        if x.vlan.is_some() {
+            self.if_closed(log, format!("'{}' may be left without its VLAN on some servers: edit it again.", was));
+        }
+        let prog = self.progress(log);
+        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            crate::conn::watch(&prog);
+            let result = conn.edit_network(&x);
+            let _ = tx.send(Msg::NetworkEdited { sid, edit: x, log, result });
+            ctx.request_repaint();
+        });
+    }
+
     /// Asks pool `sid` which folders NFS server `server` shares, in the background.
     fn browse_exports(&mut self, sid: u32, server: String, ctx: &egui::Context) {
         let Some(conn) = self.server(sid).map(|s| s.conn.clone()) else { return };
@@ -2431,6 +2461,24 @@ impl App {
                         }
                     }
                 },
+                Msg::NetworkEdited { sid, edit, log, result } => {
+                    match result {
+                        Ok(()) => {
+                            self.end_log(log, "Done", None);
+                            if matches!(self.dialog, Dialog::NewNetwork(_)) {
+                                self.dialog = Dialog::None;
+                            }
+                        }
+                        Err(e) => {
+                            let text = self.log.get(log).map(|l| l.text.replacen("Changing", "Couldn't change", 1)).unwrap_or_default();
+                            self.end_log(log, "Failed", Some(format!("{}: {}", text, e.message())));
+                            if let Dialog::NewNetwork(d) = &mut self.dialog {
+                                d.edit_failed(&edit, &e);
+                            }
+                        }
+                    }
+                    self.refresh_soon(sid);
+                }
                 Msg::NetworkDeleted { sid, name, log, result } => {
                     match result {
                         Ok(()) => self.end_log(log, "Done", None),
@@ -3620,8 +3668,9 @@ impl App {
     fn vm_text(_s: &ServerEntry, v: &VmInfo) -> String {
         v.name.clone()
     }
-    /// A server's icon: off when disabled or shut down; a red ring turning while it shuts down, a
-    /// green one while it restarts.
+    /// A server's icon: an orange dot when it's on but doesn't take new VMs (disabled, or in
+    /// maintenance mode), a red one when it's off; a red ring turning while it shuts down, a green
+    /// one while it restarts.
     fn host_icon(&self, h: &HostInfo) -> IconKind {
         if self.host_rebooting.contains_key(&h.rref) || self.host_waking.contains_key(&h.rref) {
             IconKind::Busy(Tone::Green)
@@ -3631,6 +3680,8 @@ impl App {
             IconKind::Busy(Tone::Red)
         } else if h.enabled && h.is_up() {
             IconKind::Host
+        } else if h.is_up() {
+            IconKind::HostDisabled
         } else {
             IconKind::HostOff
         }
@@ -4085,6 +4136,7 @@ impl App {
                 Intent::AdvisorCheck(sid) => self.helper_ask(sid, "advice", ctx),
                 Intent::HelperUpdate(sid) => self.helper_ask(sid, "update", ctx),
                 Intent::AdvisorFix(sid, id, fix) => self.advisor_fix(sid, id, fix, ctx),
+                Intent::AdvisorNote(sid, key, title, change) => self.advisor_note(sid, key, title, change, ctx),
                 Intent::Convert => {
                     self.select("root".into());
                     if !matches!(self.tab, Tab::Convert | Tab::Conversions) {
@@ -4210,6 +4262,14 @@ impl App {
                         let cards = self.network_cards();
                         self.dialog = Dialog::NewNetwork(Box::new(NetworkDialog::new(sid, pools, cards)));
                     }
+                }
+                Intent::EditNetwork(sid, net) => {
+                    let Some(d) = self.server(sid).and_then(|s| s.data.as_ref()) else { continue };
+                    let Some(n) = d.net(&net).cloned() else { continue };
+                    // the running VMs with a card on it
+                    let running: Vec<String> = d.vms.iter().filter(|v| matches!(v.power, PowerState::Running | PowerState::Paused) && v.nics.iter().any(|c| c.net == net)).map(|v| v.name.clone()).collect();
+                    let pools: Vec<(u32, String)> = self.servers.iter().filter(|s| s.data.is_some()).map(|s| (s.id, s.name())).collect();
+                    self.dialog = Dialog::NewNetwork(Box::new(NetworkDialog::edit(sid, pools, self.network_cards(), Editing { was: n, running })));
                 }
                 Intent::NewIsoLibrary => {
                     let pools: Vec<(u32, String)> = self.servers.iter().filter(|s| s.data.is_some()).map(|s| (s.id, s.name())).collect();
@@ -7386,14 +7446,25 @@ impl App {
                 if pools > 1 {
                     r.push(Cell::Text(pool.clone()));
                 }
-                r.extend([Cell::Text(n.connection()), Cell::Text(n.bridge.clone()), Cell::Text(n.mtu.to_string()), Cell::Text(or(&n.description, "—").into()), Cell::Custom(26.0)]);
+                r.extend([Cell::Text(n.connection()), Cell::Text(n.bridge.clone()), Cell::Text(n.mtu.to_string()), Cell::Text(or(&n.description, "—").into()), Cell::Custom(56.0)]);
                 r
             })
             .collect();
         let mut delete = None;
-        self.table_with(ui, "all-nets", &headers, &rows, false, &mut |ui, row, _col, r, hot| {
-            // the bin: red under the mouse; off, saying why, for a card's own network or one in use
+        let mut edit = None;
+        let opened = self.table_with(ui, "all-nets", &headers, &rows, true, &mut |ui, row, _col, r, hot| {
             let (sid, _, n, why) = &nets[row];
+            // the pencil: Edit Network
+            let e = Rect::from_center_size(pos2(r.max.x - 43.0, r.center().y), vec2(26.0, 26.0));
+            let resp = ui.interact(e, ui.id().with(("nedit", &n.rref)), Sense::click()).on_hover_text("Edit this network: its name, description, MTU or VLAN");
+            if resp.hovered() {
+                ui.painter().rect_filled(e, Rounding::same(5.0), pal.hover);
+            }
+            paint_glyph(ui.painter(), Rect::from_center_size(e.center(), vec2(16.0, 16.0)), "edit", if resp.hovered() { pal.ink } else if hot { pal.ink_soft } else { pal.ink_faint });
+            if resp.clicked() {
+                edit = Some((*sid, n.rref.clone()));
+            }
+            // the bin: red under the mouse; off, saying why, for a card's own network or one in use
             let b = Rect::from_center_size(pos2(r.max.x - 13.0, r.center().y), vec2(26.0, 26.0));
             let resp = ui.interact(b, ui.id().with(("ndel", &n.rref)), if why.is_none() { Sense::click() } else { Sense::hover() });
             let resp = resp.on_hover_text(why.as_deref().unwrap_or("Delete this network…"));
@@ -7414,8 +7485,12 @@ impl App {
                 delete = Some((*sid, n.rref.clone()));
             }
         });
-        if let Some((sid, net)) = delete {
+        if let Some((sid, net)) = delete.clone() {
             out.push(Intent::AskDeleteNetwork(sid, net));
+        }
+        // (a click on the row opens it too)
+        if let Some((sid, net)) = edit.or_else(|| opened.filter(|_| delete.is_none()).map(|i| (nets[i].0, nets[i].2.rref.clone()))) {
+            out.push(Intent::EditNetwork(sid, net));
         }
     }
 
@@ -7561,6 +7636,7 @@ impl App {
         let mut storage: Option<(u32, NfsStorage)> = None;
         let mut browse: Option<(u32, String)> = None;
         let mut network: Option<(u32, NewNetwork)> = None;
+        let mut network_edit: Option<(u32, NetworkEdit)> = None;
         let mut delete_net: Option<(u32, String, String)> = None;
         // the pool's own VM that the server typed in New VM Storage is, if it's one
         let guest: Option<Guest> = match &self.dialog {
@@ -7880,6 +7956,7 @@ impl App {
             Dialog::NewNetwork(d) => match d.ui(ctx, &pal) {
                 NetworkAction::Close => close = true,
                 NetworkAction::Create(sid, nw) => network = Some((sid, nw)),
+                NetworkAction::Edit(sid, x) => network_edit = Some((sid, x)),
                 NetworkAction::None => {}
             },
             Dialog::NewStorage(d) => match d.ui(ctx, &pal, guest.as_ref()) {
@@ -8765,6 +8842,9 @@ impl App {
         if let Some((sid, nw)) = network {
             self.start_network(sid, nw, ctx);
         }
+        if let Some((sid, x)) = network_edit {
+            self.start_network_edit(sid, x, ctx);
+        }
         if let Some((sid, net, name)) = delete_net {
             self.dialog = Dialog::None;
             self.delete_network(sid, net, name, ctx);
@@ -9112,6 +9192,8 @@ impl eframe::App for App {
                     out.push(Intent::Convert);
                     self.conv.shot = Some(self.shot_show.clone());
                 }
+                // the page before any source or file: what it's for
+                "convert-empty" => out.push(Intent::Convert),
                 // the Snapshots page, and snapshot schedules
                 "snapshots-page" => out.push(Intent::Snapshots),
                 "snapshots-ticked" => {
@@ -9345,6 +9427,11 @@ impl eframe::App for App {
                 "iso-library" => out.push(Intent::IsoLibrary),
                 "templates" => out.push(Intent::Templates),
                 "networks" => out.push(Intent::Networks),
+                // Edit Network, on the demo's VLAN
+                "edit-network" => {
+                    out.push(Intent::Networks);
+                    out.extend(sel.sid.or(self.servers.first().map(|s| s.id)).map(|sid| Intent::EditNetwork(sid, "net-2".into())));
+                }
                 "delete-network" => {
                     out.push(Intent::Networks);
                     out.extend(sel.sid.or(self.servers.first().map(|s| s.id)).map(|sid| Intent::AskDeleteNetwork(sid, "net-2".into())));
@@ -9557,6 +9644,30 @@ impl eframe::App for App {
                 let compact = free.width() < flat_button_width(&child, label) + 16.0 + SEP_W;
                 if flat_button(&mut child, "plus", label, Some(pal.accent), has_pool, compact, &pal).on_hover_text(tip).clicked() {
                     out.push(intent);
+                }
+                vsep(&mut child, &pal);
+            } else if let Some((sid, n, users)) = (sel.kind == Kind::Net).then(|| sel.sid.zip(sel.rref.clone())).flatten().and_then(|(sid, r)| {
+                let d = self.server(sid)?.data.as_ref()?;
+                let users = d.vms.iter().chain(&d.user_templates).filter(|v| v.nics.iter().any(|c| c.net == r)).count();
+                d.net(&r).cloned().map(|n| (sid, n, users))
+            }) {
+                // a network's: Edit, and Delete (not a card's own, nor one with cards on it)
+                let mut child = ui.new_child(egui::UiBuilder::new().max_rect(free).layout(egui::Layout::right_to_left(egui::Align::Center)));
+                child.spacing_mut().item_spacing.x = 4.0;
+                let compact = free.width() < flat_button_width(&child, "Delete") + flat_button_width(&child, "Edit") + 16.0 + SEP_W;
+                let why = if !n.device.is_empty() && n.vlan < 0 {
+                    Some(format!("It's {}'s own network: it goes only with the card", n.device))
+                } else if users > 0 {
+                    Some("Cards are on it: move or remove them first".to_string())
+                } else {
+                    None
+                };
+                let tip = why.clone().unwrap_or_else(|| "Delete this network…".into());
+                if flat_button(&mut child, "trash", "Delete", Some(pal.red), why.is_none(), compact, &pal).on_hover_text(&tip).on_disabled_hover_text(&tip).clicked() {
+                    out.push(Intent::AskDeleteNetwork(sid, n.rref.clone()));
+                }
+                if flat_button(&mut child, "edit", "Edit", Some(pal.accent), true, compact, &pal).on_hover_text("Its name, description, MTU or VLAN").clicked() {
+                    out.push(Intent::EditNetwork(sid, n.rref.clone()));
                 }
                 vsep(&mut child, &pal);
             } else if let Some((s, t)) = self.template_of(&sel) {
@@ -10267,6 +10378,21 @@ fn text_rows(rows: Vec<Vec<String>>) -> Vec<Vec<Cell>> {
 /// A frameless button, an icon then its label, with a soft background under the mouse. `tint`
 /// colours the icon (red for one that takes something away); `compact` shows only the icon, with
 /// the label as its tooltip.
+/// A page's content in a column centred in the window, as wide as it reads well: `max` at most,
+/// with `pad` at least on either side.
+pub(crate) fn centered<R>(ui: &mut Ui, max: f32, pad: f32, add: impl FnOnce(&mut Ui) -> R) -> R {
+    let w = (ui.available_width() - 2.0 * pad).min(max);
+    ui.horizontal(|ui| {
+        ui.add_space(((ui.available_width() - w) / 2.0).max(pad));
+        ui.vertical(|ui| {
+            ui.set_width(w);
+            add(ui)
+        })
+        .inner
+    })
+    .inner
+}
+
 pub(crate) fn flat_button(ui: &mut Ui, glyph: &str, label: &str, tint: Option<Color32>, enabled: bool, compact: bool, pal: &Pal) -> egui::Response {
     let font = FontId::proportional(13.0);
     let size = if compact { SQUARE } else { vec2(flat_button_width(ui, label), 26.0) };

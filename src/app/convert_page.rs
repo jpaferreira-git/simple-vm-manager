@@ -70,6 +70,9 @@ pub(crate) struct ConvView {
     pub helper_vm: HashMap<u32, Option<HelperVm>>,
     /// A screenshot's state to set up once the demo's VMware is listed (see `--show`).
     pub shot: Option<String>,
+    /// The header's Add Files… and Look Again, clicked: done by the page.
+    pub pick_files: bool,
+    pub look_again: bool,
 }
 
 pub(crate) enum ConvMsg {
@@ -246,7 +249,7 @@ impl App {
         }
         self.conv.loaded = true;
         self.conv.prepared = prepared_file().and_then(|p| std::fs::read_to_string(p).ok()).map(|t| convert::parse_prepared(&t)).unwrap_or_default();
-        let demo = self.servers.iter().any(|s| s.conn.is_demo());
+        let demo = self.servers.iter().any(|s| s.conn.is_demo()) && self.shot_show != "convert-empty";
         if demo {
             for (address, src) in [("esxi-01.lan", convert::demo::DemoSource::vmware()), ("pve.lan", convert::demo::DemoSource::proxmox())] {
                 let source: Arc<dyn Source> = Arc::new(src);
@@ -440,9 +443,23 @@ impl App {
                 self.conv.jobs.retain(|j| j.snapshot().outcome.is_none());
             }
         } else {
-            let compact = free.width() < flat_button_width(&child, "Add a Source") + 16.0 + SEP_W;
+            // Add a Source; and the shown source's own: Add Files…, or Look Again
+            let current = self.conv.sources.get(self.conv.current);
+            let files = current.is_none_or(|e| e.conf.kind == Kind::Files);
+            let second = if files { "Add Files…" } else { "Look Again" };
+            let compact = free.width() < flat_button_width(&child, "Add a Source") + flat_button_width(&child, second) + 16.0 + SEP_W;
             if flat_button(&mut child, "plus", "Add a Source", Some(pal.accent), true, compact, &pal).on_hover_text("A VMware ESXi or vCenter, or a Proxmox server, whose VMs you want to bring over").clicked() {
                 self.conv.dialog = Some(ConvDialog::Source(SourceForm::new()));
+            }
+            if files {
+                if flat_button(&mut child, "folder", "Add Files…", None, true, compact, &pal).on_hover_text("An .ova, .ovf, .vmx, or a disk image (.vmdk, .vhd, .vhdx, .qcow2, .vdi, .img); dropping them on the window adds them too").clicked() {
+                    self.conv.pick_files = true;
+                }
+            } else if let Some(e) = current {
+                let ready = e.source.is_some() && e.state != SrcState::Connecting;
+                if flat_button(&mut child, "rescan", "Look Again", None, ready, compact, &pal).on_hover_text(format!("List {}'s VMs again", e.conf.address)).clicked() {
+                    self.conv.look_again = true;
+                }
             }
         }
         vsep(&mut child, &pal);
@@ -460,53 +477,122 @@ impl App {
         let mut act_list: Option<usize> = None;
         let mut act_forget: Option<usize> = None;
         let mut act_unlock: Option<usize> = None;
-        let mut act_pick_files = false;
         let mut act_convert = false;
+        let mut act_add_source = false;
+        // what the header's buttons asked for (Add Files…, Look Again)
+        let mut act_pick_files = std::mem::take(&mut self.conv.pick_files);
+        if std::mem::take(&mut self.conv.look_again) {
+            act_list = Some(self.conv.current);
+        }
         egui::ScrollArea::vertical().id_salt("convert-page").auto_shrink([false; 2]).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 6.0;
-            ui.label(egui::RichText::new("FROM").size(11.0).color(pal.ink_faint));
-            // the sources, as cards in rows
-            let avail = ui.available_width();
-            let per_row = ((avail + 10.0) / 250.0).floor().max(1.0) as usize;
-            let w = ((avail - 10.0 * (per_row as f32 - 1.0)) / per_row as f32).floor();
-            let n = self.conv.sources.len();
-            for row in 0..n.div_ceil(per_row) {
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 10.0;
-                    for i in row * per_row..((row + 1) * per_row).min(n) {
-                        let e = &self.conv.sources[i];
+            let only_files = self.conv.sources.len() == 1 && self.conv.sources[0].conf.kind == Kind::Files;
+            if only_files && self.conv.sources[0].vms.is_empty() {
+                // nothing to convert yet: what the page is for, and its two ways in
+                ui.add_space(48.0);
+                centered(ui, 540.0, 28.0, |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.label(egui::RichText::new("Bring your VMs over").size(15.0).color(pal.ink));
+                        ui.add_space(4.0);
+                        let text = "From disk files on this computer (an .ova or .vmx, or a .vmdk, .vhd, .vhdx, .qcow2 or .vdi disk), or from a VMware ESXi, vCenter or Proxmox server. Their VMs are listed here: tick them and Convert. The originals stay as they are.";
+                        ui.add(egui::Label::new(egui::RichText::new(text).color(pal.ink_soft)).wrap());
+                        ui.add_space(12.0);
+                        let w = flat_button_width(ui, "Add Files…") + flat_button_width(ui, "Add a Source") + 10.0;
+                        ui.allocate_ui_with_layout(vec2(w, 30.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            ui.spacing_mut().item_spacing.x = 10.0;
+                            if flat_button(ui, "folder", "Add Files…", None, true, false, &pal).on_hover_text("An .ova, .ovf, .vmx, or a disk image (.vmdk, .vhd, .vhdx, .qcow2, .vdi, .img)").clicked() {
+                                act_pick_files = true;
+                            }
+                            if flat_button(ui, "plus", "Add a Source", Some(pal.accent), true, false, &pal).on_hover_text("A VMware ESXi or vCenter, or a Proxmox server, whose VMs you want to bring over").clicked() {
+                                act_add_source = true;
+                            }
+                        });
+                        ui.add_space(8.0);
+                        ui.label(egui::RichText::new("Dropping the files on the window adds them too.").size(12.0).color(pal.ink_faint));
+                    });
+                });
+                return;
+            }
+            let Some(e) = self.conv.sources.get(self.conv.current) else { return };
+            let key = e.key();
+            let files = e.conf.kind == Kind::Files;
+            let lines: Vec<&SourceVm> = e.vms.iter().collect();
+            let brought = |v: &SourceVm| converted.iter().any(|d| d.starts_with(&format!("Converted from '{}' on {} ", v.name, e.conf.address)));
+            let picked: Vec<&SourceVm> = lines.iter().copied().filter(|v| self.conv.picked.contains(&v.id) && v.blocked.is_none()).collect();
+            // what's here and what's ticked (as the ISO Library's line), then how it goes
+            let n = lines.len();
+            let vms = format!("{} VM{}", n, if n == 1 { "" } else { "s" });
+            let mut head = match &e.state {
+                _ if files => format!("{} from disk files", vms),
+                SrcState::Ready => format!("{} on {}  ·  {}", vms, e.conf.address, e.about),
+                SrcState::Connecting => format!("Connecting to {}…", e.conf.address),
+                SrcState::Locked => format!("{}'s VMs", e.conf.address),
+                SrcState::Failed(_) => format!("{}'s VMs", e.conf.address),
+            };
+            if !picked.is_empty() {
+                let disks: usize = picked.iter().map(|v| v.disks.len()).sum();
+                let size: u64 = picked.iter().map(|v| v.size()).sum();
+                let written: u64 = picked.iter().map(|v| v.written()).sum();
+                head.push_str(&format!("  ·  {} ticked: {} disk{}, {} ({} written)", picked.len(), disks, if disks == 1 { "" } else { "s" }, fmt_bytes(size as i64), fmt_bytes(written as i64)));
+            }
+            ui.label(egui::RichText::new(head).color(pal.ink_soft));
+            let (sub, col) = match &e.state {
+                SrcState::Failed(why) => (format!("Couldn't list them: {}", why), pal.red),
+                SrcState::Locked => ("Its password is needed: click its card to give it.".to_string(), pal.orange),
+                SrcState::Ready if n == 0 && !files => ("It has no VMs.".to_string(), pal.ink_faint),
+                _ => {
+                    let mut s = String::from("Tick the VMs to bring over, then Convert; the originals stay where they are.");
+                    if files {
+                        s.push_str(" Drop more files on the window to add them.");
+                    } else if self.conv.sources.len() > 1 {
+                        s.push_str(" Right-click a source to look again or forget it.");
+                    }
+                    (s, pal.ink_faint)
+                }
+            };
+            ui.add(egui::Label::new(egui::RichText::new(sub).size(12.0).color(col)).wrap());
+            // the sources, as cards (as the ISO Library's), when there's more than the files
+            if self.conv.sources.len() > 1 {
+                ui.add_space(8.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = vec2(10.0, 10.0);
+                    let w = ((ui.available_width() - 20.0) / 3.0 - 1.0).floor().clamp(220.0, 300.0).min(ui.available_width());
+                    for (i, e) in self.conv.sources.iter().enumerate() {
                         let on = i == self.conv.current;
                         let (r, resp) = ui.allocate_exact_size(vec2(w, 58.0), Sense::click());
+                        let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
                         let p = ui.painter();
-                        let stroke = if on { Stroke::new(1.5_f32, pal.accent) } else { Stroke::new(1.0_f32, if resp.hovered() { pal.border_strong } else { pal.border }) };
-                        p.rect(r, Rounding::same(9.0), if on { pal.surface } else { pal.sidebar }, stroke);
-                        let (dot, line2) = match &e.state {
-                            SrcState::Ready if e.conf.kind == Kind::Files => (None, format!("{} · {} VM{}", ".ova .vmx .vmdk .vhdx .qcow2 .vdi", e.vms.len(), if e.vms.len() == 1 { "" } else { "s" })),
-                            SrcState::Ready => (Some(pal.green), format!("{} · {} VM{} · {}", e.about, e.vms.len(), if e.vms.len() == 1 { "" } else { "s" }, e.conf.user)),
-                            SrcState::Connecting => (Some(pal.accent), "Connecting…".to_string()),
-                            SrcState::Locked => (Some(pal.orange), "Its password is needed: click to give it".to_string()),
-                            SrcState::Failed(why) => (Some(pal.red), why.clone()),
+                        let bg = if resp.hovered() && !on { pal.hover } else { pal.surface };
+                        let stroke = if on { Stroke::new(1.5_f32, pal.accent) } else { Stroke::new(1.0_f32, pal.border.gamma_multiply(0.7)) };
+                        p.rect(r, Rounding::same(10.0), bg, stroke);
+                        let (dot, state) = match &e.state {
+                            SrcState::Ready => (if e.conf.kind == Kind::Files { None } else { Some(pal.green) }, (format!("{} VM{}", e.vms.len(), if e.vms.len() == 1 { "" } else { "s" }), pal.ink_soft)),
+                            SrcState::Connecting => (Some(pal.accent), ("Connecting…".to_string(), pal.ink_soft)),
+                            SrcState::Locked => (Some(pal.orange), ("Password?".to_string(), pal.orange)),
+                            SrcState::Failed(_) => (Some(pal.red), ("Not answering".to_string(), pal.red)),
                         };
-                        let mut x = r.min.x + 12.0;
+                        let icon = Rect::from_min_size(r.min + vec2(14.0, 13.0), vec2(16.0, 16.0));
                         match dot {
                             Some(c) => {
-                                p.circle_filled(pos2(x + 4.0, r.min.y + 19.0), 4.0, c);
-                                x += 14.0;
+                                p.circle_filled(icon.center(), 4.0, c);
                             }
-                            None => {
-                                paint_glyph(p, Rect::from_center_size(pos2(x + 7.0, r.min.y + 19.0), vec2(16.0, 16.0)), "folder", pal.ink_soft);
-                                x += 20.0;
-                            }
+                            None => paint_glyph(p, icon, "folder", pal.ink_soft),
                         }
-                        let g = fit(p, &e.conf.address, FontId::new(14.0, FontFamily::Name("bold".into())), pal.ink, r.max.x - x - 10.0);
-                        p.galley(pos2(x, r.min.y + 19.0 - g.size().y / 2.0), g, pal.ink);
-                        let col = if matches!(e.state, SrcState::Failed(_)) { pal.red } else { pal.ink_soft };
-                        let g = fit(p, &line2, FontId::proportional(12.0), col, r.width() - 24.0);
-                        p.galley(pos2(r.min.x + 12.0, r.min.y + 40.0 - g.size().y / 2.0), g, col);
+                        let st = p.text(pos2(r.max.x - 14.0, r.min.y + 21.0), Align2::RIGHT_CENTER, &state.0, FontId::proportional(12.5), state.1);
+                        let name = if e.conf.kind == Kind::Files { "Disk files" } else { e.conf.address.as_str() };
+                        let g = fit(p, name, FontId::new(14.0, FontFamily::Name("bold".into())), pal.ink, (st.min.x - r.min.x - 50.0).max(30.0));
+                        p.galley(pos2(r.min.x + 38.0, r.min.y + 21.0 - g.size().y / 2.0), g, pal.ink);
+                        let line2 = match &e.state {
+                            _ if e.conf.kind == Kind::Files => "On this computer".to_string(),
+                            SrcState::Ready => format!("{}  ·  {}", e.about, e.conf.user),
+                            _ => format!("{}  ·  {}", e.kind_word(), e.conf.user),
+                        };
+                        let g = fit(p, &line2, FontId::proportional(12.0), pal.ink_faint, r.width() - 52.0);
+                        p.galley(pos2(r.min.x + 38.0, r.min.y + 40.0 - g.size().y / 2.0), g, pal.ink_faint);
                         let tip = match &e.state {
                             SrcState::Failed(why) => why.clone(),
                             _ if e.conf.kind == Kind::Files => "Disk files on this computer: Add Files…, or drop them on the window".into(),
-                            _ => format!("{} {}", e.kind_word(), e.conf.address),
+                            _ => format!("{} {}  ·  right-click to look again or forget it", e.kind_word(), e.conf.address),
                         };
                         let resp = resp.on_hover_text(tip);
                         if resp.clicked() {
@@ -531,26 +617,47 @@ impl App {
                     }
                 });
             }
-            ui.add_space(6.0);
-            let Some(e) = self.conv.sources.get(self.conv.current) else { return };
-            let key = e.key();
-            let files = e.conf.kind == Kind::Files;
-            // which VMs: all, off, running; and words in their names
-            let lines: Vec<&SourceVm> = e.vms.iter().collect();
-            let brought = |v: &SourceVm| converted.iter().any(|d| d.starts_with(&format!("Converted from '{}' on {} ", v.name, e.conf.address)));
-            let kinds = [
-                ("All", lines.len()),
-                ("Off", lines.iter().filter(|v| v.power == Power::Off).count()),
-                ("Running", lines.iter().filter(|v| v.power == Power::On).count()),
-                ("Brought over", lines.iter().filter(|v| brought(v)).count()),
-            ];
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing = vec2(10.0, 8.0);
-                let labels: Vec<String> = kinds.iter().map(|(k, n)| format!("{}  {}", k, n)).collect();
-                if let Some(i) = segmented(ui, &pal, &labels, self.conv.filter) {
-                    self.conv.filter = i;
+            // the buttons for what's ticked (as the Snapshots page's), with the filters at the right
+            let kinds: Vec<(usize, &str, usize)> = [
+                (0, "All", lines.len()),
+                (1, "Off", lines.iter().filter(|v| v.power == Power::Off).count()),
+                (2, "Running", lines.iter().filter(|v| v.power == Power::On).count()),
+                (3, "Brought over", lines.iter().filter(|v| brought(v)).count()),
+            ]
+            .into_iter()
+            // (files are neither off nor running)
+            .filter(|k| !files || k.0 == 0 || k.0 == 3)
+            .collect();
+            if !kinds.iter().any(|k| k.0 == self.conv.filter) {
+                self.conv.filter = 0;
+            }
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                ui.set_min_height(34.0);
+                ui.spacing_mut().item_spacing.x = 6.0;
+                let label = match picked.len() {
+                    0 => "Convert…".to_string(),
+                    1 => "Convert 1 VM…".to_string(),
+                    n => format!("Convert {} VMs…", n),
+                };
+                let tip = if !has_pool { "Connect to a server first: VMs are converted into one of its pools" } else if picked.is_empty() { "Tick the VMs to bring over first" } else { "Choose where they go, then convert them" };
+                if flat_button(ui, "convert", &label, Some(pal.accent), has_pool && !picked.is_empty(), false, &pal).on_hover_text(tip).on_disabled_hover_text(tip).clicked() {
+                    act_convert = true;
                 }
-                search_box(ui, &pal, &mut self.conv.search, "Search VMs", 180.0);
+                if flat_button(ui, "close", "Clear", None, !picked.is_empty(), false, &pal).on_hover_text("Untick them all").clicked() {
+                    self.conv.picked.clear();
+                }
+                if !lines.is_empty() {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.x = 10.0;
+                        search_box(ui, &pal, &mut self.conv.search, "Search VMs", 180.0);
+                        let labels: Vec<String> = kinds.iter().map(|(_, k, n)| format!("{}  {}", k, n)).collect();
+                        let at = kinds.iter().position(|k| k.0 == self.conv.filter).unwrap_or(0);
+                        if let Some(i) = segmented(ui, &pal, &labels, at) {
+                            self.conv.filter = kinds[i].0;
+                        }
+                    });
+                }
             });
             let q = self.conv.search.trim().to_lowercase();
             let filter = self.conv.filter;
@@ -565,52 +672,10 @@ impl App {
                 })
                 .filter(|v| q.is_empty() || v.name.to_lowercase().contains(&q) || v.os.to_lowercase().contains(&q))
                 .collect();
-            // what's ticked, and the buttons for it
-            let picked: Vec<&SourceVm> = lines.iter().copied().filter(|v| self.conv.picked.contains(&v.id) && v.blocked.is_none()).collect();
-            ui.horizontal_wrapped(|ui| {
-                ui.set_min_height(30.0);
-                ui.spacing_mut().item_spacing.x = 6.0;
-                if picked.is_empty() {
-                    let text = if e.vms.is_empty() {
-                        match (&e.state, files) {
-                            (_, true) => "No files yet: Add Files…, or drop .ova, .vmx, .vmdk, .vhdx, .qcow2 or .vdi files on the window.".to_string(),
-                            (SrcState::Ready, _) => "It has no VMs.".to_string(),
-                            _ => String::new(),
-                        }
-                    } else {
-                        format!("{} VM{}  ·  tick those to bring over; the originals stay where they are.", shown.len(), if shown.len() == 1 { "" } else { "s" })
-                    };
-                    ui.label(egui::RichText::new(text).color(pal.ink_soft));
-                } else {
-                    let disks: usize = picked.iter().map(|v| v.disks.len()).sum();
-                    let size: u64 = picked.iter().map(|v| v.size()).sum();
-                    let written: u64 = picked.iter().map(|v| v.written()).sum();
-                    ui.label(egui::RichText::new(format!("{} ticked", picked.len())).color(pal.ink));
-                    ui.label(egui::RichText::new(format!("·  {} disk{}, {} ({} written)", disks, if disks == 1 { "" } else { "s" }, fmt_bytes(size as i64), fmt_bytes(written as i64))).color(pal.ink_soft));
-                }
-            });
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 6.0;
-                let label = match picked.len() {
-                    0 => "Convert…".to_string(),
-                    1 => "Convert 1 VM…".to_string(),
-                    n => format!("Convert {} VMs…", n),
-                };
-                let tip = if !has_pool { "Connect to a server first: VMs are converted into one of its pools" } else if picked.is_empty() { "Tick the VMs to bring over first" } else { "Choose where they go, then convert them" };
-                if flat_button(ui, "convert", &label, Some(pal.accent), has_pool && !picked.is_empty(), false, &pal).on_hover_text(tip).on_disabled_hover_text(tip).clicked() {
-                    act_convert = true;
-                }
-                if files {
-                    if flat_button(ui, "plus", "Add Files…", None, true, false, &pal).on_hover_text("An .ova, .ovf, .vmx, or a disk image (.vmdk, .vhd, .vhdx, .qcow2, .vdi, .img)").clicked() {
-                        act_pick_files = true;
-                    }
-                } else if flat_button(ui, "rescan", "Look Again", None, e.source.is_some() && e.state != SrcState::Connecting, false, &pal).on_hover_text("List its VMs again").clicked() {
-                    act_list = Some(self.conv.current);
-                }
-                if !picked.is_empty() && flat_button(ui, "close", "Clear", None, true, false, &pal).on_hover_text("Untick them all").clicked() {
-                    self.conv.picked.clear();
-                }
-            });
+            if shown.is_empty() && !lines.is_empty() {
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new("None of them match.").color(pal.ink_soft));
+            }
             if shown.is_empty() {
                 return;
             }
@@ -735,8 +800,6 @@ impl App {
                     self.conv.picked.insert(id);
                 }
             }
-            ui.add_space(6.0);
-            ui.label(egui::RichText::new("Drop an .ova, .vmx, .vmdk, .vhdx, .qcow2 or .vdi file on the window to convert it too. Right-click a source to look again or forget it.").size(12.0).color(pal.ink_faint));
         });
         if let Some(i) = act_list {
             self.convert_list(i, &ctx);
@@ -771,6 +834,9 @@ impl App {
         }
         if act_convert {
             self.open_wizard(&ctx);
+        }
+        if act_add_source {
+            self.conv.dialog = Some(ConvDialog::Source(SourceForm::new()));
         }
     }
 

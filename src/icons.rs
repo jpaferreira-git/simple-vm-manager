@@ -10,6 +10,8 @@ pub enum IconKind {
     Home,
     Pool,
     Host,
+    /// On, but not taking new VMs (disabled, or in maintenance mode): an orange dot.
+    HostDisabled,
     HostOff,
     ServerDown,
     /// Something under way: a ring turning, in the colour of what's being done.
@@ -139,12 +141,13 @@ pub fn paint_icon(p: &Painter, rect: Rect, kind: IconKind, pal: &Pal, bg: Color3
                 p.rect(r, Rounding::same(1.2), bg, s);
             }
         }
-        IconKind::Host | IconKind::HostOff | IconKind::ServerDown => {
+        IconKind::Host | IconKind::HostDisabled | IconKind::HostOff | IconKind::ServerDown => {
             rrect(p, o, 3.0, 1.5, 9.0, 13.0, 1.8, s);
             line(p, o, &[(5.5, 5.0), (9.5, 5.0)], s);
             line(p, o, &[(5.5, 8.0), (9.5, 8.0)], s);
             match kind {
                 IconKind::Host => dot(p, o, pal.green, bg),
+                IconKind::HostDisabled => dot(p, o, pal.orange, bg),
                 IconKind::HostOff => dot(p, o, pal.red, bg),
                 _ => {
                     p.circle(o + vec2(12.5, 12.5), 3.6, pal.red, Stroke::new(1.4_f32, bg));
@@ -548,6 +551,21 @@ pub fn paint_glyph_on(p: &Painter, rect: Rect, name: &str, col: Color32, bg: Col
             // a clock face at ten past (a schedule)
             p.circle_stroke(c, 6.2, s);
             line(p, c, &[(0.0, -3.8), (0.0, 0.0), (2.9, 1.7)], s);
+        }
+        "message" => {
+            // a speech bubble, its tail at the lower left, two lines of words in it
+            line(p, c, &[(-6.5, -5.5), (6.5, -5.5), (6.5, 3.0), (-1.0, 3.0), (-4.5, 6.2), (-4.5, 3.0), (-6.5, 3.0), (-6.5, -5.5)], s);
+            line(p, c, &[(-3.8, -2.4), (3.8, -2.4)], Stroke::new(1.2_f32, col));
+            line(p, c, &[(-3.8, 0.2), (1.5, 0.2)], Stroke::new(1.2_f32, col));
+        }
+        "hide" => {
+            // an eye, struck through
+            let top: Vec<(f32, f32)> = (0..=12).map(|i| { let a = std::f32::consts::PI * i as f32 / 12.0; (-7.0 * a.cos(), -4.2 * a.sin()) }).collect();
+            let bottom: Vec<(f32, f32)> = top.iter().map(|(x, y)| (*x, -*y)).collect();
+            line(p, c, &top, s);
+            line(p, c, &bottom, s);
+            p.circle_stroke(c, 1.9, s);
+            line(p, c, &[(-6.0, 6.0), (6.0, -6.0)], s);
         }
         "edit" => {
             // a pencil, its point at the lower left

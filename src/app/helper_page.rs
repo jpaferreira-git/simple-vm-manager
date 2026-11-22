@@ -3,7 +3,7 @@
 //! page (advisor_page.rs) shows the checklist the same VM leaves in the pool.
 
 use super::*;
-use crate::helper::{Advice, Channel, Settings, VmStatus};
+use crate::helper::{Advice, Channel, Check, NoteChange, Notes, Settings, VmStatus};
 
 /// What a helper's job was, for what follows it.
 #[derive(Clone, Copy, PartialEq)]
@@ -13,6 +13,8 @@ pub(super) enum Did {
     Asked,
     /// One of the Advisor's fixes.
     Fixed,
+    /// What the owner said about one of the Advisor's checks (dismissed, explained to Claude).
+    Noted,
 }
 
 /// A pool's Helper VM, as this app knows it: its heartbeat and the Advisor's checklist as last
@@ -21,13 +23,22 @@ pub(super) enum Did {
 pub(super) struct HelperView {
     /// Its heartbeat (None: the pool has no Helper VM; Err: why it couldn't be read).
     pub vm: Option<Result<Option<VmStatus>, String>>,
+    /// The Advisor's checklist as the Helper VM left it; as shown (without the checks the owner
+    /// dismissed), and those; and what the owner said about its checks.
+    pub all_advice: Option<Advice>,
     pub advice: Option<Advice>,
+    pub dismissed: Vec<Check>,
+    pub notes: Notes,
     pub polled: Option<Instant>,
     pub polling: bool,
     /// The Advisor's check and the test alert asked of it: when (seconds since 1970), while
     /// unanswered.
     pub asked_advice: Option<i64>,
     pub asked_test: Option<i64>,
+    /// Their lines under Activities while they're waited for (the update's too).
+    pub advice_log: Option<usize>,
+    pub test_log: Option<usize>,
+    pub update_log: Option<usize>,
     /// What the Advisor page should say about its last Check now, when it didn't work.
     pub advice_note: Option<String>,
     /// The update asked of it: when, while unanswered; and how it went (fine, what).
@@ -36,8 +47,10 @@ pub(super) struct HelperView {
     /// The Advisor's check being fixed, and how the last fix went: (check, fine, what).
     pub fixing: Option<String>,
     pub fix_note: Option<(String, bool, String)>,
-    /// A fix was done: the Helper VM's to check the pool again.
+    /// A fix was done, or the owner explained a check to Claude: the Helper VM's to check the pool
+    /// again (once what they said is in the pool).
     pub recheck: bool,
+    pub explained: bool,
     pub saved: Option<Result<Settings, String>>,
     pub reading: bool,
     pub draft: Option<Settings>,
@@ -55,6 +68,25 @@ impl HelperView {
     /// Read, and the pool has none.
     pub fn none(&self) -> bool {
         matches!(self.vm, Some(Ok(None)))
+    }
+
+    /// The checklist as shown, again, after the notes changed.
+    fn split(&mut self) {
+        match self.all_advice.as_ref().map(|a| a.split(&self.notes)) {
+            Some((shown, gone)) => (self.advice, self.dismissed) = (Some(shown), gone),
+            None => (self.advice, self.dismissed) = (None, vec![]),
+        }
+    }
+}
+
+/// The Advisor's summary in words, for its line under Activities: "3 to fix, 2 worth a look".
+fn advice_words(a: &Advice) -> String {
+    let (bad, warn) = a.counts();
+    match (bad, warn) {
+        (0, 0) => "all fine".into(),
+        (b, 0) => format!("{} to fix", b),
+        (0, w) => format!("{} worth a look", w),
+        (b, w) => format!("{} to fix, {} worth a look", b, w),
     }
 }
 
@@ -91,12 +123,12 @@ impl App {
         });
     }
 
-    pub(super) fn helper_state_done(&mut self, sid: u32, result: Result<(String, String), ApiError>) {
+    pub(super) fn helper_state_done(&mut self, sid: u32, result: Result<(String, String, String), ApiError>) {
         let now = unix_now();
         let v = self.helper.entry(sid).or_default();
         v.polling = false;
         v.polled = Some(Instant::now());
-        let (beat, advice) = match result {
+        let (beat, advice, notes) = match result {
             Ok(x) => x,
             Err(e) => {
                 v.vm = Some(Err(e.message()));
@@ -104,37 +136,60 @@ impl App {
             }
         };
         v.vm = Some(Ok(VmStatus::parse(&beat)));
-        v.advice = Advice::parse(&advice);
-        // what was asked, answered
+        v.all_advice = Advice::parse(&advice);
+        // (what's being saved goes by what was asked, not by what's still in the pool)
+        if v.busy != Some(Did::Noted) {
+            v.notes = Notes::parse(&notes);
+        }
+        v.split();
+        // what was asked, answered; its line under Activities says how it went
+        let mut ended: Vec<(Option<usize>, &str, String)> = vec![];
         if let Some(t) = v.asked_advice {
-            if v.advice.as_ref().is_some_and(|a| a.request >= t) {
+            if let Some(a) = v.advice.as_ref().filter(|a| a.request >= t) {
                 v.asked_advice = None;
+                ended.push((v.advice_log.take(), "Done", format!("Advisor: the Helper VM checked the pool: {}", advice_words(a))));
             } else if now - t >= ANSWER_WITHIN {
                 v.asked_advice = None;
-                v.advice_note = Some("The Helper VM didn't answer in five minutes: is it running? ('svm-helper status' on it tells.)".into());
+                let why = "The Helper VM didn't answer in five minutes: is it running? ('svm-helper status' on it tells.)";
+                v.advice_note = Some(why.into());
+                ended.push((v.advice_log.take(), "Failed", format!("Advisor: {}", why)));
             }
         }
         if let Some(t) = v.asked_update {
             let st = v.status().cloned();
-            if let Some(st) = st.filter(|st| !crate::helper::older(&st.version, crate::helper::LATEST)) {
-                v.asked_update = None;
-                v.update_note = Some((true, format!("Updated: the Helper VM is version {} now.", st.version)));
+            let outcome = if let Some(st) = st.filter(|st| !crate::helper::older(&st.version, crate::helper::LATEST)) {
+                Some((true, format!("Updated: the Helper VM is version {} now.", st.version)))
             } else if let Some((_, _, false, why)) = v.status().and_then(|st| st.update.clone()).filter(|u| u.1 >= t - 300) {
-                v.asked_update = None;
-                v.update_note = Some((false, format!("The update didn't work: {}.", if why.is_empty() { "see /var/log/svm-helper-update.log on the Helper VM" } else { why.trim_end_matches('.') })));
+                Some((false, format!("The update didn't work: {}.", if why.is_empty() { "see /var/log/svm-helper-update.log on the Helper VM" } else { why.trim_end_matches('.') })))
             } else if now - t >= UPDATE_WITHIN {
+                Some((false, "The Helper VM didn't update in fifteen minutes: is it running, and does it reach GitHub?".to_string()))
+            } else {
+                None
+            };
+            if let Some((ok, text)) = outcome {
                 v.asked_update = None;
-                v.update_note = Some((false, "The Helper VM didn't update in fifteen minutes: is it running, and does it reach GitHub?".into()));
+                ended.push((v.update_log.take(), if ok { "Done" } else { "Failed" }, format!("Helper VM: {}", text)));
+                v.update_note = Some((ok, text));
             }
         }
         if let Some(t) = v.asked_test {
             let said = v.status().and_then(|st| st.test.clone()).filter(|(req, _)| *req >= t);
-            if let Some((_, results)) = said {
-                v.asked_test = None;
-                v.note = Some(test_note(&results));
+            let outcome = if let Some((_, results)) = said {
+                Some(test_note(&results))
             } else if now - t >= ANSWER_WITHIN {
+                Some((false, "The Helper VM didn't answer in five minutes: is it running?".to_string()))
+            } else {
+                None
+            };
+            if let Some((ok, text)) = outcome {
                 v.asked_test = None;
-                v.note = Some((false, "The Helper VM didn't answer in five minutes: is it running?".into()));
+                ended.push((v.test_log.take(), if ok { "Done" } else { "Failed" }, format!("Test alert: {}", text)));
+                v.note = Some((ok, text));
+            }
+        }
+        for (log, status, text) in ended {
+            if let Some(l) = log {
+                self.end_log(l, status, Some(text));
             }
         }
     }
@@ -170,22 +225,54 @@ impl App {
         }
     }
 
-    /// Asks pool `sid`'s Helper VM for `what` ("advice" or "test"); its answer is read as it comes.
+    /// Asks pool `sid`'s Helper VM for `what` ("advice", "test" or "update"); its answer is read
+    /// as it comes. Meanwhile it's under Activities.
     pub(super) fn helper_ask(&mut self, sid: u32, what: &'static str, ctx: &egui::Context) {
         let now = unix_now();
+        let server = self.server(sid).map(|s| s.name()).unwrap_or_default();
+        let text = match what {
+            "advice" if self.helper.get(&sid).and_then(|v| v.status()).is_some_and(|st| st.claude) => format!("Advisor: the Helper VM checks {} against good practice, and Claude words it", server),
+            "advice" => format!("Advisor: the Helper VM checks {} against good practice", server),
+            "update" => format!("Updating the Helper VM of {} to version {}", server, crate::helper::LATEST),
+            _ => format!("Sending a test alert from the Helper VM of {}", server),
+        };
+        // (one line for what's asked again while it's waited for)
+        let line = match what {
+            "advice" => self.helper.get(&sid).and_then(|v| v.advice_log),
+            "update" => self.helper.get(&sid).and_then(|v| v.update_log),
+            _ => self.helper.get(&sid).and_then(|v| v.test_log),
+        };
+        let log = line.filter(|&l| self.log.get(l).is_some_and(|e| e.status == "In progress")).unwrap_or_else(|| self.add_log(sid, &server, None, &server, &text, "In progress"));
         let v = self.helper.entry(sid).or_default();
         match what {
             "advice" => {
                 v.asked_advice = Some(now);
                 v.advice_note = None;
+                v.advice_log = Some(log);
             }
             "update" => {
                 v.asked_update = Some(now);
                 v.update_note = None;
+                v.update_log = Some(log);
             }
-            _ => v.asked_test = Some(now),
+            _ => {
+                v.asked_test = Some(now);
+                v.test_log = Some(log);
+            }
         }
         self.helper_job(sid, Did::Asked, None, move |c| c.helper_ask(what, now).map(|_| String::new()), ctx);
+    }
+
+    /// What the owner says about the Advisor's check `c` of pool `sid`: shown at once, then kept
+    /// in the pool. What they explain to Claude has the Helper VM check the pool again with it.
+    pub(super) fn advisor_note(&mut self, sid: u32, key: String, title: String, change: NoteChange, ctx: &egui::Context) {
+        let now = unix_now();
+        let v = self.helper.entry(sid).or_default();
+        v.notes = std::mem::take(&mut v.notes).with(&key, &title, &change, now);
+        v.split();
+        v.advice_note = None;
+        v.explained = matches!(change, NoteChange::Explain(_));
+        self.helper_job(sid, Did::Noted, None, move |c| c.helper_note(&key, &title, &change, now), ctx);
     }
 
     /// A helper's job in the background (`text`: its line under Activities, if it has one).
@@ -231,9 +318,25 @@ impl App {
                 v.asked_advice = None;
                 v.asked_test = None;
                 v.asked_update = None;
-                v.update_note = Some((false, format!("Couldn't ask the Helper VM: {}", e.message())));
-                v.advice_note = Some(format!("Couldn't ask the Helper VM: {}", e.message()));
-                v.note = Some((false, format!("Couldn't ask the Helper VM: {}", e.message())));
+                let why = format!("Couldn't ask the Helper VM: {}", e.message());
+                v.update_note = Some((false, why.clone()));
+                v.advice_note = Some(why.clone());
+                v.note = Some((false, why.clone()));
+                let logs = [v.advice_log.take(), v.update_log.take(), v.test_log.take()];
+                for l in logs.into_iter().flatten() {
+                    self.end_log(l, "Failed", Some(why.clone()));
+                }
+            }
+            (Did::Noted, Ok(text)) => {
+                v.notes = Notes::parse(&text);
+                v.split();
+                v.recheck |= std::mem::take(&mut v.explained);
+            }
+            (Did::Noted, Err(e)) => {
+                // (shown as the pool has them, at its next read)
+                v.polled = None;
+                v.explained = false;
+                v.advice_note = Some(format!("Couldn't keep that in the pool: {}", e.message()));
             }
             (Did::Fixed, result) => {
                 let id = v.fixing.take().unwrap_or_default();
@@ -282,22 +385,15 @@ impl App {
         let now = unix_now();
         let v = self.helper.entry(sid).or_default();
         egui::ScrollArea::vertical().id_salt("helper-page").auto_shrink([false; 2]).show(ui, |ui| {
-            let pad = 28.0;
-            let w = (ui.available_width() - 2.0 * pad).min(860.0);
             ui.add_space(18.0);
-            ui.horizontal(|ui| {
-                // centred in the window, as wide as it reads well
-                ui.add_space(((ui.available_width() - w) / 2.0).max(pad));
-                ui.vertical(|ui| {
-                    ui.set_width(w);
-                    ui.spacing_mut().item_spacing.y = 0.0;
-                    vm_card(ui, &pal, v, now, &mut act);
-                    if let Some(st) = v.status().cloned() {
-                        ui.add_space(22.0);
-                        settings_ui(ui, &pal, v, &d, st.requests, &mut act);
-                    }
-                    ui.add_space(28.0);
-                });
+            centered(ui, 860.0, 28.0, |ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                vm_card(ui, &pal, v, now, &mut act);
+                if let Some(st) = v.status().cloned() {
+                    ui.add_space(22.0);
+                    settings_ui(ui, &pal, v, &d, st.requests, &mut act);
+                }
+                ui.add_space(28.0);
             });
         });
         let Some(a) = act else { return };

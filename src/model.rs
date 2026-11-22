@@ -837,6 +837,20 @@ impl NewNetwork {
     }
 }
 
+/// A network's settings changed (Edit Network): its name and description; its MTU, when that
+/// changed; and, for a VLAN, its card and tag when they changed (the VLAN is then made again on
+/// every server). `replug`: no running VM has a card on it, so its servers' VLAN cards can be
+/// plugged again for a new MTU to take effect now.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NetworkEdit {
+    pub net: String,
+    pub name: String,
+    pub description: String,
+    pub mtu: Option<i64>,
+    pub vlan: Option<(String, i64)>,
+    pub replug: bool,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct PoolData {
     pub name: String,

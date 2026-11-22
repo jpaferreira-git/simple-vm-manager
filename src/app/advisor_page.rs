@@ -4,7 +4,7 @@
 //! new one.
 
 use super::*;
-use crate::helper::{Check, Fix, Status, TOPICS};
+use crate::helper::{Check, Fix, NoteChange, Status, TOPICS};
 
 impl App {
     pub(super) fn advisor_page(&mut self, ui: &mut Ui, out: &mut Vec<Intent>) {
@@ -18,27 +18,20 @@ impl App {
         let many = pools.len() > 1;
         let this = &*self;
         egui::ScrollArea::vertical().id_salt("advisor-page").auto_shrink([false; 2]).show(ui, |ui| {
-            let pad = 28.0;
-            let w = (ui.available_width() - 2.0 * pad).min(860.0);
             ui.add_space(18.0);
-            ui.horizontal(|ui| {
-                // centred in the window, as wide as it reads well
-                ui.add_space(((ui.available_width() - w) / 2.0).max(pad));
-                ui.vertical(|ui| {
-                    ui.set_width(w);
-                    ui.spacing_mut().item_spacing.y = 0.0;
-                    if pools.is_empty() {
-                        soft(ui, &pal, "Connect to a pool first: its Helper VM checks it against good practice every day, and this page shows what it found.");
+            centered(ui, 860.0, 28.0, |ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                if pools.is_empty() {
+                    soft(ui, &pal, "Connect to a pool first: its Helper VM checks it against good practice every day, and this page shows what it found.");
+                }
+                for (i, (sid, name)) in pools.iter().enumerate() {
+                    if i > 0 {
+                        ui.add_space(34.0);
                     }
-                    for (i, (sid, name)) in pools.iter().enumerate() {
-                        if i > 0 {
-                            ui.add_space(34.0);
-                        }
-                        let d = this.server(*sid).and_then(|s| s.data.as_ref());
-                        pool_checklist(ui, &pal, *sid, name, many, this.helper.get(sid), d, now, out);
-                    }
-                    ui.add_space(28.0);
-                });
+                    let d = this.server(*sid).and_then(|s| s.data.as_ref());
+                    pool_checklist(ui, &pal, *sid, name, many, this.helper.get(sid), d, now, out);
+                }
+                ui.add_space(28.0);
             });
         });
     }
@@ -159,6 +152,52 @@ fn pool_checklist(ui: &mut Ui, pal: &Pal, sid: u32, name: &str, many: bool, v: O
             }
         });
     }
+    dismissed_ui(ui, pal, sid, v, out);
+}
+
+/// The checks the owner dismissed, at the end: how many, and (unfolded) each with Bring back.
+fn dismissed_ui(ui: &mut Ui, pal: &Pal, sid: u32, v: &super::helper_page::HelperView, out: &mut Vec<Intent>) {
+    if v.dismissed.is_empty() {
+        return;
+    }
+    let id = egui::Id::new(("advisor-dismissed", sid));
+    let mut open = ui.data(|d| d.get_temp::<bool>(id)).unwrap_or(false);
+    ui.add_space(18.0);
+    let n = v.dismissed.len();
+    let text = format!("{} dismissed  {}", n, if open { "▾" } else { "▸" });
+    let tip = "Checks you took off the list: the Helper VM leaves them out, and Claude doesn't bring them up again";
+    if ui.add(egui::Label::new(egui::RichText::new(text).size(13.0).color(pal.ink_soft)).sense(Sense::click())).on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(tip).clicked() {
+        open = !open;
+        ui.data_mut(|d| d.insert_temp(id, open));
+    }
+    if !open {
+        return;
+    }
+    ui.add_space(6.0);
+    // (their marks faded)
+    let mut faint = *pal;
+    (faint.green, faint.orange, faint.red) = (pal.green.gamma_multiply(0.45), pal.orange.gamma_multiply(0.45), pal.red.gamma_multiply(0.45));
+    super::overview::panel(ui, pal, |ui| {
+        for (i, c) in v.dismissed.iter().enumerate() {
+            let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 40.0), Sense::hover());
+            let p = ui.painter();
+            mark(p, pos2(rect.min.x + 25.0, rect.center().y), c.status, &faint, 8.5);
+            let back = egui::Rect::from_min_max(pos2(rect.max.x - 120.0, rect.min.y), rect.max);
+            let (g, cut) = super::overview::fit(p, &c.title, FontId::proportional(14.0), pal.ink_soft, back.min.x - rect.min.x - 54.0);
+            p.galley(pos2(rect.min.x + 44.0, rect.center().y - g.size().y / 2.0), g, pal.ink_soft);
+            let mut child = ui.new_child(egui::UiBuilder::new().max_rect(back.shrink2(vec2(12.0, 0.0))).layout(egui::Layout::right_to_left(egui::Align::Center)));
+            if flat_button(&mut child, "revert", "Bring back", None, true, false, pal).on_hover_text("Show it on the list again").clicked() {
+                out.push(Intent::AdvisorNote(sid, c.key(), c.title.clone(), NoteChange::Restore));
+            }
+            if cut {
+                ui.interact(rect, egui::Id::new(("dismissed-title", sid, i)), Sense::hover()).on_hover_text(&c.title);
+            }
+            if i + 1 < v.dismissed.len() {
+                let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
+                ui.painter().line_segment([pos2(r.min.x + 44.0, r.center().y), pos2(r.max.x, r.center().y)], Stroke::new(1.0_f32, pal.border.gamma_multiply(0.6)));
+            }
+        }
+    });
 }
 
 /// Where the pool has no Helper VM: what the Advisor needs, and a way to set one up.
@@ -264,7 +303,8 @@ fn check_row(ui: &mut Ui, pal: &Pal, sid: u32, c: &Check, v: &super::helper_page
     let id = egui::Id::new(("advisor-open", sid, c.id.as_str()));
     let mut open = ui.data(|d| d.get_temp::<bool>(id)).unwrap_or(false);
     let fix = c.fix.as_ref().filter(|f| !fix_words(f).0.is_empty() && c.status != Status::Ok);
-    let more = !c.note.is_empty() || !c.objects.is_empty() || fix.is_some();
+    // (one that isn't fine can always be dismissed or explained to Claude)
+    let more = !c.note.is_empty() || !c.objects.is_empty() || fix.is_some() || c.status != Status::Ok;
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 40.0), if more { Sense::click() } else { Sense::hover() });
     let p = ui.painter();
     if more && resp.hovered() {
@@ -310,6 +350,9 @@ fn check_row(ui: &mut Ui, pal: &Pal, sid: u32, c: &Check, v: &super::helper_page
                 if let Some(f) = fix {
                     fix_ui(ui, pal, sid, c, f, v, d, out);
                 }
+                if c.status != Status::Ok {
+                    owner_ui(ui, pal, sid, c, v, out);
+                }
             });
         });
         ui.add_space(12.0);
@@ -318,6 +361,62 @@ fn check_row(ui: &mut Ui, pal: &Pal, sid: u32, c: &Check, v: &super::helper_page
         let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
         ui.painter().line_segment([pos2(r.min.x + 44.0, r.center().y), pos2(r.max.x, r.center().y)], Stroke::new(1.0_f32, pal.border.gamma_multiply(0.6)));
     }
+}
+
+/// What the owner can say about a check that isn't fine: what they told Claude about it, then
+/// Explain to Claude (when the Helper VM has Claude: a box for it, and Claude checks the pool
+/// again with it in mind) and Dismiss (off the list; it's brought back at the page's end).
+fn owner_ui(ui: &mut Ui, pal: &Pal, sid: u32, c: &Check, v: &super::helper_page::HelperView, out: &mut Vec<Intent>) {
+    let key = c.key();
+    let typing_id = egui::Id::new(("advisor-explain", sid, key.as_str()));
+    let typing = ui.data(|d| d.get_temp::<String>(typing_id));
+    let claude = v.status().is_some_and(|st| st.claude && st.requests);
+    let said = v.notes.said.get(&key).map(|s| s.1.clone());
+    if let Some(text) = &said {
+        // what they said, as a quote with a bar at its left
+        ui.horizontal(|ui| {
+            let (bar, _) = ui.allocate_exact_size(vec2(3.0, 18.0), Sense::hover());
+            ui.painter().rect_filled(bar, Rounding::same(1.5), pal.accent.gamma_multiply(0.6));
+            ui.add_space(4.0);
+            ui.add(egui::Label::new(egui::RichText::new(format!("You told Claude: \u{201c}{}\u{201d}", text)).size(12.5).italics().color(pal.ink_soft)).wrap());
+        });
+    }
+    if let Some(mut text) = typing {
+        egui::Frame::none().fill(pal.surface).stroke(Stroke::new(1.0_f32, pal.border)).rounding(Rounding::same(10.0)).inner_margin(egui::Margin::symmetric(12.0, 10.0)).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 6.0;
+            ui.label(egui::RichText::new("What should Claude know about it?").size(13.0).color(pal.ink));
+            let edit = ui.add(egui::TextEdit::multiline(&mut text).desired_rows(3).desired_width(ui.available_width()).hint_text("For example: it's off on purpose, it's the spare for when the other one fails."));
+            if edit.changed() {
+                ui.data_mut(|d| d.insert_temp(typing_id, text.clone()));
+            }
+            ui.add(egui::Label::new(egui::RichText::new("The Helper VM checks the pool again and Claude takes it into account, from now on.").size(12.0).color(pal.ink_faint)).wrap());
+            ui.horizontal(|ui| {
+                if dialog_button(ui, pal, "message", "Send to Claude", Look::Primary, !text.trim().is_empty() && v.asked_advice.is_none()) {
+                    ui.data_mut(|d| d.remove::<String>(typing_id));
+                    out.push(Intent::AdvisorNote(sid, key.clone(), c.title.clone(), NoteChange::Explain(text.clone())));
+                }
+                if dialog_button(ui, pal, "close", "Cancel", Look::Plain, true) {
+                    ui.data_mut(|d| d.remove::<String>(typing_id));
+                }
+            });
+        });
+        return;
+    }
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        let tip = "Tell Claude what it can't see: that it's like this on purpose, or what's planned. The Helper VM checks the pool again, and Claude keeps it in mind.";
+        if claude && flat_button(ui, "message", if said.is_some() { "Change what you told Claude" } else { "Explain to Claude" }, None, v.asked_advice.is_none(), false, pal).on_hover_text(tip).clicked() {
+            ui.data_mut(|d| d.insert_temp(typing_id, said.clone().unwrap_or_default()));
+        }
+        if said.is_some() && flat_button(ui, "close", "Forget it", None, true, false, pal).on_hover_text("Claude stops going by what you told it").clicked() {
+            out.push(Intent::AdvisorNote(sid, key.clone(), c.title.clone(), NoteChange::Forget));
+        }
+        let tip = "Take it off the list: the Helper VM leaves it out, and Claude doesn't bring it up again. It's at the end of the page, to bring back.";
+        if flat_button(ui, "hide", "Dismiss", None, true, false, pal).on_hover_text(tip).clicked() {
+            out.push(Intent::AdvisorNote(sid, key.clone(), c.title.clone(), NoteChange::Dismiss));
+        }
+    });
 }
 
 /// A check's fix: its button; for one this app does itself, the question and Do it / Cancel once
