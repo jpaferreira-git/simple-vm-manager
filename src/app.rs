@@ -372,7 +372,7 @@ enum Tab {
     Overview,
     /// A VM's or a server's load over ten minutes, two hours, a week or a year, in full.
     Performance,
-    /// Every pool's alerts (All servers; the toolbar's bell, not a tab in the row).
+    /// Every pool's alerts (All servers; the toolbar's bell, its Notifications page's first tab).
     Alerts,
     General,
     /// Their less used details (General, under another name).
@@ -394,6 +394,8 @@ enum Tab {
     AllSchedules,
     /// The Templates folder's list.
     Templates,
+    /// What this app did, as History: an object's (its tab), or everything (All servers: the
+    /// Notifications page's second tab, after Alerts).
     Logs,
     /// A pool's Helper VM (helper_page.rs).
     Helper,
@@ -410,7 +412,7 @@ impl Tab {
     /// A page of All servers that a toolbar button opens: not a tab in its row too, the button
     /// shown pressed instead.
     fn on_toolbar(self) -> bool {
-        matches!(self, Tab::IsoLibrary | Tab::VmStorage | Tab::Templates | Tab::AllSnapshots | Tab::AllSchedules | Tab::Networks | Tab::Alerts | Tab::Convert | Tab::Conversions | Tab::Advisor)
+        matches!(self, Tab::IsoLibrary | Tab::VmStorage | Tab::Templates | Tab::AllSnapshots | Tab::AllSchedules | Tab::Networks | Tab::Alerts | Tab::Logs | Tab::Convert | Tab::Conversions | Tab::Advisor)
     }
 
     fn label(self) -> &'static str {
@@ -434,7 +436,7 @@ impl Tab {
             Tab::AllSnapshots => "VMs",
             Tab::AllSchedules => "Schedules",
             Tab::Templates => "Templates",
-            Tab::Logs => "Logs",
+            Tab::Logs => "History",
             Tab::Helper => "Helper",
             Tab::Advisor => "Advisor",
             // (under the VM Conversion page's name)
@@ -728,6 +730,8 @@ pub struct App {
     dismissing: HashSet<String>,
     app_alerts_since: HashMap<String, i64>,
     alerts_view: AlertsView,
+    /// History's filters: the failed only, words in it.
+    history_view: (bool, String),
     /// The last look at each running VM's screen shown in an Overview, and those being taken.
     thumbs: HashMap<String, Thumb>,
     thumb_busy: HashSet<String>,
@@ -890,6 +894,7 @@ impl App {
             dismissing: HashSet::new(),
             app_alerts_since: HashMap::new(),
             alerts_view: AlertsView::default(),
+            history_view: (false, String::new()),
             thumbs: HashMap::new(),
             thumb_busy: HashSet::new(),
             vm_saving: HashMap::new(),
@@ -3513,7 +3518,7 @@ impl App {
                             "make-template" | "copy-vm" | "copy-vm-thin" | "template-made" | "vm-off" | "vm-edited" | "move-vm-off" => self.select(format!("vm:{}:vm-desk", id)),
                             "move-vm-local" | "vm-usb" => self.select(format!("vm:{}:vm-mail", id)),
                             // (Web Server: running)
-                            "vm-actions" => self.select(format!("vm:{}:vm-web", id)),
+                            "vm-actions" | "console-actions" | "console-actions-windows" => self.select(format!("vm:{}:vm-web", id)),
                             "sr-shared" => {
                                 self.expanded.insert(format!("folder:{}:srs", id));
                                 self.select(format!("sr:{}:sr-nfs", id));
@@ -4384,6 +4389,8 @@ impl App {
         let page = (sel.kind == Kind::Root && self.tab.on_toolbar()).then_some(match self.tab {
             Tab::AllSchedules => Tab::AllSnapshots,
             Tab::Conversions => Tab::Convert,
+            // (History, the bell's page's second tab)
+            Tab::Logs => Tab::Alerts,
             t => t,
         });
         let on = |t: Tab| page == Some(t);
@@ -4755,7 +4762,7 @@ impl App {
             }
             ui.add_space(4.0);
             ui.separator();
-            if ui.add(egui::Label::new(egui::RichText::new("All of it in Logs").size(12.5).color(pal.accent)).sense(Sense::click())).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+            if ui.add(egui::Label::new(egui::RichText::new("All of it in History").size(12.5).color(pal.accent)).sense(Sense::click())).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                 out.push(Intent::Select("root".into()));
                 out.push(Intent::Tab(Tab::Logs));
                 ui.close_menu();
@@ -5238,7 +5245,7 @@ impl App {
         };
         // a server's tools, in its Actions (twice for a check's screenshot, which shows them open)
         let mut tools = host.as_ref().map(|(sid, href, on, _)| self.host_entries(*sid, href, *on));
-        let shot = self.shot_path.is_some() && matches!(self.shot_show.as_str(), "vm-actions" | "host-actions");
+        let shot = self.shot_path.is_some() && matches!(self.shot_show.as_str(), "vm-actions" | "host-actions" | "console-actions" | "console-actions-windows");
         let shot_tools = if shot { host.as_ref().map(|(sid, href, on, _)| self.host_entries(*sid, href, *on)) } else { None };
         let mut console = if current == Tab::Console { self.console.as_mut() } else { None };
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(free).layout(egui::Layout::right_to_left(egui::Align::Center)));
@@ -5325,10 +5332,38 @@ impl App {
                 ];
                 tools::tool_entries(ui, &pal, rows, out);
             }
-            // the keys the desktop keeps, while its console's shown
+            // while its console's shown: this computer's clipboard pasted (a Windows VM with VM
+            // Tools) or typed there (the only ways it gets there: no key pastes it), and the keys
+            // the desktop keeps
             if let Some(c) = console {
                 ui.separator();
-                ui.add_enabled_ui(c.connected(), |ui| ui.menu_button("Send keys (Ctrl+Alt+Del…)", |ui| c.keys_menu(ui)));
+                let on = c.connected();
+                let why = "The console isn't connected";
+                if c.vm_tools {
+                    let r = ui.scope(|ui| tools::action_row(ui, &pal, tools::Icon::Glyph("paste", pal.accent), "Paste the clipboard", "", on, why));
+                    if r.inner {
+                        c.paste_clipboard(ui.ctx());
+                    }
+                    if on {
+                        r.response.on_hover_text("Gives the text on this computer's clipboard to the VM's XenServer VM Tools and presses Ctrl+V: at once, accents and all");
+                    }
+                }
+                let (glyph, tip) = if c.vm_tools {
+                    ("keyboard", "Types the text on this computer's clipboard, a key for each character: for the login screen, where VM Tools can't paste")
+                } else {
+                    ("paste", "Types the text on this computer's clipboard, a key for each character: for a Linux console, an installer, a login screen…")
+                };
+                let r = ui.scope(|ui| tools::action_row(ui, &pal, tools::Icon::Glyph(glyph, pal.accent), "Type the clipboard", "", on, why));
+                if r.inner {
+                    c.type_clipboard(ui.ctx());
+                }
+                if on {
+                    r.response.on_hover_text(tip);
+                }
+                if tools::action_row(ui, &pal, tools::Icon::Glyph("keyboard", pal.accent), "Send Ctrl+Alt+Del", "", on, why) {
+                    c.send_ctrl_alt_del();
+                }
+                tools::submenu_row(ui, &pal, "keyboard", "Send other keys", on, |ui| c.keys_menu(ui));
             }
             if vm.is_some() {
                 ui.separator();
@@ -5350,7 +5385,7 @@ impl App {
                 egui::Area::new(egui::Id::new("actions-shot")).order(egui::Order::Foreground).fixed_pos(pos2(r.max.x - 256.0, r.max.y + 4.0)).show(ui.ctx(), |ui| {
                     egui::Frame::menu(ui.style()).show(ui, |ui| {
                         ui.set_max_width(256.0);
-                        menu(ui, &mut vec![], None, shot_tools);
+                        menu(ui, &mut vec![], console.as_deref_mut(), shot_tools);
                     });
                 });
             }
@@ -5563,7 +5598,7 @@ impl App {
     fn tabs_for(&self, sel: &Node) -> Vec<Tab> {
         let has_data = sel.sid.and_then(|id| self.server(id)).map_or(false, |s| s.data.is_some());
         match sel.kind {
-            // (Logs: from Activities' "All of it in Logs")
+            // (Logs, as History: the bell's page's second tab, and Activities' "All of it in History")
             Kind::Root => vec![Tab::Home, Tab::IsoLibrary, Tab::VmStorage, Tab::Templates, Tab::AllSnapshots, Tab::AllSchedules, Tab::Networks, Tab::Logs, Tab::Alerts, Tab::Convert, Tab::Conversions, Tab::Advisor],
             Kind::Category => vec![Tab::Home, Tab::Search, Tab::Logs],
             Kind::Sr if self.sr_of(sel).map_or(false, |(_, x)| x.is_iso()) => vec![Tab::General, Tab::IsoFiles, Tab::Logs],
@@ -7055,9 +7090,11 @@ impl App {
         let picked = self.snap_pick.as_deref().and_then(|r| snaps.iter().find(|x| x.rref == r)).filter(|x| !self.snap_deleting.contains(&x.rref)).cloned();
         // (their labels in full, shorter in a narrower window, and on two lines in a narrow one:
         // always with their words)
-        const FULL: [&str; 5] = ["Revert…", "New VM…", "Make Template…", "Export to a File…", "Delete…"];
-        const SHORT: [&str; 5] = ["Revert", "New VM", "Template", "Export", "Delete"];
-        let need = |l: &[&str; 5]| l.iter().map(|l| flat_button_width(ui, l)).sum::<f32>() + 6.0 * 5.0 + 9.0;
+        // (New Snapshot first, for the VM, needing no tick; a hairline, then the ones that act
+        // on the ticked snapshot)
+        const FULL: [&str; 6] = ["New Snapshot…", "Revert…", "New VM…", "Make Template…", "Export to a File…", "Delete…"];
+        const SHORT: [&str; 6] = ["New Snapshot", "Revert", "New VM", "Template", "Export", "Delete"];
+        let need = |l: &[&str; 6]| l.iter().map(|l| flat_button_width(ui, l)).sum::<f32>() + 6.0 * 7.0 + 2.0 * 9.0;
         let room = ui.available_width();
         let labels = if room >= need(&FULL) { FULL } else { SHORT };
         let one_line = room >= need(&SHORT);
@@ -7081,24 +7118,41 @@ impl App {
             let memory = |what: &str, t: &str| -> String {
                 if ok && !disks { format!("{} come from snapshots of the disks only (this one holds its memory too)", what) } else { tip(t) }
             };
-            if flat_button(ui, "revert", labels[0], Some(pal.orange), ok, false, &pal).on_hover_text(tip("Put the VM back as it was when this snapshot was taken (it asks first)")).clicked() {
+            // (a hairline between groups; on a line of its own, no hairline)
+            let hairline = |ui: &mut Ui| {
+                if one_line {
+                    let (bar, _) = ui.allocate_exact_size(vec2(3.0, 26.0), Sense::hover());
+                    ui.painter().line_segment([pos2(bar.center().x, bar.min.y + 5.0), pos2(bar.center().x, bar.max.y - 5.0)], Stroke::new(1.0_f32, pal.border));
+                }
+            };
+            let take_tip = if busy {
+                format!("Wait until the VM is done: {}", doing.as_deref().unwrap_or_default())
+            } else if gone {
+                "Not now: its server isn't there".into()
+            } else if !can_take {
+                "This VM can't have a snapshot taken now".into()
+            } else {
+                "Take a snapshot of the VM as it is now".into()
+            };
+            if flat_button(ui, "camera", labels[0], Some(pal.accent), can_take, false, &pal).on_hover_text(take_tip).clicked() {
+                out.push(Intent::TakeSnapshot(sid, vref.clone()));
+            }
+            hairline(ui);
+            if flat_button(ui, "revert", labels[1], Some(pal.orange), ok, false, &pal).on_hover_text(tip("Put the VM back as it was when this snapshot was taken (it asks first)")).clicked() {
                 out.extend(picked.as_ref().map(|x| Intent::AskRevert(sid, x.rref.clone())));
             }
-            if flat_button(ui, "newvm", labels[1], Some(pal.accent), disks, false, &pal).on_hover_text(memory("New VMs", "A new VM from this snapshot: its disks as they were then")).clicked() {
+            if flat_button(ui, "newvm", labels[2], Some(pal.accent), disks, false, &pal).on_hover_text(memory("New VMs", "A new VM from this snapshot: its disks as they were then")).clicked() {
                 out.extend(picked.as_ref().map(|x| Intent::NewVmFromSnapshot(sid, x.rref.clone())));
             }
-            if flat_button(ui, "template", labels[2], Some(pal.accent), disks, false, &pal).on_hover_text(memory("Templates", "A template from this snapshot")).clicked() {
+            if flat_button(ui, "template", labels[3], Some(pal.accent), disks, false, &pal).on_hover_text(memory("Templates", "A template from this snapshot")).clicked() {
                 out.extend(picked.as_ref().map(|x| Intent::MakeTemplate(sid, x.rref.clone())));
             }
-            if flat_button(ui, "download", labels[3], Some(pal.accent), ok, false, &pal).on_hover_text(tip("Save this snapshot in a .xva file on this computer")).clicked() {
+            if flat_button(ui, "download", labels[4], Some(pal.accent), ok, false, &pal).on_hover_text(tip("Save this snapshot in a .xva file on this computer")).clicked() {
                 out.extend(picked.as_ref().map(|x| Intent::ExportVm(sid, x.rref.clone())));
             }
-            // (a hairline, then the one that takes it away; on a line of its own, no hairline)
-            if one_line {
-                let (bar, _) = ui.allocate_exact_size(vec2(3.0, 26.0), Sense::hover());
-                ui.painter().line_segment([pos2(bar.center().x, bar.min.y + 5.0), pos2(bar.center().x, bar.max.y - 5.0)], Stroke::new(1.0_f32, pal.border));
-            }
-            if flat_button(ui, "trash", labels[4], Some(pal.red), picked.is_some(), false, &pal).on_hover_text(if picked.is_some() { "Delete this snapshot, with its copies of the disks (it asks first)".into() } else { tip("") }).clicked() {
+            // (a hairline, then the one that takes it away)
+            hairline(ui);
+            if flat_button(ui, "trash", labels[5], Some(pal.red), picked.is_some(), false, &pal).on_hover_text(if picked.is_some() { "Delete this snapshot, with its copies of the disks (it asks first)".into() } else { tip("") }).clicked() {
                 out.extend(picked.as_ref().map(|x| Intent::AskDeleteSnapshot(sid, x.rref.clone())));
             }
         });
@@ -7109,8 +7163,8 @@ impl App {
             ui.label(egui::RichText::new(count).size(12.0).color(pal.ink_soft));
             let hint = match (&picked, snaps.len()) {
                 (Some(_), _) => "·  Revert puts the VM back as it was then; what changed since is lost.",
-                (None, 1) => "·  Tick it to use the buttons above.",
-                (None, _) => "·  Tick one to use the buttons above.",
+                (None, 1) => "·  Tick it to use Revert and the buttons after it.",
+                (None, _) => "·  Tick one to use Revert and the buttons after it.",
             };
             ui.label(egui::RichText::new(hint).size(12.0).color(pal.ink_faint));
         });
@@ -7593,17 +7647,29 @@ impl App {
         if self.console.as_ref().map_or(true, |c| c.sid != sid || c.vm != vref) {
             self.console = Some(ConsoleView::new(sid, vref, &name, &os, conn, ui.ctx().clone()));
         }
+        let usb_tablet = self.vm_of(sel).map_or(true, |(_, _, v)| v.usb_tablet || v.virt_mode != "HVM");
+        // a Windows VM with its VM Tools: Paste the clipboard gives them this computer's
+        let vm_tools = self.vm_of(sel).map_or(false, |(_, _, v)| v.tools_installed && v.os.to_lowercase().contains("windows"));
         if let Some(c) = self.console.as_mut() {
             let allow_keyboard = matches!(self.dialog, Dialog::None);
             c.share_clipboard = self.share_clipboard;
+            // (the demo's Windows VMs aren't running: its screenshot gives Web Server VM Tools)
+            c.vm_tools = vm_tools || (self.shot_path.is_some() && self.shot_show == "console-actions-windows");
+            c.usb_tablet = usb_tablet;
             c.ui(ui, &pal, allow_keyboard);
+            if std::mem::take(&mut c.want_tablet) {
+                out.push(Intent::EditVm(sid, c.vm.clone(), VmChange::UsbTablet));
+            }
         }
     }
 
     /// The Logs tab: the newest first (for a VM, its own); a click on one shows it in full, with
     /// what the server said.
-    fn logs(&self, ui: &mut Ui, sel: &Node, out: &mut Vec<Intent>) {
-        let shown: Vec<usize> = (0..self.log.len())
+    /// History: what this app did since it opened (an object's, or everything on All servers),
+    /// newest first: everything or the failed only, words in it; a line opens its details.
+    fn logs(&mut self, ui: &mut Ui, sel: &Node, out: &mut Vec<Intent>) {
+        let pal = self.pal;
+        let mine: Vec<usize> = (0..self.log.len())
             .rev()
             .filter(|&i| {
                 let e = &self.log[i];
@@ -7613,15 +7679,69 @@ impl App {
                 }
             })
             .collect();
-        let rows: Vec<Vec<Cell>> = shown
-            .iter()
-            .map(|&i| {
-                let e = &self.log[i];
-                vec![Cell::Text(e.time.clone()), Cell::Text(e.server.clone()), Cell::Text(e.obj.clone()), Cell::Text(e.text.clone()), Cell::Status(e.status.clone())]
-            })
-            .collect();
-        if let Some(r) = self.table(ui, "logs", &["Time", "Server", "Object", "What happened", "Result"], &rows, true) {
-            out.push(Intent::ShowLog(shown[r]));
+        let failed = mine.iter().filter(|&&i| self.log[i].status == "Failed").count();
+        let (mut only_failed, mut search) = self.history_view.clone();
+        let root = sel.kind == Kind::Root;
+        ui.add_space(if root { 18.0 } else { 10.0 });
+        // (All servers': lined up with the Alerts tab's)
+        let pad = if root { 28.0 } else { 0.0 };
+        let mut open = None;
+        ui.horizontal(|ui| {
+            ui.add_space(pad);
+            ui.vertical(|ui| {
+                ui.set_width(ui.available_width() - pad);
+                ui.spacing_mut().item_spacing.y = 0.0;
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = vec2(12.0, 8.0);
+                    let labels = [format!("Everything  {}", mine.len()), format!("Failed  {}", failed)];
+                    if let Some(i) = performance::segmented(ui, &pal, &labels, if only_failed { 1 } else { 0 }) {
+                        only_failed = i == 1;
+                    }
+                    search_box(ui, &pal, &mut search, "Search history", 200.0);
+                });
+                ui.add_space(8.0);
+                let what = if root { "What this app did since it opened, newest first" } else { "What this app did here since it opened, newest first" };
+                ui.add(egui::Label::new(egui::RichText::new(format!("{}: a line shows what it asked the servers and what they said. What's under way is under Activities too; what needs attention, under Alerts.", what)).size(12.0).color(pal.ink_faint)).wrap());
+                ui.add_space(6.0);
+                let q = search.trim().to_lowercase();
+                let shown: Vec<usize> = mine
+                    .iter()
+                    .copied()
+                    .filter(|&i| !only_failed || self.log[i].status == "Failed")
+                    .filter(|&i| {
+                        let e = &self.log[i];
+                        q.is_empty() || [&e.text, &e.obj, &e.server, &e.status].iter().any(|t| t.to_lowercase().contains(&q))
+                    })
+                    .collect();
+                if shown.is_empty() {
+                    ui.add_space(10.0);
+                    let none = match (mine.is_empty(), only_failed) {
+                        (true, _) => "Nothing yet.",
+                        (false, true) if q.is_empty() => "Nothing failed.",
+                        _ => "Nothing matches.",
+                    };
+                    ui.label(egui::RichText::new(none).color(pal.ink_soft));
+                    return;
+                }
+                let rows: Vec<Vec<Cell>> = shown
+                    .iter()
+                    .map(|&i| {
+                        let e = &self.log[i];
+                        let mut r = vec![Cell::Text(e.time.clone())];
+                        if root {
+                            r.push(Cell::Text(e.server.clone()));
+                        }
+                        r.extend([Cell::Text(e.obj.clone()), Cell::Text(e.text.clone()), Cell::Status(e.status.clone())]);
+                        r
+                    })
+                    .collect();
+                let headers: &[&str] = if root { &["Time", "Server", "Object", "What happened", "Result"] } else { &["Time", "Object", "What happened", "Result"] };
+                open = self.table(ui, "logs", headers, &rows, true).map(|r| shown[r]);
+            });
+        });
+        self.history_view = (only_failed, search);
+        if let Some(i) = open {
+            out.push(Intent::ShowLog(i));
         }
     }
 
@@ -8613,13 +8733,13 @@ impl App {
                     heading(ui, "Storage");
                     tick(ui, &pal, &mut repair_on, "Mount storage again when it's found unmounted");
                     ui.add_space(2.0);
-                    ui.add(egui::Label::new(egui::RichText::new("As after a server started while the share was off. Each is tried once while it stays so; Logs says how it went.").size(12.0).color(pal.ink_soft)).wrap());
+                    ui.add(egui::Label::new(egui::RichText::new("As after a server started while the share was off. Each is tried once while it stays so; History says how it went.").size(12.0).color(pal.ink_soft)).wrap());
                     ui.add_space(18.0);
 
                     heading(ui, "Console");
-                    tick(ui, &pal, &mut clipboard_on, "Share the clipboard with the consoles");
+                    tick(ui, &pal, &mut clipboard_on, "Put what's copied in a console on this computer's clipboard");
                     ui.add_space(2.0);
-                    ui.add(egui::Label::new(egui::RichText::new("Text copied in a console comes onto this computer's clipboard, and a Windows VM with XenServer VM Tools gets this computer's (Ctrl+V pastes it there). Off, Ctrl+V goes to the console as a key. Type the clipboard (Ctrl+Shift+V) works either way.").size(12.0).color(pal.ink_soft)).wrap());
+                    ui.add(egui::Label::new(egui::RichText::new("Text copied in a console (a Windows VM with XenServer VM Tools, or text selected on a server's) comes onto this computer's clipboard. No key pastes this computer's clipboard into a console: Type the clipboard, in Actions, types it there.").size(12.0).color(pal.ink_soft)).wrap());
                     ui.add_space(18.0);
 
                     heading(ui, "Updates");
@@ -9392,7 +9512,8 @@ impl eframe::App for App {
                     }
                 }
                 "sr-auto-repair" => out.push(Intent::Tab(Tab::Logs)),
-                "console" => out.push(Intent::Tab(Tab::Console)),
+                // (and its Actions open over it)
+                "console" | "console-actions" | "console-actions-windows" => out.push(Intent::Tab(Tab::Console)),
                 "update" | "update-progress" => {
                     let release = update::Release { version: "9.9.0".into(), page: "https://github.com/jpaferreira-git/simple-vm-manager/releases".into(), download: Some(("https://example.invalid/a.tar.gz".into(), 9_540_306)) };
                     let transfer = (self.shot_show == "update-progress").then(|| {
@@ -9604,6 +9725,12 @@ impl eframe::App for App {
             ui.spacing_mut().item_spacing.y = 0.0;
             let tabs = self.tabs_for(&sel);
             let current = if tabs.contains(&self.tab) { self.tab } else { tabs[0] };
+            // a console kept open on another tab doesn't hold the mouse
+            if current != Tab::Console {
+                if let Some(c) = self.console.as_mut() {
+                    c.release_mouse();
+                }
+            }
             let actions = self.tab_actions_width(&sel);
             // (a VM's or a server's console is a button at the row's end, not a tab among the others;
             // All servers' pages that the toolbar opens are its buttons only)
@@ -9612,6 +9739,7 @@ impl eframe::App for App {
             let shown: Vec<Tab> = match (sel.kind, current) {
                 (Kind::Root, Tab::AllSnapshots | Tab::AllSchedules) => vec![Tab::AllSnapshots, Tab::AllSchedules],
                 (Kind::Root, Tab::Convert | Tab::Conversions) => vec![Tab::Convert, Tab::Conversions],
+                (Kind::Root, Tab::Alerts | Tab::Logs) => vec![Tab::Alerts, Tab::Logs],
                 (Kind::Root, Tab::Home) => vec![Tab::Home],
                 (Kind::Root, _) => vec![],
                 _ => tabs.iter().copied().filter(|t| *t != Tab::Console).collect(),
@@ -10584,8 +10712,8 @@ fn vsep(ui: &mut Ui, pal: &Pal) {
 }
 
 /// `active`: the page it opens is the one shown (pressed: a soft background).
-/// An All servers page with a name of its own (a toolbar button's, or Logs): its name, and its
-/// button's icon (`paint_tool`'s op; "activity" for Logs, as the Activities button).
+/// An All servers page with a name of its own (a toolbar button's): its name, and its button's
+/// icon (`paint_tool`'s op).
 fn root_page(tab: Tab) -> Option<(&'static str, &'static str)> {
     match tab {
         Tab::IsoLibrary => Some(("ISO Library", "iso")),
@@ -10595,8 +10723,7 @@ fn root_page(tab: Tab) -> Option<(&'static str, &'static str)> {
         Tab::Networks => Some(("Networks", "networks")),
         Tab::Convert | Tab::Conversions => Some(("VM Conversion", "convert")),
         Tab::Advisor => Some(("Advisor", "advisor")),
-        Tab::Alerts => Some(("Alerts", "alerts")),
-        Tab::Logs => Some(("Logs", "activity")),
+        Tab::Alerts | Tab::Logs => Some(("Notifications", "alerts")),
         _ => None,
     }
 }

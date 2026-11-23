@@ -705,6 +705,13 @@ pub fn paint_glyph_on(p: &Painter, rect: Rect, name: &str, col: Color32, bg: Col
             p.rect_stroke(Rect::from_min_max(c + vec2(-2.5, -2.5), c + vec2(5.5, 5.5)), Rounding::same(1.5), s);
             line(p, c, &[(-5.5, 2.5), (-5.5, -4.0), (-4.0, -5.5), (2.5, -5.5)], s);
         }
+        "paste" => {
+            // a clipboard: its board, the clip at its top, two lines of writing on it
+            p.rect_stroke(Rect::from_min_max(c + vec2(-5.5, -5.0), c + vec2(5.5, 6.8)), Rounding::same(1.5), s);
+            p.rect_filled(Rect::from_min_max(c + vec2(-2.8, -7.0), c + vec2(2.8, -3.4)), Rounding::same(1.0), col);
+            line(p, c, &[(-2.8, 0.2), (2.8, 0.2)], s);
+            line(p, c, &[(-2.8, 3.4), (1.2, 3.4)], s);
+        }
         "usb" => {
             // a USB plug: its metal end with two holes, its grip, the cable out of it
             p.rect_stroke(Rect::from_min_max(c + vec2(-3.2, -7.5), c + vec2(3.2, -3.0)), Rounding::same(0.6), s);

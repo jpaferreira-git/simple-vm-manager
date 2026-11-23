@@ -1916,6 +1916,8 @@ fn vm_details(vm: &mut VmInfo, r: &Value, guest: &Value, metrics: &Value) {
     }
     .into();
     if vm.virt_mode == "HVM" {
+        let platform = r.get("platform").unwrap_or(&null);
+        vm.usb_tablet = s(platform, "usb") != "false" && s(platform, "usb_tablet") != "false";
         let boot = r.get("HVM_boot_params").unwrap_or(&null);
         vm.firmware = if s(boot, "firmware") == "uefi" { "UEFI" } else { "BIOS" }.into();
         vm.boot_order = boot_text(&s(boot, "order"));
@@ -2929,6 +2931,11 @@ impl Connection for RealConnection {
                 }
                 // plugged in at its next start (the server can't plug one into a running VM)
                 self.call("VUSB.create", vec![json!(vm), json!(group), json!({})], t).map(|_| ())
+            }
+            // the device model gets it as the VM starts
+            VmChange::UsbTablet => {
+                set_key("VM", "platform", vm, "usb", "true")?;
+                set_key("VM", "platform", vm, "usb_tablet", "true")
             }
             VmChange::RemoveUsb { vusb, .. } => {
                 if self.call("VUSB.get_currently_attached", vec![json!(vusb)], t)?.as_bool().unwrap_or(false) {
@@ -6168,6 +6175,7 @@ impl Connection for DemoConnection {
             VmChange::RemoveNic { .. } => "VIF.destroy",
             VmChange::AddUsb { .. } => "VUSB.create",
             VmChange::RemoveUsb { .. } => "VUSB.destroy",
+            VmChange::UsbTablet => "VM.add_to_platform",
         };
         said(method, &[json!(vm)]);
         demo_work(if matches!(change, VmChange::AddDisk { .. } | VmChange::GrowDisk { .. }) { 1500 } else { 500 });
@@ -6251,6 +6259,7 @@ impl Connection for DemoConnection {
             }
             VmChange::RemoveNic { vif } => v.nics.retain(|n| n.vif != *vif),
             VmChange::AddUsb { .. } | VmChange::RemoveUsb { .. } => {}
+            VmChange::UsbTablet => v.usb_tablet = true,
         }
         Ok(())
     }
@@ -6928,6 +6937,45 @@ mod tests {
             c.knock_hosts(&mut hosts);
         }
         assert!(hosts.iter().all(|h| !h.unreachable));
+    }
+
+    /// A look at a real pool's running VMs whose name or OS has SVM_TEST_VM in it (default
+    /// "ubuntu"): their platform settings and what their console says of the mouse. Reads only,
+    /// and sends the VMs nothing. SVM_TEST_POOL=<address> [SVM_TEST_USER=root], with the password
+    /// the app saved: cargo test console_mouse_live -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn console_mouse_live() {
+        let host = std::env::var("SVM_TEST_POOL").expect("SVM_TEST_POOL");
+        let user = std::env::var("SVM_TEST_USER").unwrap_or_else(|_| "root".into());
+        let want = std::env::var("SVM_TEST_VM").unwrap_or_else(|_| "ubuntu".into()).to_lowercase();
+        let pw = crate::secrets::load(&host, &user).expect("no saved password");
+        let c = RealConnection::new(&host, &user, &pw);
+        let t = 30_000;
+        let vms = c.call("VM.get_all_records", vec![], t).unwrap();
+        for (r, v) in vms.as_object().unwrap() {
+            if v["is_a_template"].as_bool() == Some(true) || v["is_control_domain"].as_bool() == Some(true) || s(v, "power_state") != "Running" {
+                continue;
+            }
+            let os = c.call("VM_guest_metrics.get_os_version", vec![v["guest_metrics"].clone()], t).ok().map(|o| s(&o, "name")).unwrap_or_default();
+            if !format!("{} {}", s(v, "name_label"), os).to_lowercase().contains(&want) {
+                continue;
+            }
+            let p = &v["platform"];
+            println!("{} [{}]  template {:?}  made {:?}", s(v, "name_label"), os, s(&v["other_config"], "base_template_name"), s(&v["other_config"], "import_task").is_empty().then(|| "").unwrap_or("imported"));
+            println!("  platform: usb={:?} usb_tablet={:?} vga={:?} device-model={:?}  domain_type={}  firmware={:?}", s(p, "usb"), s(p, "usb_tablet"), s(p, "vga"), s(p, "device-model"), s(v, "domain_type"), s(&v["HVM_boot_params"], "firmware"));
+            match c.open_console(r) {
+                Ok(mut st) => println!("  console: {}", crate::console::probe(&mut st).unwrap_or_else(|e| e)),
+                Err(e) => println!("  console: {}", e.message()),
+            }
+        }
+        if std::env::var("SVM_TEST_TEMPLATES").is_ok() {
+            for v in vms.as_object().unwrap().values().filter(|v| v["is_a_template"].as_bool() == Some(true)) {
+                let p = &v["platform"];
+                println!("template {:50} usb={:?} usb_tablet={:?} default={}", s(v, "name_label"), s(p, "usb"), s(p, "usb_tablet"), v["is_default_template"]);
+            }
+        }
+        c.close();
     }
 
     /// Against a fake server that stops answering part way (SVM_FAKE_XAPI=host:port, see the

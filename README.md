@@ -34,7 +34,7 @@ to XenCenter, feature by feature: [Simple VM Manager and XenCenter](docs/xencent
 - **Home overview** — servers, running VMs, memory and storage in use at a glance, each server's load
   and the latest activity: *All servers*' one tab. A page the toolbar opens (ISO Library, VM
   Storage, Templates, Snapshots, Networks, Alerts) has its own name and its button's icon at the
-  top, as does Logs (from Activities' *All of it in Logs*).
+  top.
 - **A VM's Overview** — what matters most, at a glance and to change right there: its name and
   description (each with a pencil), its state in a pill (where it runs, for how long), its system
   and address (to copy); its load over the last ten minutes, live (CPU, memory, disk and network,
@@ -137,12 +137,12 @@ to XenCenter, feature by feature: [Simple VM Manager and XenCenter](docs/xencent
   call to the servers and their answers below it, as in a terminal (with Copy); a server's restart
   is waited for quietly (going down, then starting up again), and the end says plainly anything
   left to do by hand.
-- **Details** — a VM's tabs are Overview, Performance, Snapshots, Logs and Details: the less used
+- **Details** — a VM's tabs are Overview, Performance, Snapshots, History and Details: the less used
   things (tags, guest tools, virtualization, high availability, every disk and card with its
   position and MAC), then *All fields*: every field the server keeps on it and on its metrics
   (references shown by name, sizes in GB too), read again while the tab is open. A search finds
   any of them (marked where found), a value's click copies it, and *Export* saves it all as a CSV
-  spreadsheet or a PDF. Pools and servers have Overview, Storage, Logs and Details, and servers
+  spreadsheet or a PDF. Pools and servers have Overview, Storage, History and Details, and servers
   Performance too. At the tab row's right end, two buttons: **Console**, and **Actions**, a menu
   of everything it can do, each with its icon (a VM's power actions with their shortcuts, then Take
   Snapshot, Move, Copy VM, Make Template, Export to a File, and Delete VM in red; a server's
@@ -156,15 +156,24 @@ to XenCenter, feature by feature: [Simple VM Manager and XenCenter](docs/xencent
   Alt+Tab…). It
   reconnects by itself after the VM reboots. A server has a Console too: its own text console (the
   control domain's, as in XenCenter), where you log in as root.
-- **The console's clipboard** — *Type the clipboard*, first in *Send keys* (or Ctrl+Shift+V over
-  the screen), types the text on your computer's clipboard there, a key for each character, with
-  how far it is and *Stop*: for a Linux console, an installer, a login screen (plain letters,
-  digits and symbols, as on a US keyboard). A Windows VM with XenServer VM Tools shares its
-  clipboard, as with XenCenter: Ctrl+V there pastes yours, and what you copy there comes onto your
-  computer's. On a server's console Ctrl+V types the clipboard, text selected with the mouse is
-  copied, and the mouse wheel scrolls back through what went by. (A Linux VM's text console keeps
-  nothing that went by: the wheel scrolls only what runs in it, a desktop or a terminal program.)
-  Settings → Console turns the sharing off; typing the clipboard still works.
+- **The console's mouse** — a VM with a USB tablet (XenServer's default) follows your pointer
+  exactly. One without (its platform `usb` or `usb_tablet` set to false) has only a PS/2 mouse,
+  which takes moves, so its pointer would drift from yours: there a click on the screen gives it
+  your mouse (your pointer hides and stays put, as in XenCenter) and **Ctrl+Alt** lets go. *Add USB
+  tablet*, over that screen, gives the VM one from its next start.
+- **The console's clipboard** — no key ever pastes your computer's clipboard into a VM: Ctrl+V
+  and Ctrl+Shift+V go to the VM as keys, for its own clipboard. Yours goes there only from
+  *Actions*, while the console is shown. *Type the clipboard* types it, a key for each character,
+  with how far it is and *Stop*: for a Linux console, an installer, a login screen (plain letters,
+  digits and symbols, as on a US keyboard; about 40 characters a second, as fast as XenServer
+  passes keys on to a VM without dropping any). On a Windows VM with XenServer VM Tools, *Paste the
+  clipboard* comes first: it hands the text to the VM Tools and presses Ctrl+V, at once and with
+  accents (Western European letters). *Send Ctrl+Alt+Del* is after them, and *Send other keys* has
+  the other combinations and the Linux text consoles. What you copy in a Windows VM with VM Tools
+  comes onto your computer's clipboard. On a server's console
+  text selected with the mouse is copied, and the mouse wheel scrolls back through what went by. (A
+  Linux VM's text console keeps nothing that went by: the wheel scrolls only what runs in it, a
+  desktop or a terminal program.) Settings → Console turns the copying off.
 - **ISO libraries** — *ISO Library* on the toolbar opens a page with every ISO file of every pool:
   each library as a card (where it is, how many files it has, or that it isn't mounted; a click
   opens it), then all the files by name, with their library when there's more than one, each with
@@ -191,7 +200,7 @@ to XenCenter, feature by feature: [Simple VM Manager and XenCenter](docs/xencent
   the coordinator first, explaining in plain words if the share won't answer. If the pool has lost
   its settings for it altogether (XenCenter's *Detach*), *Repair* asks where it is and connects the
   same library again, its discs and their descriptions kept. The app also does this by itself,
-  once, when it finds storage unmounted (Settings → Storage); Logs says how it went.
+  once, when it finds storage unmounted (Settings → Storage); History says how it went.
 - **VM storage** — *VM Storage* on the toolbar lists every pool's storage for VMs' disks: its kind
   (NFS, local disk…), where it is (the NFS folder, or the server it's in), how full it is, and which
   one is the pool's default, where new VMs' disks go and what suspending and moving VMs use
@@ -282,12 +291,13 @@ to XenCenter, feature by feature: [Simple VM Manager and XenCenter](docs/xencent
 - **Delete VM** — last in a VM's *Actions*, or on its right-click menu. It asks first, and its disks go too unless unticked (a disk another VM also uses stays);
   its snapshots go with it, and ISO files in its DVD drive aren't touched. A VM that's on is
   turned off first, the button saying so ("Shut down and delete").
-- **Snapshots** — *Take Snapshot…* in a VM's *Actions* (or its right-click menu) takes one:
+- **Snapshots** — *New Snapshot…*, first over a VM's *Snapshots* list (or *Take Snapshot…* in its
+  *Actions*, or its right-click menu) takes one:
   its disks as they are now, named with the date and time unless you name it, and, for a running VM,
   its memory too if you tick it, so that reverting resumes it right where it was. The VM's
   *Snapshots* tab lists them, the newest first: when each was taken, what it holds, a description
   you can edit in place, and "Now" on the one the VM's current state comes from. Pick one (a click
-  on its round box or its row: one at a time) and the buttons over the list act on it. *Revert* asks
+  on its round box or its row: one at a time) and the buttons after *New Snapshot* act on it. *Revert* asks
   first, offers to take a snapshot of now before it, turns the VM off if it's on, puts it back, and
   then leaves it as it was at the time: resumed, started again, or off. *Delete* takes one away,
   with its copies of the disks. *New VM* makes a VM of its own from a snapshot of the disks: its
@@ -355,8 +365,9 @@ to XenCenter, feature by feature: [Simple VM Manager and XenCenter](docs/xencent
   They're on its right-click menu too.
 - **Keyboard shortcuts** — Ctrl+B start · Ctrl+E shut down · Ctrl+R reboot · Ctrl+Y suspend/resume ·
   F5 refresh.
-- **Alerts** — the bell on the toolbar, with how many need your attention (red when one is
-  critical), opens every pool's alerts, by day: what the servers say (a VM that crashed, a
+- **Notifications** — the bell on the toolbar opens them, with two tabs: *Alerts* (what needs
+  attention) and *History* (what this app did). The bell shows how many need your attention (red
+  when one is critical). *Alerts* lists every pool's alerts, by day: what the servers say (a VM that crashed, a
   certificate or license running out, a limit you set passed) and what the app finds itself (a
   connection lost, a server off or not answering, storage not mounted). *Needs attention* or
   *Everything*, by pool when there are several, and a search. A click opens one: what it says,
@@ -374,8 +385,8 @@ to XenCenter, feature by feature: [Simple VM Manager and XenCenter](docs/xencent
   server, how long it's been and how far it is (for disks moved or copied, and uploads, how much
   of how much and how fast: "11.7 GB of 20 GB · 110 MB/s"), and the last few that ended. A server
   that stops answering or comes back is noted there too, and Refresh (F5) says how it went,
-  servers that don't answer included. Long lines take two. A click on one (or on a row of the Logs
-  tab) shows it in full: the server, when, how it went, and every call made to the server with its
+  servers that don't answer included. Long lines take two. A click on one (or on a row of History)
+  shows it in full: the server, when, how it went, and every call made to the server with its
   answer or its error, as the server gave it (passwords hidden), ready to copy.
 - **Tables** — a click on a column's heading sorts by it (an arrow says which way; again for the
   other way, a third time as it came): sizes by their bytes, dates by time, names with the numbers

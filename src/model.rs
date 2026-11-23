@@ -99,6 +99,9 @@ pub struct VmInfo {
     pub secure_boot: String,
     /// The boot order of an HVM guest, like "DVD drive, Disk".
     pub boot_order: String,
+    /// An HVM guest's mouse can be a USB tablet (platform usb and usb_tablet, on unless set to
+    /// false), which the console points at directly; without one it's a PS/2 mouse, which drifts.
+    pub usb_tablet: bool,
     pub auto_power_on: bool,
     /// High availability: "Restart", "Best effort", or empty when off.
     pub ha: String,
@@ -186,6 +189,8 @@ pub enum VmChange {
     AddUsb { pusb: String, group: String, name: String, enable: bool },
     /// Taken off it (unplugged first while it runs).
     RemoveUsb { vusb: String, name: String },
+    /// Its mouse made a USB tablet (platform usb and usb_tablet), from its next start.
+    UsbTablet,
 }
 
 impl VmChange {
@@ -208,6 +213,7 @@ impl VmChange {
             VmChange::RemoveNic { .. } => format!("Removing a network card from VM '{}'", vm),
             VmChange::AddUsb { name, .. } => format!("Passing USB device '{}' to VM '{}'", name, vm),
             VmChange::RemoveUsb { name, .. } => format!("Taking USB device '{}' off VM '{}'", name, vm),
+            VmChange::UsbTablet => format!("Giving VM '{}' a USB tablet for its mouse", vm),
         }
     }
 }

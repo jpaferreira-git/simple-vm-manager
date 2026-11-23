@@ -9,9 +9,11 @@
 //!
 //! The clipboard: text a console puts on its clipboard (RFB ServerCutText: a server's text console
 //! when text is selected with the mouse, a Windows VM with XenServer VM Tools when something is
-//! copied there) comes onto this computer's. This computer's goes to a Windows VM's (ClientCutText,
-//! which XenServer's QEMU hands its VM Tools), so Ctrl+V pastes it there; anywhere else it can be
-//! typed, a key for each character.
+//! copied there) comes onto this computer's. This computer's never goes to the VM by a key: Ctrl+V
+//! and Ctrl+Shift+V reach the VM as keys. It goes only when asked, from the Actions menu: "Type the
+//! clipboard" types it, a key for each character; on a Windows VM with VM Tools, "Paste the
+//! clipboard" gives it to them (ClientCutText, which XenServer's QEMU hands its VM Tools) and
+//! presses Ctrl+V.
 
 use crate::app::{dialog_button, Look};
 use crate::conn::{Connection, ConsoleStream};
@@ -80,6 +82,10 @@ struct Shared {
     status: Status,
     screen: Option<Screen>,
     scancodes: bool,
+    /// How the VM takes the mouse, when its console says (QEMU does): true, at a position on the
+    /// screen (a USB tablet: the VM's pointer stays under this one); false, as moves (a PS/2 mouse,
+    /// whose pointer drifts from this one, so the screen captures the mouse).
+    absolute: Option<bool>,
     /// Text the console put on its clipboard, for this computer's.
     cut_text: Option<String>,
     /// Text being typed: the characters typed so far, of how many.
@@ -88,7 +94,7 @@ struct Shared {
 
 impl Shared {
     fn new(status: Status, screen: Option<Screen>) -> Shared {
-        Shared { status, screen, scancodes: false, cut_text: None, typing: None }
+        Shared { status, screen, scancodes: false, absolute: None, cut_text: None, typing: None }
     }
 }
 
@@ -98,52 +104,67 @@ type KeyEv = (bool, u32, u32);
 enum Input {
     Key { down: bool, keysym: u32, scancode: u32 },
     Pointer { buttons: u8, x: u16, y: u16 },
-    /// This computer's clipboard, for the VM's.
+    /// This computer's clipboard, for the VM's (a Windows VM's VM Tools take it).
     CutText(String),
-    /// Keys sent a group at a time (a character's, say), `gap` apart; `shown` while it lasts (its
-    /// progress over the screen, with Stop).
-    Type { groups: Vec<Vec<KeyEv>>, gap: Duration, shown: bool },
+    /// Keys sent one at a time, `gap` apart, starting `after` from now; a group is a character's
+    /// keys, for the progress shown over the screen (with Stop) while it lasts, when `shown`.
+    Type { groups: Vec<Vec<KeyEv>>, gap: Duration, after: Duration, shown: bool },
     StopTyping,
 }
 
-/// Keys waiting to be sent, a group at a time, so a VM's keyboard (QEMU's PS/2 queue holds a few
-/// keys only) takes every one.
+/// Keys waiting to be sent, one at a time, so the VM takes every one. XenServer's QEMU passes a key
+/// on to the VM every 10 ms and drops what comes once about 340 are waiting: a clipboard typed any
+/// faster loses keys part way, a Shift let go among them, and the rest comes out scrambled.
 #[derive(Default)]
 struct Typer {
-    left: std::collections::VecDeque<Vec<KeyEv>>,
+    /// Each key, and whether it's the last of its character's (for the progress).
+    left: std::collections::VecDeque<(KeyEv, bool)>,
     done: usize,
     total: usize,
     gap: Duration,
     shown: bool,
     next: Option<Instant>,
+    /// Keys this typing pressed and hasn't let go of yet (Shift across capitals): let go on Stop.
+    held: Vec<(u32, u32)>,
 }
 
 impl Typer {
-    fn add(&mut self, groups: Vec<Vec<KeyEv>>, gap: Duration, shown: bool) {
+    fn add(&mut self, groups: Vec<Vec<KeyEv>>, gap: Duration, after: Duration, shown: bool) {
         if self.left.is_empty() {
-            (self.done, self.total, self.next) = (0, 0, None);
+            (self.done, self.total) = (0, 0);
+            self.next = (after > Duration::ZERO).then(|| Instant::now() + after);
         }
-        self.total += groups.len();
-        self.left.extend(groups);
+        for g in groups.into_iter().filter(|g| !g.is_empty()) {
+            self.total += 1;
+            let last = g.len() - 1;
+            self.left.extend(g.into_iter().enumerate().map(|(i, k)| (k, i == last)));
+        }
         self.gap = gap;
         self.shown = shown;
     }
 
-    fn stop(&mut self) {
+    /// Drops the keys not sent yet; gives the ones to let go of.
+    fn stop(&mut self) -> Vec<KeyEv> {
         self.left.clear();
+        self.held.drain(..).map(|(k, s)| (false, k, s)).collect()
     }
 
-    /// The groups due by `now` (a few hundred at most, so the screen still comes between).
-    fn due(&mut self, now: Instant) -> Vec<Vec<KeyEv>> {
+    /// The keys due by `now` (a few hundred at most, so the screen still comes between).
+    fn due(&mut self, now: Instant) -> Vec<KeyEv> {
         let mut out = vec![];
         while out.len() < 300 {
             let at = *self.next.get_or_insert(now);
             if at > now {
                 break;
             }
-            let Some(g) = self.left.pop_front() else { break };
-            out.push(g);
-            self.done += 1;
+            let Some((key, last)) = self.left.pop_front() else { break };
+            let (down, k, s) = key;
+            self.held.retain(|&h| h != (k, s));
+            if down {
+                self.held.push((k, s));
+            }
+            out.push(key);
+            self.done += last as usize;
             // after a slow moment, no burst to catch up: the gap again from now
             self.next = Some(if at + self.gap < now { now + self.gap } else { at + self.gap });
         }
@@ -191,6 +212,11 @@ impl Remote {
 
     fn scancodes(&self) -> bool {
         self.shared.lock().unwrap().scancodes
+    }
+
+    /// The VM takes the mouse as moves (a PS/2 mouse), as its console said.
+    fn relative(&self) -> bool {
+        self.shared.lock().unwrap().absolute == Some(false)
     }
 }
 
@@ -241,18 +267,21 @@ fn run(conn: &dyn Connection, vm_ref: &str, shared: &Mutex<Shared>, rx: &mpsc::R
         let scancodes = shared.lock().unwrap().scancodes;
         while let Ok(i) = rx.try_recv() {
             match i {
-                Input::Type { groups, gap, shown } => typer.add(groups, gap, shown),
-                Input::StopTyping => typer.stop(),
+                Input::Type { groups, gap, after, shown } => typer.add(groups, gap, after, shown),
+                Input::StopTyping => {
+                    for (down, keysym, scancode) in typer.stop() {
+                        s.write_all(&encode_input(Input::Key { down, keysym, scancode }, scancodes)).map_err(io_err)?;
+                        wrote = true;
+                    }
+                }
                 i => {
                     s.write_all(&encode_input(i, scancodes)).map_err(io_err)?;
                     wrote = true;
                 }
             }
         }
-        for g in typer.due(Instant::now()) {
-            for (down, keysym, scancode) in g {
-                s.write_all(&encode_input(Input::Key { down, keysym, scancode }, scancodes)).map_err(io_err)?;
-            }
+        for (down, keysym, scancode) in typer.due(Instant::now()) {
+            s.write_all(&encode_input(Input::Key { down, keysym, scancode }, scancodes)).map_err(io_err)?;
             wrote = true;
         }
         let progress = typer.progress();
@@ -340,6 +369,36 @@ pub fn snapshot(conn: &dyn Connection, vm_ref: &str, max_w: usize, wake: bool) -
     }
     let screen = shared.into_inner().unwrap().screen.ok_or("No screen came.")?;
     Ok(shrink(&screen.rgba, screen.width, screen.height, max_w))
+}
+
+/// What a console says of itself as it connects, for a look at a real pool's (a test's): its
+/// screen's size, whether it takes scancodes, and how the VM takes the mouse.
+#[cfg(test)]
+pub(crate) fn probe(s: &mut ConsoleStream) -> Result<String, String> {
+    s.set_read_timeout(Some(Duration::from_secs(10))).map_err(io_err)?;
+    let (w, h) = handshake(s)?;
+    let shared = Mutex::new(Shared::new(Status::Connected, Some(Screen::new(w as usize, h as usize))));
+    s.write_all(&set_pixel_format()).map_err(io_err)?;
+    s.write_all(&set_encodings()).map_err(io_err)?;
+    s.write_all(&update_request(false, w, h)).map_err(io_err)?;
+    s.flush().map_err(io_err)?;
+    let (mut inb, mut parser, mut chunk) = (InBuf::default(), Parser::new(), vec![0u8; 256 * 1024]);
+    let until = Instant::now() + Duration::from_secs(8);
+    while Instant::now() < until && !parser.painted {
+        match s.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => inb.data.extend_from_slice(&chunk[..n]),
+            Err(e) => return Err(io_err(e)),
+        }
+        while !matches!(parser.step(&mut inb, &shared)?, Step::NeedMore) {}
+    }
+    let sh = shared.lock().unwrap();
+    let (sw, shh) = sh.screen.as_ref().map_or((0, 0), |sc| (sc.width, sc.height));
+    Ok(format!("screen {}x{} (first {}x{}), scancodes {}, mouse {}", sw, shh, w, h, sh.scancodes, match sh.absolute {
+        Some(true) => "absolute (tablet)",
+        Some(false) => "RELATIVE (PS/2)",
+        None => "not said",
+    }))
 }
 
 /// A picture made smaller (each pixel the average of the ones it covers) to `max_w` wide at most.
@@ -460,10 +519,13 @@ const ENC_COPYRECT: i32 = 1;
 const ENC_ZRLE: i32 = 16;
 const ENC_DESKTOP_SIZE: i32 = -223;
 const ENC_QEMU_KEYS: i32 = -258;
+/// QEMU says whether the VM takes the mouse at positions or as moves (in its x), and again each
+/// time that changes. Asked for, a move is sent as 0x7FFF plus how far it went.
+const ENC_POINTER_TYPE: i32 = -257;
 
 fn set_encodings() -> Vec<u8> {
     // The server uses the first one in this list that it knows.
-    let encs = [ENC_ZRLE, ENC_COPYRECT, ENC_RAW, ENC_DESKTOP_SIZE, ENC_QEMU_KEYS];
+    let encs = [ENC_ZRLE, ENC_COPYRECT, ENC_RAW, ENC_DESKTOP_SIZE, ENC_QEMU_KEYS, ENC_POINTER_TYPE];
     let mut m = vec![2, 0];
     m.extend_from_slice(&(encs.len() as u16).to_be_bytes());
     for e in encs {
@@ -524,11 +586,12 @@ fn cut_text(b: &[u8]) -> String {
 
 /// The keys that type `text`, a group for each character, and how many characters were left out
 /// (only plain ASCII can be typed: QEMU's keyboard map and the server's text console have nothing
-/// else). On a VM's keyboard a capital or a symbol gets Shift, as on a US keyboard; the server's
-/// text console takes each character as it is.
+/// else). On a VM's keyboard a capital or a symbol gets Shift, as on a US keyboard, held across a
+/// run of them (fewer keys to send); the server's text console takes each character as it is.
 fn typing_keys(text: &str, host: bool) -> (Vec<Vec<KeyEv>>, usize) {
-    let mut out = vec![];
+    let mut out: Vec<Vec<KeyEv>> = vec![];
     let mut left_out = 0;
+    let mut shifted = false;
     for ch in text.chars() {
         let (keysym, scancode) = match ch {
             '\n' => (0xff0d, 0x1c),
@@ -540,9 +603,17 @@ fn typing_keys(text: &str, host: bool) -> (Vec<Vec<KeyEv>>, usize) {
             }
             c => (char_keysym(c), 0),
         };
-        let tap = vec![(true, keysym, scancode), (false, keysym, scancode)];
         let shift = !host && (ch.is_ascii_uppercase() || "~!@#$%^&*()_+{}|:\"<>?".contains(ch));
-        out.push(if shift { [vec![(true, SHIFT.0, SHIFT.1)], tap, vec![(false, SHIFT.0, SHIFT.1)]].concat() } else { tap });
+        let mut g = vec![];
+        if shift != shifted {
+            g.push((shift, SHIFT.0, SHIFT.1));
+            shifted = shift;
+        }
+        g.extend([(true, keysym, scancode), (false, keysym, scancode)]);
+        out.push(g);
+    }
+    if let (true, Some(g)) = (shifted, out.last_mut()) {
+        g.push((false, SHIFT.0, SHIFT.1));
     }
     (out, left_out)
 }
@@ -641,7 +712,7 @@ impl Parser {
         let body = match enc {
             ENC_RAW => w * h * 4,
             ENC_COPYRECT => 4,
-            ENC_DESKTOP_SIZE | ENC_QEMU_KEYS => 0,
+            ENC_DESKTOP_SIZE | ENC_QEMU_KEYS | ENC_POINTER_TYPE => 0,
             ENC_ZRLE if a.len() >= 16 => 4 + be32(&a[12..16]) as usize,
             ENC_ZRLE => return Ok(Step::NeedMore),
             other => return Err(format!("The console used a screen format this app doesn't understand ({}).", other)),
@@ -655,6 +726,7 @@ impl Parser {
             let mut sh = shared.lock().unwrap();
             match enc {
                 ENC_QEMU_KEYS => sh.scancodes = true,
+                ENC_POINTER_TYPE => sh.absolute = Some(x != 0),
                 ENC_DESKTOP_SIZE => {
                     sh.screen = Some(Screen::new(w, h));
                     self.resized = true;
@@ -826,6 +898,8 @@ fn zrle(sc: &mut Screen, d: &[u8], x: usize, y: usize, w: usize, h: usize) -> Re
 // ---------------------------------------------------------------- keys
 
 // (keysym, scancode) pairs
+/// Between keys typed into a VM: a little over the 10 ms QEMU waits between the keys it passes on.
+const TYPING_GAP: Duration = Duration::from_millis(12);
 const SHIFT: (u32, u32) = (0xffe1, 0x2a);
 const CTRL: (u32, u32) = (0xffe3, 0x1d);
 const ALT: (u32, u32) = (0xffe9, 0x38);
@@ -1033,14 +1107,32 @@ fn follow_pointer(ui: &Ui, resp: &egui::Response, focused: bool, allow: bool) {
         resp.request_focus();
     }
     if focused {
-        // Tab, arrows and Escape belong to the VM while it has the keyboard.
-        ui.memory_mut(|m| m.set_focus_lock_filter(screen_id(), egui::EventFilter { tab: true, horizontal_arrows: true, vertical_arrows: true, escape: true }));
+        keep_keys(ui);
         if !resp.hovered() && !resp.dragged() {
             ui.memory_mut(|m| m.surrender_focus(screen_id()));
         }
     }
 }
 
+/// Tab, arrows and Escape belong to the VM while it has the keyboard.
+fn keep_keys(ui: &Ui) {
+    ui.memory_mut(|m| m.set_focus_lock_filter(screen_id(), egui::EventFilter { tab: true, horizontal_arrows: true, vertical_arrows: true, escape: true }));
+}
+
+/// How the window holds the mouse while the screen has it: locked in place, its moves still
+/// coming (Wayland, macOS); kept inside the window where locking isn't there (X11, Windows).
+fn grab_mode() -> egui::viewport::CursorGrab {
+    if cfg!(target_os = "macos") || (cfg!(target_os = "linux") && std::env::var_os("WAYLAND_DISPLAY").is_some()) {
+        egui::viewport::CursorGrab::Locked
+    } else {
+        egui::viewport::CursorGrab::Confined
+    }
+}
+
+/// A move of `d` pixels as QEMU takes it from a VM with a PS/2 mouse: 0x7FFF plus the move.
+fn rel_coord(d: f32) -> u16 {
+    (0x7FFF as f32 + d.clamp(-0x7FFF as f32, 0x7FFF as f32)) as u16
+}
 
 // ---------------------------------------------------------------- the demo server's pretend console
 
@@ -1135,35 +1227,49 @@ pub struct ConsoleView {
     wake_pending: bool,
     /// A server's own text console (vncterm), not a VM's screen.
     host: bool,
-    /// A Windows VM: its XenServer VM Tools take this computer's clipboard, and give theirs.
-    shares_clipboard: bool,
     /// Settings' "Share the clipboard with the consoles": off, nothing copied there comes here
-    /// and no VM gets this computer's clipboard (typing it, asked for, still works).
+    /// (typing this computer's, asked for, works either way).
     pub share_clipboard: bool,
     /// The mouse wheel's turn not sent yet (a part of a step).
     wheel: f32,
-    /// A paste asked of the window (it comes as a Paste event a frame later), and frames waited.
+    /// A Windows VM with XenServer VM Tools (the app's): they take this computer's clipboard,
+    /// for Paste the clipboard.
+    pub vm_tools: bool,
+    /// The clipboard asked of the window (it comes as a Paste event a frame later), what for, and
+    /// frames waited.
     paste: Option<(Paste, u8)>,
     /// This frame's Paste event was that one.
     paste_taken: bool,
-    /// Text to type, once no key is held any more (Ctrl+Shift+V's would reach the VM otherwise).
+    /// Text to type, once no key is held any more.
     to_type: Option<String>,
-    /// The clipboard as last given to the VM, and when the connection came (the VM may tell its
-    /// own clipboard as it connects: that isn't a copy).
+    /// The console's clipboard as last copied here, and when the connection came (the VM may tell
+    /// its own clipboard as it connects: that isn't a copy).
     shared_clip: Option<String>,
     connected_at: Option<Instant>,
-    was_focused: bool,
-    window_focused: bool,
     /// A short note over the screen ("Copied…"), until then.
     note: Option<(String, Instant)>,
+    /// The screen has the mouse: the VM's is a PS/2 mouse, which takes moves, not positions, so
+    /// this window's pointer is hidden and held, and its moves go to the VM. Ctrl+Alt lets go.
+    captured: bool,
+    /// Parts of a pixel moved and not sent yet, and the buttons the VM was last told of.
+    rel_rest: egui::Vec2,
+    rel_buttons: u8,
+    /// Ctrl and Alt were both down last frame.
+    ctrl_alt: bool,
+    /// The VM's setting for a USB tablet (the app's; true for a server's console).
+    pub usb_tablet: bool,
+    /// Asked for one: the app makes the change, once.
+    pub want_tablet: bool,
+    tablet_asked: bool,
 }
 
+/// What this computer's clipboard is asked for.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Paste {
-    /// To give the VM (a Windows VM's clipboard).
-    Share,
     /// To type, a key for each character.
     Type,
+    /// To give a Windows VM's VM Tools, then press Ctrl+V.
+    Give,
 }
 
 impl ConsoleView {
@@ -1187,17 +1293,22 @@ impl ConsoleView {
             last_pass: 0,
             wake_pending: true,
             host: os.starts_with("XenServer "), // what the app passes for a server's console
-            shares_clipboard: os.to_lowercase().contains("windows"),
             share_clipboard: true,
             wheel: 0.0,
+            vm_tools: false,
             paste: None,
             paste_taken: false,
             to_type: None,
             shared_clip: None,
             connected_at: None,
-            was_focused: false,
-            window_focused: true,
             note: None,
+            captured: false,
+            rel_rest: egui::Vec2::ZERO,
+            rel_buttons: 0,
+            ctrl_alt: false,
+            usb_tablet: true,
+            want_tablet: false,
+            tablet_asked: false,
         };
         if !demo {
             v.connect();
@@ -1251,8 +1362,11 @@ impl ConsoleView {
                 }
             }
         }
+        if status != Status::Connected {
+            self.release_mouse(); // its screen went away (a restart): the mouse comes back
+        }
         let focused = ui.memory(|m| m.has_focus(screen_id()));
-        self.clipboard(ui, &status, focused);
+        self.clipboard(ui, &status);
 
         ui.add_space(8.0);
 
@@ -1261,7 +1375,7 @@ impl ConsoleView {
         ui.painter().rect_filled(area, Rounding::same(4.0), SCREEN_BG);
 
         if let Some(demo) = self.demo.as_mut() {
-            Self::demo_screen(ui, area, demo, focused, allow_keyboard, self.paste_taken);
+            Self::demo_screen(ui, area, demo, focused, allow_keyboard);
             ui.allocate_rect(area, Sense::hover());
             self.overlays(ui, pal, area, &status);
             return;
@@ -1329,6 +1443,8 @@ impl ConsoleView {
             } else {
                 self.note = None;
             }
+        } else if !self.captured && *status == Status::Connected && (ui.rect_contains_pointer(area) || std::env::var("SVM_SHOT_MOUSE").is_ok()) && self.remote.as_ref().map_or(false, |r| r.relative()) {
+            self.mouse_hint(ui, pal, area);
         }
         let typing = self.remote.as_ref().and_then(|r| r.shared.lock().unwrap().typing);
         let typing = typing.or_else(|| std::env::var("SVM_SHOT_TYPING").ok().map(|_| (312, 1480))); // for --screenshot
@@ -1352,11 +1468,10 @@ impl ConsoleView {
         }
     }
 
-    /// The clipboard, each frame: what the console copied comes onto this computer's; a Windows
-    /// VM gets this computer's as its screen takes the keyboard (or the window comes back to the
-    /// front); a paste asked of the window is taken; and text waiting to be typed goes once no
-    /// key is held.
-    fn clipboard(&mut self, ui: &Ui, status: &Status, focused: bool) {
+    /// The clipboard, each frame: what the console copied comes onto this computer's; this
+    /// computer's, asked for by Type or Paste the clipboard, is taken; and text waiting to be
+    /// typed goes once no key is held. (Nothing of this computer's goes to the VM unasked.)
+    fn clipboard(&mut self, ui: &Ui, status: &Status) {
         let ctx = ui.ctx().clone();
         let connected = *status == Status::Connected;
         if connected && self.connected_at.is_none() {
@@ -1367,15 +1482,10 @@ impl ConsoleView {
             let settled = self.connected_at.map_or(false, |t| t.elapsed() > Duration::from_secs(2));
             if let Some(text) = copied.filter(|t| self.share_clipboard && settled && Some(t) != self.shared_clip.as_ref()) {
                 ctx.copy_text(text.clone());
-                self.shared_clip = Some(text); // the same text isn't given back to it
+                self.shared_clip = Some(text); // the same copy isn't told twice
                 self.show_note("Copied to this computer's clipboard");
             }
         }
-        let window_focused = ui.input(|i| i.focused);
-        if self.shares_clipboard && self.share_clipboard && connected && focused && (!self.was_focused || (window_focused && !self.window_focused)) {
-            self.ask_paste(&ctx, Paste::Share);
-        }
-        (self.was_focused, self.window_focused) = (focused, window_focused);
 
         self.paste_taken = false;
         if let Some((mode, waited)) = self.paste.take() {
@@ -1384,18 +1494,15 @@ impl ConsoleView {
                 Some(t) => {
                     self.paste_taken = true;
                     match mode {
-                        Paste::Share => {
-                            self.share(&t);
-                        }
-                        Paste::Type => self.type_text_later(t),
+                        Paste::Give if self.demo.is_none() => self.give(&t),
+                        _ => self.type_text_later(t),
                     }
                 }
                 None if waited < 3 => {
                     self.paste = Some((mode, waited + 1));
                     ctx.request_repaint();
                 }
-                None if mode == Paste::Type => self.show_note("The clipboard has no text to type."),
-                None => {}
+                None => self.show_note(if mode == Paste::Type { "The clipboard has no text to type." } else { "The clipboard has no text to paste." }),
             }
         }
         if self.to_type.is_some() && ui.input(|i| i.keys_down.is_empty() && i.modifiers.is_none()) {
@@ -1404,34 +1511,99 @@ impl ConsoleView {
         }
     }
 
+    /// Over a screen whose VM has a PS/2 mouse: a click there gives it the mouse; and, when the VM
+    /// has no USB tablet, the button that gives it one.
+    fn mouse_hint(&mut self, ui: &mut Ui, pal: &Pal, area: Rect) {
+        let offer = !self.usb_tablet && !self.tablet_asked;
+        let (text, button) = ("Click to use the mouse · Ctrl+Alt lets go", "Add USB tablet");
+        let tip = "This VM's mouse is a PS/2 mouse: it takes moves, not where the pointer is, so its pointer would drift from yours. The screen holds your mouse instead while you use it there. A USB tablet follows your pointer exactly; it comes at the VM's next start.";
+        let width = |t: &str, font: FontId| ui.painter().layout_no_wrap(t.into(), font, Color32::WHITE).size().x;
+        let button_w = if offer { (50.0 + width(button, egui::TextStyle::Button.resolve(ui.style()))).max(80.0) + 10.0 } else { 0.0 };
+        let w = (width(text, FontId::proportional(13.0)) + 28.0 + button_w).min(area.width() - 12.0);
+        let r = Rect::from_center_size(pos2(area.center().x, area.min.y + 34.0), vec2(w, 40.0));
+        ui.painter().rect_filled(r, Rounding::same(8.0), Color32::from_black_alpha(215));
+        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(r.shrink2(vec2(12.0, 6.0))).layout(egui::Layout::right_to_left(egui::Align::Center)), |ui| {
+            if offer && dialog_button(ui, pal, "usb", button, Look::Plain, true) {
+                self.want_tablet = true;
+                self.tablet_asked = true;
+                self.show_note("The VM gets its USB tablet when it restarts.");
+            }
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                ui.add(egui::Label::new(egui::RichText::new(text).size(13.0).color(Color32::from_gray(235))).truncate()).on_hover_text(tip);
+            });
+        });
+    }
+
+    /// The screen takes the mouse (a VM with a PS/2 mouse).
+    fn capture(&mut self, ctx: &egui::Context) {
+        (self.captured, self.rel_rest, self.rel_buttons) = (true, egui::Vec2::ZERO, 0);
+        ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(grab_mode()));
+        ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(false));
+        self.show_note("Ctrl+Alt lets go of the mouse");
+    }
+
+    /// Gives the mouse back to the window, its buttons let go in the VM.
+    pub fn release_mouse(&mut self) {
+        if !std::mem::take(&mut self.captured) {
+            return;
+        }
+        if std::mem::take(&mut self.rel_buttons) != 0 {
+            if let Some(r) = &self.remote {
+                r.send(Input::Pointer { buttons: 0, x: 0x7FFF, y: 0x7FFF });
+            }
+        }
+        self.ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(egui::viewport::CursorGrab::None));
+        self.ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(true));
+        self.ctx.request_repaint();
+    }
+
     fn show_note(&mut self, text: &str) {
         self.note = Some((text.to_string(), Instant::now() + Duration::from_millis(2500)));
         self.ctx.request_repaint();
     }
 
-    /// Asks the window for its clipboard's text; it comes as a Paste event in a frame or two.
+    /// Types this computer's clipboard on the console's keyboard (Type the clipboard, in the
+    /// Actions menu: the only way this computer's clipboard reaches the VM). The window is asked
+    /// for its clipboard's text; it comes as a Paste event in a frame or two.
+    pub fn type_clipboard(&mut self, ctx: &egui::Context) {
+        self.ask_paste(ctx, Paste::Type);
+    }
+
+    /// Pastes this computer's clipboard in a Windows VM (Paste the clipboard, in the Actions
+    /// menu): its VM Tools get it, then Ctrl+V is pressed. At once, accents and all.
+    pub fn paste_clipboard(&mut self, ctx: &egui::Context) {
+        self.ask_paste(ctx, Paste::Give);
+    }
+
     fn ask_paste(&mut self, ctx: &egui::Context, mode: Paste) {
-        if self.paste.map_or(true, |(m, _)| m == Paste::Share) {
+        if self.paste.is_none() {
             self.paste = Some((mode, 0));
             ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste);
             ctx.request_repaint();
         }
     }
 
-    /// Gives a Windows VM this computer's clipboard; whether it was new to it.
-    fn share(&mut self, text: &str) -> bool {
-        if !self.shares_clipboard || !self.share_clipboard || text.len() > 1_000_000 || self.shared_clip.as_deref() == Some(text) {
-            return false;
+    /// Gives the VM Tools this computer's clipboard, and presses Ctrl+V a moment later (they take
+    /// a moment to have it).
+    fn give(&mut self, text: &str) {
+        let Some(r) = &self.remote else { return };
+        if text.len() > 1_000_000 {
+            self.show_note("The clipboard is too big to paste (over a million characters).");
+            return;
         }
-        let Some(r) = &self.remote else { return false };
         r.send(Input::CutText(text.to_string()));
-        self.shared_clip = Some(text.to_string());
-        true
+        let v = ('v' as u32, if r.scancodes() { 0x2f } else { 0 });
+        let keys = vec![vec![(true, CTRL.0, CTRL.1), (true, v.0, v.1), (false, v.0, v.1), (false, CTRL.0, CTRL.1)]];
+        r.send(Input::Type { groups: keys, gap: TYPING_GAP, after: Duration::from_millis(300), shown: false });
+        let odd = text.chars().filter(|c| *c as u32 >= 0x100).count();
+        if odd > 0 {
+            self.show_note(&format!("{} character{} came as \"?\": the console passes only Western European letters.", odd, if odd == 1 { "" } else { "s" }));
+        }
     }
 
-    /// Types this computer's clipboard on the console's keyboard (the item in Send keys).
-    pub fn type_clipboard(&mut self, ctx: &egui::Context) {
-        self.ask_paste(ctx, Paste::Type);
+    /// Presses Ctrl+Alt+Del on the VM (the desktop keeps those keys for itself).
+    pub fn send_ctrl_alt_del(&mut self) {
+        self.send_combo(&[CTRL, ALT, DELETE]);
     }
 
     fn type_text_later(&mut self, text: String) {
@@ -1454,9 +1626,9 @@ impl ConsoleView {
             self.show_note("The clipboard has nothing that can be typed.");
             return;
         }
-        // a VM's keyboard takes about 80 characters a second safely; the server's console, any
-        let gap = if self.host { Duration::ZERO } else { Duration::from_millis(12) };
-        r.send(Input::Type { groups, gap, shown: true });
+        // a VM takes a key every 10 ms (about 40 characters a second); the server's console, any
+        let gap = if self.host { Duration::ZERO } else { TYPING_GAP };
+        r.send(Input::Type { groups, gap, after: Duration::ZERO, shown: true });
         if left_out > 0 {
             self.show_note(&format!("{} character{} left out: only plain letters, digits and symbols can be typed.", left_out, if left_out == 1 { "" } else { "s" }));
         }
@@ -1467,21 +1639,12 @@ impl ConsoleView {
         self.demo.is_some() || self.status() == Status::Connected
     }
 
-    /// The keys the desktop keeps for itself, as a menu's items (the keyboard button in the row of
-    /// tabs): Ctrl+Alt+Del first, then the other combinations and the Linux text consoles.
+    /// The other keys the desktop keeps for itself, as a menu's items (Send other keys, in the
+    /// Actions menu, after Type the clipboard and Send Ctrl+Alt+Del): the combinations, then the
+    /// Linux text consoles.
     pub fn keys_menu(&mut self, ui: &mut Ui) {
         ui.set_min_width(230.0);
         let mut combo: Option<Vec<(u32, u32)>> = None;
-        if ui.add(egui::Button::new("Type the clipboard").shortcut_text("Ctrl+Shift+V")).on_hover_text("Types the text on this computer's clipboard, a key for each character: for a Linux console, an installer, a login screen…").clicked() {
-            self.type_clipboard(ui.ctx());
-            ui.close_menu();
-        }
-        ui.separator();
-        if ui.button("Send Ctrl+Alt+Del").clicked() {
-            combo = Some(vec![CTRL, ALT, DELETE]);
-            ui.close_menu();
-        }
-        ui.separator();
         for (label, keys) in KEY_MENU {
             if ui.button(label).clicked() {
                 combo = Some(keys.to_vec());
@@ -1561,19 +1724,33 @@ impl ConsoleView {
 
     /// Keyboard and mouse from the window to the VM.
     fn input(&mut self, ui: &Ui, resp: &egui::Response, img: Rect, scale: f32, focused: bool, allow: bool) {
-        follow_pointer(ui, resp, focused, allow);
-        let (events, mods, pos, buttons) = ui.input(|i| {
+        let (events, mods, pos, buttons, window_focused) = ui.input(|i| {
             let p = &i.pointer;
             let buttons = (p.button_down(egui::PointerButton::Primary) as u8) | (p.button_down(egui::PointerButton::Middle) as u8) << 1 | (p.button_down(egui::PointerButton::Secondary) as u8) << 2;
-            (i.events.clone(), i.modifiers, p.latest_pos(), buttons)
+            (i.events.clone(), i.modifiers, p.latest_pos(), buttons, i.focused)
         });
+        // The mouse is let go with Ctrl+Alt (pressed together), when the window goes to the back
+        // or a dialog opens, and when the VM starts taking positions after all (its USB tablet).
+        let relative = self.remote.as_ref().map_or(false, |r| r.relative());
+        let ctrl_alt = mods.ctrl && mods.alt;
+        if self.captured && ((ctrl_alt && !self.ctrl_alt) || !window_focused || !allow || !relative) {
+            self.release_mouse();
+        }
+        self.ctrl_alt = ctrl_alt;
+        if self.captured {
+            // the keyboard stays with the VM while it has the mouse
+            resp.request_focus();
+            keep_keys(ui);
+        } else {
+            follow_pointer(ui, resp, focused, allow);
+        }
         if !focused {
             if self.sent_mods != Modifiers::NONE {
                 self.sync_mods(Modifiers::NONE); // never leave Shift or Ctrl held down in the VM
             }
         } else {
             let scancodes = self.remote.as_ref().map_or(false, |r| r.scancodes());
-            for e in events {
+            for e in events.clone() {
                 match e {
                     Event::Key { key, physical_key, pressed, modifiers, .. } => {
                         self.sync_mods(modifiers);
@@ -1607,26 +1784,20 @@ impl ConsoleView {
                     // The window turns Ctrl+C / X / V into copy, cut and paste; the VM gets the keys.
                     Event::Copy => self.tap('c' as u32, if scancodes { 0x2e } else { 0 }),
                     Event::Cut => self.tap('x' as u32, if scancodes { 0x2d } else { 0 }),
+                    // (the clipboard Type the clipboard asked for: it's typed, not a key)
                     Event::Paste(_) if self.paste_taken => {}
-                    // Ctrl+Shift+V types the clipboard; on a server's console Ctrl+V does too (it
-                    // has no clipboard). A Windows VM gets it first, then Ctrl+V pastes it there,
-                    // a moment later when it was new to it (its VM Tools take a moment).
-                    Event::Paste(t) if mods.shift || (self.host && self.share_clipboard) => self.type_text_later(t),
-                    Event::Paste(t) => {
-                        let v = ('v' as u32, if scancodes { 0x2f } else { 0 });
-                        if self.share(&t) {
-                            let keys = vec![vec![], vec![(true, CTRL.0, CTRL.1), (true, v.0, v.1), (false, v.0, v.1), (false, CTRL.0, CTRL.1)]];
-                            if let Some(r) = &self.remote {
-                                r.send(Input::Type { groups: keys, gap: Duration::from_millis(300), shown: false });
-                            }
-                        } else {
-                            self.tap(v.0, v.1);
-                        }
-                    }
+                    // Ctrl+V and Ctrl+Shift+V never paste this computer's clipboard: the VM gets
+                    // the keys, for its own clipboard (Type the clipboard, in Actions, types ours)
+                    Event::Paste(_) => self.tap('v' as u32, if scancodes { 0x2f } else { 0 }),
                     _ => {}
                 }
             }
             self.sync_mods(mods);
+        }
+
+        if relative {
+            self.relative_mouse(ui, resp, &events, buttons, allow);
+            return;
         }
 
         // The mouse: where it is over the screen, its buttons, and the wheel as buttons 4 and 5.
@@ -1660,8 +1831,42 @@ impl ConsoleView {
         }
     }
 
+    /// A VM with a PS/2 mouse: a click on its screen gives it the mouse; from then on, the mouse's
+    /// moves as the system reports them (not where the pointer is: it's held still), its buttons
+    /// and its wheel.
+    fn relative_mouse(&mut self, ui: &Ui, resp: &egui::Response, events: &[Event], buttons: u8, allow: bool) {
+        if !self.captured {
+            self.wheel = 0.0;
+            if allow && resp.clicked() {
+                self.capture(ui.ctx());
+            }
+            return;
+        }
+        let Some(r) = &self.remote else { return };
+        let mut d = self.rel_rest;
+        for e in events {
+            if let Event::MouseMoved(m) = e {
+                d += *m;
+            }
+        }
+        let whole = vec2(d.x.trunc(), d.y.trunc());
+        self.rel_rest = d - whole;
+        if whole != egui::Vec2::ZERO || buttons != self.rel_buttons {
+            r.send(Input::Pointer { buttons, x: rel_coord(whole.x), y: rel_coord(whole.y) });
+            self.rel_buttons = buttons;
+        }
+        self.wheel += events.iter().map(wheel_steps).sum::<f32>();
+        let clicks = self.wheel.trunc();
+        self.wheel -= clicks;
+        let b = if clicks > 0.0 { 1 << 3 } else { 1 << 4 };
+        for _ in 0..(clicks.abs() as u32).min(30) {
+            r.send(Input::Pointer { buttons: buttons | b, x: 0x7FFF, y: 0x7FFF });
+            r.send(Input::Pointer { buttons, x: 0x7FFF, y: 0x7FFF });
+        }
+    }
+
     /// The demo console: an 80x25 text screen.
-    fn demo_screen(ui: &mut Ui, area: Rect, demo: &mut DemoTerm, focused: bool, allow: bool, paste_taken: bool) {
+    fn demo_screen(ui: &mut Ui, area: Rect, demo: &mut DemoTerm, focused: bool, allow: bool) {
         let size = vec2(720.0, 400.0);
         let s = (area.width() / size.x).min(area.height() / size.y);
         let img = Rect::from_center_size(area.center(), size * s);
@@ -1671,14 +1876,7 @@ impl ConsoleView {
             for e in ui.input(|i| i.events.clone()) {
                 match e {
                     Event::Text(t) => demo.type_text(&t),
-                    Event::Paste(t) if !paste_taken => {
-                        for (i, line) in t.split('\n').enumerate() {
-                            if i > 0 {
-                                demo.enter();
-                            }
-                            demo.type_text(line);
-                        }
-                    }
+                    // (Ctrl+V pastes nothing here either: Type the clipboard, in Actions, does)
                     Event::Key { key: Key::Enter, pressed: true, .. } => demo.enter(),
                     Event::Key { key: Key::Backspace, pressed: true, .. } => {
                         demo.input.pop();
@@ -1702,6 +1900,12 @@ impl ConsoleView {
         if focused {
             ui.ctx().request_repaint_after(Duration::from_millis(500)); // the blinking cursor
         }
+    }
+}
+
+impl Drop for ConsoleView {
+    fn drop(&mut self) {
+        self.release_mouse();
     }
 }
 
@@ -1774,6 +1978,65 @@ mod tests {
         println!("screen {}x{}, encodings seen {:?}, scancodes {}", w, h, seen, scancodes);
     }
 
+    /// Types SVM_TEST_TEXT into a real VNC server as the console does, with the pacing it uses, for
+    /// QEMU's input trace to show which keys reached the VM: SVM_TEST_VNC=127.0.0.1:5977 cargo test
+    /// live_typing -- --ignored --nocapture.
+    #[test]
+    #[ignore]
+    fn live_typing() {
+        let addr = std::env::var("SVM_TEST_VNC").expect("SVM_TEST_VNC=host:port");
+        let text = std::env::var("SVM_TEST_TEXT").unwrap_or_else(|_| "The Quick Brown Fox Jumps Over The Lazy Dog! echo $HOME && ls -la /tmp | grep X".into());
+        let mut s = ConsoleStream::Plain(std::net::TcpStream::connect(&addr).unwrap());
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let (w, h) = handshake(&mut s).unwrap();
+        let shared = Mutex::new(Shared::new(Status::Connected, Some(Screen::new(w as usize, h as usize))));
+        s.write_all(&set_pixel_format()).unwrap();
+        s.write_all(&set_encodings()).unwrap();
+        s.write_all(&update_request(false, w, h)).unwrap();
+        s.set_read_timeout(Some(Duration::from_millis(8))).unwrap();
+        let (mut inb, mut parser, mut seen) = (InBuf::default(), Parser::new(), vec![]);
+        pump(&mut s, &mut inb, &mut parser, &shared, &mut seen, Duration::from_millis(800));
+        let scancodes = shared.lock().unwrap().scancodes;
+        let (groups, _) = typing_keys(&text, false);
+        let events: usize = groups.iter().map(|g| g.len()).sum();
+        let mut typer = Typer::default();
+        typer.add(groups, TYPING_GAP, Duration::ZERO, true);
+        let start = Instant::now();
+        while typer.progress().is_some() {
+            for (down, keysym, scancode) in typer.due(Instant::now()) {
+                s.write_all(&encode_input(Input::Key { down, keysym, scancode }, scancodes)).unwrap();
+            }
+            s.flush().unwrap();
+            pump(&mut s, &mut inb, &mut parser, &shared, &mut seen, Duration::from_millis(1));
+        }
+        println!("{} characters, {} key events in {:?} (scancodes {})", text.chars().count(), events, start.elapsed(), scancodes);
+        pump(&mut s, &mut inb, &mut parser, &shared, &mut seen, Duration::from_millis(1500));
+    }
+
+    /// A VM with a PS/2 mouse as QEMU has it with no guest running (SVM_TEST_VNC=host:port, its
+    /// input traced): the console says so, and moves go as 0x7FFF plus the move.
+    #[test]
+    #[ignore]
+    fn live_relative_mouse() {
+        let addr = std::env::var("SVM_TEST_VNC").expect("SVM_TEST_VNC=host:port");
+        let mut s = ConsoleStream::Plain(std::net::TcpStream::connect(&addr).unwrap());
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let (w, h) = handshake(&mut s).unwrap();
+        let shared = Mutex::new(Shared::new(Status::Connected, Some(Screen::new(w as usize, h as usize))));
+        s.write_all(&set_pixel_format()).unwrap();
+        s.write_all(&set_encodings()).unwrap();
+        s.write_all(&update_request(false, w, h)).unwrap();
+        s.set_read_timeout(Some(Duration::from_millis(8))).unwrap();
+        let (mut inb, mut parser, mut seen) = (InBuf::default(), Parser::new(), vec![]);
+        pump(&mut s, &mut inb, &mut parser, &shared, &mut seen, Duration::from_millis(800));
+        assert_eq!(shared.lock().unwrap().absolute, Some(false));
+        for (buttons, dx, dy) in [(0, 10.0, -5.0), (1, 0.0, 0.0), (0, 0.0, 0.0), (0, -300.0, 40000.0)] {
+            s.write_all(&encode_input(Input::Pointer { buttons, x: rel_coord(dx), y: rel_coord(dy) }, true)).unwrap();
+        }
+        s.flush().unwrap();
+        pump(&mut s, &mut inb, &mut parser, &shared, &mut seen, Duration::from_millis(300));
+    }
+
     #[test]
     fn raw_and_copyrect() {
         let shared = Mutex::new(Shared::new(Status::Connected, Some(Screen::new(4, 2))));
@@ -1835,7 +2098,7 @@ mod tests {
         assert_eq!(shared.lock().unwrap().cut_text.as_deref(), Some("root@tico"));
         assert_eq!(cut_text(&[b'a', 0xe7, b'\r', b'\n', 0]), "a\u{e7}\n"); // Latin-1 when not UTF-8
         assert_eq!(cut_text("ação".as_bytes()), "ação");
-        // this computer's (ClientCutText), in Latin-1
+        // this computer's (ClientCutText, for Paste the clipboard), in Latin-1
         assert_eq!(encode_input(Input::CutText("ç€".into()), false), vec![6, 0, 0, 0, 0, 0, 0, 2, 0xe7, b'?']);
     }
 
@@ -1845,9 +2108,13 @@ mod tests {
         assert_eq!(left_out, 1);
         assert_eq!(keys.len(), 4);
         assert_eq!(keys[0], vec![(true, 'a' as u32, 0), (false, 'a' as u32, 0)]);
-        assert_eq!(keys[1], vec![(true, SHIFT.0, SHIFT.1), (true, 'B' as u32, 0), (false, 'B' as u32, 0), (false, SHIFT.0, SHIFT.1)]);
-        assert_eq!(keys[2][1], (true, '!' as u32, 0));
-        assert_eq!(keys[3], vec![(true, 0xff0d, 0x1c), (false, 0xff0d, 0x1c)]); // Enter
+        // Shift goes down for "B" and stays down for "!", the next one that needs it
+        assert_eq!(keys[1], vec![(true, SHIFT.0, SHIFT.1), (true, 'B' as u32, 0), (false, 'B' as u32, 0)]);
+        assert_eq!(keys[2], vec![(true, '!' as u32, 0), (false, '!' as u32, 0)]);
+        assert_eq!(keys[3], vec![(false, SHIFT.0, SHIFT.1), (true, 0xff0d, 0x1c), (false, 0xff0d, 0x1c)]); // Enter
+        // ending on a capital lets go of Shift
+        let (keys, _) = typing_keys("xY", false);
+        assert_eq!(keys[1].last(), Some(&(false, SHIFT.0, SHIFT.1)));
         // the server's text console takes the characters as they are, without Shift
         let (keys, _) = typing_keys("B", true);
         assert_eq!(keys, vec![vec![(true, 'B' as u32, 0), (false, 'B' as u32, 0)]]);
@@ -1857,19 +2124,35 @@ mod tests {
     fn typing_is_paced() {
         let mut t = Typer::default();
         let start = Instant::now();
-        t.add(vec![vec![(true, 1, 0)], vec![(true, 2, 0)], vec![(true, 3, 0)]], Duration::from_millis(12), true);
-        assert_eq!(t.due(start).len(), 1);
-        assert_eq!(t.due(start + Duration::from_millis(5)).len(), 0);
-        assert_eq!(t.progress(), Some((1, 3)));
-        assert_eq!(t.due(start + Duration::from_millis(12)).len(), 1);
+        let gap = Duration::from_millis(12);
+        // one key at a time, a character's keys too
+        t.add(vec![vec![(true, 1, 0), (false, 1, 0)], vec![(true, 2, 0), (false, 2, 0)]], gap, Duration::ZERO, true);
+        assert_eq!(t.due(start), vec![(true, 1, 0)]);
+        assert_eq!(t.due(start + Duration::from_millis(5)), vec![]);
+        assert_eq!(t.progress(), Some((0, 2)));
+        assert_eq!(t.due(start + gap), vec![(false, 1, 0)]);
+        assert_eq!(t.progress(), Some((1, 2)));
         // after a slow moment, still one at a time
         assert_eq!(t.due(start + Duration::from_millis(500)).len(), 1);
+        assert_eq!(t.due(start + Duration::from_millis(600)).len(), 1);
         assert_eq!(t.progress(), None);
-        // no gap: all at once; Stop drops the rest
-        t.add((0..500).map(|i| vec![(true, i, 0)]).collect(), Duration::ZERO, true);
+        // no gap: all at once; Stop drops the rest and lets go of what is still held
+        t.add((0..500).map(|i| vec![(true, i, 0)]).collect(), Duration::ZERO, Duration::ZERO, true);
         assert_eq!(t.due(start).len(), 300);
-        t.stop();
+        assert_eq!(t.stop().len(), 300);
         assert_eq!((t.due(start).len(), t.progress()), (0, None));
+        // Stop in the middle of a run of capitals lets go of Shift
+        let (keys, _) = typing_keys("ABC", false);
+        t.add(keys, gap, Duration::ZERO, true);
+        let mut now = start + Duration::from_secs(1);
+        for _ in 0..3 {
+            t.due(now);
+            now += gap;
+        }
+        assert_eq!(t.stop(), vec![(false, SHIFT.0, SHIFT.1)]);
+        // a later start
+        t.add(vec![vec![(true, 9, 0)]], gap, Duration::from_secs(60), false);
+        assert_eq!(t.due(Instant::now()), vec![]);
     }
 
     #[test]

@@ -410,6 +410,15 @@ pub(super) enum Icon<'a> {
 /// be done now.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn menu_row(ui: &mut Ui, pal: &Pal, icon: Icon, label: &str, shortcut: &str, ok: bool, why: &str, intent: Intent, out: &mut Vec<Intent>) {
+    if action_row(ui, pal, icon, label, shortcut, ok, why) {
+        out.push(intent);
+    }
+}
+
+/// A menu's row as `menu_row`, for an action done on the spot: whether it was clicked (the menu
+/// then closes).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn action_row(ui: &mut Ui, pal: &Pal, icon: Icon, label: &str, shortcut: &str, ok: bool, why: &str) -> bool {
     let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), if ok { Sense::click() } else { Sense::hover() });
     if ok && resp.hovered() {
         ui.painter().rect_filled(r, Rounding::same(5.0), pal.hover);
@@ -423,10 +432,27 @@ pub(super) fn menu_row(ui: &mut Ui, pal: &Pal, icon: Icon, label: &str, shortcut
         ui.painter().text(pos2(r.max.x - 8.0, r.center().y), Align2::RIGHT_CENTER, shortcut, FontId::proportional(12.0), pal.ink_faint);
     }
     let resp = if ok || why.is_empty() { resp } else { resp.on_hover_text(why) };
-    if ok && resp.clicked() {
-        out.push(intent);
+    let clicked = ok && resp.clicked();
+    if clicked {
         ui.close_menu();
     }
+    clicked
+}
+
+/// A submenu's row in a menu, lined up with `menu_row`'s: its glyph, its name, the arrow; opens
+/// on hover.
+pub(super) fn submenu_row(ui: &mut Ui, pal: &Pal, glyph: &str, label: &str, ok: bool, add_contents: impl FnOnce(&mut Ui)) {
+    ui.scope(|ui| {
+        ui.spacing_mut().interact_size.y = 30.0;
+        ui.add_enabled_ui(ok, |ui| {
+            // the name after room for the glyph, as the other rows have it
+            let mut job = egui::text::LayoutJob::default();
+            let pad = ui.spacing().button_padding.x;
+            job.append(label, 32.0 - pad, egui::TextFormat { font_id: FontId::proportional(13.0), color: Color32::PLACEHOLDER, ..Default::default() });
+            let r = ui.menu_button(job, add_contents).response.rect;
+            paint_glyph(ui.painter(), Rect::from_min_size(pos2(r.min.x + 7.0, r.center().y - 8.0), vec2(16.0, 16.0)), glyph, if ok { pal.accent } else { pal.ink_faint });
+        });
+    });
 }
 
 /// A menu's entry in red (Disconnect).
