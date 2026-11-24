@@ -845,15 +845,18 @@ fn tiles(ui: &mut Ui, pal: &Pal, w: f32, v: &VmInfo, at: &Around, perf: Option<&
     };
     let last = |s: &[f64]| s.last().copied().unwrap_or(0.0);
     let peak = |a: &[f64], b: &[f64]| a.iter().chain(b).fold(1024.0f64, |m, x| m.max(*x)) * 1.15;
-    let mem_total = p.mem_total.iter().fold(1.0f64, |m, x| m.max(*x));
+    // what it has now (the window keeps an older size a while after a change); the line's scale
+    // that or more, if it used more before
+    let mem_total = crate::history::mem_now(&p.mem_total, v).max(1.0);
+    let mem_top = p.mem_used.iter().fold(mem_total, |m, x| m.max(*x));
     let cpus = v.vcpus.max(1);
     // what it uses, when its tools say; otherwise only what it was given
     let memory = if p.mem_inside {
-        Tile { title: "Memory", figs: vec![Fig::Big(fmt_bytes(last(&p.mem_used) as i64)), Fig::Soft(format!("of {}", fmt_bytes(mem_total as i64)))], lines: vec![(&p.mem_used, pal.green, "")], max: mem_total, note: None, tone: None }
+        Tile { title: "Memory", figs: vec![Fig::Big(fmt_bytes(last(&p.mem_used) as i64)), Fig::Soft(format!("of {}", fmt_bytes(mem_total as i64)))], lines: vec![(&p.mem_used, pal.green, "")], max: mem_top, note: None, tone: None }
     } else {
         let note = if v.tools_installed { "Its guest tools don't say how much of it is in use" } else { "No guest tools to say how much of it is in use" };
         let tip = "XenServer only knows how much memory a VM uses when the guest tools inside it report it, and this VM's don't.";
-        Tile { title: "Memory", figs: vec![Fig::Big(fmt_bytes(mem_total as i64)), Fig::Soft("given".into())], lines: vec![], max: mem_total, note: Some((note, tip)), tone: None }
+        Tile { title: "Memory", figs: vec![Fig::Big(fmt_bytes(mem_total as i64)), Fig::Soft("given".into())], lines: vec![], max: mem_top, note: Some((note, tip)), tone: None }
     };
     let tiles = [
         Tile { title: "CPU", figs: vec![Fig::Big(format!("{:.0}%", last(&p.cpu) * 100.0)), Fig::Soft(format!("of {} CPU{}", cpus, if cpus == 1 { "" } else { "s" }))], lines: vec![(&p.cpu, pal.accent, "")], max: 1.0, note: None, tone: None },

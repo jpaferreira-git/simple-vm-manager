@@ -435,18 +435,50 @@ impl Notes {
     }
 }
 
-/// The request to leave in the pool: what was there, with `what` asked at `now`.
-pub fn request(before: &str, what: &str, now: i64) -> String {
+/// The request to leave in the pool: what was there, with `what` asked at `now` (an update with
+/// the version on GitHub to fetch it from, `update_ref`).
+pub fn request(before: &str, what: &str, now: i64, update_ref: Option<&str>) -> String {
     let mut m = match serde_json::from_str::<Value>(before) {
         Ok(Value::Object(m)) => m,
         _ => Map::new(),
     };
     m.insert(what.to_string(), json!(now));
-    if what == "update" {
-        // this app's own version's: the Helper VM it comes with
-        m.insert("update_ref".into(), json!(format!("v{}", env!("CARGO_PKG_VERSION"))));
+    if let Some(r) = update_ref.filter(|_| what == "update") {
+        m.insert("update_ref".into(), json!(r));
     }
     Value::Object(m).to_string()
+}
+
+/// The Helper VM version a copy of svm-helper.py is ("2.4.0").
+pub fn version_in(script: &str) -> Option<&str> {
+    script.lines().find_map(|l| l.strip_prefix("VERSION = \"")?.strip_suffix('"'))
+}
+
+/// The version of this app on GitHub for the Helper VM to update from: one that's there and comes
+/// with this app's Helper VM (LATEST). That's this copy's own version once it's released; a copy
+/// built before its release takes the latest release, if that one has the same Helper VM.
+pub fn update_ref() -> Result<String, String> {
+    let has_latest = |r: &str| -> Result<bool, String> {
+        let url = format!("https://raw.githubusercontent.com/{}/{}/helper-vm/svm-helper.py", crate::update::REPO, r);
+        match crate::conn::web_agent()?.get(&url).call() {
+            Ok(a) => Ok(version_in(&a.into_string().map_err(|e| e.to_string())?) == Some(LATEST)),
+            Err(ureq::Error::Status(404, _)) => Ok(false),
+            Err(ureq::Error::Status(code, _)) => Err(format!("GitHub answered with HTTP {}.", code)),
+            Err(e) => Err(match e.kind() {
+                ureq::ErrorKind::Dns | ureq::ErrorKind::ConnectionFailed => "Couldn't reach GitHub: is this computer online?".into(),
+                _ => e.to_string(),
+            }),
+        }
+    };
+    let own = format!("v{}", env!("CARGO_PKG_VERSION"));
+    if has_latest(&own)? {
+        return Ok(own);
+    }
+    let latest = format!("v{}", crate::update::latest()?.version);
+    if latest != own && has_latest(&latest)? {
+        return Ok(latest);
+    }
+    Err(format!("its version {} isn't on GitHub yet: it comes out with the next release of Simple VM Manager.", LATEST))
 }
 
 #[cfg(test)]
@@ -503,9 +535,12 @@ mod tests {
         let a = Advice::parse(r#"{"at": 950, "request": 940, "by": "claude", "checks": [{"id": "clocks", "topic": "servers", "status": "bad", "title": "Relógio errado", "note": "Ligue o NTP.", "objects": ["godofredo"]}, {"id": "x", "topic": "vms", "status": "odd", "title": "skipped"}, {"id": "claude_1", "topic": "vms", "status": "warn", "title": "dc01", "by": "claude"}]}"#).unwrap();
         assert_eq!((a.at, a.request, a.by_claude, a.checks.len(), a.counts()), (950, 940, true, 2, (1, 1)));
         assert_eq!((a.checks[0].status, a.checks[0].objects.clone(), a.checks[1].by_claude), (Status::Bad, vec!["godofredo".to_string()], true));
-        assert_eq!(request(r#"{"test": 5}"#, "advice", 9), r#"{"advice":9,"test":5}"#);
-        assert_eq!(request("", "test", 3), r#"{"test":3}"#);
-        assert!(request("", "update", 4).contains(&format!(r#""update_ref":"v{}""#, env!("CARGO_PKG_VERSION"))));
+        assert_eq!(request(r#"{"test": 5}"#, "advice", 9, None), r#"{"advice":9,"test":5}"#);
+        assert_eq!(request("", "test", 3, Some("v1.31.5")), r#"{"test":3}"#);
+        assert_eq!(request("", "update", 4, Some("v1.31.5")), r#"{"update":4,"update_ref":"v1.31.5"}"#);
+        // the version a copy of the helper is, as update_ref reads it from GitHub
+        assert_eq!(version_in("import os\n\nVERSION = \"2.4.0\"\nREPO = \"x\"\n"), Some("2.4.0"));
+        assert_eq!(version_in("404: Not Found"), None);
         // a check the app can fix, and an update as the VM tells it
         let a = Advice::parse(r#"{"at": 1, "checks": [{"id": "autostart", "topic": "vms", "status": "warn", "title": "x", "fix": {"action": "autostart", "uuids": ["u-1"], "names": ["Plex"]}}]}"#).unwrap();
         assert_eq!(a.checks[0].fix, Some(Fix { action: "autostart".into(), uuids: vec!["u-1".into()], names: vec!["Plex".into()] }));
@@ -537,6 +572,7 @@ mod tests {
     fn latest_is_the_helper_this_version_comes_with() {
         let helper = include_str!("../helper-vm/svm-helper.py");
         assert!(helper.contains(&format!("\nVERSION = \"{}\"\n", LATEST)), "helper.rs's LATEST isn't helper-vm/svm-helper.py's VERSION");
+        assert_eq!(version_in(helper), Some(LATEST));
         assert!(older("2.0.3", LATEST) && older("2.2.10", "2.3") && !older(LATEST, LATEST) && !older("2.10.0", "2.9.9"));
     }
 }

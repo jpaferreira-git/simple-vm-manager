@@ -231,6 +231,12 @@ pub fn last(v: &[f64]) -> Option<f64> {
     v.iter().rev().copied().find(|x| x.is_finite())
 }
 
+/// The memory a VM has now: its newest record of what it was given, else what it's set to. (Not
+/// the most in the records: after a change the old size stays in them a while.)
+pub fn mem_now(given: &[f64], v: &VmInfo) -> f64 {
+    last(given).filter(|x| *x > 0.0).unwrap_or(v.mem_dyn_max as f64)
+}
+
 /// Where its values begin (the first that's there).
 pub fn first_there(v: &[f64]) -> Option<usize> {
     v.iter().position(|x| x.is_finite())
@@ -376,7 +382,7 @@ pub fn vm_charts(r: &Records, v: &VmInfo) -> Charts {
     let two = |a: &str, b: &str, x: Vec<f64>, y: Vec<f64>| vec![Line { name: a.into(), hue: Hue::Blue, vals: x }, Line { name: b.into(), hue: Hue::Orange, vals: y }];
     let main = vec![
         Chart { top: Some(1.0), of: cpus_text(count), ..Chart::new("CPU", Unit::Share, vec![Line { name: "CPU".into(), hue: Hue::Accent, vals: cpu }]) },
-        Chart { top: Some(mem_top), of: fmt_bytes(mem_top as i64), ..Chart::new("Memory", Unit::Bytes, vec![Line { name: mem_name.into(), hue: Hue::Green, vals: mem }]) },
+        Chart { top: Some(mem_top), of: fmt_bytes(mem_now(given.map_or(&[][..], |g| g), v) as i64), ..Chart::new("Memory", Unit::Bytes, vec![Line { name: mem_name.into(), hue: Hue::Green, vals: mem }]) },
         Chart::new("Disk", Unit::Rate, two("read", "write", total(&disks, "read"), total(&disks, "write"))),
         Chart::new("Network", Unit::Rate, two("in", "out", total(&cards, "rx"), total(&cards, "tx"))),
     ];
@@ -842,6 +848,20 @@ mod tests {
         assert_eq!(average(cpu), Some(0.375));
         assert_eq!(peak(cpu), Some(0.5));
         assert_eq!(last(&[1.0, f64::NAN]), Some(1.0));
+    }
+
+    #[test]
+    fn memory_is_what_it_has_now_not_the_most() {
+        let v = VmInfo { uuid: "u1".into(), mem_dyn_max: 4 << 30, ..Default::default() };
+        // it ran with 8 GB, was given 4 and started again: both in the window
+        let given = vec![8589934592.0, 8589934592.0, f64::NAN, 4294967296.0, 4294967296.0];
+        assert_eq!(mem_now(&given, &v), 4294967296.0);
+        assert_eq!(mem_now(&[f64::NAN], &v), 4294967296.0, "its setting when there's no record");
+        let mut r = Records { times: vec![0, 5, 10, 15, 20], ..Default::default() };
+        r.cols.insert("vm:u1:memory".into(), given);
+        let c = vm_charts(&r, &v);
+        assert_eq!(c.main[1].of, "4 GB");
+        assert_eq!(c.main[1].top, Some(8589934592.0), "the scale still fits the old size");
     }
 
     #[test]

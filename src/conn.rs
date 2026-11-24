@@ -4301,7 +4301,9 @@ impl Connection for RealConnection {
         let t = 30_000;
         let pool = self.all("pool", t)?.keys().next().cloned().unwrap_or_default();
         let oc = self.call("pool.get_other_config", vec![json!(pool)], t)?;
-        let text = crate::helper::request(&s(&oc, crate::helper::REQUEST_KEY), what, now);
+        // (an update: from the version on GitHub that has this app's Helper VM)
+        let from = if what == "update" { Some(crate::helper::update_ref().map_err(ApiError::other)?) } else { None };
+        let text = crate::helper::request(&s(&oc, crate::helper::REQUEST_KEY), what, now, from.as_deref());
         let _ = self.call_raw("pool.remove_from_other_config", vec![json!(pool), json!(crate::helper::REQUEST_KEY)], t);
         self.call("pool.add_to_other_config", vec![json!(pool), json!(crate::helper::REQUEST_KEY), json!(text)], t)?;
         Ok(())
@@ -6782,7 +6784,7 @@ impl Connection for DemoConnection {
         Ok(h.notes.clone())
     }
     fn helper_ask(&self, what: &str, now: i64) -> Result<(), ApiError> {
-        said("pool.add_to_other_config", &[json!(crate::helper::REQUEST_KEY), json!(crate::helper::request("", what, now))]);
+        said("pool.add_to_other_config", &[json!(crate::helper::REQUEST_KEY), json!(crate::helper::request("", what, now, Some(concat!("v", env!("CARGO_PKG_VERSION")))))]);
         demo_work(300);
         let mut h = self.helper.lock().unwrap();
         if !h.vm {
