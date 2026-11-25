@@ -17,6 +17,7 @@
 
 use crate::app::{dialog_button, Look};
 use crate::conn::{Connection, ConsoleStream};
+use crate::scrollback::Scrollback;
 use crate::theme::Pal;
 use eframe::egui::{self, pos2, vec2, Align2, Color32, Event, FontId, Key, Modifiers, Rect, Rounding, Sense, Stroke, Ui};
 use std::io::{ErrorKind, Read, Write};
@@ -50,7 +51,14 @@ pub enum Status {
 struct Screen {
     width: usize,
     height: usize,
+    /// The screen as the pieces of an update come in.
     rgba: Vec<u8>,
+    /// The screen shown: as of the last whole update. An update comes in pieces (a server's
+    /// console sends up to 40), and shown one by one they tore the picture.
+    frame: Vec<u8>,
+    /// Where the pieces painted since the last whole update was shown: x, y, right, bottom.
+    damage: Option<(usize, usize, usize, usize)>,
+    /// `frame` changed since the window last took it.
     dirty: bool,
 }
 
@@ -60,7 +68,30 @@ impl Screen {
         for px in rgba.chunks_exact_mut(4) {
             px[3] = 255;
         }
-        Screen { width, height, rgba, dirty: true }
+        Screen { width, height, frame: rgba.clone(), rgba, damage: None, dirty: true }
+    }
+
+    /// A piece was painted there.
+    fn mark(&mut self, x: usize, y: usize, w: usize, h: usize) {
+        let (x1, y1) = ((x + w).min(self.width), (y + h).min(self.height));
+        if x >= x1 || y >= y1 {
+            return;
+        }
+        self.damage = Some(match self.damage {
+            Some((a, b, c, d)) => (a.min(x), b.min(y), c.max(x1), d.max(y1)),
+            None => (x, y, x1, y1),
+        });
+    }
+
+    /// Shows what was painted since it was last shown; whether there was anything.
+    fn present(&mut self) -> bool {
+        let Some((x0, y0, x1, y1)) = self.damage.take() else { return false };
+        for row in y0..y1 {
+            let (a, b) = ((row * self.width + x0) * 4, (row * self.width + x1) * 4);
+            self.frame[a..b].copy_from_slice(&self.rgba[a..b]);
+        }
+        self.dirty = true;
+        true
     }
     fn put(&mut self, x: usize, y: usize, px: [u8; 4]) {
         if x < self.width && y < self.height {
@@ -90,11 +121,13 @@ struct Shared {
     cut_text: Option<String>,
     /// Text being typed: the characters typed so far, of how many.
     typing: Option<(usize, usize)>,
+    /// What went up a text console's screen, kept for the wheel (a Linux VM's: see scrollback.rs).
+    history: Option<Scrollback>,
 }
 
 impl Shared {
     fn new(status: Status, screen: Option<Screen>) -> Shared {
-        Shared { status, screen, scancodes: false, absolute: None, cut_text: None, typing: None }
+        Shared { status, screen, scancodes: false, absolute: None, cut_text: None, typing: None, history: None }
     }
 }
 
@@ -186,8 +219,11 @@ struct Remote {
 }
 
 impl Remote {
-    fn start(conn: Arc<dyn Connection>, vm_ref: String, ctx: egui::Context) -> Remote {
-        let shared = Arc::new(Mutex::new(Shared::new(Status::Connecting, None)));
+    /// With `history`, what goes up the screen of a text console is kept, for the wheel.
+    fn start(conn: Arc<dyn Connection>, vm_ref: String, ctx: egui::Context, history: bool) -> Remote {
+        let mut sh = Shared::new(Status::Connecting, None);
+        sh.history = history.then(Scrollback::default);
+        let shared = Arc::new(Mutex::new(sh));
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel();
         let (sh, st) = (shared.clone(), stop.clone());
@@ -259,9 +295,14 @@ fn run(conn: &dyn Connection, vm_ref: &str, shared: &Mutex<Shared>, rx: &mpsc::R
     let mut parser = Parser::new();
     let mut chunk = vec![0u8; 256 * 1024];
     let mut typer = Typer::default();
+    let mut shower = Shower::default();
     loop {
         if stop.load(Ordering::Relaxed) {
             return Ok(());
+        }
+        if shower.due(Instant::now()) {
+            show(&mut shared.lock().unwrap());
+            ctx.request_repaint();
         }
         let mut wrote = false;
         let scancodes = shared.lock().unwrap().scancodes;
@@ -275,12 +316,18 @@ fn run(conn: &dyn Connection, vm_ref: &str, shared: &Mutex<Shared>, rx: &mpsc::R
                     }
                 }
                 i => {
+                    if matches!(i, Input::Key { down: true, .. }) {
+                        key_pressed(shared);
+                    }
                     s.write_all(&encode_input(i, scancodes)).map_err(io_err)?;
                     wrote = true;
                 }
             }
         }
         for (down, keysym, scancode) in typer.due(Instant::now()) {
+            if down {
+                key_pressed(shared);
+            }
             s.write_all(&encode_input(Input::Key { down, keysym, scancode }, scancodes)).map_err(io_err)?;
             wrote = true;
         }
@@ -305,7 +352,13 @@ fn run(conn: &dyn Connection, vm_ref: &str, shared: &Mutex<Shared>, rx: &mpsc::R
                 Step::NeedMore => break,
                 Step::Progress => {}
                 Step::UpdateDone => {
-                    let (w, h) = shared.lock().unwrap().screen.as_ref().map(|sc| (sc.width as u16, sc.height as u16)).unwrap_or((w, h));
+                    let (w, h) = {
+                        let mut sh = shared.lock().unwrap();
+                        if shower.done(parser.update(), Instant::now()) {
+                            show(&mut sh);
+                        }
+                        sh.screen.as_ref().map(|sc| (sc.width as u16, sc.height as u16)).unwrap_or((w, h))
+                    };
                     let full = std::mem::take(&mut parser.resized);
                     s.write_all(&update_request(!full, w, h)).map_err(io_err)?;
                     s.flush().map_err(io_err)?;
@@ -313,6 +366,63 @@ fn run(conn: &dyn Connection, vm_ref: &str, shared: &Mutex<Shared>, rx: &mpsc::R
                 }
             }
         }
+    }
+}
+
+/// How long a scroll that came alone waits for its new lines before it's shown anyway (a server's
+/// console sends them on its next refresh: 30 ms when busy, longer after a quiet while).
+const HOLD_SCROLL: Duration = Duration::from_millis(200);
+
+/// When to show what came: each update whole, once it's done; a scroll that came alone with the
+/// new lines that follow it (or by itself, HOLD_SCROLL later).
+#[derive(Default)]
+struct Shower {
+    /// The scroll waiting: since when.
+    held: Option<Instant>,
+}
+
+impl Shower {
+    /// An update is done: whether to show the screen now.
+    fn done(&mut self, u: Update, now: Instant) -> bool {
+        match u {
+            Update::Nothing => false,
+            Update::MovedOnly => {
+                self.held.get_or_insert(now);
+                false
+            }
+            Update::Painted => {
+                self.held = None;
+                true
+            }
+        }
+    }
+
+    /// A scroll has waited long enough: show it as it is.
+    fn due(&mut self, now: Instant) -> bool {
+        let due = self.held.map_or(false, |t| now.duration_since(t) >= HOLD_SCROLL);
+        if due {
+            self.held = None;
+        }
+        due
+    }
+}
+
+/// Shows the screen as the updates so far left it, and lets the history look at it.
+fn show(sh: &mut Shared) {
+    let Shared { screen, history, .. } = sh;
+    if let Some(sc) = screen.as_mut() {
+        if sc.present() {
+            if let Some(hist) = history.as_mut() {
+                hist.look(sc.width, sc.height, &sc.frame);
+            }
+        }
+    }
+}
+
+/// A key went to the VM: the history's next screen that changes all at once is a new one.
+fn key_pressed(shared: &Mutex<Shared>) {
+    if let Some(h) = shared.lock().unwrap().history.as_mut() {
+        h.key();
     }
 }
 
@@ -399,6 +509,70 @@ pub(crate) fn probe(s: &mut ConsoleStream) -> Result<String, String> {
         Some(false) => "RELATIVE (PS/2)",
         None => "not said",
     }))
+}
+
+/// Watches a console for a while, sending it nothing, as the Console tab keeps its history (a
+/// test's look at a real pool's): whether it's a text console, and what was kept.
+#[cfg(test)]
+pub(crate) fn watch_history(s: &mut ConsoleStream, dur: Duration) -> Result<String, String> {
+    s.set_read_timeout(Some(Duration::from_secs(10))).map_err(io_err)?;
+    let (w, h) = handshake(s)?;
+    let shared = Mutex::new(Shared::new(Status::Connected, Some(Screen::new(w as usize, h as usize))));
+    shared.lock().unwrap().history = Some(Scrollback::default());
+    s.write_all(&set_pixel_format()).map_err(io_err)?;
+    s.write_all(&set_encodings()).map_err(io_err)?;
+    s.write_all(&update_request(false, w, h)).map_err(io_err)?;
+    s.flush().map_err(io_err)?;
+    s.set_read_timeout(Some(Duration::from_millis(8))).map_err(io_err)?;
+    let (mut inb, mut parser, mut chunk) = (InBuf::default(), Parser::new(), vec![0u8; 256 * 1024]);
+    let (until, mut looks) = (Instant::now() + dur, 0);
+    // what the updates were like: the formats used, rectangles in each, bytes
+    let (mut encs, mut rects, mut most, mut in_this, mut bytes) = (vec![], 0, 0, 0, 0);
+    while Instant::now() < until {
+        match s.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                bytes += n;
+                inb.data.extend_from_slice(&chunk[..n]);
+            }
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted) => {}
+            Err(e) => return Err(io_err(e)),
+        }
+        loop {
+            if parser.rects_left.is_some() && inb.avail().len() >= 12 {
+                let e = be32(&inb.avail()[8..12]) as i32;
+                if !encs.contains(&e) {
+                    encs.push(e);
+                }
+            }
+            let rect = parser.rects_left.is_some();
+            match parser.step(&mut inb, &shared)? {
+                Step::NeedMore => break,
+                Step::Progress => {
+                    if rect && parser.rects_left.is_some() {
+                        (rects, in_this) = (rects + 1, in_this + 1);
+                    }
+                }
+                Step::UpdateDone => {
+                    (rects, in_this) = (rects + rect as usize, in_this + rect as usize);
+                    most = most.max(in_this);
+                    in_this = 0;
+                    looks += 1;
+                    let mut sh = shared.lock().unwrap();
+                    let Shared { screen, history, .. } = &mut *sh;
+                    let sc = screen.as_ref().unwrap();
+                    history.as_mut().unwrap().look(sc.width, sc.height, &sc.rgba);
+                    let (w, h) = (sc.width as u16, sc.height as u16);
+                    drop(sh);
+                    s.write_all(&update_request(!std::mem::take(&mut parser.resized), w, h)).map_err(io_err)?;
+                    s.flush().map_err(io_err)?;
+                }
+            }
+        }
+    }
+    let sh = shared.lock().unwrap();
+    let hist = sh.history.as_ref().unwrap();
+    Ok(format!("{} looks, text console {}, {} rows kept; screen {}x{}, formats {:?}, {} rectangles ({} at most in one update), {} KB", looks, hist.is_text(), hist.rows(), w, h, encs, rects, most, bytes / 1024))
 }
 
 /// A picture made smaller (each pixel the average of the ones it covers) to `max_w` wide at most.
@@ -516,6 +690,8 @@ fn set_pixel_format() -> Vec<u8> {
 
 const ENC_RAW: i32 = 0;
 const ENC_COPYRECT: i32 = 1;
+/// A server's console (vncterm) knows only Raw and Hextile: Hextile is a fraction of the bytes.
+const ENC_HEXTILE: i32 = 5;
 const ENC_ZRLE: i32 = 16;
 const ENC_DESKTOP_SIZE: i32 = -223;
 const ENC_QEMU_KEYS: i32 = -258;
@@ -525,7 +701,10 @@ const ENC_POINTER_TYPE: i32 = -257;
 
 fn set_encodings() -> Vec<u8> {
     // The server uses the first one in this list that it knows.
-    let encs = [ENC_ZRLE, ENC_COPYRECT, ENC_RAW, ENC_DESKTOP_SIZE, ENC_QEMU_KEYS, ENC_POINTER_TYPE];
+    let mut encs = vec![ENC_ZRLE, ENC_HEXTILE, ENC_COPYRECT, ENC_RAW, ENC_DESKTOP_SIZE, ENC_QEMU_KEYS, ENC_POINTER_TYPE];
+    if cfg!(test) && std::env::var("SVM_TEST_RAW").is_ok() {
+        encs.retain(|&e| e != ENC_HEXTILE); // (a test's: the picture as it was before Hextile)
+    }
     let mut m = vec![2, 0];
     m.extend_from_slice(&(encs.len() as u16).to_be_bytes());
     for e in encs {
@@ -655,6 +834,21 @@ struct Parser {
     resized: bool,
     /// Some of the screen has come (not only news such as its size).
     painted: bool,
+    /// The update coming in (or the last one) painted something, and only by moving what was
+    /// there (CopyRect: a server's console sends a scroll that way, the new lines after it).
+    this_painted: bool,
+    this_moved_only: bool,
+}
+
+/// What an update was, for showing it.
+#[derive(PartialEq, Debug)]
+enum Update {
+    /// Nothing painted (news such as its size, or nothing).
+    Nothing,
+    /// Only what was there moved: a server's console scrolls so, and sends the new lines a moment
+    /// later in another update. Shown alone, the old bottom showed twice meanwhile.
+    MovedOnly,
+    Painted,
 }
 
 fn be16(b: &[u8]) -> u16 {
@@ -665,8 +859,17 @@ fn be32(b: &[u8]) -> u32 {
 }
 
 impl Parser {
+    /// What the update just done was.
+    fn update(&self) -> Update {
+        match (self.this_painted, self.this_moved_only) {
+            (false, _) => Update::Nothing,
+            (true, true) => Update::MovedOnly,
+            (true, false) => Update::Painted,
+        }
+    }
+
     fn new() -> Parser {
-        Parser { rects_left: None, zlib: flate2::Decompress::new(true), resized: false, painted: false }
+        Parser { rects_left: None, zlib: flate2::Decompress::new(true), resized: false, painted: false, this_painted: false, this_moved_only: true }
     }
 
     fn step(&mut self, inb: &mut InBuf, shared: &Mutex<Shared>) -> Result<Step, String> {
@@ -688,6 +891,7 @@ impl Parser {
             if kind == 0 {
                 let n = be16(&a[2..4]);
                 inb.consume(4);
+                (self.this_painted, self.this_moved_only) = (false, true);
                 if n == 0 {
                     return Ok(Step::UpdateDone);
                 }
@@ -715,6 +919,11 @@ impl Parser {
             ENC_DESKTOP_SIZE | ENC_QEMU_KEYS | ENC_POINTER_TYPE => 0,
             ENC_ZRLE if a.len() >= 16 => 4 + be32(&a[12..16]) as usize,
             ENC_ZRLE => return Ok(Step::NeedMore),
+            // (its length shows only by going through its tiles)
+            ENC_HEXTILE => match hextile(&a[12..], w, h, None) {
+                Some(n) => n,
+                None => return Ok(Step::NeedMore),
+            },
             other => return Err(format!("The console used a screen format this app doesn't understand ({}).", other)),
         };
         if a.len() < 12 + body {
@@ -743,10 +952,15 @@ impl Parser {
                             }
                         }
                         ENC_COPYRECT => copy_rect(sc, be16(&data[0..2]) as usize, be16(&data[2..4]) as usize, x, y, w, h),
+                        ENC_HEXTILE => {
+                            hextile(data, w, h, Some((sc, x, y)));
+                        }
                         _ => zrle(sc, inflated.as_deref().unwrap_or(&[]), x, y, w, h)?,
                     }
-                    sc.dirty = true;
+                    sc.mark(x, y, w, h);
                     self.painted = true;
+                    self.this_painted = true;
+                    self.this_moved_only &= enc == ENC_COPYRECT;
                 }
             }
         }
@@ -759,6 +973,60 @@ impl Parser {
             Ok(Step::Progress)
         }
     }
+}
+
+/// A Hextile rectangle: 16x16 tiles, each its pixels as they come, or a background with
+/// rectangles of a foreground (or of their own colours) over it. The background and foreground
+/// carry on from tile to tile. Paints it, when given the screen and where; how many bytes it
+/// takes, or None if more are still to come.
+fn hextile(data: &[u8], w: usize, h: usize, mut paint: Option<(&mut Screen, usize, usize)>) -> Option<usize> {
+    let px = |b: &[u8]| [b[2], b[1], b[0], 255];
+    let (mut at, mut bg, mut fg) = (0usize, [0u8, 0, 0, 255], [0u8, 0, 0, 255]);
+    for ty in (0..h).step_by(16) {
+        for tx in (0..w).step_by(16) {
+            let (tw, th) = (16.min(w - tx), 16.min(h - ty));
+            let flags = *data.get(at)?;
+            at += 1;
+            if flags & 1 != 0 {
+                let raw = data.get(at..at + tw * th * 4)?;
+                if let Some((sc, x, y)) = paint.as_mut() {
+                    for (i, p) in raw.chunks_exact(4).enumerate() {
+                        sc.put(*x + tx + i % tw, *y + ty + i / tw, px(p));
+                    }
+                }
+                at += tw * th * 4;
+                continue;
+            }
+            if flags & 2 != 0 {
+                bg = px(data.get(at..at + 4)?);
+                at += 4;
+            }
+            if flags & 4 != 0 {
+                fg = px(data.get(at..at + 4)?);
+                at += 4;
+            }
+            if let Some((sc, x, y)) = paint.as_mut() {
+                sc.fill(*x + tx, *y + ty, tw, th, bg);
+            }
+            if flags & 8 != 0 {
+                let n = *data.get(at)? as usize;
+                at += 1;
+                let coloured = flags & 16 != 0;
+                let each = if coloured { 6 } else { 2 };
+                let rects = data.get(at..at + n * each)?;
+                if let Some((sc, x, y)) = paint.as_mut() {
+                    for r in rects.chunks_exact(each) {
+                        let (colour, xy, wh) = if coloured { (px(&r[..4]), r[4], r[5]) } else { (fg, r[0], r[1]) };
+                        let (sx, sy) = ((xy >> 4) as usize, (xy & 15) as usize);
+                        let (sw, sh) = ((wh >> 4) as usize + 1, (wh & 15) as usize + 1);
+                        sc.fill(*x + tx + sx, *y + ty + sy, sw.min(tw.saturating_sub(sx)), sh.min(th.saturating_sub(sy)), colour);
+                    }
+                }
+                at += n * each;
+            }
+        }
+    }
+    Some(at)
 }
 
 fn copy_rect(sc: &mut Screen, sx: usize, sy: usize, x: usize, y: usize, w: usize, h: usize) {
@@ -1261,6 +1529,22 @@ pub struct ConsoleView {
     /// Asked for one: the app makes the change, once.
     pub want_tablet: bool,
     tablet_asked: bool,
+    /// Keep what goes up a text console's screen, for the wheel: a VM's that isn't Windows (a Linux
+    /// VM's text console keeps none of its own). A server's keeps its own.
+    text_history: bool,
+    /// How far back the wheel went, in rows of the screen's pixels (0: the screen as it is), and
+    /// a part of a row not gone yet.
+    back: usize,
+    back_rest: f32,
+    /// The screen as it was that far back, and what it was made from (how far back, rows ever
+    /// kept, the screen's uploads).
+    back_tex: Option<egui::TextureHandle>,
+    back_made: Option<(usize, usize, u64)>,
+    /// The screen's uploads so far (that picture shows the screen's own rows under the kept ones).
+    uploads: u64,
+    /// The history as last seen: rows kept, rows ever kept (while back there, the view stays on
+    /// the same lines as more go up), a line's height; None when the screen isn't a text console.
+    hist: Option<(usize, usize, usize)>,
 }
 
 /// What this computer's clipboard is asked for.
@@ -1309,6 +1593,13 @@ impl ConsoleView {
             usb_tablet: true,
             want_tablet: false,
             tablet_asked: false,
+            text_history: !os.starts_with("XenServer ") && !os.to_lowercase().contains("windows"),
+            back: 0,
+            back_rest: 0.0,
+            back_tex: None,
+            back_made: None,
+            uploads: 0,
+            hist: None,
         };
         if !demo {
             v.connect();
@@ -1317,7 +1608,8 @@ impl ConsoleView {
     }
 
     fn connect(&mut self) {
-        self.remote = Some(Remote::start(self.conn.clone(), self.vm.clone(), self.ctx.clone()));
+        self.remote = Some(Remote::start(self.conn.clone(), self.vm.clone(), self.ctx.clone(), self.text_history));
+        (self.back, self.back_made, self.hist) = (0, None, None);
         self.retry_at = None;
         self.connected_at = None;
         self.shared_clip = None;
@@ -1416,7 +1708,9 @@ impl ConsoleView {
         let s = (area.width() / size.x).min(area.height() / size.y);
         let img = Rect::from_center_size(area.center(), size * s);
         let resp = ui.interact(img, screen_id(), Sense::click_and_drag());
-        ui.painter().image(tex, img, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+        let shown = self.history_texture(ui.ctx()).unwrap_or(tex);
+        ui.painter().image(shown, img, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+        self.history_bar(ui, img);
         ui.allocate_rect(area, Sense::hover());
         self.input(ui, &resp, img, s, focused, allow_keyboard);
         if focused {
@@ -1443,8 +1737,25 @@ impl ConsoleView {
             } else {
                 self.note = None;
             }
-        } else if !self.captured && *status == Status::Connected && (ui.rect_contains_pointer(area) || std::env::var("SVM_SHOT_MOUSE").is_ok()) && self.remote.as_ref().map_or(false, |r| r.relative()) {
+        } else if !self.captured && self.hist.is_none() && *status == Status::Connected && (ui.rect_contains_pointer(area) || std::env::var("SVM_SHOT_MOUSE").is_ok()) && self.remote.as_ref().map_or(false, |r| r.relative()) {
             self.mouse_hint(ui, pal, area);
+        }
+        if let Some((_, _, line)) = self.hist.filter(|_| self.back > 0) {
+            let r = Rect::from_center_size(pos2(area.center().x, area.max.y - 34.0), vec2(440.0_f32.min(area.width() - 20.0), 40.0));
+            ui.painter().rect_filled(r, Rounding::same(8.0), Color32::from_black_alpha(215));
+            let lines = self.back.div_ceil(line.max(1));
+            let mut live = false;
+            ui.allocate_new_ui(egui::UiBuilder::new().max_rect(r.shrink2(vec2(12.0, 6.0))), |ui| {
+                ui.horizontal_centered(|ui| {
+                    ui.label(egui::RichText::new(format!("Showing earlier lines · {} up", lines)).color(Color32::from_gray(235)));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        live = dialog_button(ui, pal, "down", "Back to the live screen", Look::Plain, true);
+                    });
+                });
+            });
+            if live {
+                self.back = 0;
+            }
         }
         let typing = self.remote.as_ref().and_then(|r| r.shared.lock().unwrap().typing);
         let typing = typing.or_else(|| std::env::var("SVM_SHOT_TYPING").ok().map(|_| (312, 1480))); // for --screenshot
@@ -1576,6 +1887,7 @@ impl ConsoleView {
     }
 
     fn ask_paste(&mut self, ctx: &egui::Context, mode: Paste) {
+        self.back = 0;
         if self.paste.is_none() {
             self.paste = Some((mode, 0));
             ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste);
@@ -1673,18 +1985,83 @@ impl ConsoleView {
             match sh.screen.as_mut() {
                 Some(sc) if sc.dirty || self.texture.is_none() => {
                     sc.dirty = false;
-                    Some(egui::ColorImage::from_rgba_unmultiplied([sc.width, sc.height], &sc.rgba))
+                    Some(egui::ColorImage::from_rgba_unmultiplied([sc.width, sc.height], &sc.frame))
                 }
                 _ => None,
             }
         };
         if let Some(img) = img {
+            self.uploads += 1;
             self.tex_size = img.size;
             match &mut self.texture {
                 Some(t) => t.set(img, egui::TextureOptions::LINEAR),
                 None => self.texture = Some(ctx.load_texture("vm-console", img, egui::TextureOptions::LINEAR)),
             }
         }
+    }
+
+    /// The wheel over a text console the app keeps a history of: it goes up and down that (three
+    /// lines a step, as a terminal), not to the VM. False on any other screen.
+    fn wheel_history(&mut self, steps: f32) -> bool {
+        let Some((kept, _, line)) = self.hist else { return false };
+        if steps != 0.0 {
+            self.back_rest += steps * 3.0 * line as f32;
+            let rows = self.back_rest.trunc();
+            self.back_rest -= rows;
+            self.back = (self.back as f32 + rows).clamp(0.0, kept as f32) as usize;
+            self.ctx.request_repaint();
+        }
+        true
+    }
+
+    /// The history as it is now (`hist`), and while back up it, the screen as it was there: made
+    /// again when how far back, what's kept or the screen changed.
+    fn history_texture(&mut self, ctx: &egui::Context) -> Option<egui::TextureId> {
+        let r = self.remote.as_ref()?;
+        let sh = r.shared.lock().unwrap();
+        let (h, sc) = match (sh.history.as_ref(), sh.screen.as_ref()) {
+            (Some(h), Some(sc)) if h.is_text() => (h, sc),
+            _ => {
+                (self.back, self.hist) = (0, None);
+                return None;
+            }
+        };
+        let (kept, pushed) = (h.rows(), h.pushed());
+        if let Some((_, seen, _)) = self.hist {
+            if self.back > 0 && pushed > seen {
+                self.back += pushed - seen; // the same lines stay in view as more go up
+            }
+        }
+        if let Ok(v) = std::env::var("SVM_SHOT_BACK") {
+            // (for --screenshot: that many lines back)
+            self.back = self.back.max(v.parse::<usize>().unwrap_or(0) * h.line());
+        }
+        self.back = self.back.min(kept);
+        self.hist = Some((kept, pushed, h.line()));
+        if self.back == 0 {
+            return None;
+        }
+        let made = (self.back, pushed, self.uploads);
+        if self.back_made != Some(made) || self.back_tex.is_none() {
+            let img = egui::ColorImage::from_rgba_unmultiplied([sc.width, sc.height], &h.view(self.back, &sc.frame));
+            match &mut self.back_tex {
+                Some(t) => t.set(img, egui::TextureOptions::LINEAR),
+                None => self.back_tex = Some(ctx.load_texture("vm-console-history", img, egui::TextureOptions::LINEAR)),
+            }
+            self.back_made = Some(made);
+        }
+        self.back_tex.as_ref().map(|t| t.id())
+    }
+
+    /// While back up the history: a thin bar on the screen's right showing where.
+    fn history_bar(&self, ui: &Ui, img: Rect) {
+        let Some((kept, _, _)) = self.hist.filter(|_| self.back > 0) else { return };
+        let h = self.tex_size[1].max(1) as f32;
+        let total = kept as f32 + h;
+        let top = img.min.y + img.height() * (kept - self.back) as f32 / total;
+        let len = (img.height() * h / total).max(18.0);
+        let r = Rect::from_min_size(pos2(img.max.x - 6.0, top.min(img.max.y - len)), vec2(4.0, len));
+        ui.painter().rect_filled(r, Rounding::same(2.0), Color32::from_white_alpha(70));
     }
 
     fn send_key(&self, down: bool, keysym: u32, scancode: u32) {
@@ -1700,6 +2077,7 @@ impl ConsoleView {
 
     /// Presses the keys in order, then lets go of them in reverse.
     fn send_combo(&mut self, keys: &[(u32, u32)]) {
+        self.back = 0;
         if let Some(d) = self.demo.as_mut() {
             d.lines.push("(The demo ignores key combinations.)".into());
             return;
@@ -1730,10 +2108,11 @@ impl ConsoleView {
             (i.events.clone(), i.modifiers, p.latest_pos(), buttons, i.focused)
         });
         // The mouse is let go with Ctrl+Alt (pressed together), when the window goes to the back
-        // or a dialog opens, and when the VM starts taking positions after all (its USB tablet).
+        // or a dialog opens, when the VM starts taking positions after all (its USB tablet), and
+        // on a text console (no mouse there).
         let relative = self.remote.as_ref().map_or(false, |r| r.relative());
         let ctrl_alt = mods.ctrl && mods.alt;
-        if self.captured && ((ctrl_alt && !self.ctrl_alt) || !window_focused || !allow || !relative) {
+        if self.captured && ((ctrl_alt && !self.ctrl_alt) || !window_focused || !allow || !relative || self.hist.is_some()) {
             self.release_mouse();
         }
         self.ctrl_alt = ctrl_alt;
@@ -1751,6 +2130,10 @@ impl ConsoleView {
         } else {
             let scancodes = self.remote.as_ref().map_or(false, |r| r.scancodes());
             for e in events.clone() {
+                // a key back up the history: the screen as it is again, and the key goes on
+                if matches!(e, Event::Key { pressed: true, .. } | Event::Text(_) | Event::Copy | Event::Cut | Event::Paste(_)) {
+                    self.back = 0;
+                }
                 match e {
                     Event::Key { key, physical_key, pressed, modifiers, .. } => {
                         self.sync_mods(modifiers);
@@ -1795,13 +2178,17 @@ impl ConsoleView {
             self.sync_mods(mods);
         }
 
+        // The wheel over a text console with a history scrolls that, not the VM.
+        let over = resp.hovered() || resp.dragged();
+        let wheel: f32 = events.iter().map(wheel_steps).sum();
+        let wheel = if (over || self.captured) && self.wheel_history(wheel) { 0.0 } else { wheel };
+
         if relative {
-            self.relative_mouse(ui, resp, &events, buttons, allow);
+            self.relative_mouse(ui, resp, &events, buttons, allow, wheel);
             return;
         }
 
         // The mouse: where it is over the screen, its buttons, and the wheel as buttons 4 and 5.
-        let over = resp.hovered() || resp.dragged();
         if let (true, Some(p)) = (over, pos) {
             let x = ((p.x - img.min.x) / scale).clamp(0.0, self.tex_size[0].saturating_sub(1) as f32) as u16;
             let y = ((p.y - img.min.y) / scale).clamp(0.0, self.tex_size[1].saturating_sub(1) as f32) as u16;
@@ -1813,8 +2200,7 @@ impl ConsoleView {
             }
             // The wheel: a click of buttons 4 or 5 for each step. A server's text console scrolls
             // one line a click through what went by, so it gets three, as a terminal scrolls.
-            let steps: f32 = ui.input(|i| i.events.iter().map(wheel_steps).sum());
-            self.wheel += steps * if self.host { 3.0 } else { 1.0 };
+            self.wheel += wheel * if self.host { 3.0 } else { 1.0 };
             let clicks = self.wheel.trunc();
             self.wheel -= clicks;
             if clicks != 0.0 {
@@ -1834,10 +2220,11 @@ impl ConsoleView {
     /// A VM with a PS/2 mouse: a click on its screen gives it the mouse; from then on, the mouse's
     /// moves as the system reports them (not where the pointer is: it's held still), its buttons
     /// and its wheel.
-    fn relative_mouse(&mut self, ui: &Ui, resp: &egui::Response, events: &[Event], buttons: u8, allow: bool) {
+    fn relative_mouse(&mut self, ui: &Ui, resp: &egui::Response, events: &[Event], buttons: u8, allow: bool, wheel: f32) {
         if !self.captured {
             self.wheel = 0.0;
-            if allow && resp.clicked() {
+            // (a text console has no mouse to give: it stays this window's)
+            if allow && resp.clicked() && self.hist.is_none() {
                 self.capture(ui.ctx());
             }
             return;
@@ -1855,7 +2242,7 @@ impl ConsoleView {
             r.send(Input::Pointer { buttons, x: rel_coord(whole.x), y: rel_coord(whole.y) });
             self.rel_buttons = buttons;
         }
-        self.wheel += events.iter().map(wheel_steps).sum::<f32>();
+        self.wheel += wheel;
         let clicks = self.wheel.trunc();
         self.wheel -= clicks;
         let b = if clicks > 0.0 { 1 << 3 } else { 1 << 4 };
@@ -1933,7 +2320,14 @@ mod tests {
                     Step::NeedMore => break,
                     Step::Progress => {}
                     Step::UpdateDone => {
-                        let (w, h) = shared.lock().unwrap().screen.as_ref().map(|sc| (sc.width as u16, sc.height as u16)).unwrap();
+                        let mut sh = shared.lock().unwrap();
+                        let Shared { screen, history, .. } = &mut *sh;
+                        let sc = screen.as_ref().unwrap();
+                        if let Some(hist) = history.as_mut() {
+                            hist.look(sc.width, sc.height, &sc.rgba);
+                        }
+                        let (w, h) = (sc.width as u16, sc.height as u16);
+                        drop(sh);
                         let full = std::mem::take(&mut parser.resized);
                         s.write_all(&update_request(!full, w, h)).unwrap();
                     }
@@ -2013,6 +2407,60 @@ mod tests {
         pump(&mut s, &mut inb, &mut parser, &shared, &mut seen, Duration::from_millis(1500));
     }
 
+    /// A Linux text console's history, against a real one: QEMU running a kernel with a shell on
+    /// tty0 (see scrollback.rs; SVM_TEST_VNC=host:port SVM_TEST_OUT=<dir>). Types commands whose
+    /// output goes up the screen a little, by more than a screen at once, and slowly (or
+    /// SVM_TEST_COMMANDS, split by ";;"), and saves the screen and what was kept.
+    #[test]
+    #[ignore]
+    fn live_history() {
+        let addr = std::env::var("SVM_TEST_VNC").expect("SVM_TEST_VNC=host:port");
+        let out = std::env::var("SVM_TEST_OUT").unwrap_or_else(|_| ".".into());
+        let mut s = ConsoleStream::Plain(std::net::TcpStream::connect(&addr).unwrap());
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let (w, h) = handshake(&mut s).unwrap();
+        let shared = Mutex::new(Shared::new(Status::Connected, Some(Screen::new(w as usize, h as usize))));
+        shared.lock().unwrap().history = Some(Scrollback::default());
+        s.write_all(&set_pixel_format()).unwrap();
+        s.write_all(&set_encodings()).unwrap();
+        s.write_all(&update_request(false, w, h)).unwrap();
+        s.set_read_timeout(Some(Duration::from_millis(8))).unwrap();
+        let (mut inb, mut parser, mut seen) = (InBuf::default(), Parser::new(), vec![]);
+        pump(&mut s, &mut inb, &mut parser, &shared, &mut seen, Duration::from_millis(1500));
+        let scancodes = shared.lock().unwrap().scancodes;
+        let report = |what: &str, shared: &Mutex<Shared>| {
+            let sh = shared.lock().unwrap();
+            let hist = sh.history.as_ref().unwrap();
+            println!("{:28} text {}  kept {} rows ({} lines of {})", what, hist.is_text(), hist.rows(), hist.rows() / hist.line(), hist.line());
+        };
+        report("at first", &shared);
+        let commands = std::env::var("SVM_TEST_COMMANDS").unwrap_or_else(|_| "seq 1 12;;seq 100 160;;for i in $(seq 1 30); do echo slowly $i; sleep 0.1; done".into());
+        for cmd in commands.split(";;").filter(|c| !c.is_empty()) {
+            let (groups, _) = typing_keys(&format!("{}\n", cmd), false);
+            let mut typer = Typer::default();
+            typer.add(groups, TYPING_GAP, Duration::ZERO, false);
+            while !typer.left.is_empty() {
+                for (down, keysym, scancode) in typer.due(Instant::now()) {
+                    if down {
+                        key_pressed(&shared);
+                    }
+                    s.write_all(&encode_input(Input::Key { down, keysym, scancode }, scancodes)).unwrap();
+                }
+                s.flush().unwrap();
+                pump(&mut s, &mut inb, &mut parser, &shared, &mut seen, Duration::from_millis(2));
+            }
+            pump(&mut s, &mut inb, &mut parser, &shared, &mut seen, Duration::from_millis(4500));
+            report(cmd, &shared);
+        }
+        save(&shared, &format!("{}/history-screen.png", out));
+        let sh = shared.lock().unwrap();
+        let (hist, sc) = (sh.history.as_ref().unwrap(), sh.screen.as_ref().unwrap());
+        let all = hist.kept_pixels();
+        image::RgbaImage::from_raw(sc.width as u32, (all.len() / 4 / sc.width) as u32, all).unwrap().save(format!("{}/history-kept.png", out)).unwrap();
+        let back = hist.view(hist.line() * 10, &sc.rgba);
+        image::RgbaImage::from_raw(sc.width as u32, sc.height as u32, back).unwrap().save(format!("{}/history-10-back.png", out)).unwrap();
+    }
+
     /// A VM with a PS/2 mouse as QEMU has it with no guest running (SVM_TEST_VNC=host:port, its
     /// input traced): the console says so, and moves go as 0x7FFF plus the move.
     #[test]
@@ -2062,6 +2510,89 @@ mod tests {
         assert_eq!(px(1, 0), vec![1, 2, 3, 255]);
         assert_eq!(px(2, 1), vec![10, 20, 30, 255]);
         assert_eq!(px(3, 1), vec![1, 2, 3, 255]);
+        // what's shown is the whole update, once it's done (and only the part it changed)
+        assert_eq!(p.update(), Update::Painted);
+    }
+
+    /// Runs `bytes` through a parser until an update is done: what it was.
+    fn one_update(p: &mut Parser, shared: &Mutex<Shared>, bytes: &[u8]) -> Update {
+        let mut inb = InBuf::default();
+        inb.data.extend_from_slice(bytes);
+        loop {
+            match p.step(&mut inb, shared).unwrap() {
+                Step::UpdateDone => return p.update(),
+                Step::NeedMore => panic!("ran out of bytes"),
+                Step::Progress => {}
+            }
+        }
+    }
+
+    #[test]
+    fn the_picture_shown_is_whole_updates() {
+        let shared = Mutex::new(Shared::new(Status::Connected, Some(Screen::new(4, 2))));
+        let mut p = Parser::new();
+        // a 1x1 raw piece at (1,1)
+        let u = one_update(&mut p, &shared, &[0, 0, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 0, 0, 0, 9, 8, 7, 0]);
+        assert_eq!(u, Update::Painted);
+        let mut sh = shared.lock().unwrap();
+        let sc = sh.screen.as_mut().unwrap();
+        sc.dirty = false;
+        let at = (1 * 4 + 1) * 4;
+        assert_eq!(&sc.rgba[at..at + 4], &[7, 8, 9, 255]);
+        assert_eq!(&sc.frame[at..at + 4], &[0, 0, 0, 255], "not shown until it's presented");
+        assert!(sc.present() && sc.dirty);
+        assert_eq!(&sc.frame[at..at + 4], &[7, 8, 9, 255]);
+        assert!(!sc.present(), "nothing new to show");
+        drop(sh);
+        // a server's console scrolling: a copy alone, then the new line
+        let u = one_update(&mut p, &shared, &[0, 0, 0, 1, 0, 0, 0, 0, 0, 4, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1]);
+        assert_eq!(u, Update::MovedOnly);
+        let u = one_update(&mut p, &shared, &[0, 0, 0, 0]);
+        assert_eq!(u, Update::Nothing);
+    }
+
+    #[test]
+    fn a_scroll_alone_waits_for_its_new_lines() {
+        let (mut sw, t) = (Shower::default(), Instant::now());
+        let ms = |n: u64| t + Duration::from_millis(n);
+        assert!(!sw.done(Update::MovedOnly, t), "a server's console moved its lines up: not shown yet");
+        assert!(!sw.due(ms(100)));
+        assert!(sw.done(Update::Painted, ms(120)), "the new lines came: both shown together");
+        assert!(!sw.due(ms(500)), "nothing waits any more");
+        assert!(!sw.done(Update::MovedOnly, ms(600)));
+        assert!(!sw.done(Update::Nothing, ms(650)), "an empty update doesn't show it");
+        assert!(sw.due(ms(600) + HOLD_SCROLL), "the new lines never came: shown as it is");
+        assert!(!sw.due(ms(2000)));
+        assert!(sw.done(Update::Painted, ms(2100)));
+    }
+
+    #[test]
+    fn hextile() {
+        // 20x18: four tiles, 16x16, 4x16, 16x2 and 4x2
+        let (w, h) = (20, 18);
+        let mut d = vec![];
+        // 1: a background (1,2,3) and foreground (4,5,6), with a 3x2 rectangle of it at (2,1)
+        d.extend_from_slice(&[2 | 4 | 8, 3, 2, 1, 0, 6, 5, 4, 0, 1, 0x21, 0x21]);
+        // 2: the same background, no rectangles
+        d.push(0);
+        // 3: rectangles of their own colours over a new background (9,9,9): a 1x1 of (7,7,7) at (15,1)
+        d.extend_from_slice(&[2 | 8 | 16, 9, 9, 9, 0, 1, 7, 7, 7, 0, 0xf1, 0x00]);
+        // 4: its pixels as they are (4x2)
+        d.push(1);
+        for i in 0..8u8 {
+            d.extend_from_slice(&[i, i, i, 0]);
+        }
+        assert_eq!(super::hextile(&d, w, h, None), Some(d.len()));
+        assert_eq!(super::hextile(&d[..d.len() - 1], w, h, None), None, "more to come");
+        let mut sc = Screen::new(w, h);
+        super::hextile(&d, w, h, Some((&mut sc, 0, 0)));
+        let px = |x: usize, y: usize| sc.rgba[(y * w + x) * 4..(y * w + x) * 4 + 4].to_vec();
+        // (pixels come as blue, green, red)
+        assert_eq!(px(0, 0), vec![1, 2, 3, 255]);
+        assert_eq!((px(2, 1), px(4, 2), px(5, 2), px(2, 3)), (vec![4, 5, 6, 255], vec![4, 5, 6, 255], vec![1, 2, 3, 255], vec![1, 2, 3, 255]));
+        assert_eq!(px(17, 5), vec![1, 2, 3, 255], "the background carries on");
+        assert_eq!((px(15, 17), px(0, 16)), (vec![7, 7, 7, 255], vec![9, 9, 9, 255]));
+        assert_eq!((px(16, 16), px(19, 17)), (vec![0, 0, 0, 255], vec![7, 7, 7, 255]));
     }
 
     #[test]

@@ -596,6 +596,11 @@ pub fn paint_glyph_on(p: &Painter, rect: Rect, name: &str, col: Color32, bg: Col
             line(p, c, &[(-3.8, -1.5), (0.0, 2.3), (3.8, -1.5)], s);
             line(p, c, &[(-6.0, 1.5), (-6.0, 5.5), (6.0, 5.5), (6.0, 1.5)], s);
         }
+        "down" => {
+            // an arrow pointing down
+            line(p, c, &[(0.0, -5.5), (0.0, 5.0)], s);
+            line(p, c, &[(-4.2, 0.8), (0.0, 5.0), (4.2, 0.8)], s);
+        }
         "back" => {
             line(p, c, &[(5.5, 0.0), (-5.0, 0.0)], s);
             line(p, c, &[(-1.0, -4.0), (-5.0, 0.0), (-1.0, 4.0)], s);

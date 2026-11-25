@@ -21,6 +21,7 @@ mod newnet;
 mod newsr;
 mod newvm;
 mod pool_update;
+mod scrollback;
 mod secrets;
 mod theme;
 mod update;

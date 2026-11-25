@@ -6980,6 +6980,36 @@ mod tests {
         c.close();
     }
 
+    /// A real VM's screen as it is, at its full size, for the console's text reader: looks only
+    /// (sends the VM nothing). SVM_TEST_POOL=<address> SVM_TEST_VM=<part of its name>
+    /// SVM_TEST_OUT=<file.png> [SVM_TEST_WATCH=<seconds>: first what its history keeps that long].
+    #[test]
+    #[ignore]
+    fn console_capture_live() {
+        let host = std::env::var("SVM_TEST_POOL").expect("SVM_TEST_POOL");
+        let user = std::env::var("SVM_TEST_USER").unwrap_or_else(|_| "root".into());
+        let want = std::env::var("SVM_TEST_VM").expect("SVM_TEST_VM").to_lowercase();
+        let out = std::env::var("SVM_TEST_OUT").expect("SVM_TEST_OUT");
+        let pw = crate::secrets::load(&host, &user).expect("no saved password");
+        let c = RealConnection::new(&host, &user, &pw);
+        let vms = c.call("VM.get_all_records", vec![], 30_000).unwrap();
+        let (r, v) = vms.as_object().unwrap().iter().find(|(_, v)| v["is_a_template"].as_bool() != Some(true) && s(v, "power_state") == "Running" && s(v, "name_label").to_lowercase().contains(&want)).expect("no running VM by that name");
+        println!("{} (control domain {})", s(v, "name_label"), v["is_control_domain"]);
+        for con in c.call("VM.get_consoles", vec![json!(r)], 30_000).unwrap().as_array().unwrap() {
+            let rec = c.call("console.get_record", vec![con.clone()], 30_000).unwrap();
+            println!("console {} at {}", s(&rec, "protocol"), s(&rec, "location"));
+        }
+        if let Ok(secs) = std::env::var("SVM_TEST_WATCH").map(|v| v.parse::<u64>().unwrap()) {
+            // and its history, as the Console tab keeps it, watched that long
+            let mut st = c.open_console(r).unwrap();
+            println!("history: {}", crate::console::watch_history(&mut st, std::time::Duration::from_secs(secs)).unwrap());
+        }
+        let (w, h, rgba) = crate::console::snapshot(&c, r, usize::MAX, false).unwrap();
+        image::RgbaImage::from_raw(w as u32, h as u32, rgba).unwrap().save(&out).unwrap();
+        println!("{}: {}x{} → {}", s(v, "name_label"), w, h, out);
+        c.close();
+    }
+
     /// Against a fake server that stops answering part way (SVM_FAKE_XAPI=host:port, see the
     /// session's notes): the copy gives up LOST_AFTER after the last answer.
     #[test]
