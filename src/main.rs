@@ -9,6 +9,7 @@ mod conn;
 mod convert;
 mod console;
 mod details;
+mod gpu;
 mod helper;
 mod history;
 mod hosttools;
@@ -147,7 +148,7 @@ fn main() -> eframe::Result {
 
 fn run(viewport: egui::ViewportBuilder, renderer: eframe::Renderer, args: Args) -> eframe::Result {
     #[allow(unused_mut)]
-    let mut options = eframe::NativeOptions { viewport, renderer, ..Default::default() };
+    let mut options = eframe::NativeOptions { viewport, renderer, wgpu_options: gpu::wgpu_options(), ..Default::default() };
     #[cfg(target_os = "macos")]
     if args.shot.is_some() {
         options.event_loop_builder = Some(Box::new(|builder| {

@@ -46,6 +46,22 @@ pub const REFRESH_MS: u64 = 15_000; // XenConnection.HEARTBEAT_INTERVAL
 pub const RECONNECT_FIRST_MS: u64 = 5_000; // XenConnection.RECONNECT_SHORT_TIMEOUT_MS
 pub const RECONNECT_LATER_MS: u64 = 120_000; // XenConnection.RECONNECT_HOST_TIMEOUT_MS
 pub const FETCH_TIMEOUT_MS: u64 = 30_000; // estimated
+/// After the computer wakes up, a server that doesn't answer is tried at the short delay for this
+/// long (the network takes a moment to come back).
+const WOKE_RETRY_SHORT: Duration = Duration::from_secs(120);
+/// Between two ticks, the wall clock went this much further than the monotonic one (Linux and
+/// macOS don't count sleep in `Instant`)...
+const SLEPT_DRIFT: Duration = Duration::from_secs(5);
+/// ...or this much time passed at all (Windows counts it; the app otherwise ticks every 15 s at most).
+const SLEPT_GAP: Duration = Duration::from_secs(60);
+
+/// Whether the computer slept between two ticks, each on the monotonic and the wall clock.
+/// Mistaking a long pause for sleep only makes the servers be looked at a little earlier.
+fn slept(then: (Instant, SystemTime), now: (Instant, SystemTime)) -> bool {
+    let mono = now.0.duration_since(then.0);
+    let wall = now.1.duration_since(then.1).unwrap_or_default();
+    mono >= SLEPT_GAP || wall > mono + SLEPT_DRIFT
+}
 const RAIL_WIDTH: f32 = 46.0;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -825,6 +841,10 @@ pub struct App {
     /// Servers told to turn on, by reference ("srv:<id>" for a connection's own server known
     /// only from the last time).
     host_waking: HashMap<String, Waking>,
+    /// The last tick on both clocks, to notice that the computer slept (see `tick`).
+    last_tick: (Instant, SystemTime),
+    /// When the computer last woke up: reconnecting then retries at the short delay.
+    woke_at: Option<Instant>,
     /// Servers going into maintenance mode (true) or coming out of it (false).
     host_maint: HashMap<String, bool>,
     /// Each pool's updates as last read (its /updates), and those being read; those fetching from
@@ -860,6 +880,7 @@ pub struct App {
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, start: Startup) -> App {
+        crate::gpu::watch(cc);
         setup_fonts(&cc.egui_ctx);
         let shot = start.shot_path.is_some();
         // A check's screenshot doesn't use the person's saved settings: light theme, sidebar open,
@@ -950,6 +971,8 @@ impl App {
             host_busy: HashSet::new(),
             host_rebooting: HashMap::new(),
             host_waking: HashMap::new(),
+            last_tick: (Instant::now(), SystemTime::now()),
+            woke_at: None,
             host_maint: HashMap::new(),
             pool_updates: HashMap::new(),
             pool_updates_busy: HashMap::new(),
@@ -2358,12 +2381,29 @@ impl App {
         }
     }
 
+    /// The computer woke up: every server is looked at again right away (its connection may have
+    /// gone while asleep), and one that doesn't answer yet (the network comes back a moment after)
+    /// is tried again soon, not only after the long delay.
+    fn on_wake(&mut self, now: Instant) {
+        self.woke_at = Some(now);
+        for s in self.servers.iter_mut() {
+            if s.state != ConnState::Disconnected {
+                s.failures = 0;
+                s.next_refresh = now;
+            }
+        }
+    }
+
     fn tick(&mut self, ctx: &egui::Context) {
         if !self.host_waking.is_empty() {
             self.check_waking();
             ctx.request_repaint_after(Duration::from_secs(1));
         }
         let now = Instant::now();
+        if slept(self.last_tick, (now, SystemTime::now())) {
+            self.on_wake(now);
+        }
+        self.last_tick = (now, SystemTime::now());
         for s in self.servers.iter_mut() {
             if !s.fetching && now >= s.next_refresh && s.state != ConnState::Disconnected {
                 s.fetching = true;
@@ -3585,7 +3625,8 @@ impl App {
                     s.state = ConnState::Reconnecting;
                     s.error = Some(msg.clone());
                     // first retry after the short delay, later ones after the long one
-                    let delay = if s.failures <= 1 { RECONNECT_FIRST_MS } else { RECONNECT_LATER_MS };
+                    let just_woke = self.woke_at.map_or(false, |t| t.elapsed() < WOKE_RETRY_SHORT);
+                    let delay = if s.failures <= 1 || just_woke { RECONNECT_FIRST_MS } else { RECONNECT_LATER_MS };
                     s.next_refresh = Instant::now() + Duration::from_millis(delay);
                     if first_loss {
                         self.add_log(id, &name, None, &name, &format!("Lost the connection to {}: {}", name, msg), "Reconnecting");
@@ -9209,6 +9250,17 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // the GPU was lost while the computer slept: this window can't draw anymore, so a new copy
+        // of the app takes over (reconnecting as at any start) and this one closes; a job that
+        // would be left half done (an upload…) is let finish first
+        if crate::gpu::device_lost() && !self.closing && self.shot_path.is_none() {
+            if !self.halfway().is_empty() {
+                ctx.request_repaint_after(Duration::from_secs(1));
+            } else if crate::gpu::relaunch() {
+                self.closing = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
         self.apply_theme(ctx); // follows the system theme when set to "Same as the system"
         // a newer version found: offered when nothing else is asked
         if matches!(self.dialog, Dialog::None) {
@@ -11134,6 +11186,16 @@ fn setup_fonts(ctx: &egui::Context) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sleep_is_noticed_from_the_clocks() {
+        let (t0, w0) = (Instant::now(), SystemTime::now());
+        let s = Duration::from_secs;
+        assert!(!slept((t0, w0), (t0 + s(15), w0 + s(15)))); // a normal tick
+        assert!(slept((t0, w0), (t0 + s(1), w0 + s(3600)))); // Linux, macOS: Instant stood still
+        assert!(slept((t0, w0), (t0 + s(3600), w0 + s(3600)))); // Windows: both went on
+        assert!(!slept((t0, w0), (t0 + s(15), w0))); // the clock was set back
+    }
 
     #[test]
     fn copy_says_what_it_takes() {

@@ -23,7 +23,7 @@ use eframe::egui::{self, pos2, vec2, Align2, Color32, Event, FontId, Key, Modifi
 use std::io::{ErrorKind, Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 /// The id of the screen widget: while it has keyboard focus, keys go to the VM and the window's own
 /// shortcuts are off.
@@ -296,9 +296,18 @@ fn run(conn: &dyn Connection, vm_ref: &str, shared: &Mutex<Shared>, rx: &mpsc::R
     let mut chunk = vec![0u8; 256 * 1024];
     let mut typer = Typer::default();
     let mut shower = Shower::default();
+    let mut alive = Alive::new(Instant::now(), SystemTime::now());
     loop {
         if stop.load(Ordering::Relaxed) {
             return Ok(());
+        }
+        match alive.check(Instant::now(), SystemTime::now()) {
+            Check::Fine => {}
+            Check::Ping => {
+                s.write_all(&ping()).map_err(io_err)?;
+                s.flush().map_err(io_err)?;
+            }
+            Check::Dead => return Err("The console stopped answering.".into()),
         }
         if shower.due(Instant::now()) {
             show(&mut shared.lock().unwrap());
@@ -343,7 +352,10 @@ fn run(conn: &dyn Connection, vm_ref: &str, shared: &Mutex<Shared>, rx: &mpsc::R
         }
         match s.read(&mut chunk) {
             Ok(0) => return Err("The console connection was closed.".into()),
-            Ok(n) => inb.data.extend_from_slice(&chunk[..n]),
+            Ok(n) => {
+                inb.data.extend_from_slice(&chunk[..n]);
+                alive.heard(Instant::now());
+            }
             Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted) => {}
             Err(e) => return Err(io_err(e)),
         }
@@ -367,6 +379,64 @@ fn run(conn: &dyn Connection, vm_ref: &str, shared: &Mutex<Shared>, rx: &mpsc::R
             }
         }
     }
+}
+
+/// A console that sent nothing for this long is asked for one pixel of its screen, which it must
+/// answer (a still screen otherwise sends nothing, so silence alone says nothing).
+const QUIET_PING: Duration = Duration::from_secs(20);
+/// How long that answer may take before the connection is taken for dead (the computer slept, or
+/// the network went away under it): the console then connects again by itself.
+const PING_ANSWER: Duration = Duration::from_secs(15);
+/// The wall clock moved this much further than the monotonic one between two looks: the computer
+/// slept (Linux and macOS don't count sleep in `Instant`), so the connection is checked right away.
+const SLEPT: Duration = Duration::from_secs(5);
+
+/// Whether the console's connection is still alive.
+struct Alive {
+    heard: Instant,
+    asked: Option<Instant>,
+    looked: (Instant, SystemTime),
+}
+
+#[derive(Debug, PartialEq)]
+enum Check {
+    Fine,
+    /// Ask it for something it must answer.
+    Ping,
+    /// It didn't answer.
+    Dead,
+}
+
+impl Alive {
+    fn new(now: Instant, wall: SystemTime) -> Alive {
+        Alive { heard: now, asked: None, looked: (now, wall) }
+    }
+
+    /// Something came from the console.
+    fn heard(&mut self, now: Instant) {
+        self.heard = now;
+        self.asked = None;
+    }
+
+    fn check(&mut self, now: Instant, wall: SystemTime) -> Check {
+        let (then, then_wall) = std::mem::replace(&mut self.looked, (now, wall));
+        let mono = now.duration_since(then);
+        let slept = wall.duration_since(then_wall).map_or(false, |w| w > mono + SLEPT);
+        match self.asked {
+            Some(at) if now.duration_since(at) >= PING_ANSWER => Check::Dead,
+            Some(_) => Check::Fine,
+            None if slept || now.duration_since(self.heard) >= QUIET_PING => {
+                self.asked = Some(now);
+                Check::Ping
+            }
+            None => Check::Fine,
+        }
+    }
+}
+
+/// A request for the top-left pixel, whole (not "only if it changed"): the console must answer it.
+fn ping() -> Vec<u8> {
+    update_request(false, 1, 1)
 }
 
 /// How long a scroll that came alone waits for its new lines before it's shown anyway (a server's
@@ -2299,6 +2369,44 @@ impl Drop for ConsoleView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_quiet_console_is_asked_then_given_up_on() {
+        let (t0, w0) = (Instant::now(), SystemTime::now());
+        let mut a = Alive::new(t0, w0);
+        let at = |s: u64| (t0 + Duration::from_secs(s), w0 + Duration::from_secs(s));
+        let (t, w) = at(10);
+        assert_eq!(a.check(t, w), Check::Fine);
+        let (t, w) = at(20);
+        assert_eq!(a.check(t, w), Check::Ping);
+        let (t, w) = at(30);
+        assert_eq!(a.check(t, w), Check::Fine); // waiting for the answer
+        let (t, w) = at(35);
+        assert_eq!(a.check(t, w), Check::Dead);
+    }
+
+    #[test]
+    fn an_answer_keeps_it_alive() {
+        let (t0, w0) = (Instant::now(), SystemTime::now());
+        let mut a = Alive::new(t0, w0);
+        let at = |s: u64| (t0 + Duration::from_secs(s), w0 + Duration::from_secs(s));
+        let (t, w) = at(20);
+        assert_eq!(a.check(t, w), Check::Ping);
+        a.heard(t0 + Duration::from_secs(21));
+        let (t, w) = at(36);
+        assert_eq!(a.check(t, w), Check::Fine);
+        let (t, w) = at(41);
+        assert_eq!(a.check(t, w), Check::Ping);
+    }
+
+    #[test]
+    fn after_sleep_it_is_asked_right_away() {
+        let (t0, w0) = (Instant::now(), SystemTime::now());
+        let mut a = Alive::new(t0, w0);
+        // a second on the monotonic clock, an hour on the wall: the computer slept
+        let (t, w) = (t0 + Duration::from_secs(1), w0 + Duration::from_secs(3600));
+        assert_eq!(a.check(t, w), Check::Ping);
+    }
 
     fn pump(s: &mut ConsoleStream, inb: &mut InBuf, parser: &mut Parser, shared: &Mutex<Shared>, seen: &mut Vec<i32>, dur: Duration) {
         let end = Instant::now() + dur;
