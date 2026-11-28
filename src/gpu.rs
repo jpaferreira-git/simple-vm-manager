@@ -9,6 +9,15 @@
 // Some drivers (NVIDIA on Linux, DirectX on Windows after a driver reset) lose the whole GPU device
 // while asleep. wgpu can't bring a device back, so the app starts itself again (the servers that
 // were connected reconnect from the keychain, as at any start) and this copy closes.
+//
+// A frame that can't be drawn mustn't keep what it sent the GPU. egui-wgpu copies the frame's
+// shapes and any changed pictures (a console's screen, a thumbnail) to the GPU before it asks for
+// the window's picture, and hands them over together with the drawing once it has one. When it
+// gets none (the screen is locked or off, the computer is going to sleep) it gives up on the frame
+// and those copies stay queued: wgpu only lets them go once something is handed to the GPU. A
+// window that can't draw for a whole night queued gigabytes that way, until the system ran out of
+// memory, and the GPU driver refused the lot when the screen came back. So after each frame that
+// couldn't be drawn, what's queued is handed over right away (with nothing to draw), and freed.
 
 use eframe::egui;
 use eframe::egui_wgpu::{SurfaceErrorAction, WgpuConfiguration};
@@ -19,6 +28,8 @@ use std::time::{Duration, Instant};
 
 /// The window's context, so a callback from the renderer can ask for the next frame.
 static CTX: OnceLock<egui::Context> = OnceLock::new();
+/// The GPU's queue, to hand over a frame's copies when the frame couldn't be drawn.
+static QUEUE: OnceLock<Arc<wgpu::Queue>> = OnceLock::new();
 /// The GPU device was lost: the app should start again.
 static DEVICE_LOST: AtomicBool = AtomicBool::new(false);
 /// Surface errors in a row (none for two seconds ends a row), to quiet the warnings and slow down
@@ -45,6 +56,7 @@ fn on_surface_error(err: wgpu::SurfaceError) -> SurfaceErrorAction {
     if n < 5 && err != wgpu::SurfaceError::Outdated {
         eprintln!("The window's picture couldn't be drawn ({}); setting it up again", err);
     }
+    flush();
     if let Some(ctx) = CTX.get() {
         // the first retries right away; a window that keeps failing (minimized) a few times a second
         let wait = if n < 10 { 16 } else { 500 };
@@ -56,10 +68,18 @@ fn on_surface_error(err: wgpu::SurfaceError) -> SurfaceErrorAction {
     }
 }
 
+/// Hands the GPU what this frame copied to it, with nothing to draw: wgpu frees it once done.
+fn flush() {
+    if let Some(q) = QUEUE.get() {
+        q.submit(std::iter::empty());
+    }
+}
+
 /// Called once the window is up: remembers its context and watches the GPU device.
 pub fn watch(cc: &eframe::CreationContext<'_>) {
     let _ = CTX.set(cc.egui_ctx.clone());
     let Some(rs) = cc.wgpu_render_state.as_ref() else { return }; // drawing with OpenGL
+    let _ = QUEUE.set(rs.queue.clone());
     let ctx = cc.egui_ctx.clone();
     rs.device.set_device_lost_callback(move |reason, msg| {
         // dropping or replacing the device at exit calls it too: those aren't a loss
@@ -87,7 +107,7 @@ pub fn relaunch() -> bool {
     }
     let Ok(exe) = std::env::current_exe() else { return false };
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match std::process::Command::new(exe).args(args).spawn() {
+    match std::process::Command::new(exe).args(args).env(crate::single::TAKING_OVER, "1").spawn() {
         Ok(_) => true,
         Err(e) => {
             eprintln!("Couldn't start the app again: {}", e);

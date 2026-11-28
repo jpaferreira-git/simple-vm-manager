@@ -883,6 +883,9 @@ impl App {
         crate::gpu::watch(cc);
         setup_fonts(&cc.egui_ctx);
         let shot = start.shot_path.is_some();
+        if !shot {
+            crate::single::watch(&cc.egui_ctx, config_dir());
+        }
         // A check's screenshot doesn't use the person's saved settings: light theme, sidebar open,
         // unless --theme / --sidebar say otherwise.
         let saved = if shot { Settings::default() } else { load_settings() };
@@ -2977,7 +2980,7 @@ impl App {
                     Ok(exe) => {
                         // the new version starts, this one closes
                         let args: Vec<String> = std::env::args().skip(1).collect();
-                        match std::process::Command::new(&exe).args(args).spawn() {
+                        match std::process::Command::new(&exe).args(args).env(crate::single::TAKING_OVER, "1").spawn() {
                             Ok(_) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
                             Err(e) => {
                                 if let Dialog::Update(d) = &mut self.dialog {
@@ -9261,6 +9264,11 @@ impl eframe::App for App {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
         }
+        // another copy was started: this window comes forward instead
+        if crate::single::show_asked() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
         self.apply_theme(ctx); // follows the system theme when set to "Same as the system"
         // a newer version found: offered when nothing else is asked
         if matches!(self.dialog, Dialog::None) {
@@ -10959,7 +10967,7 @@ fn rename_box_width(name_w: f32) -> f32 {
     (name_w + 60.0).clamp(220.0, 420.0)
 }
 
-fn config_dir() -> Option<std::path::PathBuf> {
+pub(crate) fn config_dir() -> Option<std::path::PathBuf> {
     let base = if cfg!(windows) {
         std::env::var_os("APPDATA").map(std::path::PathBuf::from)
     } else {
