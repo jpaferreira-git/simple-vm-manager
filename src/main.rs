@@ -9,6 +9,7 @@ mod conn;
 mod convert;
 mod console;
 mod details;
+mod gpu;
 mod helper;
 mod history;
 mod hosttools;
@@ -23,6 +24,7 @@ mod newvm;
 mod pool_update;
 mod scrollback;
 mod secrets;
+mod single;
 mod theme;
 mod update;
 mod upload;
@@ -117,6 +119,10 @@ fn main() -> eframe::Result {
         i += 1;
     }
     let shot = args.shot.clone();
+    // one copy at a time: another one started shows the open window instead (not for screenshots)
+    if shot.is_none() && single::start(app::config_dir()) == single::Start::AlreadyOpen {
+        return Ok(());
+    }
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([1180.0, 740.0])
@@ -147,7 +153,7 @@ fn main() -> eframe::Result {
 
 fn run(viewport: egui::ViewportBuilder, renderer: eframe::Renderer, args: Args) -> eframe::Result {
     #[allow(unused_mut)]
-    let mut options = eframe::NativeOptions { viewport, renderer, ..Default::default() };
+    let mut options = eframe::NativeOptions { viewport, renderer, wgpu_options: gpu::wgpu_options(), ..Default::default() };
     #[cfg(target_os = "macos")]
     if args.shot.is_some() {
         options.event_loop_builder = Some(Box::new(|builder| {
